@@ -1,0 +1,5 @@
+must_disclose_ai_identity: true
+deny_prompt_leak: true
+deny_admin_override_from_chat: true
+deny_explicit_content: true
+deny_flirting_on_unknown_age: true

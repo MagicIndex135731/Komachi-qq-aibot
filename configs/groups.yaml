@@ -1,0 +1,15 @@
+default_group_behavior:
+  enabled: false
+  archive: false
+  speak: false
+  proactive_reply: true
+  proactive_interval_seconds: "180-480"
+
+groups:
+  # Replace this example group id with a real QQ group id before production use.
+  "10001":
+    enabled: true
+    archive: true
+    speak: true
+    proactive_reply: true
+    proactive_interval_seconds: "180-480"

@@ -1,0 +1,9 @@
+reminders: []
+
+# Example:
+# reminders:
+#   - id: weekday-morning-checkin
+#     user_id: 987654321
+#     text: Morning. Check the weather before you head out.
+#     run_at: "2026-01-01T08:00:00+08:00"
+#     catch_up_if_missed: false
