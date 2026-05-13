@@ -5,12 +5,15 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_group_message_event, parse_private_message_event
 from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.context_builder import ContextBuilder
+from app.core.group_image_generation import GroupImageGenerationService
 from app.core.message_archive import sync_group_message_archives_from_db
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
@@ -109,6 +112,41 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
     )
 
 
+def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
+    if not settings.group_image_base_url.strip() and not settings.group_image_api_key.strip():
+        return llm_client
+    responses_model, compat_model = resolve_llm_transport_models(
+        model=settings.llm_model,
+        fallback_model=settings.llm_fallback_model,
+    )
+    return LlmClient(
+        base_url=settings.group_image_base_url.strip() or settings.llm_base_url,
+        api_key=settings.group_image_api_key.strip() or settings.llm_api_key,
+        model=settings.llm_model,
+        fallback_model=settings.llm_fallback_model,
+        responses_model=responses_model,
+        compat_model=compat_model,
+        http_client=httpx.Client(timeout=30.0, trust_env=False),
+        usage_recorder=build_usage_recorder(engine),
+    )
+
+
+def build_group_image_service(*, settings: AppSettings, llm_client, sender) -> GroupImageGenerationService:
+    return GroupImageGenerationService(
+        llm_client=llm_client,
+        sender=sender,
+        output_dir=settings.data_dir / "generated_images",
+        model=settings.group_image_model,
+        size=settings.group_image_size,
+        quality=settings.group_image_quality,
+        background=settings.group_image_background,
+        output_format=settings.group_image_output_format,
+        output_compression=settings.group_image_output_compression,
+        moderation=settings.group_image_moderation,
+        max_slots=settings.group_image_queue_capacity,
+    )
+
+
 async def run() -> None:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
@@ -119,6 +157,12 @@ async def run() -> None:
     gateway = NapCatGateway(ws_url=settings.napcat_ws_url)
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
+    group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+    group_image_service = build_group_image_service(
+        settings=settings,
+        llm_client=group_image_llm_client,
+        sender=sender,
+    )
     web_search_client = build_web_search_client(settings)
     dev_control_service = DevControlService(
         engine=engine,
@@ -127,6 +171,7 @@ async def run() -> None:
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
+        admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
         assistant_name=str(runtime.persona.get("name", "Codex")),
@@ -144,6 +189,7 @@ async def run() -> None:
         admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
         web_search_client=web_search_client,
         dev_control_service=dev_control_service,
+        group_image_service=group_image_service,
     )
 
     async def handle_payload(payload: dict) -> None:

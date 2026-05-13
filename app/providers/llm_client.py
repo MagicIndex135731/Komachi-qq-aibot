@@ -25,6 +25,7 @@ INSTRUCTION_PREFIXES = (
     "Reply style:",
 )
 PROXY_CHAT_IMAGE_STRING_HOSTS = {"api.codexzh.com"}
+USE_CLIENT_DEFAULT_TIMEOUT = object()
 
 
 @dataclass(slots=True)
@@ -42,6 +43,12 @@ class ResponsesStreamResult:
     text: str | None
     response_id: str | None
     usage: LlmUsage | None
+
+
+@dataclass(slots=True)
+class ImageGenerationResult:
+    created: int | None
+    images: list[dict[str, Any]]
 
 
 class LlmClient:
@@ -683,6 +690,65 @@ class LlmClient:
             raise ValueError("responses request failed without a captured exception")
         raise ValueError("responses request failed after retries") from last_error
 
+    def _request_images_generations_json(
+        self,
+        *,
+        payload: dict[str, Any],
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                request_kwargs: dict[str, Any] = {
+                    "headers": {"Authorization": f"Bearer {self.api_key}"},
+                    "json": payload,
+                }
+                if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
+                    request_kwargs["timeout"] = timeout_seconds
+                response = self.http_client.post(
+                    f"{self.base_url}/images/generations",
+                    **request_kwargs,
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                logger.warning("images_generations_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+            except httpx.TransportError as exc:
+                last_error = exc
+                logger.warning("images_generations_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if not self._is_retryable_status_code(status_code):
+                    raise
+                last_error = exc
+                logger.warning("images_generations_status_retry attempt=%s status=%s", attempt, status_code)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+
+            try:
+                return response.json()
+            except ValueError as exc:
+                last_error = exc
+                logger.warning(
+                    "images_generations_invalid_json attempt=%s status=%s content_type=%s body_prefix=%r",
+                    attempt,
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    response.text[:200],
+                )
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+
+        if last_error is None:
+            raise ValueError("images generations request failed without a captured exception")
+        raise ValueError("images generations request failed after retries") from last_error
+
     def _generate_text_without_responses(
         self,
         *,
@@ -774,5 +840,53 @@ class LlmClient:
         return self._generate_text_without_responses(
             instructions=instructions,
             input_lines=input_lines,
+            images=images,
+        )
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        output_compression: int | None = None,
+        moderation: str | None = None,
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> ImageGenerationResult:
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "n": 1,
+            "response_format": "url",
+        }
+        if size:
+            payload["size"] = size
+        if quality:
+            payload["quality"] = quality
+        if background:
+            payload["background"] = background
+        if output_format:
+            payload["output_format"] = output_format
+        normalized_output_format = (output_format or "").strip().lower()
+        if output_compression is not None and normalized_output_format in {"jpeg", "jpg", "webp"}:
+            payload["output_compression"] = int(output_compression)
+        if moderation:
+            payload["moderation"] = moderation
+
+        response_data = self._request_images_generations_json(
+            payload=payload,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
+        )
+        data = response_data.get("data")
+        if not isinstance(data, list):
+            raise ValueError("image generation response did not include data list")
+        images = [item for item in data if isinstance(item, dict)]
+        return ImageGenerationResult(
+            created=int(response_data["created"]) if "created" in response_data and response_data["created"] is not None else None,
             images=images,
         )

@@ -154,6 +154,9 @@ Useful optional values:
 - `PRIVATE_CHAT_QQS`
 - `SEARCH_PROVIDER`
 - `SEARCH_API_KEY`
+- `CONTEXT_RECENT_LIMIT`
+- `CONTEXT_SUMMARY_LIMIT`
+- `CONTEXT_HISTORY_LIMIT`
 - `QQ_EXE_PATH`
 - `NAPCAT_SHELL_DIR`
 
@@ -169,6 +172,7 @@ Before production use:
 - replace the example group id in `configs/groups.yaml`
 - set `enabled: true` and `speak: true` only for groups you actually want the bot to join
 - rewrite the persona if you do not want the included example tone
+- only groups with both `enabled: true` and `speak: true` are ingested
 
 ### 4. Run the bot
 
@@ -185,6 +189,7 @@ powershell -ExecutionPolicy Bypass -File start_xiaomachi.ps1
 ```
 
 If you prefer a double-click workflow, root-level `.bat` launchers are also included for local Windows start/stop.
+`启动小町.bat` starts QQ, NapCat, and the Python bot together, and `关闭小町.bat` stops the launcher-managed local stack.
 
 ## Run Modes
 

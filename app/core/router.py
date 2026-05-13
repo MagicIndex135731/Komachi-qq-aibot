@@ -11,6 +11,7 @@ from app.admin.commands import AdminCommandParser, CommandContext
 from app.config import AppSettings, RuntimeConfig
 from app.core.chat_style import build_human_chat_style_lines, normalize_chat_reply, normalize_proactive_chat_reply
 from app.core.context_builder import ContextBuilder
+from app.core.group_image_generation import GroupImageGenerationRequest
 from app.core.image_cache import cache_images_in_raw_payload
 from app.core.message_archive import append_group_message_archive
 from app.core.image_turn_resolver import resolve_images_for_turn
@@ -49,6 +50,18 @@ from app.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
+GROUP_IMAGE_REQUEST_PATTERNS = (
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:个|一张|张)?(?P<prompt>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?来张(?P<prompt>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?出图(?P<prompt>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?生成(?:一张)?(?:图片|图像|图)?(?P<prompt>.+)$", re.IGNORECASE),
+)
+GROUP_IMAGE_NEGATIVE_PATTERNS = (
+    re.compile(r"会画图吗|能画图吗|会不会画图", re.IGNORECASE),
+    re.compile(r"为什么.*出图", re.IGNORECASE),
+    re.compile(r"谁画的", re.IGNORECASE),
+    re.compile(r"识图", re.IGNORECASE),
+)
 LOOKUP_NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?，。！？：；、“”‘’（）《》【】]")
 
 
@@ -56,6 +69,7 @@ LOOKUP_NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?�
 class PreparedGroupReply:
     should_reply: bool
     prompt_lines: list[str] | None = None
+    group_image_request: GroupImageGenerationRequest | None = None
     target_images: list[ImageAttachment] | None = None
     requires_user_visible_failure_reply: bool = False
     proactive_turn: bool = False
@@ -72,9 +86,19 @@ class InboundRouter:
     admin_parser: AdminCommandParser
     web_search_client: WebSearchClient | None = None
     dev_control_service: object | None = None
+    group_image_service: object | None = None
 
     @classmethod
-    def build_for_test(cls, *, sqlite_engine, sender, llm_client, web_search_client=None, dev_control_service=None):
+    def build_for_test(
+        cls,
+        *,
+        sqlite_engine,
+        sender,
+        llm_client,
+        web_search_client=None,
+        dev_control_service=None,
+        group_image_service=None,
+    ):
         settings = AppSettings.model_construct(
             napcat_ws_url="ws://127.0.0.1:3001",
             llm_base_url="https://api.example.test/v1",
@@ -134,6 +158,7 @@ class InboundRouter:
             context_builder=ContextBuilder(),
             admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
             dev_control_service=dev_control_service,
+            group_image_service=group_image_service,
         )
 
     def _group_runtime_policy(
@@ -322,6 +347,73 @@ class InboundRouter:
         if image_count == 1:
             return "[sent 1 image]" if event.images else "[asked about 1 image]"
         return f"[sent {image_count} images]" if event.images else f"[asked about {image_count} images]"
+
+    def _strip_group_image_prefix(self, text: str) -> str:
+        persona_name = str(self.runtime.persona.get("name", "")).strip()
+        stripped = text.strip()
+        if persona_name:
+            stripped = re.sub(
+                rf"^(?:@?{re.escape(persona_name)}[\s,，:：]*)+",
+                "",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+        stripped = re.sub(r"^@[A-Za-z0-9_\-\u4e00-\u9fff]+\s*", "", stripped)
+        return stripped.strip()
+
+    def _build_group_image_request(self, *, event, addressed_turn: bool) -> GroupImageGenerationRequest | None:
+        if self.group_image_service is None or not addressed_turn:
+            return None
+        stripped = self._strip_group_image_prefix(event.plain_text)
+        if not stripped:
+            return None
+        if any(pattern.search(stripped) for pattern in GROUP_IMAGE_NEGATIVE_PATTERNS):
+            return None
+        for pattern in GROUP_IMAGE_REQUEST_PATTERNS:
+            match = pattern.match(stripped)
+            if match is None:
+                continue
+            prompt = match.group("prompt").strip(" \t,，。.!！?？")
+            if not prompt:
+                return None
+            return GroupImageGenerationRequest(
+                group_id=event.group_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=prompt,
+                requester_user_id=event.user_id,
+            )
+        return None
+
+    def _group_image_enqueue_reply_text(self, enqueue_result) -> str:
+        if not getattr(enqueue_result, "accepted", False):
+            return "先等等，出图队列满了"
+        queue_position = int(getattr(enqueue_result, "queue_position", 1) or 1)
+        if queue_position <= 1:
+            return "行，我画"
+        return f"收到了，排队第 {queue_position}"
+
+    async def _handle_group_image_request(self, event, request: GroupImageGenerationRequest) -> None:
+        if self.group_image_service is None:
+            return
+        try:
+            enqueue_result = await self.group_image_service.enqueue(request)
+        except Exception:
+            logger.exception(
+                "group_image_enqueue_failed group_id=%s msg_id=%s",
+                event.group_id,
+                event.platform_msg_id,
+            )
+            await self._send_prebuilt_reply(event, "出图队列刚卡了一下，你再叫我一次")
+            return
+        logger.info(
+            "group_image_enqueue group_id=%s msg_id=%s accepted=%s queue_position=%s reason=%s",
+            event.group_id,
+            event.platform_msg_id,
+            getattr(enqueue_result, "accepted", False),
+            getattr(enqueue_result, "queue_position", None),
+            getattr(enqueue_result, "reason", ""),
+        )
+        await self._send_prebuilt_reply(event, self._group_image_enqueue_reply_text(enqueue_result))
 
     def _resolve_referenced_member_id(
         self,
@@ -728,6 +820,16 @@ class InboundRouter:
             )
             if not decision.should_reply:
                 return PreparedGroupReply(False)
+            group_image_request = self._build_group_image_request(
+                event=event,
+                addressed_turn=addressed_turn,
+            )
+            if group_image_request is not None:
+                return PreparedGroupReply(
+                    should_reply=True,
+                    group_image_request=group_image_request,
+                    requires_user_visible_failure_reply=True,
+                )
 
             relevant_summaries = summaries.list_recent_group_summaries(
                 scope_id=str(event.group_id),
@@ -991,7 +1093,12 @@ class InboundRouter:
             return
         quoted_raw_payload = await self._fetch_quoted_message_payload(reply_to_msg_id=event.reply_to_msg_id)
         prepared_reply = self._prepare_group_reply(event, quoted_raw_payload=quoted_raw_payload)
-        if not prepared_reply.should_reply or prepared_reply.prompt_lines is None:
+        if not prepared_reply.should_reply:
+            return
+        if prepared_reply.group_image_request is not None:
+            await self._handle_group_image_request(event, prepared_reply.group_image_request)
+            return
+        if prepared_reply.prompt_lines is None:
             return
 
         try:

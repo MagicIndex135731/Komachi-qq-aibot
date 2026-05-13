@@ -220,6 +220,7 @@ class PublicReleaseSync:
             ".git",
             ".venv",
             ".pytest_cache",
+            ".pytest_tmp",
             ".tmp_pytest",
             ".worktrees",
             "__pycache__",
@@ -228,6 +229,10 @@ class PublicReleaseSync:
             "release",
         }
         if top_level in ignored_top_levels:
+            return True
+        if top_level.startswith(".tmp_pytest"):
+            return True
+        if top_level.startswith("dbg_service_"):
             return True
 
         if top_level == "scripts" and len(parts) > 1 and parts[1] == self.asset_root.name:
@@ -242,7 +247,7 @@ class PublicReleaseSync:
         if top_level == "data":
             if len(parts) == 1:
                 return True
-            if parts[1] in {"history", "dev_control", "image_cache"}:
+            if parts[1] in {"history", "dev_control", "image_cache", "generated_images"}:
                 return True
             if len(parts) > 1 and parts[1] == "logs":
                 return True

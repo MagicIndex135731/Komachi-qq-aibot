@@ -18,6 +18,14 @@ from app.private_reminders import PrivateReminderScheduler, load_private_reminde
 from app.storage.db import build_engine, create_all
 
 
+async def _wait_for_gateway_ready(gateway: NapCatGateway, *, timeout_seconds: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while gateway.websocket is None:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("private gateway did not connect in time")
+        await asyncio.sleep(0.1)
+
+
 async def run() -> None:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
@@ -38,6 +46,7 @@ async def run() -> None:
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
+        admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
         enable_local_worker=False,
@@ -46,14 +55,12 @@ async def run() -> None:
         persona=runtime.persona,
         safety=runtime.safety,
     )
-    await dev_control_service.start()
     reminder_scheduler = PrivateReminderScheduler(
         sender=sender,
         data_dir=settings.data_dir,
         reminders=load_private_reminders(config_dir=settings.config_dir),
         allowed_user_ids=settings.private_chat_whitelist,
     )
-    await reminder_scheduler.start()
     router = InboundRouter(
         engine=engine,
         runtime=runtime,
@@ -76,9 +83,15 @@ async def run() -> None:
         await router.handle_private_message(event)
 
     logging.info(f"qq-ai-private starting with owner={settings.owner_qq} model={settings.llm_model}")
+    gateway_task = asyncio.create_task(gateway.connect_and_consume(handle_payload))
     try:
-        await gateway.connect_and_consume(handle_payload)
+        await _wait_for_gateway_ready(gateway)
+        await dev_control_service.start()
+        await reminder_scheduler.start()
+        await gateway_task
     finally:
+        gateway_task.cancel()
+        await asyncio.gather(gateway_task, return_exceptions=True)
         await reminder_scheduler.stop()
         await dev_control_service.stop()
 

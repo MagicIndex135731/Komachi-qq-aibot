@@ -12,6 +12,8 @@ from app.core.context_builder import ContextBuilder
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.main import (
+    build_group_image_llm_client,
+    build_group_image_service,
     build_llm_client,
     build_web_search_client,
     create_runtime_banner,
@@ -31,6 +33,12 @@ async def run() -> None:
     gateway = NapCatGateway(ws_url=settings.napcat_ws_url)
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
+    group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+    group_image_service = build_group_image_service(
+        settings=settings,
+        llm_client=group_image_llm_client,
+        sender=sender,
+    )
     web_search_client = build_web_search_client(settings)
     router = InboundRouter(
         engine=engine,
@@ -42,6 +50,7 @@ async def run() -> None:
         admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
         web_search_client=web_search_client,
         dev_control_service=None,
+        group_image_service=group_image_service,
     )
 
     async def handle_payload(payload: dict) -> None:

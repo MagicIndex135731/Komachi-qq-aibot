@@ -3,6 +3,7 @@ import base64
 from pathlib import Path
 
 import httpx
+import pytest
 
 from app.providers.llm_client import LlmClient
 from app.core.message_content import ImageAttachment
@@ -1116,3 +1117,269 @@ def test_llm_client_uses_string_image_url_for_codexzh_proxy_chat_payload() -> No
             ],
         }
     ]
+
+
+def test_llm_client_posts_to_images_generations_endpoint() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "created": 123,
+                "data": [{"b64_json": "abc"}],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    result = client.generate_image(
+        prompt="draw a cat",
+        model="gpt-image-2",
+        size="1024x1024",
+    )
+
+    assert captured["url"] == "https://api.example.test/v1/images/generations"
+    assert captured["authorization"] == "Bearer test-key"
+    assert captured["payload"] == {
+        "model": "gpt-image-2",
+        "prompt": "draw a cat",
+        "n": 1,
+        "response_format": "url",
+        "size": "1024x1024",
+    }
+    assert result.created == 123
+    assert result.images == [{"b64_json": "abc"}]
+
+
+def test_llm_client_retries_images_generations_when_server_returns_502() -> None:
+    captured_urls: list[str] = []
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return httpx.Response(502, json={"error": "bad gateway"})
+        return httpx.Response(
+            200,
+            json={
+                "created": 123,
+                "data": [{"url": "https://img.example.test/generated.png"}],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    result = client.generate_image(prompt="draw a cat", model="gpt-image-2")
+
+    assert result.images == [{"url": "https://img.example.test/generated.png"}]
+    assert captured_urls == [
+        "https://api.example.test/v1/images/generations",
+        "https://api.example.test/v1/images/generations",
+    ]
+
+
+def test_llm_client_generate_image_respects_max_attempts_override() -> None:
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        attempts["count"] += 1
+        raise httpx.ReadTimeout("timed out")
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    with pytest.raises(ValueError, match="images generations request failed after retries") as exc_info:
+        client.generate_image(prompt="draw a cat", model="gpt-image-2", max_attempts=1)
+
+    assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+    assert attempts["count"] == 1
+
+
+def test_llm_client_generate_image_passes_timeout_override_to_http_client() -> None:
+    captured = {}
+
+    class FakeHttpClient:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            captured["json"] = kwargs.get("json")
+            captured["has_timeout_key"] = "timeout" in kwargs
+            captured["timeout"] = kwargs.get("timeout")
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url, headers=kwargs.get("headers"), json=kwargs.get("json")),
+                json={
+                    "created": 123,
+                    "data": [{"b64_json": "abc"}],
+                },
+            )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=FakeHttpClient(),
+    )
+
+    result = client.generate_image(
+        prompt="draw a cat",
+        model="gpt-image-2",
+        timeout_seconds=60.0,
+    )
+
+    assert result.images == [{"b64_json": "abc"}]
+    assert captured["has_timeout_key"] is True
+    assert captured["timeout"] == 60.0
+
+
+def test_llm_client_generate_image_can_disable_http_timeout_per_request() -> None:
+    captured = {}
+
+    class FakeHttpClient:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            captured["json"] = kwargs.get("json")
+            captured["has_timeout_key"] = "timeout" in kwargs
+            captured["timeout"] = kwargs.get("timeout")
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url, headers=kwargs.get("headers"), json=kwargs.get("json")),
+                json={
+                    "created": 123,
+                    "data": [{"b64_json": "abc"}],
+                },
+            )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=FakeHttpClient(),
+    )
+
+    result = client.generate_image(
+        prompt="draw a cat",
+        model="gpt-image-2",
+        timeout_seconds=None,
+    )
+
+    assert result.images == [{"b64_json": "abc"}]
+    assert captured["has_timeout_key"] is True
+    assert captured["timeout"] is None
+
+
+def test_llm_client_generate_image_includes_compression_and_moderation_fields() -> None:
+    captured = {}
+
+    class FakeHttpClient:
+        def post(self, url, *, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url, headers=headers, json=json),
+                json={
+                    "created": 123,
+                    "data": [{"b64_json": "abc"}],
+                },
+            )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=FakeHttpClient(),
+    )
+
+    result = client.generate_image(
+        prompt="draw a cat",
+        model="gpt-image-2",
+        quality="low",
+        output_format="jpeg",
+        output_compression=70,
+        moderation="low",
+    )
+
+    assert result.images == [{"b64_json": "abc"}]
+    assert captured["json"] == {
+        "model": "gpt-image-2",
+        "prompt": "draw a cat",
+        "n": 1,
+        "response_format": "url",
+        "quality": "low",
+        "output_format": "jpeg",
+        "output_compression": 70,
+        "moderation": "low",
+    }
+
+
+def test_llm_client_generate_image_omits_compression_for_png() -> None:
+    captured = {}
+
+    class FakeHttpClient:
+        def post(self, url, *, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url, headers=headers, json=json),
+                json={
+                    "created": 123,
+                    "data": [{"url": "https://img.example.test/generated.png"}],
+                },
+            )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=FakeHttpClient(),
+    )
+
+    result = client.generate_image(
+        prompt="draw a cat",
+        model="gpt-image-2",
+        quality="high",
+        output_format="png",
+        output_compression=70,
+        moderation="low",
+    )
+
+    assert result.images == [{"url": "https://img.example.test/generated.png"}]
+    assert captured["json"] == {
+        "model": "gpt-image-2",
+        "prompt": "draw a cat",
+        "n": 1,
+        "response_format": "url",
+        "quality": "high",
+        "output_format": "png",
+        "moderation": "low",
+    }

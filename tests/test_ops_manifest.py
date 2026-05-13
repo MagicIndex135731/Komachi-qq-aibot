@@ -145,4 +145,7 @@ def test_public_release_has_license_env_example_and_reminder_state_ignore() -> N
     assert "LLM_MODEL" in env_example
     assert "OWNER_QQ" in env_example
     assert "data/private_reminders_state.json" in gitignore
+    assert "data/generated_images/" in gitignore
+    assert ".tmp_pytest*/" in gitignore
+    assert "dbg_service_*/" in gitignore
     assert "MIT License" in license_text

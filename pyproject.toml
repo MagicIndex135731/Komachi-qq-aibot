@@ -26,7 +26,18 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
-norecursedirs = ["data", ".git", ".venv", "__pycache__", ".pytest_cache", ".tmp_pytest", "release"]
+norecursedirs = [
+  "data",
+  ".git",
+  ".venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".pytest_tmp",
+  ".tmp_pytest",
+  ".tmp_pytest*",
+  "release",
+  "scripts/public_release_assets",
+]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

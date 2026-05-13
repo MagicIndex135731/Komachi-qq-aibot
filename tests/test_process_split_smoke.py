@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,9 @@ def _settings() -> AppSettings:
         llm_api_key="test-key",
         llm_model="gpt-5.4",
         llm_fallback_model="",
+        group_image_base_url="",
+        group_image_api_key="",
+        group_image_size="auto",
         bot_qq=123456789,
         owner_qq=987654321,
         admin_qqs="",
@@ -96,7 +100,6 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None
     assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
 
 
-@pytest.mark.asyncio
 async def test_private_main_disables_local_worker(monkeypatch) -> None:
     settings = _settings()
     captured: dict[str, object] = {}
@@ -163,6 +166,79 @@ async def test_private_main_disables_local_worker(monkeypatch) -> None:
     assert reminder_events == ["start", "stop"]
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
+
+
+@pytest.mark.asyncio
+async def test_private_main_waits_for_gateway_before_starting_services(monkeypatch) -> None:
+    settings = _settings()
+    events: list[str] = []
+    search_client = object()
+    FakeGateway.instances.clear()
+
+    class OrderedGateway(FakeGateway):
+        async def connect_and_consume(self, handler) -> None:
+            events.append("gateway-connect")
+            await asyncio.sleep(0)
+            self.websocket = object()
+            events.append("gateway-ready")
+            await handler({})
+
+    class FakeService:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+        async def start(self) -> None:
+            assert OrderedGateway.instances[0].websocket is not None
+            events.append("service-start")
+
+        async def stop(self) -> None:
+            events.append("service-stop")
+
+    class FakeReminderScheduler:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+        async def start(self) -> None:
+            assert OrderedGateway.instances[0].websocket is not None
+            events.append("reminder-start")
+
+        async def stop(self) -> None:
+            events.append("reminder-stop")
+
+    monkeypatch.setattr(private_main, "AppSettings", lambda: settings)
+    monkeypatch.setattr(
+        private_main,
+        "load_runtime_config",
+        lambda provided_settings: SimpleNamespace(
+            persona={"name": "bot"},
+            group_policy={},
+            safety={},
+            settings=provided_settings,
+        ),
+    )
+    monkeypatch.setattr(private_main, "build_engine", lambda _path: object())
+    monkeypatch.setattr(private_main, "create_all", lambda _engine: None)
+    monkeypatch.setattr(private_main, "NapCatGateway", OrderedGateway)
+    monkeypatch.setattr(private_main, "Sender", lambda _gateway: object())
+    monkeypatch.setattr(app_main, "LlmClient", lambda **_kwargs: object())
+    monkeypatch.setattr(private_main, "ReplyPolicy", lambda: object())
+    monkeypatch.setattr(private_main, "ContextBuilder", lambda: object())
+    monkeypatch.setattr(private_main, "AdminCommandParser", lambda **_kwargs: object())
+    monkeypatch.setattr(private_main, "build_web_search_client", lambda _settings: search_client)
+    monkeypatch.setattr(private_main, "load_private_reminders", lambda *, config_dir: ["reminder"])
+    monkeypatch.setattr(private_main, "PrivateReminderScheduler", FakeReminderScheduler)
+    monkeypatch.setattr(private_main, "DevControlService", FakeService)
+    monkeypatch.setattr(private_main, "InboundRouter", lambda **_kwargs: object())
+
+    await private_main.run()
+
+    assert events[:4] == [
+        "gateway-connect",
+        "gateway-ready",
+        "service-start",
+        "reminder-start",
+    ]
+    assert events[-2:] == ["reminder-stop", "service-stop"]
 
 
 @pytest.mark.asyncio

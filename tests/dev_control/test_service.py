@@ -35,6 +35,17 @@ class SlowSender(FakeSender):
         await super().send_private_text(outbound)
 
 
+class SelectiveFailSender(FakeSender):
+    def __init__(self, *, failing_user_ids: set[int]) -> None:
+        super().__init__()
+        self.failing_user_ids = set(failing_user_ids)
+
+    async def send_private_text(self, outbound) -> None:
+        if outbound.user_id in self.failing_user_ids:
+            raise RuntimeError(f"send_private_msg failed: target={outbound.user_id}")
+        await super().send_private_text(outbound)
+
+
 class FakeLlmClient:
     def __init__(self, reply_text: str = "fast project reply") -> None:
         self.reply_text = reply_text
@@ -1979,6 +1990,114 @@ async def test_owner_private_send_private_message_request_is_refused_consistentl
         completed = DevTaskRepository(session).list_tasks_by_status("completed")
     assert completed[0].intent_type == "project_chat"
     assert "不能直接替你给别人发私聊消息" in completed[0].result_text
+
+
+@pytest.mark.asyncio
+async def test_owner_project_private_send_request_delivers_to_allowlisted_target_and_replies_with_receipt(
+    sqlite_engine, tmp_path
+) -> None:
+    sender = FakeSender()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    service = DevControlService(
+        engine=sqlite_engine,
+        sender=sender,
+        llm_client=FakeLlmClient(),
+        owner_qq=987654321,
+        private_chat_qqs={20002},
+        repo_root=repo_root,
+        data_dir=tmp_path / "data",
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-project-send-ok",
+            user_id=987654321,
+            text=owner_admin_text('给 20002 私聊发送“管理员模式使用方法：先发启动管理员模式，再直接说要查什么、改什么。”'),
+        )
+    )
+
+    assert handled is True
+    assert [outbound.user_id for outbound in sender.private_sent] == [20002, 987654321]
+    assert sender.private_sent[0].text == "管理员模式使用方法：先发启动管理员模式，再直接说要查什么、改什么。"
+    assert "已经给 20002 私聊发过去了" in sender.private_sent[1].text
+    assert "管理员模式使用方法" in sender.private_sent[1].text
+    with session_scope(sqlite_engine) as session:
+        completed = DevTaskRepository(session).list_tasks_by_status("completed")
+    assert completed[-1].intent_type == "project_chat"
+    assert "已经给 20002 私聊发过去了" in completed[-1].result_text
+
+
+@pytest.mark.asyncio
+async def test_owner_project_private_send_request_refuses_non_allowlisted_target_with_visible_receipt(
+    sqlite_engine, tmp_path
+) -> None:
+    sender = FakeSender()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    service = DevControlService(
+        engine=sqlite_engine,
+        sender=sender,
+        llm_client=FakeLlmClient(),
+        owner_qq=987654321,
+        private_chat_qqs={20003},
+        repo_root=repo_root,
+        data_dir=tmp_path / "data",
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-project-send-denied",
+            user_id=987654321,
+            text=owner_admin_text('给 20002 私聊发送“你好”'),
+        )
+    )
+
+    assert handled is True
+    assert len(sender.private_sent) == 1
+    assert sender.private_sent[0].user_id == 987654321
+    assert "20002" in sender.private_sent[0].text
+    assert "不在私聊白名单" in sender.private_sent[0].text
+    with session_scope(sqlite_engine) as session:
+        completed = DevTaskRepository(session).list_tasks_by_status("completed")
+    assert completed[-1].intent_type == "project_chat"
+    assert "不在私聊白名单" in completed[-1].result_text
+
+
+@pytest.mark.asyncio
+async def test_owner_project_private_send_request_reports_target_delivery_failure(
+    sqlite_engine, tmp_path
+) -> None:
+    sender = SelectiveFailSender(failing_user_ids={20002})
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    service = DevControlService(
+        engine=sqlite_engine,
+        sender=sender,
+        llm_client=FakeLlmClient(),
+        owner_qq=987654321,
+        private_chat_qqs={20002},
+        repo_root=repo_root,
+        data_dir=tmp_path / "data",
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-project-send-failed",
+            user_id=987654321,
+            text=owner_admin_text('给 20002 私聊发送“你好”'),
+        )
+    )
+
+    assert handled is True
+    assert [outbound.user_id for outbound in sender.private_sent] == [987654321]
+    assert "20002" in sender.private_sent[0].text
+    assert "没发出去" in sender.private_sent[0].text
+    assert "send_private_msg failed: target=20002" in sender.private_sent[0].text
+    with session_scope(sqlite_engine) as session:
+        completed = DevTaskRepository(session).list_tasks_by_status("completed")
+    assert completed[-1].intent_type == "project_chat"
+    assert "没发出去" in completed[-1].result_text
 
 
 @pytest.mark.asyncio

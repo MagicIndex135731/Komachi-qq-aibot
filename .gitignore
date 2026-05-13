@@ -10,9 +10,13 @@ data/*.usage-backup-*
 data/private_reminders_state.json
 data/history/
 data/dev_control/
+data/generated_images/
 data/image_cache/
 data/logs/*
 !data/logs/.gitkeep
+.pytest_tmp/
+.tmp_pytest*/
+dbg_service_*/
 .env
 .worktrees/
 release/

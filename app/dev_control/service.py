@@ -354,6 +354,12 @@ class ScriptRunResult:
 
 
 @dataclass(slots=True)
+class ExplicitPrivateSendRequest:
+    target_user_id: int
+    message_text: str
+
+
+@dataclass(slots=True)
 class InspectionSnapshot:
     prompt_block: str
     files_read: list[str]
@@ -553,6 +559,15 @@ class DevControlService:
                 )
                 return True
 
+            if self._parse_explicit_private_send_request(project_event.plain_text) is not None:
+                if await self._schedule_private_image_followup_if_needed(
+                    project_event,
+                    private_scope=PRIVATE_SCOPE_OWNER_PROJECT,
+                ):
+                    return True
+                await self._handle_private_chat_turn(project_event, private_scope=PRIVATE_SCOPE_OWNER_PROJECT)
+                return True
+
             intent_type = self._classify_intent(project_event.plain_text)
             if intent_type == "project_chat":
                 if await self._schedule_private_image_followup_if_needed(
@@ -652,6 +667,13 @@ class DevControlService:
                     event=followup_event,
                     intent_type=followup_intent,
                     request_text=followup_text,
+                )
+                return True
+
+            if self._parse_explicit_private_send_request(admin_event.plain_text) is not None:
+                await self._handle_private_chat_turn(
+                    admin_event,
+                    private_scope=PRIVATE_SCOPE_OWNER_PROJECT,
                 )
                 return True
 
@@ -962,17 +984,32 @@ class DevControlService:
         timeout_seconds: float = 8.0,
     ) -> bool:
         del timeout_seconds
+        delivered, _failure_reason = await self._deliver_private_text(
+            user_id=user_id,
+            text=text,
+            context=context,
+        )
+        return delivered
+
+    async def _deliver_private_text(
+        self,
+        *,
+        user_id: int,
+        text: str,
+        context: str,
+    ) -> tuple[bool, str | None]:
         if not self._reserve_private_outbound_reply(user_id=user_id, reply_text=text, context=context):
             logger.info("private_reply_dedup_skip context=%s user_id=%s", context, user_id)
-            return True
+            return True, None
         try:
             await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
             self._mark_private_outbound_reply_sent(user_id=user_id, reply_text=text, context=context)
-            return True
-        except Exception:
+            return True, None
+        except Exception as exc:
             self._clear_private_outbound_reply_reservation(context=context)
             logger.exception("private_reply_send_failed context=%s user_id=%s", context, user_id)
-            return False
+            failure_reason = str(exc).strip() or exc.__class__.__name__
+            return False, failure_reason
 
     def _private_image_turn_key(self, *, user_id: int, private_scope: str) -> tuple[int, str]:
         return (user_id, private_scope)
@@ -1092,10 +1129,19 @@ class DevControlService:
                     context=f"private_chat:{task_id}:progress",
                 )
             conversation_key = f"dev-session:{session_id}"
-            reply_text = self._build_unsupported_private_action_reply(
-                request_text=request_text,
-                private_scope=private_scope,
-            )
+            reply_text = None
+            if private_scope == PRIVATE_SCOPE_OWNER_PROJECT:
+                explicit_private_send = self._parse_explicit_private_send_request(request_text)
+                if explicit_private_send is not None:
+                    reply_text = await self._handle_owner_project_private_send_request(
+                        task_id=task_id,
+                        private_send=explicit_private_send,
+                    )
+            if reply_text is None:
+                reply_text = self._build_unsupported_private_action_reply(
+                    request_text=request_text,
+                    private_scope=private_scope,
+                )
             if reply_text is None:
                 prompt_lines = self._build_private_chat_prompt(
                     session_id=session_id,
@@ -3131,6 +3177,84 @@ class DevControlService:
         if not isinstance(payload, dict):
             return {}
         return {str(key): value for key, value in payload.items() if key}
+
+    def _parse_explicit_private_send_request(self, text: str) -> ExplicitPrivateSendRequest | None:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return None
+        if not self._looks_like_private_send_request(normalized):
+            return None
+        target_match = re.search(r"\d{5,16}", normalized)
+        if target_match is None:
+            return None
+        remainder = normalized[target_match.end() :].strip()
+        if not remainder:
+            return None
+
+        send_markers = (
+            "私聊发送",
+            "发送私聊",
+            "发私聊",
+            "发私信",
+            "私信发送",
+            "发送私信",
+            "发送消息",
+            "发消息",
+            "发送",
+            "发",
+        )
+        message_text = ""
+        for marker in send_markers:
+            marker_index = remainder.find(marker)
+            if marker_index < 0:
+                continue
+            message_text = remainder[marker_index + len(marker) :].strip()
+            break
+        if not message_text:
+            return None
+
+        message_text = self._strip_balanced_wrapping_quotes(message_text.lstrip(" :：,，"))
+        if not message_text:
+            return None
+        return ExplicitPrivateSendRequest(
+            target_user_id=int(target_match.group(0)),
+            message_text=message_text,
+        )
+
+    def _strip_balanced_wrapping_quotes(self, text: str) -> str:
+        normalized = text.strip()
+        quote_pairs = (("“", "”"), ('"', '"'), ("'", "'"), ("‘", "’"))
+        for left, right in quote_pairs:
+            if normalized.startswith(left) and normalized.endswith(right):
+                return normalized[len(left) : len(normalized) - len(right)].strip()
+        return normalized
+
+    async def _handle_owner_project_private_send_request(
+        self,
+        *,
+        task_id: int,
+        private_send: ExplicitPrivateSendRequest,
+    ) -> str:
+        allowed_targets = {self.owner_qq, *self.private_chat_qqs}
+        if private_send.target_user_id not in allowed_targets:
+            return (
+                f"QQ {private_send.target_user_id} 现在不在私聊白名单里，这条不能直接发。"
+                "先把它加入 PRIVATE_CHAT_QQS，再重试。"
+            )
+
+        delivered, failure_reason = await self._deliver_private_text(
+            user_id=private_send.target_user_id,
+            text=private_send.message_text,
+            context=f"private_send:{task_id}:target:{private_send.target_user_id}",
+        )
+        if not delivered:
+            return (
+                f"给 {private_send.target_user_id} 的这条私聊没发出去：{failure_reason or 'unknown error'}"
+            )
+        return (
+            f"已经给 {private_send.target_user_id} 私聊发过去了。"
+            f"\n内容：{private_send.message_text}"
+        )
 
     def _looks_like_private_send_request(self, text: str) -> bool:
         lowered = text.lower()
