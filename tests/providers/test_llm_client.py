@@ -1195,6 +1195,73 @@ def test_llm_client_retries_images_generations_when_server_returns_502() -> None
     ]
 
 
+def test_llm_client_posts_to_images_edits_endpoint_with_reference_images(tmp_path) -> None:
+    captured = {}
+    source_path = tmp_path / "source.png"
+    source_path.write_bytes(b"png-bytes")
+
+    class FakeHttpClient:
+        def post(self, url, *, headers=None, data=None, files=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["data"] = data
+            captured["files"] = files
+            captured["timeout"] = timeout
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url, headers=headers),
+                json={
+                    "created": 123,
+                    "data": [{"b64_json": "abc"}],
+                },
+            )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=FakeHttpClient(),
+    )
+
+    result = client.edit_image(
+        prompt="turn this into watercolor",
+        model="gpt-image-2",
+        images=[
+            ImageAttachment(
+                url="https://img.example.test/source.png",
+                file_id="source.png",
+                local_path=str(source_path),
+            )
+        ],
+        size="1024x1024",
+        quality="low",
+        output_format="jpeg",
+        output_compression=70,
+        moderation="low",
+        timeout_seconds=60.0,
+    )
+
+    assert result.images == [{"b64_json": "abc"}]
+    assert captured["url"] == "https://api.example.test/v1/images/edits"
+    assert captured["headers"] == {"Authorization": "Bearer test-key"}
+    assert captured["data"] == {
+        "model": "gpt-image-2",
+        "prompt": "turn this into watercolor",
+        "n": "1",
+        "size": "1024x1024",
+        "quality": "low",
+        "output_format": "jpeg",
+        "output_compression": "70",
+        "moderation": "low",
+    }
+    assert captured["timeout"] == 60.0
+    assert len(captured["files"]) == 1
+    assert captured["files"][0][0] == "image"
+    assert captured["files"][0][1][0] == "source.png"
+    assert captured["files"][0][1][1] == b"png-bytes"
+    assert captured["files"][0][1][2] == "image/png"
+
+
 def test_llm_client_generate_image_respects_max_attempts_override() -> None:
     attempts = {"count": 0}
 

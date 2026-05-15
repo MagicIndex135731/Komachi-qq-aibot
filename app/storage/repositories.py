@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.storage.models import (
+    BbotListenerCacheEntry,
     DevSession,
     DevTask,
     DevTaskArtifact,
@@ -257,6 +258,86 @@ class MessageRepository:
         return timestamp
 
 
+class BbotListenerCacheRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_entry(
+        self,
+        *,
+        group_id: int,
+        platform: str,
+        external_id: str,
+        canonical_name: str,
+        aliases: list[str],
+        source: str,
+        updated_at: datetime,
+    ) -> BbotListenerCacheEntry:
+        stmt = (
+            select(BbotListenerCacheEntry)
+            .where(
+                BbotListenerCacheEntry.group_id == group_id,
+                BbotListenerCacheEntry.platform == platform,
+                BbotListenerCacheEntry.external_id == external_id,
+            )
+            .limit(1)
+        )
+        entry = self.session.execute(stmt).scalar_one_or_none()
+        if entry is None:
+            entry = BbotListenerCacheEntry(
+                group_id=group_id,
+                platform=platform,
+                external_id=external_id,
+            )
+        entry.canonical_name = canonical_name
+        entry.aliases_json = aliases
+        entry.source = source
+        entry.updated_at = updated_at
+        self.session.add(entry)
+        return entry
+
+    def find_best_match(self, *, group_id: int, platform: str, query: str) -> BbotListenerCacheEntry | None:
+        stmt = (
+            select(BbotListenerCacheEntry)
+            .where(
+                BbotListenerCacheEntry.group_id == group_id,
+                BbotListenerCacheEntry.platform == platform,
+            )
+            .order_by(BbotListenerCacheEntry.updated_at.desc(), BbotListenerCacheEntry.id.desc())
+        )
+        normalized_query = self._normalize(query)
+        if not normalized_query:
+            return None
+
+        best_entry = None
+        best_score = -1
+        for entry in self.session.scalars(stmt):
+            names = [str(entry.canonical_name or "")] + [str(alias) for alias in (entry.aliases_json or [])]
+            normalized_candidates = [candidate for candidate in (self._normalize(name) for name in names) if candidate]
+            score = self._score_candidates(normalized_query, normalized_candidates)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        if best_score <= 0:
+            return None
+        return best_entry
+
+    def _score_candidates(self, query: str, candidates: list[str]) -> int:
+        score = 0
+        for candidate in candidates:
+            if query == candidate:
+                score = max(score, 100)
+            elif query in candidate:
+                score = max(score, 80)
+            elif candidate in query:
+                score = max(score, 60)
+        return score
+
+    def _normalize(self, value: str) -> str:
+        lowered = value.strip().lower()
+        return "".join(character for character in lowered if character.isalnum() or "\u4e00" <= character <= "\u9fff")
+
+
 class SummaryRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -353,10 +434,59 @@ class JobRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def add_job(self, *, job_type: str, payload_json: dict[str, Any], run_at: datetime) -> Job:
-        job = Job(job_type=job_type, payload_json=payload_json, run_at=run_at)
+    def add_job(self, *, job_type: str, payload_json: dict[str, Any], run_at: datetime, status: str = "queued") -> Job:
+        job = Job(job_type=job_type, payload_json=payload_json, run_at=run_at, status=status)
+        self.session.add(job)
+        self.session.flush()
+        return job
+
+    def count_active_jobs(self, *, job_type: str, statuses: list[str] | None = None) -> int:
+        active_statuses = statuses or ["queued", "running"]
+        stmt = select(func.count(Job.id)).where(Job.job_type == job_type, Job.status.in_(active_statuses))
+        return int(self.session.execute(stmt).scalar_one() or 0)
+
+    def list_jobs(self, *, job_type: str, statuses: list[str]) -> list[Job]:
+        if not statuses:
+            return []
+        stmt = (
+            select(Job)
+            .where(Job.job_type == job_type, Job.status.in_(statuses))
+            .order_by(Job.id.asc())
+        )
+        return list(self.session.scalars(stmt))
+
+    def claim_oldest_queued_job(self, *, job_type: str, now: datetime | None = None) -> Job | None:
+        run_before = _normalize_utc_sqlite_timestamp(now or datetime.now().astimezone())
+        stmt = (
+            select(Job)
+            .where(Job.job_type == job_type, Job.status == "queued", Job.run_at <= run_before)
+            .order_by(Job.id.asc())
+            .limit(1)
+        )
+        job = self.session.execute(stmt).scalar_one_or_none()
+        if job is None:
+            return None
+        job.status = "running"
+        self.session.add(job)
+        self.session.flush()
+        return job
+
+    def mark_job_status(self, *, job_id: int, status: str, payload_json: dict[str, Any] | None = None) -> Job | None:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            return None
+        job.status = status
+        if payload_json is not None:
+            job.payload_json = payload_json
         self.session.add(job)
         return job
+
+    def requeue_running_jobs(self, *, job_type: str) -> int:
+        jobs = self.list_jobs(job_type=job_type, statuses=["running"])
+        for job in jobs:
+            job.status = "queued"
+            self.session.add(job)
+        return len(jobs)
 
 
 class UsageRepository:
@@ -528,6 +658,15 @@ class DevTaskRepository:
             .where(DevTask.session_id == session_id, DevTask.status.in_(statuses))
             .order_by(DevTask.id.asc())
         )
+        return list(self.session.scalars(stmt))
+
+    def list_tasks_by_statuses(self, *, statuses: list[str], intent_types: list[str] | None = None) -> list[DevTask]:
+        if not statuses:
+            return []
+        stmt = select(DevTask).where(DevTask.status.in_(statuses))
+        if intent_types:
+            stmt = stmt.where(DevTask.intent_type.in_(intent_types))
+        stmt = stmt.order_by(DevTask.id.asc())
         return list(self.session.scalars(stmt))
 
     def list_recent_tasks_for_session(self, *, session_id: int, limit: int) -> list[DevTask]:

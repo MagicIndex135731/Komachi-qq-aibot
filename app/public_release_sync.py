@@ -247,7 +247,7 @@ class PublicReleaseSync:
         if top_level == "data":
             if len(parts) == 1:
                 return True
-            if parts[1] in {"history", "dev_control", "image_cache", "generated_images"}:
+            if parts[1] in {"history", "dev_control", "image_cache", "generated_images", "generated_private_images"}:
                 return True
             if len(parts) > 1 and parts[1] == "logs":
                 return True

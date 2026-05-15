@@ -60,6 +60,7 @@ def test_reconcile_skips_ignored_runtime_files(tmp_path: Path) -> None:
     _write(source_root / ".env", "LLM_API_KEY=secret\n")
     _write(source_root / "data" / "history" / "chat.json", "{}\n")
     _write(source_root / "data" / "generated_images" / "private.png", "png-bytes\n")
+    _write(source_root / "data" / "generated_private_images" / "private-dm.png", "png-bytes\n")
     _write(source_root / "docs" / "notes.md", "internal\n")
     _write(asset_root / "README.md", "public readme\n")
 
@@ -68,6 +69,7 @@ def test_reconcile_skips_ignored_runtime_files(tmp_path: Path) -> None:
     assert not (release_root / ".env").exists()
     assert not (release_root / "data" / "history" / "chat.json").exists()
     assert not (release_root / "data" / "generated_images" / "private.png").exists()
+    assert not (release_root / "data" / "generated_private_images" / "private-dm.png").exists()
     assert not (release_root / "docs" / "notes.md").exists()
 
 

@@ -336,6 +336,88 @@ class LlmClient:
             )
         return encoded_images
 
+    def _input_image_filename(self, *, image: ImageAttachment, media_type: str, index: int) -> str:
+        extension = mimetypes.guess_extension(media_type) or ".png"
+        if extension == ".jpe":
+            extension = ".jpg"
+
+        candidates = [
+            (image.file_id or "").strip(),
+            Path((image.local_path or "").strip()).name if (image.local_path or "").strip() else "",
+            Path(urlparse(image.url).path).name,
+        ]
+        for candidate in candidates:
+            name = Path(candidate).name.strip()
+            if not name:
+                continue
+            if Path(name).suffix:
+                return name
+            return f"{name}{extension}"
+        return f"image-{index}{extension}"
+
+    def _load_edit_input_images(self, images: list[ImageAttachment]) -> list[tuple[str, tuple[str, bytes, str]]]:
+        multipart_images: list[tuple[str, tuple[str, bytes, str]]] = []
+        for index, image in enumerate(images, start=1):
+            local_path = (image.local_path or "").strip()
+            if local_path:
+                local_image = self._load_local_input_image(
+                    local_path=local_path,
+                    image_url=image.url,
+                    file_id=image.file_id,
+                )
+                if local_image is not None:
+                    multipart_images.append(
+                        (
+                            "image",
+                            (
+                                self._input_image_filename(
+                                    image=image,
+                                    media_type=local_image["media_type"],
+                                    index=index,
+                                ),
+                                base64.b64decode(local_image["data"]),
+                                local_image["media_type"],
+                            ),
+                        )
+                    )
+                    continue
+
+            image_url = image.url.strip()
+            if not image_url:
+                logger.warning("llm_input_image_missing_url file_id=%s", image.file_id)
+                continue
+            response = self._download_input_image(image_url=image_url, file_id=image.file_id)
+            if response is None:
+                continue
+
+            media_type = self._guess_image_media_type(url=image_url, response=response)
+            if media_type is None:
+                logger.warning(
+                    "llm_input_image_unsupported_media_type url=%s content_type=%s",
+                    image_url,
+                    response.headers.get("content-type"),
+                )
+                continue
+            if not response.content:
+                logger.warning("llm_input_image_empty_body url=%s file_id=%s", image_url, image.file_id)
+                continue
+
+            multipart_images.append(
+                (
+                    "image",
+                    (
+                        self._input_image_filename(
+                            image=image,
+                            media_type=media_type,
+                            index=index,
+                        ),
+                        response.content,
+                        media_type,
+                    ),
+                )
+            )
+        return multipart_images
+
     def _extract_responses_text(self, payload: dict[str, Any]) -> str | None:
         output_text = payload.get("output_text")
         if isinstance(output_text, str):
@@ -749,6 +831,77 @@ class LlmClient:
             raise ValueError("images generations request failed without a captured exception")
         raise ValueError("images generations request failed after retries") from last_error
 
+    def _request_images_edits_json(
+        self,
+        *,
+        data: dict[str, str],
+        files: list[tuple[str, tuple[str, bytes, str]]],
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                request_kwargs: dict[str, Any] = {
+                    "headers": {"Authorization": f"Bearer {self.api_key}"},
+                    "data": data,
+                    "files": files,
+                }
+                if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
+                    request_kwargs["timeout"] = timeout_seconds
+                response = self.http_client.post(
+                    f"{self.base_url}/images/edits",
+                    **request_kwargs,
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                logger.warning("images_edits_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+            except httpx.TransportError as exc:
+                last_error = exc
+                logger.warning("images_edits_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if not self._is_retryable_status_code(status_code):
+                    raise
+                last_error = exc
+                logger.warning("images_edits_status_retry attempt=%s status=%s", attempt, status_code)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+
+            try:
+                return response.json()
+            except ValueError as exc:
+                last_error = exc
+                logger.warning(
+                    "images_edits_invalid_json attempt=%s status=%s content_type=%s body_prefix=%r",
+                    attempt,
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    response.text[:200],
+                )
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+
+        if last_error is None:
+            raise ValueError("images edits request failed without a captured exception")
+        raise ValueError("images edits request failed after retries") from last_error
+
+    def _parse_image_generation_result(self, response_data: dict[str, Any]) -> ImageGenerationResult:
+        data = response_data.get("data")
+        if not isinstance(data, list):
+            raise ValueError("image generation response did not include data list")
+        images = [item for item in data if isinstance(item, dict)]
+        return ImageGenerationResult(
+            created=int(response_data["created"]) if "created" in response_data and response_data["created"] is not None else None,
+            images=images,
+        )
+
     def _generate_text_without_responses(
         self,
         *,
@@ -882,11 +1035,50 @@ class LlmClient:
             max_attempts=max_attempts,
             timeout_seconds=timeout_seconds,
         )
-        data = response_data.get("data")
-        if not isinstance(data, list):
-            raise ValueError("image generation response did not include data list")
-        images = [item for item in data if isinstance(item, dict)]
-        return ImageGenerationResult(
-            created=int(response_data["created"]) if "created" in response_data and response_data["created"] is not None else None,
-            images=images,
+        return self._parse_image_generation_result(response_data)
+
+    def edit_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        images: list[ImageAttachment],
+        size: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        output_compression: int | None = None,
+        moderation: str | None = None,
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> ImageGenerationResult:
+        files = self._load_edit_input_images(images)
+        if not files:
+            raise ValueError("image edit request did not include a usable input image")
+
+        data: dict[str, str] = {
+            "model": model,
+            "prompt": prompt,
+            "n": "1",
+        }
+        if size:
+            data["size"] = size
+        if quality:
+            data["quality"] = quality
+        if background:
+            data["background"] = background
+        if output_format:
+            data["output_format"] = output_format
+        normalized_output_format = (output_format or "").strip().lower()
+        if output_compression is not None and normalized_output_format in {"jpeg", "jpg", "webp"}:
+            data["output_compression"] = str(int(output_compression))
+        if moderation:
+            data["moderation"] = moderation
+
+        response_data = self._request_images_edits_json(
+            data=data,
+            files=files,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
         )
+        return self._parse_image_generation_result(response_data)

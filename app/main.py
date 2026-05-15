@@ -131,10 +131,17 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     )
 
 
-def build_group_image_service(*, settings: AppSettings, llm_client, sender) -> GroupImageGenerationService:
+def build_group_image_service(
+    *,
+    settings: AppSettings,
+    llm_client,
+    sender,
+    web_search_client=None,
+) -> GroupImageGenerationService:
     return GroupImageGenerationService(
         llm_client=llm_client,
         sender=sender,
+        web_search_client=web_search_client,
         output_dir=settings.data_dir / "generated_images",
         model=settings.group_image_model,
         size=settings.group_image_size,
@@ -158,22 +165,38 @@ async def run() -> None:
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+    web_search_client = build_web_search_client(settings)
     group_image_service = build_group_image_service(
         settings=settings,
         llm_client=group_image_llm_client,
         sender=sender,
+        web_search_client=web_search_client,
     )
-    web_search_client = build_web_search_client(settings)
+    persistent_group_engine = engine if hasattr(engine, "connect") else None
+    if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
+        group_image_service.engine = persistent_group_engine
+    if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
+        await group_image_service.start()
     dev_control_service = DevControlService(
         engine=engine,
         sender=sender,
         llm_client=llm_client,
+        image_llm_client=group_image_llm_client,
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
         admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
+        web_search_client=web_search_client,
+        image_model=settings.group_image_model,
+        image_size=settings.group_image_size,
+        image_quality=settings.group_image_quality,
+        image_background=settings.group_image_background,
+        image_output_format=settings.group_image_output_format,
+        image_output_compression=settings.group_image_output_compression,
+        image_moderation=settings.group_image_moderation,
+        image_queue_capacity=settings.group_image_queue_capacity,
         assistant_name=str(runtime.persona.get("name", "Codex")),
         persona=runtime.persona,
         safety=runtime.safety,
@@ -219,6 +242,8 @@ async def run() -> None:
     try:
         await gateway.connect_and_consume(handle_payload)
     finally:
+        if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
+            await group_image_service.stop()
         await dev_control_service.stop()
 
 

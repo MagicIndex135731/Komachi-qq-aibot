@@ -30,16 +30,25 @@ async def run() -> None:
     create_all(engine)
     sync_history_archives(engine, runtime)
 
-    gateway = NapCatGateway(ws_url=settings.napcat_ws_url)
+    gateway = NapCatGateway(
+        ws_url=settings.napcat_ws_url,
+        reconnect_forever=True,
+    )
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+    web_search_client = build_web_search_client(settings)
     group_image_service = build_group_image_service(
         settings=settings,
         llm_client=group_image_llm_client,
         sender=sender,
+        web_search_client=web_search_client,
     )
-    web_search_client = build_web_search_client(settings)
+    persistent_group_engine = engine if hasattr(engine, "connect") else None
+    if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
+        group_image_service.engine = persistent_group_engine
+    if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
+        await group_image_service.start()
     router = InboundRouter(
         engine=engine,
         runtime=runtime,
@@ -71,7 +80,11 @@ async def run() -> None:
         await router.handle_group_message(event)
 
     logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
-    await gateway.connect_and_consume(handle_payload)
+    try:
+        await gateway.connect_and_consume(handle_payload)
+    finally:
+        if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
+            await group_image_service.stop()
 
 
 def main() -> int:

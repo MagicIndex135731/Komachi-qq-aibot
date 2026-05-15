@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from html import unescape
 from math import ceil
+from pathlib import Path
 import re
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
+
+from app.core.message_content import ImageAttachment
 
 
 @dataclass(slots=True)
@@ -36,6 +39,10 @@ HTML_NOISE_ATTR_PATTERN = re.compile(
 )
 HTML_BLOCK_BREAK_PATTERN = re.compile(r"(?is)</?(?:p|div|section|article|main|li|ul|ol|h[1-6]|br|tr|table)\b[^>]*>")
 HTML_TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
+HTML_META_IMAGE_PATTERN = re.compile(
+    r'(?is)<meta\b[^>]*(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*content=["\']([^"\']+)["\'][^>]*>'
+)
+HTML_IMG_SRC_PATTERN = re.compile(r'(?is)<img\b[^>]*src=["\']([^"\']+)["\'][^>]*>')
 WHITESPACE_PATTERN = re.compile(r"\s+")
 TEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+")
 
@@ -145,6 +152,11 @@ class WebSearchClient:
         if self.provider == "ddgs":
             return self._search_ddgs(query=query, max_results=max_results)
         return self._search_tavily(query=query, max_results=max_results)
+
+    def image_search(self, query: str, max_results: int = 3) -> list[ImageAttachment]:
+        if self.provider == "ddgs":
+            return self._image_search_ddgs(query=query, max_results=max_results)
+        return self._image_search_from_web_pages(query=query, max_results=max_results)
 
     def read_pages(
         self,
@@ -283,6 +295,99 @@ class WebSearchClient:
             if len(results) >= max_results:
                 break
         return results
+
+    def _image_search_ddgs(self, *, query: str, max_results: int) -> list[ImageAttachment]:
+        factory = self.ddgs_factory
+        if factory is None:
+            try:
+                from ddgs import DDGS
+            except ImportError as exc:
+                raise RuntimeError("ddgs provider requires the 'ddgs' package to be installed") from exc
+            factory = DDGS
+
+        ddgs_client = factory(timeout=max(1, int(ceil(self.timeout_seconds))))
+        last_error: Exception | None = None
+        for region, backend in self._ddgs_search_variants():
+            try:
+                raw_results = ddgs_client.images(
+                    query,
+                    region=region,
+                    safesearch="moderate",
+                    max_results=max_results,
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            images = self._map_ddgs_image_results(raw_results=raw_results, max_results=max_results)
+            if images:
+                return images
+
+        if last_error is not None:
+            raise last_error
+        return []
+
+    def _map_ddgs_image_results(self, *, raw_results: Any, max_results: int) -> list[ImageAttachment]:
+        if raw_results is None:
+            return []
+        images: list[ImageAttachment] = []
+        for index, item in enumerate(raw_results, start=1):
+            if not isinstance(item, dict):
+                continue
+            image_url = str(item.get("image", "") or item.get("thumbnail", "")).strip()
+            if not image_url:
+                continue
+            file_id = str(item.get("title", "")).strip() or f"search-image-{index}"
+            images.append(ImageAttachment(url=image_url, file_id=file_id))
+            if len(images) >= max_results:
+                break
+        return images
+
+    def _image_search_from_web_pages(self, *, query: str, max_results: int) -> list[ImageAttachment]:
+        text_results = self.search(query=query, max_results=max_results)
+        images: list[ImageAttachment] = []
+        seen_urls: set[str] = set()
+        for result in text_results:
+            for candidate_url in self._extract_image_urls_from_page(result.source):
+                normalized_url = candidate_url.strip()
+                if not normalized_url or normalized_url in seen_urls:
+                    continue
+                seen_urls.add(normalized_url)
+                images.append(ImageAttachment(url=normalized_url, file_id=Path(urlparse(normalized_url).path).name or None))
+                if len(images) >= max_results:
+                    return images
+        return images
+
+    def _extract_image_urls_from_page(self, url: str) -> list[str]:
+        try:
+            response = self.http_client.get(
+                url,
+                follow_redirects=True,
+                headers={"User-Agent": "qq-ai-bot/0.1"},
+            )
+            response.raise_for_status()
+        except Exception:
+            return []
+        html_text = response.text or ""
+        if not html_text.strip():
+            return []
+
+        candidates: list[str] = []
+        for match in HTML_META_IMAGE_PATTERN.finditer(html_text):
+            candidates.append(urljoin(str(response.url), unescape(match.group(1)).strip()))
+        for match in HTML_IMG_SRC_PATTERN.finditer(html_text):
+            candidates.append(urljoin(str(response.url), unescape(match.group(1)).strip()))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            parsed = urlparse(candidate)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
 
     def _read_single_page(self, *, url: str, fallback_title: str) -> WebPageContent | None:
         try:

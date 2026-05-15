@@ -333,12 +333,29 @@ PRIVATE_SCOPE_ALLOWLIST_DAILY = "allowlist_daily"
 RESTART_DENIAL_REPLY_FRAGMENTS = (
     "不能直接替你执行重启",
     "不能替你执行重启",
+    "不能替你直接重启",
+    "我不能替你直接重启",
     "不能直接重启",
     "不能自己重启",
     "没有重启权限",
     "没权限重启",
     "我不能重启",
     "我不能自己重启",
+    "我这边按规则没有替你重启",
+    "按规则没有替你重启",
+    "没有替你重启",
+    "要真正生效还得重启",
+    "要生效还需要重启",
+    "确实需要重启运行时",
+    "还需要重启运行时",
+    "还需要你那边实际重启",
+    "还需要你那边实际重启运行时",
+    "如果运行时还没重启",
+    "如果还没重启",
+    "还没重启的话",
+    "不要自己重启运行时",
+    "不会假装已经重启",
+    "不会说它已经生效",
 )
 SUMMARY_LINE_LIMIT = 14
 RECENT_TURN_LIMIT = 8
@@ -2335,7 +2352,7 @@ class DevControlService:
 
     def _rewrite_reply_after_successful_restart(self, text: str, *, restart_result: str) -> str:
         normalized = self._normalize_private_reply(text)
-        if restart_result != "success" or not normalized:
+        if restart_result not in {"success", "recovered-on-start"} or not normalized:
             return normalized
 
         cleaned = normalized

@@ -220,6 +220,7 @@ def resolve_images_for_turn(
     messages,
     quoted_raw_payload: dict | None = None,
     lookback_window: timedelta = timedelta(minutes=3),
+    allow_recent_image_without_intent: bool = False,
 ) -> ResolvedImageTurn | None:
     prior_messages = _recent_user_messages_before_event(
         event=event,
@@ -248,13 +249,14 @@ def resolve_images_for_turn(
             followup_from_prior_prompt=True,
         )
 
-    if not _message_opens_image_session(
+    opens_image_session = _message_opens_image_session(
         plain_text=event.plain_text,
         mentioned_bot=addressed_turn,
         bot_names=bot_names,
         reply_to_msg_id=event.reply_to_msg_id,
         has_images=False,
-    ):
+    )
+    if not opens_image_session and not (allow_recent_image_without_intent and addressed_turn and event.reply_to_msg_id is None):
         return None
 
     if event.reply_to_msg_id is not None:
@@ -299,6 +301,7 @@ def resolve_private_images_for_turn(
     *,
     event,
     messages,
+    quoted_raw_payload: dict | None = None,
     lookback_window: timedelta = timedelta(minutes=3),
 ) -> ResolvedImageTurn | None:
     if event.images:
@@ -325,6 +328,20 @@ def resolve_private_images_for_turn(
                     source_kind="quoted",
                 )
             return None
+        if isinstance(quoted_raw_payload, dict):
+            quoted_images = extract_images_from_raw_payload(quoted_raw_payload)
+            if quoted_images:
+                source_msg_id = str(quoted_raw_payload.get("message_id", "")).strip() or str(event.reply_to_msg_id)
+                return ResolvedImageTurn(
+                    images=quoted_images,
+                    source_msg_id=source_msg_id,
+                    source_kind="quoted_remote",
+                )
+            return ResolvedImageTurn(
+                images=[],
+                source_msg_id=str(event.reply_to_msg_id),
+                source_kind="quoted_remote",
+            )
         return None
 
     plain_text = str(getattr(event, "plain_text", ""))

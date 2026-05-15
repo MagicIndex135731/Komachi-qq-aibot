@@ -65,6 +65,7 @@ class FakeGateway:
 async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None:
     settings = _settings()
     captured: dict[str, object] = {}
+    FakeGateway.instances.clear()
 
     def fake_llm_client(**kwargs):
         captured["llm_kwargs"] = kwargs
@@ -98,6 +99,8 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None
     assert captured["dev_control_service"] is None
     assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
     assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
+    assert len(FakeGateway.instances) == 1
+    assert FakeGateway.instances[0].reconnect_forever is True
 
 
 async def test_private_main_disables_local_worker(monkeypatch) -> None:

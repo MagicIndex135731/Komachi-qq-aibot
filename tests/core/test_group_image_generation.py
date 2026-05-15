@@ -3,16 +3,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 import httpx
 
 import pytest
+from sqlalchemy import text
 
 from app.core.group_image_generation import (
     GroupImageGenerationRequest,
     GroupImageGenerationService,
 )
+from app.core.message_content import ImageAttachment
 from app.providers.llm_client import ImageGenerationResult
+from app.storage.db import session_scope
+from app.storage.repositories import JobRepository
 
 
 class FakeGroupImageSender:
@@ -72,6 +77,85 @@ class StaticImageLlm:
     ):
         del prompt, model, size, quality, background, output_format, output_compression, moderation, max_attempts
         return ImageGenerationResult(created=123, images=[{"b64_json": self.image_b64}])
+
+
+class ReferenceAwareImageLlm:
+    def __init__(self, *, image_b64: str) -> None:
+        self.image_b64 = image_b64
+        self.generate_calls: list[dict] = []
+        self.edit_calls: list[dict] = []
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size=None,
+        quality=None,
+        background=None,
+        output_format=None,
+        output_compression=None,
+        moderation=None,
+        max_attempts=None,
+        timeout_seconds=None,
+    ):
+        self.generate_calls.append(
+            {
+                "prompt": prompt,
+                "model": model,
+                "size": size,
+                "quality": quality,
+                "background": background,
+                "output_format": output_format,
+                "output_compression": output_compression,
+                "moderation": moderation,
+                "max_attempts": max_attempts,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return ImageGenerationResult(created=123, images=[{"b64_json": self.image_b64}])
+
+    def edit_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        images: list[ImageAttachment],
+        size=None,
+        quality=None,
+        background=None,
+        output_format=None,
+        output_compression=None,
+        moderation=None,
+        max_attempts=None,
+        timeout_seconds=None,
+    ):
+        self.edit_calls.append(
+            {
+                "prompt": prompt,
+                "model": model,
+                "images": images,
+                "size": size,
+                "quality": quality,
+                "background": background,
+                "output_format": output_format,
+                "output_compression": output_compression,
+                "moderation": moderation,
+                "max_attempts": max_attempts,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return ImageGenerationResult(created=123, images=[{"b64_json": self.image_b64}])
+
+
+class FakeImageSearchClient:
+    def __init__(self, *, image_results: list[ImageAttachment]) -> None:
+        self.image_results = list(image_results)
+        self.queries: list[tuple[str, int]] = []
+
+    def image_search(self, query: str, max_results: int = 3) -> list[ImageAttachment]:
+        self.queries.append((query, max_results))
+        return list(self.image_results)
 
 
 class FailingImageLlm:
@@ -176,12 +260,16 @@ def make_request(
     *,
     prompt: str = "rainy convenience store",
     requester_user_id: int = 20001,
+    reference_images: list[ImageAttachment] | None = None,
+    web_search_query: str | None = None,
 ) -> GroupImageGenerationRequest:
     return GroupImageGenerationRequest(
         group_id=10001,
         trigger_message_id=message_id,
         prompt=prompt,
         requester_user_id=requester_user_id,
+        reference_images=reference_images or [],
+        web_search_query=web_search_query,
     )
 
 
@@ -250,6 +338,169 @@ async def test_group_image_service_sends_generated_file(tmp_path) -> None:
             "text": "[CQ:at,qq=20001] \u56fe\u597d\u4e86",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_uses_edit_path_when_reference_images_are_present(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="jpeg",
+        output_compression=70,
+        moderation="low",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(
+        make_request(
+            "draw-edit-1",
+            prompt="turn this into cyberpunk neon",
+            reference_images=[ImageAttachment(url="https://img.example.test/source.png", file_id="source.png")],
+        )
+    )
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert llm.generate_calls == []
+    assert len(llm.edit_calls) == 1
+    assert llm.edit_calls[0]["prompt"] == "turn this into cyberpunk neon"
+    assert [image.url for image in llm.edit_calls[0]["images"]] == ["https://img.example.test/source.png"]
+    assert len(sender.image_calls) == 1
+    assert sender.text_calls[-1]["text"] == "[CQ:at,qq=20001] \u56fe\u597d\u4e86"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_uses_4k_landscape_size_when_prompt_mentions_landscape(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1536x1024",
+        quality="high",
+        background="",
+        output_format="png",
+        moderation="low",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(make_request("draw-landscape-1", prompt="请画一张横图，机甲站在城市天台"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert llm.generate_calls[0]["size"] == "3840x2160"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_uses_4k_portrait_size_when_prompt_mentions_portrait(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="auto",
+        quality="high",
+        background="",
+        output_format="png",
+        moderation="low",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(
+        make_request(
+            "draw-portrait-1",
+            prompt="请按竖图出图，保留人物动作",
+            reference_images=[ImageAttachment(url="https://img.example.test/source.png", file_id="source.png")],
+        )
+    )
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert llm.generate_calls == []
+    assert llm.edit_calls[0]["size"] == "2160x3840"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_uses_auto_size_when_prompt_does_not_specify_orientation(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="auto",
+        quality="high",
+        background="",
+        output_format="png",
+        moderation="low",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(make_request("draw-auto-size-1", prompt="请画夜晚下雨的便利店门口"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert llm.generate_calls[0]["size"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_combines_searched_character_refs_with_existing_reference_images(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    search_client = FakeImageSearchClient(
+        image_results=[
+            ImageAttachment(url="https://img.example.test/kaguya-a.png", file_id="kaguya-a.png"),
+            ImageAttachment(url="https://img.example.test/kaguya-b.png", file_id="kaguya-b.png"),
+        ]
+    )
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        web_search_client=search_client,
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="jpeg",
+        output_compression=70,
+        moderation="low",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(
+        make_request(
+            "draw-auto-ref-1",
+            prompt="保留前图构图，只替换人物出图",
+            reference_images=[ImageAttachment(url="https://img.example.test/layout.png", file_id="layout.png")],
+            web_search_query="超时空辉夜姬 两个女主",
+        )
+    )
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert search_client.queries == [("超时空辉夜姬 两个女主", 3)]
+    assert llm.generate_calls == []
+    assert len(llm.edit_calls) == 1
+    assert [image.url for image in llm.edit_calls[0]["images"]] == [
+        "https://img.example.test/layout.png",
+        "https://img.example.test/kaguya-a.png",
+        "https://img.example.test/kaguya-b.png",
+    ]
+    assert len(sender.image_calls) == 1
+    assert sender.text_calls[-1]["text"] == "[CQ:at,qq=20001] \u56fe\u597d\u4e86"
 
 
 @pytest.mark.asyncio
@@ -335,6 +586,47 @@ async def test_group_image_service_continues_after_failure_notification_send_err
     assert first.accepted is True
     assert second.accepted is True
     assert len(sender.image_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_start_recovers_running_job_from_persistent_queue(sqlite_engine, tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = StaticImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    service = GroupImageGenerationService(
+        engine=sqlite_engine,
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="jpeg",
+        output_compression=70,
+        moderation="low",
+        max_slots=3,
+    )
+
+    with session_scope(sqlite_engine) as session:
+        JobRepository(session).add_job(
+            job_type=service.job_type,
+            payload_json=service._serialize_request(make_request("draw-recover-1")),
+            run_at=datetime.now(UTC),
+            status="running",
+        )
+
+    await service.start()
+    await service.wait_for_idle()
+
+    assert len(sender.image_calls) == 1
+    assert sender.image_calls[0]["group_id"] == 10001
+    assert sender.text_calls[-1]["text"] == "[CQ:at,qq=20001] 图好了"
+    with session_scope(sqlite_engine) as session:
+        completed = session.execute(
+            text("select count(*) from jobs where job_type = :job_type and status = 'completed'"),
+            {"job_type": service.job_type},
+        ).scalar_one()
+    assert completed == 1
 
 
 @pytest.mark.asyncio

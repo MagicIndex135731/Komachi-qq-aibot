@@ -50,6 +50,22 @@ class Sender:
         )
         self._require_ok(response, action="send_group_msg")
 
+    async def send_private_image(self, *, user_id: int, image_file: str) -> None:
+        image_uri = Path(image_file).resolve().as_uri()
+        response = await self.gateway.call_api(
+            "send_private_msg",
+            {
+                "user_id": user_id,
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {"file": image_uri},
+                    }
+                ],
+            },
+        )
+        self._require_ok(response, action="send_private_msg")
+
     def _require_ok(self, response: dict | None, *, action: str) -> None:
         payload = response or {}
         status = str(payload.get("status", "")).strip().lower()

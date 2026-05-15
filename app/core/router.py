@@ -9,12 +9,18 @@ import re
 from app.adapters.sender import OutboundMessage, OutboundPrivateMessage
 from app.admin.commands import AdminCommandParser, CommandContext
 from app.config import AppSettings, RuntimeConfig
+from app.core.bbot_bridge import build_bbot_outbound_message, resolve_bbot_command
+from app.core.bbot_listener_cache import (
+    extract_listener_cache_entries,
+    resolve_cached_command_target,
+    upsert_listener_cache_entries,
+)
 from app.core.chat_style import build_human_chat_style_lines, normalize_chat_reply, normalize_proactive_chat_reply
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
 from app.core.image_cache import cache_images_in_raw_payload
 from app.core.message_archive import append_group_message_archive
-from app.core.image_turn_resolver import resolve_images_for_turn
+from app.core.image_turn_resolver import ResolvedImageTurn, resolve_images_for_turn
 from app.core.message_content import ImageAttachment, extract_images_from_raw_payload
 from app.core.memory_engine import extract_memory_candidates, retrieve_relevant_memories
 from app.core.persona_engine import render_persona, render_safety_lines
@@ -44,6 +50,7 @@ from app.storage.repositories import (
     GroupRepository,
     MemoryRepository,
     MessageRepository,
+    BbotListenerCacheRepository,
     SummaryRepository,
     UsageRepository,
     UserRepository,
@@ -62,7 +69,71 @@ GROUP_IMAGE_NEGATIVE_PATTERNS = (
     re.compile(r"谁画的", re.IGNORECASE),
     re.compile(r"识图", re.IGNORECASE),
 )
+GROUP_IMAGE_REFERENCE_PROMPT_PREFIX = re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?", re.IGNORECASE)
+GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS = (
+    "改成",
+    "换成",
+    "变成",
+    "做成",
+    "转成",
+    "替换成",
+    "替换为",
+)
+GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS = (
+    "参考",
+    "参照",
+    "仿照",
+    "照着",
+    "按照",
+    "按这张",
+    "按这个",
+    "按这两张",
+    "根据这张",
+    "根据这个",
+    "根据这两张",
+    "根据之前生成的图",
+    "根据前面生成的图",
+    "基于这张",
+    "基于这个",
+    "基于这两张",
+    "基于前面生成的图",
+    "同样动作",
+    "同款动作",
+    "同样画风",
+    "同款画风",
+    "同样构图",
+    "同款构图",
+    "在这张图基础上",
+    "在这个图基础上",
+    "在这两张图基础上",
+    "在之前生成的图基础上",
+    "在前面生成的图基础上",
+    "这张图基础上",
+    "这个图基础上",
+    "这两张图基础上",
+    "前图基础上",
+    "前面那张图基础上",
+)
+GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS = (
+    "画",
+    "画一张",
+    "来一张",
+    "来张",
+    "出图",
+    "生成",
+    "做一张",
+    "整一张",
+    "搞一张",
+    "弄一张",
+)
 LOOKUP_NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?，。！？：；、“”‘’（）《》【】]")
+
+
+AUTO_WEB_REFERENCE_QUERY_PATTERN = re.compile(
+    r"(?:先)?(?:去)?(?:网上|上网|联网)?(?:找|搜一下|搜索一下|搜索|搜)(?P<query>.+?)(?:的人设图|人设图|设定图|参考图)",
+    re.IGNORECASE,
+)
+AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN = re.compile(r"^(?:然后|再|并且|并|再去|接着|随后)+")
 
 
 @dataclass(slots=True)
@@ -361,14 +432,63 @@ class InboundRouter:
         stripped = re.sub(r"^@[A-Za-z0-9_\-\u4e00-\u9fff]+\s*", "", stripped)
         return stripped.strip()
 
-    def _build_group_image_request(self, *, event, addressed_turn: bool) -> GroupImageGenerationRequest | None:
-        if self.group_image_service is None or not addressed_turn:
+    def _extract_auto_web_reference_query(self, *, stripped_text: str) -> str | None:
+        match = AUTO_WEB_REFERENCE_QUERY_PATTERN.search(stripped_text)
+        if match is None:
+            return None
+        query = str(match.group("query") or "").strip(" \t,，。.!?？；;:：")
+        return query or None
+
+    def _build_auto_web_reference_prompt(self, *, stripped_text: str, query: str) -> str:
+        prompt = AUTO_WEB_REFERENCE_QUERY_PATTERN.sub("", stripped_text, count=1)
+        prompt = AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN.sub("", prompt).strip(" \t,，。.!?？；;:：")
+        if not prompt:
+            return f"参考搜索到的{query}人设图生成一张图"
+        return f"参考搜索到的{query}人设图，{prompt}"
+
+    def _strip_group_image_request_prefix(self, text: str) -> str:
+        stripped = GROUP_IMAGE_REFERENCE_PROMPT_PREFIX.sub("", text, count=1)
+        return stripped.strip(" \t,，。.!！?？")
+
+    def _looks_like_reference_image_generation_request(
+        self,
+        *,
+        stripped_text: str,
+        resolved_image_turn: ResolvedImageTurn | None,
+    ) -> bool:
+        if resolved_image_turn is None or not resolved_image_turn.images:
+            return False
+        normalized_text = self._normalize_lookup_text(stripped_text)
+        if not normalized_text:
+            return False
+        has_transform_intent = any(
+            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS
+        )
+        has_reference_context = any(
+            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS
+        )
+        has_generation_intent = any(
+            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS
+        )
+        return has_transform_intent or (has_reference_context and has_generation_intent)
+
+    def _build_group_image_request(
+        self,
+        *,
+        event,
+        addressed_turn: bool,
+        resolved_image_turn: ResolvedImageTurn | None = None,
+    ) -> GroupImageGenerationRequest | None:
+        if self.group_image_service is None:
             return None
         stripped = self._strip_group_image_prefix(event.plain_text)
         if not stripped:
             return None
         if any(pattern.search(stripped) for pattern in GROUP_IMAGE_NEGATIVE_PATTERNS):
             return None
+        reference_images = list(resolved_image_turn.images) if resolved_image_turn is not None else []
+        auto_web_reference_query = self._extract_auto_web_reference_query(stripped_text=stripped)
+        explicit_prompt: str | None = None
         for pattern in GROUP_IMAGE_REQUEST_PATTERNS:
             match = pattern.match(stripped)
             if match is None:
@@ -376,13 +496,51 @@ class InboundRouter:
             prompt = match.group("prompt").strip(" \t,，。.!！?？")
             if not prompt:
                 return None
+            explicit_prompt = prompt
+            break
+        reference_request = self._looks_like_reference_image_generation_request(
+            stripped_text=stripped,
+            resolved_image_turn=resolved_image_turn,
+        )
+        implicitly_addressed_image_request = (
+            event.reply_to_msg_id is not None
+            and bool(reference_images)
+            and (auto_web_reference_query is not None or explicit_prompt is not None or reference_request)
+        )
+        if not addressed_turn and not implicitly_addressed_image_request:
+            return None
+        if auto_web_reference_query is not None:
             return GroupImageGenerationRequest(
                 group_id=event.group_id,
                 trigger_message_id=event.platform_msg_id,
-                prompt=prompt,
+                prompt=self._build_auto_web_reference_prompt(
+                    stripped_text=stripped,
+                    query=auto_web_reference_query,
+                ),
                 requester_user_id=event.user_id,
+                reference_images=reference_images,
+                web_search_query=auto_web_reference_query,
             )
-        return None
+        if explicit_prompt is not None:
+            return GroupImageGenerationRequest(
+                group_id=event.group_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=explicit_prompt,
+                requester_user_id=event.user_id,
+                reference_images=reference_images,
+            )
+        if not reference_request:
+            return None
+        prompt = self._strip_group_image_request_prefix(stripped)
+        if not prompt:
+            return None
+        return GroupImageGenerationRequest(
+            group_id=event.group_id,
+            trigger_message_id=event.platform_msg_id,
+            prompt=prompt,
+            requester_user_id=event.user_id,
+            reference_images=reference_images,
+        )
 
     def _group_image_enqueue_reply_text(self, enqueue_result) -> str:
         if not getattr(enqueue_result, "accepted", False):
@@ -781,6 +939,24 @@ class InboundRouter:
                 messages=messages,
                 quoted_raw_payload=quoted_raw_payload,
             )
+            group_image_resolved_turn = resolved_image_turn
+            if group_image_resolved_turn is None:
+                group_image_resolved_turn = resolve_images_for_turn(
+                    event=event,
+                    addressed_turn=addressed_turn,
+                    bot_names=bot_names,
+                    messages=messages,
+                    quoted_raw_payload=quoted_raw_payload,
+                    allow_recent_image_without_intent=True,
+                )
+            if group_image_resolved_turn is None and event.reply_to_msg_id is not None:
+                group_image_resolved_turn = resolve_images_for_turn(
+                    event=event,
+                    addressed_turn=True,
+                    bot_names=bot_names,
+                    messages=messages,
+                    quoted_raw_payload=quoted_raw_payload,
+                )
             image_followup_trigger = (
                 resolved_image_turn is not None and resolved_image_turn.followup_from_prior_prompt
             )
@@ -823,6 +999,7 @@ class InboundRouter:
             group_image_request = self._build_group_image_request(
                 event=event,
                 addressed_turn=addressed_turn,
+                resolved_image_turn=group_image_resolved_turn,
             )
             if group_image_request is not None:
                 return PreparedGroupReply(
@@ -1088,9 +1265,23 @@ class InboundRouter:
         if not persisted:
             return
         self._archive_inbound_message(event)
+        self._ingest_bbot_listener_cache(event)
         if self._is_admin_usage_query(event):
             await self._send_prebuilt_reply(event, self._build_admin_usage_report(event))
             return
+        bbot_match = resolve_bbot_command(
+            group_id=event.group_id,
+            mentioned_bot=event.mentioned_bot,
+            plain_text=event.plain_text,
+        )
+        if bbot_match is not None:
+            if bbot_match.denied_reason is not None:
+                await self._send_prebuilt_reply(event, bbot_match.denied_reason)
+                return
+            if bbot_match.command_text is not None:
+                rewritten_command = self._resolve_bbot_cached_command(event=event, command_text=bbot_match.command_text)
+                await self._send_prebuilt_reply(event, build_bbot_outbound_message(rewritten_command))
+                return
         quoted_raw_payload = await self._fetch_quoted_message_payload(reply_to_msg_id=event.reply_to_msg_id)
         prepared_reply = self._prepare_group_reply(event, quoted_raw_payload=quoted_raw_payload)
         if not prepared_reply.should_reply:
@@ -1160,6 +1351,30 @@ class InboundRouter:
             return
 
         await self._send_prebuilt_reply(event, reply_text)
+
+    def _ingest_bbot_listener_cache(self, event) -> None:
+        entries = extract_listener_cache_entries(
+            group_id=event.group_id,
+            user_id=event.user_id,
+            plain_text=event.plain_text,
+        )
+        if not entries:
+            return
+        with session_scope(self.engine) as session:
+            upsert_listener_cache_entries(
+                cache_repo=BbotListenerCacheRepository(session),
+                group_id=event.group_id,
+                entries=entries,
+                now=event.timestamp,
+            )
+
+    def _resolve_bbot_cached_command(self, *, event, command_text: str) -> str:
+        with session_scope(self.engine) as session:
+            return resolve_cached_command_target(
+                command_text=command_text,
+                group_id=event.group_id,
+                cache_repo=BbotListenerCacheRepository(session),
+            )
 
     async def _fetch_quoted_message_payload(self, *, reply_to_msg_id: str | None) -> dict | None:
         if not reply_to_msg_id:

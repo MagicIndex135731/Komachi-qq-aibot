@@ -99,6 +99,19 @@ class UsageRecord(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class BbotListenerCacheEntry(Base):
+    __tablename__ = "bbot_listener_cache_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(Integer, index=True)
+    platform: Mapped[str] = mapped_column(String(32), index=True)
+    external_id: Mapped[str] = mapped_column(String(128), index=True)
+    canonical_name: Mapped[str] = mapped_column(String(255), default="")
+    aliases_json: Mapped[list] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class DevSession(Base):
     __tablename__ = "dev_sessions"
 

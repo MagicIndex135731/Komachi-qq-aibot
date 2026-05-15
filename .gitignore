@@ -11,6 +11,7 @@ data/private_reminders_state.json
 data/history/
 data/dev_control/
 data/generated_images/
+data/generated_private_images/
 data/image_cache/
 data/logs/*
 !data/logs/.gitkeep
