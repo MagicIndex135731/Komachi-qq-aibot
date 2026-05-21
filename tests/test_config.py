@@ -45,7 +45,9 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     monkeypatch.delenv("CONTEXT_RECENT_LIMIT", raising=False)
     monkeypatch.delenv("CONTEXT_SUMMARY_LIMIT", raising=False)
     monkeypatch.delenv("CONTEXT_HISTORY_LIMIT", raising=False)
-    monkeypatch.delenv("LLM_FALLBACK_MODEL", raising=False)
+    monkeypatch.delenv("LLM_TEXT_ENDPOINT", raising=False)
+    monkeypatch.delenv("GROUP_IMAGE_GENERATIONS_ENDPOINT", raising=False)
+    monkeypatch.delenv("GROUP_IMAGE_EDITS_ENDPOINT", raising=False)
 
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
@@ -58,7 +60,9 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.context_recent_limit == 60
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
-    assert settings.llm_fallback_model == ""
+    assert settings.llm_text_endpoint == "/chat/completions"
+    assert settings.group_image_generations_endpoint == "/images/generations"
+    assert settings.group_image_edits_endpoint == "/images/edits"
 
 
 def test_app_settings_exposes_private_chat_whitelist(tmp_path, monkeypatch) -> None:
@@ -75,15 +79,31 @@ def test_app_settings_exposes_private_chat_whitelist(tmp_path, monkeypatch) -> N
     assert settings.private_chat_whitelist == {987654321, 20002, 20002}
 
 
-def test_app_settings_reads_llm_fallback_model(tmp_path, monkeypatch) -> None:
+def test_app_settings_reads_llm_text_endpoint(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
-    monkeypatch.setenv("LLM_MODEL", "cc-gpt-5.4")
-    monkeypatch.setenv("LLM_FALLBACK_MODEL", "gpt-5.4")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+    monkeypatch.setenv("LLM_TEXT_ENDPOINT", "/chat/completions")
     monkeypatch.setenv("BOT_QQ", "123456789")
     monkeypatch.setenv("OWNER_QQ", "987654321")
 
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
-    assert settings.llm_fallback_model == "gpt-5.4"
+    assert settings.llm_text_endpoint == "/chat/completions"
+
+
+def test_app_settings_reads_group_image_endpoints(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+    monkeypatch.setenv("GROUP_IMAGE_GENERATIONS_ENDPOINT", "/v1/images/generations")
+    monkeypatch.setenv("GROUP_IMAGE_EDITS_ENDPOINT", "/v1/images/edits")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+
+    settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
+
+    assert settings.group_image_generations_endpoint == "/v1/images/generations"
+    assert settings.group_image_edits_endpoint == "/v1/images/edits"

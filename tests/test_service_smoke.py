@@ -26,7 +26,7 @@ def _settings_for_search(*, provider: str, search_api_key: str) -> AppSettings:
         llm_base_url="https://api.example.test/v1",
         llm_api_key="test-key",
         llm_model="gpt-5.4",
-        llm_fallback_model="",
+        llm_text_endpoint="/chat/completions",
         bot_qq=123456789,
         owner_qq=987654321,
         admin_qqs="",
@@ -170,8 +170,8 @@ def test_build_web_search_client_supports_ddgs_without_api_key() -> None:
 @pytest.mark.asyncio
 async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.llm_model = "cc-gpt-5.4"
-    settings.llm_fallback_model = "gpt-5.4"
+    settings.llm_model = "gpt-5.4"
+    settings.llm_text_endpoint = "/chat/completions"
     router_arguments: dict[str, object] = {}
     sync_calls: list[tuple[object, object]] = []
     llm_kwargs: dict[str, object] = {}
@@ -188,8 +188,43 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
             router_arguments.update(kwargs)
 
     class FakeDevControlService:
-        def __init__(self, **kwargs) -> None:
-            router_arguments["dev_control_service_init"] = kwargs
+        def __init__(
+            self,
+            *,
+            engine,
+            sender,
+            llm_client,
+            owner_qq,
+            bot_qq=None,
+            private_chat_qqs=None,
+            repo_root,
+            data_dir,
+            codex_bridge=None,
+            command_runner=None,
+            poll_interval_seconds=1.0,
+            enable_local_worker=True,
+            private_image_followup_window_seconds=1.2,
+            web_search_client=None,
+            assistant_name="Codex",
+            persona=None,
+            safety=None,
+        ) -> None:
+            del codex_bridge, command_runner, poll_interval_seconds, private_image_followup_window_seconds
+            router_arguments["dev_control_service_init"] = {
+                "engine": engine,
+                "sender": sender,
+                "llm_client": llm_client,
+                "owner_qq": owner_qq,
+                "bot_qq": bot_qq,
+                "private_chat_qqs": private_chat_qqs,
+                "repo_root": repo_root,
+                "data_dir": data_dir,
+                "enable_local_worker": enable_local_worker,
+                "web_search_client": web_search_client,
+                "assistant_name": assistant_name,
+                "persona": persona,
+                "safety": safety,
+            }
 
         async def start(self) -> None:
             return None
@@ -224,7 +259,5 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
 
     assert isinstance(router_arguments["web_search_client"], WebSearchClient)
     assert len(sync_calls) == 1
-    assert llm_kwargs["model"] == "cc-gpt-5.4"
-    assert llm_kwargs["fallback_model"] == "gpt-5.4"
-    assert llm_kwargs["responses_model"] == "gpt-5.4"
-    assert llm_kwargs["compat_model"] == "cc-gpt-5.4"
+    assert llm_kwargs["model"] == "gpt-5.4"
+    assert llm_kwargs["text_endpoint"] == "/chat/completions"

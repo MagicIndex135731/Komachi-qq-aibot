@@ -16,10 +16,18 @@ class AppSettings(BaseSettings):
     llm_base_url: str = Field(alias="LLM_BASE_URL")
     llm_api_key: str = Field(alias="LLM_API_KEY")
     llm_model: str = Field(alias="LLM_MODEL")
-    llm_fallback_model: str = Field(default="", alias="LLM_FALLBACK_MODEL")
+    llm_text_endpoint: str = Field(default="/chat/completions", alias="LLM_TEXT_ENDPOINT")
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
     group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")
     group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
+    group_image_generations_endpoint: str = Field(
+        default="/images/generations",
+        alias="GROUP_IMAGE_GENERATIONS_ENDPOINT",
+    )
+    group_image_edits_endpoint: str = Field(
+        default="/images/edits",
+        alias="GROUP_IMAGE_EDITS_ENDPOINT",
+    )
     group_image_size: str = Field(default="auto", alias="GROUP_IMAGE_SIZE")
     group_image_quality: str = Field(default="high", alias="GROUP_IMAGE_QUALITY")
     group_image_background: str = Field(default="", alias="GROUP_IMAGE_BACKGROUND")

@@ -104,6 +104,7 @@ def _generation_check(base_url: str, api_key: str, http_client: httpx.Client, *,
             base_url=candidate_base_url.rstrip("/"),
             api_key=api_key,
             model="gpt-5.4",
+            image_generations_endpoint=path,
             http_client=http_client,
         )
         try:

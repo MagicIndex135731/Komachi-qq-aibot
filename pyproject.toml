@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qq-ai-bot"
 version = "0.1.0"
-description = "Personal QQ AI bot backed by NapCat Shell"
+description = "NapCat-based QQ AI bot with image generation and private admin repo control"
 requires-python = ">=3.12"
 dependencies = [
   "ddgs>=9.14.2",

@@ -62,42 +62,40 @@ class LlmClient:
         base_url: str,
         api_key: str,
         model: str,
-        fallback_model: str | None = None,
-        responses_model: str | None = None,
-        compat_model: str | None = None,
+        text_endpoint: str = "/chat/completions",
+        image_generations_endpoint: str = "/images/generations",
+        image_edits_endpoint: str = "/images/edits",
         http_client: httpx.Client | None = None,
         usage_recorder=None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
-        self.fallback_model = (fallback_model or "").strip()
-        self.responses_model = (responses_model or "").strip()
-        self.compat_model = (compat_model or model).strip() or model
+        self.text_endpoint = self._normalize_endpoint(text_endpoint, default="/chat/completions")
+        self.image_generations_endpoint = self._normalize_endpoint(
+            image_generations_endpoint,
+            default="/images/generations",
+        )
+        self.image_edits_endpoint = self._normalize_endpoint(
+            image_edits_endpoint,
+            default="/images/edits",
+        )
         self.http_client = http_client or httpx.Client(timeout=30.0)
         self.usage_recorder = usage_recorder
-        self._conversation_response_ids: dict[str, str] = {}
         self._base_host = (urlparse(self.base_url).hostname or "").lower()
 
-    def _uses_anthropic_messages_api(self, *, model: str | None = None) -> bool:
-        active_model = (model or self.model).strip()
-        return active_model.startswith("cc-")
-
-    def _responses_enabled(self) -> bool:
-        return bool(self.responses_model)
+    def _normalize_endpoint(self, endpoint: str, *, default: str) -> str:
+        normalized = (endpoint or "").strip()
+        if not normalized:
+            normalized = default
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        if self.base_url.endswith("/v1") and normalized.startswith("/v1/"):
+            normalized = normalized[3:]
+        return normalized
 
     def _chat_image_url_uses_string_shape(self) -> bool:
         return self._base_host in PROXY_CHAT_IMAGE_STRING_HOSTS
-
-    def _responses_previous_response_id(self, *, conversation_key: str | None) -> str | None:
-        if not conversation_key:
-            return None
-        return self._conversation_response_ids.get(conversation_key)
-
-    def _remember_response_id(self, *, conversation_key: str | None, response_id: str | None) -> None:
-        if not conversation_key or not response_id:
-            return
-        self._conversation_response_ids[conversation_key] = response_id
 
     def _split_prompt_lines(self, prompt_lines: list[str]) -> tuple[list[str], list[str]]:
         instructions: list[str] = []
@@ -113,35 +111,6 @@ class LlmClient:
             input_lines.append(line)
 
         return instructions, input_lines
-
-    def _build_responses_payload(
-        self,
-        *,
-        model: str,
-        instructions: list[str],
-        input_lines: list[str],
-        previous_response_id: str | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": model,
-            "stream": True,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "\n\n".join(input_lines),
-                        }
-                    ],
-                }
-            ],
-        }
-        if instructions:
-            payload["instructions"] = "\n\n".join(instructions)
-        if previous_response_id:
-            payload["previous_response_id"] = previous_response_id
-        return payload
 
     def _build_chat_completions_payload(
         self,
@@ -178,40 +147,6 @@ class LlmClient:
             "model": model or self.model,
             "messages": messages,
         }
-
-    def _build_anthropic_messages_payload(
-        self,
-        *,
-        model: str,
-        instructions: list[str],
-        input_lines: list[str],
-        images: list[ImageAttachment] | None = None,
-    ) -> dict[str, Any]:
-        user_text = "\n\n".join(input_lines)
-        image_parts = self._load_input_images(images or [])
-        if image_parts:
-            user_content: str | list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-            user_content.extend(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": image_part["media_type"],
-                        "data": image_part["data"],
-                    },
-                }
-                for image_part in image_parts
-            )
-        else:
-            user_content = user_text
-        payload: dict[str, Any] = {
-            "model": model,
-            "max_tokens": self.ANTHROPIC_MAX_TOKENS,
-            "messages": [{"role": "user", "content": user_content}],
-        }
-        if instructions:
-            payload["system"] = "\n\n".join(instructions)
-        return payload
 
     def _guess_image_media_type(self, *, url: str, response: httpx.Response) -> str | None:
         content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
@@ -618,7 +553,7 @@ class LlmClient:
         for attempt in range(1, self.REQUEST_MAX_ATTEMPTS + 1):
             try:
                 response = self.http_client.post(
-                    f"{self.base_url}/chat/completions",
+                    f"{self.base_url}{self.text_endpoint}",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json=chat_payload,
                 )
@@ -791,7 +726,7 @@ class LlmClient:
                 if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
                     request_kwargs["timeout"] = timeout_seconds
                 response = self.http_client.post(
-                    f"{self.base_url}/images/generations",
+                    f"{self.base_url}{self.image_generations_endpoint}",
                     **request_kwargs,
                 )
                 response.raise_for_status()
@@ -852,7 +787,7 @@ class LlmClient:
                 if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
                     request_kwargs["timeout"] = timeout_seconds
                 response = self.http_client.post(
-                    f"{self.base_url}/images/edits",
+                    f"{self.base_url}{self.image_edits_endpoint}",
                     **request_kwargs,
                 )
                 response.raise_for_status()
@@ -909,46 +844,15 @@ class LlmClient:
         input_lines: list[str],
         images: list[ImageAttachment] | None = None,
     ) -> str:
-        compat_model = self.compat_model or self.model
-
-        if self._uses_anthropic_messages_api(model=compat_model):
-            messages_payload = self._build_anthropic_messages_payload(
-                model=compat_model,
-                instructions=instructions,
-                input_lines=input_lines,
-                images=images,
-            )
-            try:
-                response_data = self._request_anthropic_messages_json(messages_payload=messages_payload)
-            except ValueError as exc:
-                logger.warning(
-                    "anthropic_messages_fallback_to_chat_completions reason=%s",
-                    type(exc.__cause__ or exc).__name__,
-                )
-                chat_payload = self._build_chat_completions_payload(
-                    instructions=instructions,
-                    input_lines=input_lines,
-                    images=images,
-                    model=self._chat_fallback_model(),
-                )
-                response_data = self._request_chat_completions_json(chat_payload=chat_payload)
-                self._record_usage(
-                    self._extract_chat_completions_usage(response_data, model=chat_payload["model"])
-                )
-                text = self._extract_chat_completions_text(response_data)
-            else:
-                self._record_usage(self._extract_anthropic_messages_usage(response_data, model=compat_model))
-                text = self._extract_anthropic_messages_text(response_data)
-        else:
-            chat_payload = self._build_chat_completions_payload(
-                instructions=instructions,
-                input_lines=input_lines,
-                images=images,
-                model=compat_model,
-            )
-            response_data = self._request_chat_completions_json(chat_payload=chat_payload)
-            self._record_usage(self._extract_chat_completions_usage(response_data, model=chat_payload["model"]))
-            text = self._extract_chat_completions_text(response_data)
+        chat_payload = self._build_chat_completions_payload(
+            instructions=instructions,
+            input_lines=input_lines,
+            images=images,
+            model=self.model,
+        )
+        response_data = self._request_chat_completions_json(chat_payload=chat_payload)
+        self._record_usage(self._extract_chat_completions_usage(response_data, model=chat_payload["model"]))
+        text = self._extract_chat_completions_text(response_data)
 
         if text is not None:
             return text
@@ -961,35 +865,8 @@ class LlmClient:
         images: list[ImageAttachment] | None = None,
         conversation_key: str | None = None,
     ) -> str:
+        del conversation_key
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
-
-        if not images and self._responses_enabled():
-            responses_payload = self._build_responses_payload(
-                model=self.responses_model,
-                instructions=instructions,
-                input_lines=input_lines,
-                previous_response_id=self._responses_previous_response_id(conversation_key=conversation_key),
-            )
-            try:
-                responses_result = self._request_responses_stream_result(
-                    responses_payload=responses_payload,
-                    model=self.responses_model,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "responses_fallback_to_compat reason=%s",
-                    type(exc.__cause__ or exc).__name__,
-                )
-            else:
-                self._remember_response_id(
-                    conversation_key=conversation_key,
-                    response_id=responses_result.response_id,
-                )
-                self._record_usage(responses_result.usage)
-                if responses_result.text is not None:
-                    return responses_result.text
-                raise ValueError("model response did not include output text")
-
         return self._generate_text_without_responses(
             instructions=instructions,
             input_lines=input_lines,

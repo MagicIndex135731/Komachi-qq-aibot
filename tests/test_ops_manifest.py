@@ -41,6 +41,14 @@ def test_readme_mentions_search_and_context_limits() -> None:
 
     assert "SEARCH_API_KEY" in readme
     assert "CONTEXT_RECENT_LIMIT" in readme
+    assert "OWNER_QQ" in readme
+    assert "ADMIN_QQS" in readme
+    assert "PRIVATE_CHAT_QQS" in readme
+    assert "启动管理员模式" in readme
+    assert "退出管理员模式" in readme
+    assert "GROUP_IMAGE_MODEL" in readme
+    assert "GROUP_IMAGE_GENERATIONS_ENDPOINT" in readme
+    assert "GROUP_IMAGE_EDITS_ENDPOINT" in readme
     assert "only groups with both `enabled: true` and `speak: true` are ingested" in readme
     assert "enabled: true" in readme
     assert "speak: true" in readme
@@ -143,6 +151,15 @@ def test_public_release_has_license_env_example_and_reminder_state_ignore() -> N
     license_text = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8")
 
     assert "LLM_MODEL" in env_example
+    assert "LLM_TEXT_ENDPOINT" in env_example
+    assert "GROUP_IMAGE_MODEL" in env_example
+    assert "GROUP_IMAGE_GENERATIONS_ENDPOINT" in env_example
+    assert "GROUP_IMAGE_EDITS_ENDPOINT" in env_example
+    assert "GROUP_IMAGE_SIZE" in env_example
+    assert "GROUP_IMAGE_QUALITY" in env_example
+    assert "GROUP_IMAGE_OUTPUT_FORMAT" in env_example
+    assert "ADMIN_QQS" in env_example
+    assert "PRIVATE_CHAT_QQS" in env_example
     assert "OWNER_QQ" in env_example
     assert "data/private_reminders_state.json" in gitignore
     assert "data/generated_images/" in gitignore

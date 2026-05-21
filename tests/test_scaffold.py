@@ -77,6 +77,6 @@ def test_editable_install_metadata_exists() -> None:
 
     assert metadata.version("qq-ai-bot") == "0.1.0"
     assert package_metadata["Name"] == "qq-ai-bot"
-    assert package_metadata["Summary"] == "Personal QQ AI bot backed by NapCat Shell"
+    assert package_metadata["Summary"] == "NapCat-based QQ AI bot with image generation and private admin repo control"
     assert Path(distribution.locate_file("pyproject.toml")).resolve() == ROOT / "pyproject.toml"
     assert Path(distribution.locate_file("app/main.py")).resolve() == ROOT / "app" / "main.py"

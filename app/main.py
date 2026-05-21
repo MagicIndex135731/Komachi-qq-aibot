@@ -86,46 +86,32 @@ def build_usage_recorder(engine):
     return recorder
 
 
-def resolve_llm_transport_models(*, model: str, fallback_model: str | None) -> tuple[str, str]:
-    compat_model = model.strip()
-    fallback = (fallback_model or "").strip()
-    if fallback and not fallback.startswith("cc-"):
-        return fallback, compat_model
-    if compat_model and not compat_model.startswith("cc-"):
-        return compat_model, compat_model
-    return "", compat_model
-
-
 def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
-    responses_model, compat_model = resolve_llm_transport_models(
-        model=settings.llm_model,
-        fallback_model=settings.llm_fallback_model,
-    )
     return LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
-        fallback_model=settings.llm_fallback_model,
-        responses_model=responses_model,
-        compat_model=compat_model,
+        text_endpoint=settings.llm_text_endpoint,
         usage_recorder=build_usage_recorder(engine),
     )
 
 
 def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
-    if not settings.group_image_base_url.strip() and not settings.group_image_api_key.strip():
-        return llm_client
-    responses_model, compat_model = resolve_llm_transport_models(
-        model=settings.llm_model,
-        fallback_model=settings.llm_fallback_model,
+    use_default_transport = (
+        not settings.group_image_base_url.strip()
+        and not settings.group_image_api_key.strip()
+        and settings.group_image_generations_endpoint.strip() in {"", "/images/generations", "images/generations"}
+        and settings.group_image_edits_endpoint.strip() in {"", "/images/edits", "images/edits"}
     )
+    if use_default_transport:
+        return llm_client
     return LlmClient(
         base_url=settings.group_image_base_url.strip() or settings.llm_base_url,
         api_key=settings.group_image_api_key.strip() or settings.llm_api_key,
         model=settings.llm_model,
-        fallback_model=settings.llm_fallback_model,
-        responses_model=responses_model,
-        compat_model=compat_model,
+        text_endpoint=settings.llm_text_endpoint,
+        image_generations_endpoint=settings.group_image_generations_endpoint,
+        image_edits_endpoint=settings.group_image_edits_endpoint,
         http_client=httpx.Client(timeout=30.0, trust_env=False),
         usage_recorder=build_usage_recorder(engine),
     )
@@ -181,22 +167,12 @@ async def run() -> None:
         engine=engine,
         sender=sender,
         llm_client=llm_client,
-        image_llm_client=group_image_llm_client,
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
-        admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
         web_search_client=web_search_client,
-        image_model=settings.group_image_model,
-        image_size=settings.group_image_size,
-        image_quality=settings.group_image_quality,
-        image_background=settings.group_image_background,
-        image_output_format=settings.group_image_output_format,
-        image_output_compression=settings.group_image_output_compression,
-        image_moderation=settings.group_image_moderation,
-        image_queue_capacity=settings.group_image_queue_capacity,
         assistant_name=str(runtime.persona.get("name", "Codex")),
         persona=runtime.persona,
         safety=runtime.safety,
