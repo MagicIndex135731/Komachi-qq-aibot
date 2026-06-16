@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -100,22 +101,41 @@ def test_codex_bridge_writes_utf8_prompt_to_subprocess(monkeypatch, tmp_path) ->
     bridge.codex_executable = str(fake_codex)
     calls: dict[str, object] = {}
 
-    def fake_run(command, **kwargs):
-        calls["command"] = command
-        calls["kwargs"] = kwargs
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text('{"summary":"done","reply_text":"ready","restart_required":false}', encoding="utf-8")
-        return type(
-            "Completed",
-            (),
-            {
-                "returncode": 0,
-                "stdout": '{"type":"thread.started","thread_id":"thread-123"}\n',
-                "stderr": "",
-            },
-        )()
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            calls["command"] = command
+            calls["kwargs"] = kwargs
+            self.returncode = 0
+            self._stdout = '{"type":"thread.started","thread_id":"thread-123"}\n'
+            self._stderr = ""
+            self.stdin = self
+            self._closed = False
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text('{"summary":"done","reply_text":"ready","restart_required":false}', encoding="utf-8")
 
-    monkeypatch.setattr("app.dev_control.codex_bridge.subprocess.run", fake_run)
+        def write(self, value):
+            calls["input"] = value
+
+        def close(self):
+            self._closed = True
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            del timeout
+            return self._stdout, self._stderr
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(command, **kwargs):
+        return FakeProcess(command, **kwargs)
+
+    monkeypatch.setattr("app.dev_control.codex_bridge.subprocess.Popen", fake_popen)
 
     result = bridge.run_task(
         prompt="hello xiaomachi",
@@ -126,7 +146,7 @@ def test_codex_bridge_writes_utf8_prompt_to_subprocess(monkeypatch, tmp_path) ->
     assert result.reply_text == "ready"
     assert result.thread_id == "thread-123"
     assert calls["kwargs"]["encoding"] == "utf-8"
-    assert calls["kwargs"]["input"] == "hello xiaomachi"
+    assert calls["input"] == "hello xiaomachi"
 
 
 def test_codex_bridge_uses_exec_resume_when_resume_thread_id_provided(monkeypatch, tmp_path) -> None:
@@ -137,13 +157,38 @@ def test_codex_bridge_uses_exec_resume_when_resume_thread_id_provided(monkeypatc
     bridge.codex_executable = str(fake_codex)
     calls: dict[str, object] = {}
 
-    def fake_run(command, **kwargs):
-        calls["command"] = command
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text('{"summary":"done","reply_text":"resumed","restart_required":false}', encoding="utf-8")
-        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            del kwargs
+            calls["command"] = command
+            self.returncode = 0
+            self.stdin = self
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text('{"summary":"done","reply_text":"resumed","restart_required":false}', encoding="utf-8")
 
-    monkeypatch.setattr("app.dev_control.codex_bridge.subprocess.run", fake_run)
+        def write(self, _value):
+            return None
+
+        def close(self):
+            return None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            del timeout
+            return "", ""
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(command, **kwargs):
+        return FakeProcess(command, **kwargs)
+
+    monkeypatch.setattr("app.dev_control.codex_bridge.subprocess.Popen", fake_popen)
 
     result = bridge.run_task(
         prompt="continue",
@@ -156,3 +201,108 @@ def test_codex_bridge_uses_exec_resume_when_resume_thread_id_provided(monkeypatc
     assert result.thread_id == "thread-42"
     assert calls["command"][:3] == [str(fake_codex), "exec", "resume"]
     assert "thread-42" in calls["command"]
+
+
+def test_codex_bridge_returns_after_last_message_even_if_process_hangs(monkeypatch, tmp_path) -> None:
+    fake_codex = tmp_path / "codex.exe"
+    fake_codex.write_text("", encoding="utf-8")
+    bridge = CodexBridge.__new__(CodexBridge)
+    bridge.timeout_seconds = 30
+    bridge.codex_executable = str(fake_codex)
+    calls: dict[str, object] = {"terminate_called": False}
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            del kwargs
+            self.returncode = None
+            self.stdin = self
+            self._stdout = '{"type":"thread.started","thread_id":"thread-hang"}\n'
+            self._stderr = ""
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(
+                '{"summary":"done","reply_text":"late result","restart_required":false}',
+                encoding="utf-8",
+            )
+
+        def write(self, _value):
+            return None
+
+        def close(self):
+            return None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            del timeout
+            return self._stdout, self._stderr
+
+        def terminate(self):
+            calls["terminate_called"] = True
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr("app.dev_control.codex_bridge.subprocess.Popen", lambda command, **kwargs: FakeProcess(command, **kwargs))
+    monkeypatch.setattr("app.dev_control.codex_bridge.time.sleep", lambda _seconds: None)
+
+    result = bridge.run_task(
+        prompt="continue",
+        repo_root=tmp_path,
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result.reply_text == "late result"
+    assert result.thread_id == "thread-hang"
+    assert calls["terminate_called"] is True
+
+
+def test_codex_bridge_drains_live_output_so_large_stream_does_not_deadlock(monkeypatch, tmp_path) -> None:
+    bridge = CodexBridge.__new__(CodexBridge)
+    bridge.timeout_seconds = 2
+    bridge.codex_executable = sys.executable
+
+    child_script = tmp_path / "emit_large_output.py"
+    child_script.write_text(
+        "\n".join(
+            [
+                "import json",
+                "from pathlib import Path",
+                "import sys",
+                "",
+                "last_message_path = Path(sys.argv[1])",
+                "sys.stdin.read()",
+                "sys.stdout.write('{\"type\":\"thread.started\",\"thread_id\":\"thread-live\"}\\n')",
+                "sys.stdout.flush()",
+                "chunk = ('{\"type\":\"item.started\",\"item\":{\"id\":\"x\",\"type\":\"command_execution\",\"status\":\"in_progress\"}}\\n' * 4096)",
+                "err_chunk = ('warn queue full maybe\\n' * 256)",
+                "for _ in range(16):",
+                "    sys.stdout.write(chunk)",
+                "    sys.stdout.flush()",
+                "    sys.stderr.write(err_chunk)",
+                "    sys.stderr.flush()",
+                "last_message_path.write_text(json.dumps({\"summary\": \"done\", \"reply_text\": \"stream drained\", \"restart_required\": False}), encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        bridge,
+        "_build_command",
+        lambda *, last_message_path, resume_thread_id: [sys.executable, str(child_script), str(last_message_path)],
+    )
+
+    result = bridge.run_task(
+        prompt="hello",
+        repo_root=tmp_path,
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result.reply_text == "stream drained"
+    assert result.thread_id == "thread-live"
+    stdout_log = (tmp_path / "artifacts" / "codex.stdout.log").read_text(encoding="utf-8")
+    stderr_log = (tmp_path / "artifacts" / "codex.stderr.log").read_text(encoding="utf-8")
+    assert "thread.started" in stdout_log
+    assert "warn queue full maybe" in stderr_log

@@ -14,6 +14,15 @@ from urllib.parse import urlparse
 import httpx
 
 from app.core.message_content import ImageAttachment
+from app.providers.image_adapter import (
+    FALLBACK_IMAGE_RESPONSE_FORMAT,
+    ImageGenerationResult,
+    build_image_edit_data,
+    build_image_generation_payload,
+    is_unsupported_b64_response_format_error,
+    normalize_image_response_format,
+    parse_image_generation_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +54,6 @@ class ResponsesStreamResult:
     usage: LlmUsage | None
 
 
-@dataclass(slots=True)
-class ImageGenerationResult:
-    created: int | None
-    images: list[dict[str, Any]]
-
-
 class LlmClient:
     ANTHROPIC_MAX_TOKENS = 1024
     REQUEST_MAX_ATTEMPTS = 5
@@ -62,7 +65,10 @@ class LlmClient:
         base_url: str,
         api_key: str,
         model: str,
-        text_endpoint: str = "/chat/completions",
+        fallback_model: str | None = None,
+        vision_model: str | None = None,
+        responses_model: str | None = None,
+        compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
         image_edits_endpoint: str = "/images/edits",
         http_client: httpx.Client | None = None,
@@ -71,7 +77,10 @@ class LlmClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
-        self.text_endpoint = self._normalize_endpoint(text_endpoint, default="/chat/completions")
+        self.fallback_model = (fallback_model or "").strip()
+        self.vision_model = (vision_model or "").strip()
+        self.responses_model = (responses_model or "").strip()
+        self.compat_model = (compat_model or model).strip() or model
         self.image_generations_endpoint = self._normalize_endpoint(
             image_generations_endpoint,
             default="/images/generations",
@@ -82,6 +91,7 @@ class LlmClient:
         )
         self.http_client = http_client or httpx.Client(timeout=30.0)
         self.usage_recorder = usage_recorder
+        self._conversation_response_ids: dict[str, str] = {}
         self._base_host = (urlparse(self.base_url).hostname or "").lower()
 
     def _normalize_endpoint(self, endpoint: str, *, default: str) -> str:
@@ -94,8 +104,22 @@ class LlmClient:
             normalized = normalized[3:]
         return normalized
 
+    def _uses_anthropic_messages_api(self, *, model: str | None = None) -> bool:
+        active_model = (model or self.model).strip()
+        return active_model.startswith("cc-")
+
+    def _responses_enabled(self) -> bool:
+        return bool(self.responses_model)
+
     def _chat_image_url_uses_string_shape(self) -> bool:
         return self._base_host in PROXY_CHAT_IMAGE_STRING_HOSTS
+
+    def _responses_previous_response_id(self, *, conversation_key: str | None) -> str | None:
+        del conversation_key
+        return None
+
+    def _remember_response_id(self, *, conversation_key: str | None, response_id: str | None) -> None:
+        del conversation_key, response_id
 
     def _split_prompt_lines(self, prompt_lines: list[str]) -> tuple[list[str], list[str]]:
         instructions: list[str] = []
@@ -111,6 +135,46 @@ class LlmClient:
             input_lines.append(line)
 
         return instructions, input_lines
+
+    def _build_responses_payload(
+        self,
+        *,
+        model: str,
+        instructions: list[str],
+        input_lines: list[str],
+        images: list[ImageAttachment] | None = None,
+        previous_response_id: str | None = None,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": "\n\n".join(input_lines),
+            }
+        ]
+        image_parts = self._load_input_images(images or [])
+        for image_part in image_parts:
+            data_url = f"data:{image_part['media_type']};base64,{image_part['data']}"
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": data_url,
+                }
+            )
+        payload: dict[str, Any] = {
+            "model": model,
+            "stream": True,
+            "input": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        }
+        if instructions:
+            payload["instructions"] = "\n\n".join(instructions)
+        if previous_response_id:
+            payload["previous_response_id"] = previous_response_id
+        return payload
 
     def _build_chat_completions_payload(
         self,
@@ -147,6 +211,47 @@ class LlmClient:
             "model": model or self.model,
             "messages": messages,
         }
+
+    def _apply_model_specific_chat_payload_options(self, *, payload: dict[str, Any], model: str) -> dict[str, Any]:
+        normalized_model = str(model or "").strip().lower()
+        updated_payload = dict(payload)
+        if normalized_model == "gpt-5-nano":
+            updated_payload["reasoning_effort"] = "minimal"
+        return updated_payload
+
+    def _build_anthropic_messages_payload(
+        self,
+        *,
+        model: str,
+        instructions: list[str],
+        input_lines: list[str],
+        images: list[ImageAttachment] | None = None,
+    ) -> dict[str, Any]:
+        user_text = "\n\n".join(input_lines)
+        image_parts = self._load_input_images(images or [])
+        if image_parts:
+            user_content: str | list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+            user_content.extend(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image_part["media_type"],
+                        "data": image_part["data"],
+                    },
+                }
+                for image_part in image_parts
+            )
+        else:
+            user_content = user_text
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": self.ANTHROPIC_MAX_TOKENS,
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        if instructions:
+            payload["system"] = "\n\n".join(instructions)
+        return payload
 
     def _guess_image_media_type(self, *, url: str, response: httpx.Response) -> str | None:
         content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
@@ -403,7 +508,12 @@ class LlmClient:
         return "".join(pieces)
 
     def _extract_chat_completions_text_from_sse(self, response_text: str) -> str | None:
+        payload = self._extract_chat_completions_payload_from_sse(response_text)
+        return self._extract_chat_completions_text(payload) if payload is not None else None
+
+    def _extract_chat_completions_payload_from_sse(self, response_text: str) -> dict[str, Any] | None:
         pieces: list[str] = []
+        usage: dict[str, Any] | None = None
         for raw_line in response_text.splitlines():
             line = raw_line.strip()
             if not line.startswith("data:"):
@@ -417,18 +527,28 @@ class LlmClient:
                 continue
             if not isinstance(payload, dict):
                 continue
+            raw_usage = payload.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = raw_usage
             for choice in payload.get("choices", []):
                 if not isinstance(choice, dict):
                     continue
                 delta = choice.get("delta")
-                if not isinstance(delta, dict):
-                    continue
-                content = delta.get("content")
+                message = choice.get("message")
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                elif isinstance(message, dict):
+                    content = message.get("content")
+                else:
+                    content = choice.get("text")
                 if isinstance(content, str) and content:
                     pieces.append(content)
         if not pieces:
-            return None
-        return "".join(pieces)
+            return {"choices": [], "usage": usage} if usage is not None else None
+        payload: dict[str, Any] = {"choices": [{"message": {"content": "".join(pieces)}}]}
+        if usage is not None:
+            payload["usage"] = usage
+        return payload
 
     def _extract_responses_result_from_sse(
         self,
@@ -547,13 +667,29 @@ class LlmClient:
     def _chat_fallback_model(self) -> str:
         return self.fallback_model or self.model
 
-    def _request_chat_completions_json(self, *, chat_payload: dict[str, Any]) -> dict[str, Any]:
-        last_error: Exception | None = None
+    def _distinct_chat_fallback_model(self, *, primary_model: str) -> str:
+        fallback_model = (self.fallback_model or "").strip()
+        if not fallback_model or fallback_model == primary_model:
+            return ""
+        return fallback_model
 
-        for attempt in range(1, self.REQUEST_MAX_ATTEMPTS + 1):
+    def _image_chat_model(self, *, default_model: str) -> str:
+        vision_model = (self.vision_model or "").strip()
+        return vision_model or default_model
+
+    def _request_chat_completions_json(
+        self,
+        *,
+        chat_payload: dict[str, Any],
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+
+        for attempt in range(1, attempt_limit + 1):
             try:
                 response = self.http_client.post(
-                    f"{self.base_url}{self.text_endpoint}",
+                    f"{self.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json=chat_payload,
                 )
@@ -561,12 +697,12 @@ class LlmClient:
             except httpx.TimeoutException as exc:
                 last_error = exc
                 logger.warning("chat_completions_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
                 continue
             except httpx.TransportError as exc:
                 last_error = exc
                 logger.warning("chat_completions_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
                 continue
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
@@ -574,17 +710,17 @@ class LlmClient:
                     raise
                 last_error = exc
                 logger.warning("chat_completions_status_retry attempt=%s status=%s", attempt, status_code)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
                 continue
 
-            sse_text = self._extract_chat_completions_text_from_sse(response.text)
-            if sse_text is not None:
+            sse_payload = self._extract_chat_completions_payload_from_sse(response.text)
+            if sse_payload is not None and self._extract_chat_completions_text(sse_payload) is not None:
                 logger.warning(
                     "chat_completions_unexpected_sse attempt=%s content_type=%s",
                     attempt,
                     response.headers.get("content-type"),
                 )
-                return {"choices": [{"message": {"content": sse_text}}]}
+                return sse_payload
             try:
                 return response.json()
             except ValueError as exc:
@@ -596,7 +732,7 @@ class LlmClient:
                     response.headers.get("content-type"),
                     response.text[:200],
                 )
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
 
         if last_error is None:
             raise ValueError("chat completions request failed without a captured exception")
@@ -828,14 +964,78 @@ class LlmClient:
         raise ValueError("images edits request failed after retries") from last_error
 
     def _parse_image_generation_result(self, response_data: dict[str, Any]) -> ImageGenerationResult:
-        data = response_data.get("data")
-        if not isinstance(data, list):
-            raise ValueError("image generation response did not include data list")
-        images = [item for item in data if isinstance(item, dict)]
-        return ImageGenerationResult(
-            created=int(response_data["created"]) if "created" in response_data and response_data["created"] is not None else None,
-            images=images,
-        )
+        return parse_image_generation_result(response_data)
+
+    def _request_images_generations_with_response_format_fallback(
+        self,
+        *,
+        payload: dict[str, Any],
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> dict[str, Any]:
+        try:
+            return self._request_images_generations_json(
+                payload=payload,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
+        except httpx.HTTPStatusError as exc:
+            if (
+                normalize_image_response_format(str(payload.get("response_format", "")))
+                != "b64_json"
+                or not is_unsupported_b64_response_format_error(exc)
+            ):
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload["response_format"] = FALLBACK_IMAGE_RESPONSE_FORMAT
+            logger.warning(
+                "images_generations_response_format_fallback from=%s to=%s status=%s",
+                payload.get("response_format"),
+                fallback_payload["response_format"],
+                exc.response.status_code if exc.response is not None else 0,
+            )
+            return self._request_images_generations_json(
+                payload=fallback_payload,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def _request_images_edits_with_response_format_fallback(
+        self,
+        *,
+        data: dict[str, str],
+        files: list[tuple[str, tuple[str, bytes, str]]],
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> dict[str, Any]:
+        try:
+            return self._request_images_edits_json(
+                data=data,
+                files=files,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
+        except httpx.HTTPStatusError as exc:
+            if (
+                normalize_image_response_format(data.get("response_format"))
+                != "b64_json"
+                or not is_unsupported_b64_response_format_error(exc)
+            ):
+                raise
+            fallback_data = dict(data)
+            fallback_data["response_format"] = FALLBACK_IMAGE_RESPONSE_FORMAT
+            logger.warning(
+                "images_edits_response_format_fallback from=%s to=%s status=%s",
+                data.get("response_format"),
+                fallback_data["response_format"],
+                exc.response.status_code if exc.response is not None else 0,
+            )
+            return self._request_images_edits_json(
+                data=fallback_data,
+                files=files,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
 
     def _generate_text_without_responses(
         self,
@@ -844,15 +1044,78 @@ class LlmClient:
         input_lines: list[str],
         images: list[ImageAttachment] | None = None,
     ) -> str:
-        chat_payload = self._build_chat_completions_payload(
-            instructions=instructions,
-            input_lines=input_lines,
-            images=images,
-            model=self.model,
-        )
-        response_data = self._request_chat_completions_json(chat_payload=chat_payload)
-        self._record_usage(self._extract_chat_completions_usage(response_data, model=chat_payload["model"]))
-        text = self._extract_chat_completions_text(response_data)
+        compat_model = self.compat_model or self.model
+        active_model = self._image_chat_model(default_model=compat_model) if images else compat_model
+
+        if self._uses_anthropic_messages_api(model=active_model):
+            messages_payload = self._build_anthropic_messages_payload(
+                model=active_model,
+                instructions=instructions,
+                input_lines=input_lines,
+                images=images,
+            )
+            try:
+                response_data = self._request_anthropic_messages_json(messages_payload=messages_payload)
+            except ValueError as exc:
+                logger.warning(
+                    "anthropic_messages_fallback_to_chat_completions reason=%s",
+                    type(exc.__cause__ or exc).__name__,
+                )
+                chat_payload = self._build_chat_completions_payload(
+                    instructions=instructions,
+                    input_lines=input_lines,
+                    images=images,
+                    model=self._chat_fallback_model(),
+                )
+                response_data = self._request_chat_completions_json(chat_payload=chat_payload)
+                self._record_usage(
+                    self._extract_chat_completions_usage(response_data, model=chat_payload["model"])
+                )
+                text = self._extract_chat_completions_text(response_data)
+            else:
+                self._record_usage(self._extract_anthropic_messages_usage(response_data, model=active_model))
+                text = self._extract_anthropic_messages_text(response_data)
+        else:
+            chat_payload = self._build_chat_completions_payload(
+                instructions=instructions,
+                input_lines=input_lines,
+                images=images,
+                model=active_model,
+            )
+            chat_payload = self._apply_model_specific_chat_payload_options(
+                payload=chat_payload,
+                model=active_model,
+            )
+            response_model = chat_payload["model"]
+            fallback_model = "" if images and self.vision_model else self._distinct_chat_fallback_model(primary_model=response_model)
+            try:
+                response_data = self._request_chat_completions_json(
+                    chat_payload=chat_payload,
+                    max_attempts=1 if fallback_model else None,
+                )
+            except Exception as exc:
+                if not fallback_model:
+                    raise
+                logger.warning(
+                    "chat_completions_model_fallback primary_model=%s fallback_model=%s reason=%s",
+                    response_model,
+                    fallback_model,
+                    type(exc.__cause__ or exc).__name__,
+                )
+                fallback_payload = self._build_chat_completions_payload(
+                    instructions=instructions,
+                    input_lines=input_lines,
+                    images=images,
+                    model=fallback_model,
+                )
+                fallback_payload = self._apply_model_specific_chat_payload_options(
+                    payload=fallback_payload,
+                    model=fallback_model,
+                )
+                response_data = self._request_chat_completions_json(chat_payload=fallback_payload)
+                response_model = fallback_payload["model"]
+            self._record_usage(self._extract_chat_completions_usage(response_data, model=response_model))
+            text = self._extract_chat_completions_text(response_data)
 
         if text is not None:
             return text
@@ -865,8 +1128,37 @@ class LlmClient:
         images: list[ImageAttachment] | None = None,
         conversation_key: str | None = None,
     ) -> str:
-        del conversation_key
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
+
+        if self._responses_enabled():
+            responses_model = self._image_chat_model(default_model=self.responses_model) if images else self.responses_model
+            responses_payload = self._build_responses_payload(
+                model=responses_model,
+                instructions=instructions,
+                input_lines=input_lines,
+                images=images,
+                previous_response_id=self._responses_previous_response_id(conversation_key=conversation_key),
+            )
+            try:
+                responses_result = self._request_responses_stream_result(
+                    responses_payload=responses_payload,
+                    model=responses_model,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "responses_fallback_to_compat reason=%s",
+                    type(exc.__cause__ or exc).__name__,
+                )
+            else:
+                self._remember_response_id(
+                    conversation_key=conversation_key,
+                    response_id=responses_result.response_id,
+                )
+                self._record_usage(responses_result.usage)
+                if responses_result.text is not None:
+                    return responses_result.text
+                raise ValueError("model response did not include output text")
+
         return self._generate_text_without_responses(
             instructions=instructions,
             input_lines=input_lines,
@@ -884,30 +1176,23 @@ class LlmClient:
         output_format: str | None = None,
         output_compression: int | None = None,
         moderation: str | None = None,
+        response_format: str | None = None,
         max_attempts: int | None = None,
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
-        payload: dict[str, Any] = {
-            "model": model,
-            "prompt": prompt,
-            "n": 1,
-            "response_format": "url",
-        }
-        if size:
-            payload["size"] = size
-        if quality:
-            payload["quality"] = quality
-        if background:
-            payload["background"] = background
-        if output_format:
-            payload["output_format"] = output_format
-        normalized_output_format = (output_format or "").strip().lower()
-        if output_compression is not None and normalized_output_format in {"jpeg", "jpg", "webp"}:
-            payload["output_compression"] = int(output_compression)
-        if moderation:
-            payload["moderation"] = moderation
+        payload = build_image_generation_payload(
+            model=model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            output_compression=output_compression,
+            moderation=moderation,
+            response_format=response_format,
+        )
 
-        response_data = self._request_images_generations_json(
+        response_data = self._request_images_generations_with_response_format_fallback(
             payload=payload,
             max_attempts=max_attempts,
             timeout_seconds=timeout_seconds,
@@ -926,6 +1211,7 @@ class LlmClient:
         output_format: str | None = None,
         output_compression: int | None = None,
         moderation: str | None = None,
+        response_format: str | None = None,
         max_attempts: int | None = None,
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
@@ -933,26 +1219,19 @@ class LlmClient:
         if not files:
             raise ValueError("image edit request did not include a usable input image")
 
-        data: dict[str, str] = {
-            "model": model,
-            "prompt": prompt,
-            "n": "1",
-        }
-        if size:
-            data["size"] = size
-        if quality:
-            data["quality"] = quality
-        if background:
-            data["background"] = background
-        if output_format:
-            data["output_format"] = output_format
-        normalized_output_format = (output_format or "").strip().lower()
-        if output_compression is not None and normalized_output_format in {"jpeg", "jpg", "webp"}:
-            data["output_compression"] = str(int(output_compression))
-        if moderation:
-            data["moderation"] = moderation
+        data = build_image_edit_data(
+            model=model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            output_compression=output_compression,
+            moderation=moderation,
+            response_format=response_format,
+        )
 
-        response_data = self._request_images_edits_json(
+        response_data = self._request_images_edits_with_response_format_fallback(
             data=data,
             files=files,
             max_attempts=max_attempts,

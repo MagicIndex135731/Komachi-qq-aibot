@@ -30,15 +30,21 @@ class NapCatGateway:
         self._handler_tasks: set[asyncio.Task] = set()
 
     async def connect_and_consume(
-        self, handler: Callable[[dict[str, Any]], Awaitable[None]]
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[None]],
+        on_connect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {self.access_token}"} if self.access_token else None
         while True:
             disconnect_error = ConnectionError("NapCat websocket disconnected")
             should_reconnect = False
+            on_connect_task: asyncio.Task | None = None
             try:
                 async with websockets.connect(self.ws_url, additional_headers=headers) as websocket:
                     self.websocket = websocket
+                    if on_connect is not None:
+                        on_connect_task = asyncio.create_task(self._run_on_connect(on_connect))
+                        await asyncio.sleep(0)
                     async for raw_message in websocket:
                         payload = json.loads(raw_message)
                         echo = payload.get("echo")
@@ -64,10 +70,14 @@ class NapCatGateway:
             finally:
                 self.websocket = None
                 self._fail_pending_calls(disconnect_error)
+                if on_connect_task is not None and not on_connect_task.done():
+                    on_connect_task.cancel()
                 pending_tasks = list(self._handler_tasks)
                 if pending_tasks:
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
                 self._handler_tasks.clear()
+                if on_connect_task is not None:
+                    await asyncio.gather(on_connect_task, return_exceptions=True)
             if not should_reconnect:
                 return
             await asyncio.sleep(self.reconnect_delay_seconds)
@@ -81,6 +91,17 @@ class NapCatGateway:
             await handler(payload)
         except Exception:
             logging.exception("NapCat payload handler failed")
+
+    async def _run_on_connect(
+        self,
+        on_connect: Callable[[], Awaitable[None]],
+    ) -> None:
+        try:
+            await on_connect()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("NapCat on_connect hook failed")
 
     async def call_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         if self.websocket is None:

@@ -4,8 +4,6 @@ import pytest
 
 from app.core.bbot_commands import (
     BBOT_ADMIN_DENIED_TEXT,
-    BBOT_TARGET_GROUP_ID,
-    BBOT_TARGET_QQ,
     BbotCommandContext,
     BbotCommandSpec,
     BbotCommandResolver,
@@ -15,7 +13,7 @@ from app.core.bbot_commands import (
 def test_bbot_command_resolver_parses_today_anime_query() -> None:
     resolver = BbotCommandResolver()
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text="@Mira 帮我看看今天有什么新番")
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text="@Mira 帮我看看今天有什么新番")
 
     assert parsed is not None
     assert parsed.command_id == "today_anime"
@@ -37,7 +35,7 @@ def test_bbot_command_resolver_supports_multiple_today_anime_phrasings(
 ) -> None:
     resolver = BbotCommandResolver()
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text=plain_text)
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text=plain_text)
 
     assert parsed is not None
     assert parsed.command_id == "today_anime"
@@ -47,7 +45,7 @@ def test_bbot_command_resolver_supports_multiple_today_anime_phrasings(
 def test_bbot_command_resolver_marks_listener_admin_command() -> None:
     resolver = BbotCommandResolver()
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text="@Mira 帮我监听一下 elonmusk 的推特")
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text="@Mira 帮我监听一下 elonmusk 的推特")
 
     assert parsed is not None
     assert parsed.command_id == "add_twitter_listener"
@@ -58,7 +56,7 @@ def test_bbot_command_resolver_marks_listener_admin_command() -> None:
 def test_bbot_command_resolver_marks_bilibili_dynamic_query_as_cacheable() -> None:
     resolver = BbotCommandResolver()
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text="@Mira 看一下猫雷最新的b站动态")
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text="@Mira 看一下猫雷最新的b站动态")
 
     assert parsed is not None
     assert parsed.command_id == "latest_bilibili_dynamic"
@@ -83,7 +81,7 @@ def test_bbot_command_resolver_supports_multiple_phrasings_for_other_commands(
 ) -> None:
     resolver = BbotCommandResolver()
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text=plain_text)
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text=plain_text)
 
     assert parsed is not None
     assert parsed.command_id == expected_command_id
@@ -95,7 +93,7 @@ def test_bbot_command_resolver_builds_outbound_message() -> None:
 
     outbound = resolver.build_outbound_message("最新动态 697091119")
 
-    assert outbound == f"[CQ:at,qq={BBOT_TARGET_QQ}] 最新动态 697091119"
+    assert outbound == "[CQ:at,qq=20002] 最新动态 697091119"
 
 
 def test_bbot_command_resolver_allows_registering_custom_command_specs() -> None:
@@ -113,7 +111,7 @@ def test_bbot_command_resolver_allows_registering_custom_command_specs() -> None
         ]
     )
 
-    parsed = resolver.resolve(group_id=BBOT_TARGET_GROUP_ID, mentioned_bot=True, plain_text="@Mira 刷新BBot状态")
+    parsed = resolver.resolve(group_id=10001, mentioned_bot=True, plain_text="@Mira 刷新BBot状态")
 
     assert parsed is not None
     assert parsed.command_id == "refresh_status"

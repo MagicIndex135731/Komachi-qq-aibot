@@ -62,9 +62,9 @@ class ReplyPolicy:
         if policy_input.group_traffic_last_minute < 3:
             return ReplyDecision(False, "below_threshold", 0)
 
-        score = 2
+        score = 1
         if policy_input.direct_question:
-            score += 2
+            score += 3
         if policy_input.has_interjection_opportunity:
             score += 2
 

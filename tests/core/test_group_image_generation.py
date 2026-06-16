@@ -158,6 +158,44 @@ class FakeImageSearchClient:
         return list(self.image_results)
 
 
+class FakeAdapterImage:
+    def __init__(self, *, b64_json: str | None = None, url: str | None = None, output_format: str | None = None) -> None:
+        self.b64_json = b64_json
+        self.url = url
+        self.output_format = output_format
+
+
+class UrlImageLlm:
+    def __init__(self, *, image_url: str) -> None:
+        self.image_url = image_url
+        self.http_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    content=b"url-png-bytes",
+                    headers={"content-type": "image/png"},
+                )
+            )
+        )
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size=None,
+        quality=None,
+        background=None,
+        output_format=None,
+        output_compression=None,
+        moderation=None,
+        max_attempts=None,
+        timeout_seconds=None,
+    ):
+        del prompt, model, size, quality, background, output_format, output_compression, moderation, max_attempts, timeout_seconds
+        return ImageGenerationResult(created=123, images=[{"url": self.image_url, "output_format": "png"}])
+
+
 class FailingImageLlm:
     def __init__(self) -> None:
         self.calls = 0
@@ -528,6 +566,85 @@ async def test_group_image_service_accepts_base64_without_padding(tmp_path) -> N
     assert len(sender.image_calls) == 1
     written = tmp_path / "generated_images" / Path(sender.image_calls[0]["image_file"]).name
     assert written.read_bytes() == b"ab"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_accepts_typed_adapter_image_objects_without_extra_download(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+
+    class TypedResultLlm:
+        def generate_image(
+            self,
+            *,
+            prompt: str,
+            model: str,
+            size=None,
+            quality=None,
+            background=None,
+            output_format=None,
+            output_compression=None,
+            moderation=None,
+            max_attempts=None,
+            timeout_seconds=None,
+        ):
+            del prompt, model, size, quality, background, output_format, output_compression, moderation, max_attempts, timeout_seconds
+            return type(
+                "TypedImageResult",
+                (),
+                {
+                    "images": [
+                        FakeAdapterImage(
+                            b64_json=base64.b64encode(b"typed-png-bytes").decode("ascii"),
+                            output_format="png",
+                        )
+                    ]
+                },
+            )()
+
+    service = GroupImageGenerationService(
+        llm_client=TypedResultLlm(),
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="png",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(make_request("draw-typed-image-1"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert len(sender.image_calls) == 1
+    written = tmp_path / "generated_images" / Path(sender.image_calls[0]["image_file"]).name
+    assert written.read_bytes() == b"typed-png-bytes"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_downloads_url_artifacts_when_provider_returns_url(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = UrlImageLlm(image_url="https://img.example.test/generated.png")
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="png",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(make_request("draw-url-image-1"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert len(sender.image_calls) == 1
+    written = tmp_path / "generated_images" / Path(sender.image_calls[0]["image_file"]).name
+    assert written.read_bytes() == b"url-png-bytes"
 
 
 @pytest.mark.asyncio

@@ -4,8 +4,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import re
 
-BBOT_TARGET_GROUP_ID = 123456789
-BBOT_TARGET_QQ = 234567890
+BBOT_TARGET_GROUP_ID = 10001
+BBOT_TARGET_QQ = 20002
 BBOT_ADMIN_DENIED_TEXT = "这个需求对应 BBot 管理员命令，但我现在还没有它的管理员权限，先不能代你执行。"
 
 Matcher = Callable[["BbotCommandContext"], str | None]

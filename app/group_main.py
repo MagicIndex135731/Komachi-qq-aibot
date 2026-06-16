@@ -9,6 +9,7 @@ from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.context_builder import ContextBuilder
+from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.main import (
@@ -20,6 +21,7 @@ from app.main import (
     should_ingest_group_message,
     sync_history_archives,
 )
+from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all
 
 
@@ -34,6 +36,7 @@ async def run() -> None:
         ws_url=settings.napcat_ws_url,
         reconnect_forever=True,
     )
+    heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "group.heartbeat.json")
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
@@ -69,6 +72,13 @@ async def run() -> None:
             return
 
         group_id = int(payload["group_id"])
+        if group_id == 10001:
+            logging.info(
+                "group_payload_received group_id=%s msg_id=%s user_id=%s",
+                group_id,
+                payload.get("message_id"),
+                payload.get("user_id"),
+            )
         if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):
             return
 
@@ -79,12 +89,22 @@ async def run() -> None:
         )
         await router.handle_group_message(event)
 
+    async def backfill_group_history_on_connect() -> None:
+        await backfill_recent_group_history(
+            router=router,
+            gateway=gateway,
+            bot_qq=settings.bot_qq,
+            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+        )
+
     logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
     try:
-        await gateway.connect_and_consume(handle_payload)
+        await heartbeat.start()
+        await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
         if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
+        await heartbeat.stop()
 
 
 def main() -> int:

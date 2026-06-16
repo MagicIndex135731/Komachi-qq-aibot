@@ -66,9 +66,9 @@ async def test_router_forwards_owner_private_message_to_dev_service(sqlite_engin
         llm_client=FakeLlm(),
         dev_control_service=dev_service,
     )
-    router.runtime.settings.owner_qq = 987654321
+    router.runtime.settings.owner_qq = 10001
 
-    await router.handle_private_message(make_private_event(user_id=987654321, text="check logs"))
+    await router.handle_private_message(make_private_event(user_id=10001, text="check logs"))
 
     assert [event.plain_text for event in dev_service.events] == ["check logs"]
     assert sender.private_sent == []
@@ -84,8 +84,8 @@ async def test_router_ignores_duplicate_owner_private_message_delivery(sqlite_en
         llm_client=FakeLlm(),
         dev_control_service=dev_service,
     )
-    router.runtime.settings.owner_qq = 987654321
-    event = make_private_event(user_id=987654321, text="check logs")
+    router.runtime.settings.owner_qq = 10001
+    event = make_private_event(user_id=10001, text="check logs")
 
     await router.handle_private_message(event)
     await router.handle_private_message(event)
@@ -104,7 +104,7 @@ async def test_router_private_message_dedup_does_not_conflict_with_group_message
         llm_client=FakeLlm(),
         dev_control_service=dev_service,
     )
-    router.runtime.settings.owner_qq = 987654321
+    router.runtime.settings.owner_qq = 10001
 
     with session_scope(sqlite_engine) as session:
         GroupRepository(session).upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
@@ -121,7 +121,7 @@ async def test_router_private_message_dedup_does_not_conflict_with_group_message
             mentioned_bot=False,
         )
 
-    await router.handle_private_message(make_private_event(user_id=987654321, text="check logs"))
+    await router.handle_private_message(make_private_event(user_id=10001, text="check logs"))
 
     assert [event.plain_text for event in dev_service.events] == ["check logs"]
     assert sender.private_sent == []
@@ -137,7 +137,7 @@ async def test_router_handles_private_group_allow_command_without_dev_service(sq
         llm_client=FakeLlm(),
         dev_control_service=dev_service,
     )
-    router.runtime.settings.owner_qq = 987654321
+    router.runtime.settings.owner_qq = 10001
 
     await router.handle_private_message(make_private_event(user_id=987654321, text="/bot group allow 10086"))
 
@@ -160,7 +160,7 @@ async def test_router_persists_private_images_and_forwards_cached_event(sqlite_e
         llm_client=FakeLlm(),
         dev_control_service=dev_service,
     )
-    router.runtime.settings.owner_qq = 987654321
+    router.runtime.settings.owner_qq = 10001
 
     def fake_cache(raw_payload, *, cache_dir, http_client=None) -> None:
         del cache_dir, http_client
@@ -169,7 +169,7 @@ async def test_router_persists_private_images_and_forwards_cached_event(sqlite_e
     monkeypatch.setattr(router_module, "cache_images_in_raw_payload", fake_cache)
 
     event = make_private_event(
-        user_id=987654321,
+        user_id=10001,
         text="看这个",
         raw_payload={
             "message_id": "p-1",
@@ -195,7 +195,7 @@ async def test_router_persists_private_images_and_forwards_cached_event(sqlite_e
     assert dev_service.events[0].images[0].local_path == str(tmp_path / "private-cat.png")
 
     with session_scope(sqlite_engine) as session:
-        stored = MessageRepository(session).get_by_platform_msg_id("private-inbound-987654321-p-1")
+        stored = MessageRepository(session).get_by_platform_msg_id("private-inbound-10001-p-1")
 
     assert stored is not None
     assert stored.msg_type == "mixed"

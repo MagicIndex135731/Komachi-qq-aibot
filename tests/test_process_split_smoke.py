@@ -19,7 +19,8 @@ def _settings() -> AppSettings:
         llm_base_url="https://api.example.test/v1",
         llm_api_key="test-key",
         llm_model="gpt-5.4",
-        llm_text_endpoint="/chat/completions",
+        llm_fallback_model="",
+        llm_text_endpoint="chat_completions",
         group_image_base_url="",
         group_image_api_key="",
         group_image_size="auto",
@@ -56,8 +57,10 @@ class FakeGateway:
         self.websocket = None
         self.__class__.instances.append(self)
 
-    async def connect_and_consume(self, handler) -> None:
+    async def connect_and_consume(self, handler, on_connect=None) -> None:
         self.websocket = object()
+        if on_connect is not None:
+            await on_connect()
         await handler({})
 
 
@@ -97,8 +100,8 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None
     await group_main.run()
 
     assert captured["dev_control_service"] is None
-    assert captured["llm_kwargs"]["text_endpoint"] == "/chat/completions"
-    assert captured["llm_kwargs"]["model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == ""
+    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
 
@@ -115,45 +118,8 @@ async def test_private_main_disables_local_worker(monkeypatch) -> None:
         return object()
 
     class FakeService:
-        def __init__(
-            self,
-            *,
-            engine,
-            sender,
-            llm_client,
-            owner_qq,
-            bot_qq=None,
-            private_chat_qqs=None,
-            repo_root,
-            data_dir,
-            codex_bridge=None,
-            command_runner=None,
-            poll_interval_seconds=1.0,
-            enable_local_worker=True,
-            private_image_followup_window_seconds=1.2,
-            web_search_client=None,
-            assistant_name="Codex",
-            persona=None,
-            safety=None,
-        ) -> None:
-            del codex_bridge, command_runner, poll_interval_seconds, private_image_followup_window_seconds
-            captured.update(
-                {
-                    "engine": engine,
-                    "sender": sender,
-                    "llm_client": llm_client,
-                    "owner_qq": owner_qq,
-                    "bot_qq": bot_qq,
-                    "private_chat_qqs": private_chat_qqs,
-                    "repo_root": repo_root,
-                    "data_dir": data_dir,
-                    "enable_local_worker": enable_local_worker,
-                    "web_search_client": web_search_client,
-                    "assistant_name": assistant_name,
-                    "persona": persona,
-                    "safety": safety,
-                }
-            )
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
 
         async def start(self) -> None:
             return None
@@ -201,8 +167,8 @@ async def test_private_main_disables_local_worker(monkeypatch) -> None:
     assert captured["enable_local_worker"] is False
     assert captured["web_search_client"] is search_client
     assert captured["reminder_scheduler"]["reminders"] == ["reminder"]
-    assert captured["llm_kwargs"]["text_endpoint"] == "/chat/completions"
-    assert captured["llm_kwargs"]["model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == ""
+    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
     assert reminder_events == ["start", "stop"]
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
@@ -216,54 +182,17 @@ async def test_private_main_waits_for_gateway_before_starting_services(monkeypat
     FakeGateway.instances.clear()
 
     class OrderedGateway(FakeGateway):
-        async def connect_and_consume(self, handler) -> None:
+        async def connect_and_consume(self, handler, on_connect=None) -> None:
             events.append("gateway-connect")
             await asyncio.sleep(0)
             self.websocket = object()
             events.append("gateway-ready")
+            if on_connect is not None:
+                await on_connect()
             await handler({})
 
     class FakeService:
-        def __init__(
-            self,
-            *,
-            engine,
-            sender,
-            llm_client,
-            owner_qq,
-            bot_qq=None,
-            private_chat_qqs=None,
-            repo_root,
-            data_dir,
-            codex_bridge=None,
-            command_runner=None,
-            poll_interval_seconds=1.0,
-            enable_local_worker=True,
-            private_image_followup_window_seconds=1.2,
-            web_search_client=None,
-            assistant_name="Codex",
-            persona=None,
-            safety=None,
-        ) -> None:
-            del (
-                engine,
-                sender,
-                llm_client,
-                owner_qq,
-                bot_qq,
-                private_chat_qqs,
-                repo_root,
-                data_dir,
-                codex_bridge,
-                command_runner,
-                poll_interval_seconds,
-                enable_local_worker,
-                private_image_followup_window_seconds,
-                web_search_client,
-                assistant_name,
-                persona,
-                safety,
-            )
+        def __init__(self, **_kwargs) -> None:
             return None
 
         async def start(self) -> None:
@@ -357,7 +286,7 @@ async def test_dev_worker_main_enables_local_worker(monkeypatch) -> None:
 
     await dev_worker_main.run()
 
-    assert captured["llm_kwargs"]["text_endpoint"] == "/chat/completions"
-    assert captured["llm_kwargs"]["model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == ""
+    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
     assert captured["enable_local_worker"] is True
     assert captured["assistant_name"] == "比企谷小町"
