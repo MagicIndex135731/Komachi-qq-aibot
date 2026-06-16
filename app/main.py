@@ -14,12 +14,14 @@ from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationService
+from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.message_archive import sync_group_message_archives_from_db
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.dev_control.service import DevControlService
 from app.providers.llm_client import LlmClient
 from app.providers.web_search import WebSearchClient
+from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all
 from app.storage.db import session_scope
 from app.storage.repositories import UsageRepository
@@ -86,12 +88,43 @@ def build_usage_recorder(engine):
     return recorder
 
 
+def resolve_llm_transport_models(*, model: str, fallback_model: str | None) -> tuple[str, str]:
+    compat_model = model.strip()
+    fallback = (fallback_model or "").strip()
+    if fallback and not fallback.startswith("cc-"):
+        return fallback, compat_model
+    if compat_model and not compat_model.startswith("cc-"):
+        return compat_model, compat_model
+    return "", compat_model
+
+
+def resolve_primary_chat_completions_model(*, model: str, fallback_model: str | None) -> str:
+    del fallback_model
+    compat_model = model.strip()
+    if compat_model.startswith("cc-"):
+        stripped = compat_model[3:].strip()
+        if stripped:
+            return stripped
+    return compat_model
+
+
 def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
+    chat_model = resolve_primary_chat_completions_model(
+        model=settings.llm_model,
+        fallback_model=settings.llm_fallback_model,
+    )
+    fallback_model = (settings.llm_fallback_model or "").strip()
+    if fallback_model == chat_model:
+        fallback_model = ""
+    responses_model = chat_model if settings.llm_text_endpoint == "responses" else ""
     return LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        text_endpoint=settings.llm_text_endpoint,
+        model=chat_model,
+        fallback_model=fallback_model,
+        vision_model=(settings.llm_vision_model or "").strip(),
+        responses_model=responses_model,
+        compat_model=chat_model,
         usage_recorder=build_usage_recorder(engine),
     )
 
@@ -105,11 +138,17 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     )
     if use_default_transport:
         return llm_client
+    responses_model, compat_model = resolve_llm_transport_models(
+        model=settings.llm_model,
+        fallback_model=settings.llm_fallback_model,
+    )
     return LlmClient(
         base_url=settings.group_image_base_url.strip() or settings.llm_base_url,
         api_key=settings.group_image_api_key.strip() or settings.llm_api_key,
         model=settings.llm_model,
-        text_endpoint=settings.llm_text_endpoint,
+        fallback_model=settings.llm_fallback_model,
+        responses_model=responses_model,
+        compat_model=compat_model,
         image_generations_endpoint=settings.group_image_generations_endpoint,
         image_edits_endpoint=settings.group_image_edits_endpoint,
         http_client=httpx.Client(timeout=30.0, trust_env=False),
@@ -147,7 +186,8 @@ async def run() -> None:
     create_all(engine)
     sync_history_archives(engine, runtime)
 
-    gateway = NapCatGateway(ws_url=settings.napcat_ws_url)
+    gateway = NapCatGateway(ws_url=settings.napcat_ws_url, reconnect_forever=True)
+    heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "app.heartbeat.json")
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
@@ -167,12 +207,22 @@ async def run() -> None:
         engine=engine,
         sender=sender,
         llm_client=llm_client,
+        image_llm_client=group_image_llm_client,
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
+        admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
         web_search_client=web_search_client,
+        image_model=settings.group_image_model,
+        image_size=settings.group_image_size,
+        image_quality=settings.group_image_quality,
+        image_background=settings.group_image_background,
+        image_output_format=settings.group_image_output_format,
+        image_output_compression=settings.group_image_output_compression,
+        image_moderation=settings.group_image_moderation,
+        image_queue_capacity=settings.group_image_queue_capacity,
         assistant_name=str(runtime.persona.get("name", "Codex")),
         persona=runtime.persona,
         safety=runtime.safety,
@@ -214,13 +264,23 @@ async def run() -> None:
         )
         await router.handle_group_message(event)
 
+    async def backfill_group_history_on_connect() -> None:
+        await backfill_recent_group_history(
+            router=router,
+            gateway=gateway,
+            bot_qq=settings.bot_qq,
+            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+        )
+
     logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=settings.llm_model))
     try:
-        await gateway.connect_and_consume(handle_payload)
+        await heartbeat.start()
+        await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
         if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
         await dev_control_service.stop()
+        await heartbeat.stop()
 
 
 def main() -> int:

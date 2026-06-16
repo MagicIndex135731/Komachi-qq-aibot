@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 
-from scripts.probe_gpt_image2 import classify_probe_result, probe_gpt_image_2
+from scripts.probe_gpt_image2 import (
+    classify_probe_result,
+    probe_gpt_image_2,
+    resolve_probe_image_api_settings,
+)
 
 
 def test_probe_gpt_image_2_reports_listed_and_generation_success() -> None:
     calls: list[tuple[str, str]] = []
+    generation_payloads: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, str(request.url)))
@@ -21,6 +28,7 @@ def test_probe_gpt_image_2_reports_listed_and_generation_success() -> None:
                 },
             )
         if str(request.url).endswith("/images/generations"):
+            generation_payloads.append(json.loads(request.content.decode("utf-8")))
             return httpx.Response(
                 200,
                 json={"created": 123, "data": [{"b64_json": "abc"}]},
@@ -38,6 +46,37 @@ def test_probe_gpt_image_2_reports_listed_and_generation_success() -> None:
     assert result["generation_check"]["path"] == "/images/generations"
     assert result["generation_check"]["usable"] is True
     assert result["generation_check"]["image_count"] == 1
+    assert generation_payloads == [
+        {
+            "model": "gpt-image-2",
+            "prompt": "A tiny test image with a plain background.",
+            "n": 1,
+            "response_format": "url",
+        }
+    ]
+    assert calls == [
+        ("GET", "https://api.example.test/v1/models"),
+        ("POST", "https://api.example.test/v1/images/generations"),
+    ]
+
+
+def test_probe_gpt_image_2_uses_supplied_http_client_without_env_proxy_side_effects() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url)))
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "gpt-image-2"}]})
+        return httpx.Response(200, json={"created": 123, "data": [{"b64_json": "abc"}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = probe_gpt_image_2(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        http_client=client,
+    )
+
+    assert result["generation_check"]["usable"] is True
     assert calls == [
         ("GET", "https://api.example.test/v1/models"),
         ("POST", "https://api.example.test/v1/images/generations"),
@@ -121,3 +160,19 @@ def test_classify_probe_result_does_not_claim_machine_block_when_models_endpoint
     classified = classify_probe_result(result)
 
     assert classified["diagnosis"] == "image_generation_transport_failed"
+
+
+def test_resolve_probe_image_api_settings_prefers_group_image_env_when_present(monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.text.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "text-key")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+    monkeypatch.setenv("GROUP_IMAGE_BASE_URL", "https://api.image.test/v1")
+    monkeypatch.setenv("GROUP_IMAGE_API_KEY", "image-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+
+    base_url, api_key = resolve_probe_image_api_settings()
+
+    assert base_url == "https://api.image.test/v1"
+    assert api_key == "image-key"

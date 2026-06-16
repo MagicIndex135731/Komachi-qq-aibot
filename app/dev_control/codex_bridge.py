@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
+import time
 
 
 @dataclass(slots=True)
@@ -93,28 +95,155 @@ class CodexBridge:
             last_message_path=last_message_path,
             resume_thread_id=resume_thread_id,
         )
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=repo_root,
             env={**os.environ},
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            input=prompt,
-            timeout=self.timeout_seconds,
-            check=False,
         )
-        stdout_path.write_text(completed.stdout, encoding="utf-8")
-        stderr_path.write_text(completed.stderr, encoding="utf-8")
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"codex exec failed with exit code {completed.returncode}: {completed.stderr.strip()}"
-            )
-        if not last_message_path.exists():
-            raise RuntimeError("codex exec did not write a last message")
+        stdout_chunks, stdout_thread = self._start_stream_reader(getattr(process, "stdout", None))
+        stderr_chunks, stderr_thread = self._start_stream_reader(getattr(process, "stderr", None))
+        stdout_text = ""
+        stderr_text = ""
+        parsed_result: CodexTaskResult | None = None
+        try:
+            if process.stdin is None:
+                raise RuntimeError("codex exec did not expose stdin")
+            process.stdin.write(prompt)
+            process.stdin.close()
 
-        thread_id = resume_thread_id or _extract_thread_id(completed.stdout)
-        return _parse_last_message(last_message_path, thread_id=thread_id)
+            deadline = time.monotonic() + self.timeout_seconds
+            while True:
+                if process.poll() is not None:
+                    stdout_text, stderr_text = self._collect_process_output(
+                        process=process,
+                        stdout_chunks=stdout_chunks,
+                        stdout_thread=stdout_thread,
+                        stderr_chunks=stderr_chunks,
+                        stderr_thread=stderr_thread,
+                    )
+                    break
+
+                if parsed_result is None and last_message_path.exists():
+                    try:
+                        parsed_result = _parse_last_message(last_message_path)
+                    except Exception:
+                        parsed_result = None
+                    else:
+                        grace_deadline = min(deadline, time.monotonic() + 2.0)
+                        while process.poll() is None and time.monotonic() < grace_deadline:
+                            time.sleep(0.1)
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                stdout_text, stderr_text = self._collect_process_output(
+                                    process=process,
+                                    stdout_chunks=stdout_chunks,
+                                    stdout_thread=stdout_thread,
+                                    stderr_chunks=stderr_chunks,
+                                    stderr_thread=stderr_thread,
+                                    wait_timeout=5,
+                                )
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                stdout_text, stderr_text = self._collect_process_output(
+                                    process=process,
+                                    stdout_chunks=stdout_chunks,
+                                    stdout_thread=stdout_thread,
+                                    stderr_chunks=stderr_chunks,
+                                    stderr_thread=stderr_thread,
+                                    wait_timeout=5,
+                                )
+                            break
+
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, self.timeout_seconds)
+                time.sleep(0.1)
+        except Exception:
+            if process.poll() is None:
+                process.kill()
+                try:
+                    stdout_text, stderr_text = self._collect_process_output(
+                        process=process,
+                        stdout_chunks=stdout_chunks,
+                        stdout_thread=stdout_thread,
+                        stderr_chunks=stderr_chunks,
+                        stderr_thread=stderr_thread,
+                        wait_timeout=5,
+                    )
+                except Exception:
+                    stdout_text = stdout_text or "".join(stdout_chunks)
+                    stderr_text = stderr_text or "".join(stderr_chunks)
+            stdout_path.write_text(stdout_text, encoding="utf-8")
+            stderr_path.write_text(stderr_text, encoding="utf-8")
+            raise
+
+        stdout_path.write_text(stdout_text, encoding="utf-8")
+        stderr_path.write_text(stderr_text, encoding="utf-8")
+
+        if parsed_result is None:
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"codex exec failed with exit code {process.returncode}: {stderr_text.strip()}"
+                )
+            if not last_message_path.exists():
+                raise RuntimeError("codex exec did not write a last message")
+            parsed_result = _parse_last_message(last_message_path)
+
+        thread_id = resume_thread_id or _extract_thread_id(stdout_text)
+        parsed_result.thread_id = thread_id
+        return parsed_result
+
+    def _start_stream_reader(self, stream) -> tuple[list[str], threading.Thread | None]:
+        if stream is None or not hasattr(stream, "readline"):
+            return [], None
+
+        chunks: list[str] = []
+
+        def _reader() -> None:
+            try:
+                while True:
+                    chunk = stream.readline()
+                    if chunk == "":
+                        break
+                    chunks.append(chunk)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    return
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        return chunks, thread
+
+    def _collect_process_output(
+        self,
+        *,
+        process,
+        stdout_chunks: list[str],
+        stdout_thread: threading.Thread | None,
+        stderr_chunks: list[str],
+        stderr_thread: threading.Thread | None,
+        wait_timeout: float | None = None,
+    ) -> tuple[str, str]:
+        if stdout_thread is None and stderr_thread is None:
+            out, err = process.communicate(timeout=wait_timeout)
+            return out or "", err or ""
+
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            wait(timeout=wait_timeout)
+
+        if stdout_thread is not None:
+            stdout_thread.join(timeout=wait_timeout)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=wait_timeout)
+        return "".join(stdout_chunks), "".join(stderr_chunks)
 
     def _build_command(self, *, last_message_path: Path, resume_thread_id: str | None) -> list[str]:
         base = [

@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -262,6 +262,17 @@ class ImageCapturingLlm:
         return "I can see it."
 
 
+class WeeklyReportLlm:
+    def __init__(self) -> None:
+        self.calls = []
+        self.conversation_keys: list[str | None] = []
+
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+        self.calls.append(prompt_lines)
+        self.conversation_keys.append(conversation_key)
+        return "1|Alice|今天这波真离谱|火药味拉满\n2|Bob|这也太炸了吧|节目效果很强"
+
+
 class FakeGateway:
     def __init__(self, *, responses=None, error: Exception | None = None) -> None:
         self.responses = responses or {}
@@ -308,6 +319,42 @@ class AlwaysReplyPolicy:
     def decide(self, policy_input) -> ReplyDecision:
         del policy_input
         return ReplyDecision(True, "proactive_score", 10)
+
+
+def _fake_cache_local_paths(raw_payload, *, cache_dir) -> None:
+    del cache_dir
+    for index, segment in enumerate(raw_payload.get("message", []), start=1):
+        if segment.get("type") == "image":
+            segment.setdefault("data", {})["local_path"] = f"C:/tmp/cached-{index}.png"
+
+
+class FakeGroupImageService:
+    def __init__(self, *, accepted: bool, queue_position: int | None = None, reason: str = "") -> None:
+        self.accepted = accepted
+        self.queue_position = queue_position
+        self.reason = reason
+        self.requests = []
+
+    async def enqueue(self, request):
+        self.requests.append(request)
+        return type(
+            "GroupImageEnqueueResult",
+            (),
+            {
+                "accepted": self.accepted,
+                "queue_position": self.queue_position,
+                "reason": self.reason,
+            },
+        )()
+
+
+class FakeImageSearchClient:
+    def __init__(self) -> None:
+        self.image_queries: list[tuple[str, int]] = []
+
+    def image_search(self, query: str, max_results: int = 3):
+        self.image_queries.append((query, max_results))
+        return []
 
 
 def make_raw_payload(
@@ -408,6 +455,933 @@ async def test_router_replies_to_direct_mention_in_allowlisted_group(sqlite_engi
 
 
 @pytest.mark.asyncio
+async def test_router_forwards_supported_bbot_command_in_target_group(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-1",
+            plain_text="@Mira 帮我看看今天有什么新番",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 今日新番"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_forwards_today_anime_command_for_alternate_phrasing(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-1b",
+            plain_text="@Mira 告诉我今天有什么动画",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 今日新番"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_forwards_bbot_command_with_extracted_argument(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-2",
+            plain_text="@Mira 来个6657的烂梗",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 随机烂梗 6657"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_forward_bbot_command_outside_target_group(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=30003,
+            mentioned_bot=True,
+            message_id="bbot-3",
+            plain_text="@Mira 帮我看看今天有什么新番",
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_blocks_bbot_admin_intent_without_bridge_admin_permission(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-4",
+            plain_text="@Mira 把每日新番提醒打开",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["这个需求对应 BBot 管理员命令，但我现在还没有它的管理员权限，先不能代你执行。"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_forwards_bbot_latest_dynamic_for_natural_language_query(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-dynamic-1",
+            plain_text="@Mira 帮我看看老番茄的b站动态",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 最新动态 老番茄"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_strips_latest_modifier_from_bbot_bilibili_dynamic_target(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-dynamic-2",
+            plain_text="@Mira 看一下猫雷最新的b站动态",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 最新动态 猫雷"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_uses_cached_bilibili_listener_uid_from_bbot_push_message(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            user_id=20002,
+            nickname="BBot",
+            message_id="bbot-cache-seed-1",
+            plain_text=(
+                "猫雷NyaRu_Official（UID: 697091119）于2026-05-13 21:05:50发布了一条新动态："
+                "\n动态内容：\n【B限】可愛歌回！"
+            ),
+        )
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-cache-hit-1",
+            plain_text="@Mira 看一下猫雷最新的b站动态",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 最新动态 697091119"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_uses_cached_bilibili_listener_uid_from_list_response(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            user_id=20002,
+            nickname="BBot",
+            message_id="bbot-cache-seed-2",
+            plain_text=(
+                "B站监听列表：\n"
+                "1. 猫雷NyaRu_Official（UID: 697091119）\n"
+                "2. 阿森纳View（UID: 1473277782）"
+            ),
+        )
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-cache-hit-2",
+            plain_text="@Mira 看一下猫雷最新的b站动态",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 最新动态 697091119"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_forwards_bbot_latest_tweet_for_natural_language_query(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-tweet-1",
+            plain_text="@Mira 看看 elonmusk 最近发了什么推文",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["[CQ:at,qq=20002] 最新推文 elonmusk"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_blocks_natural_language_twitter_watch_admin_intent(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-admin-5",
+            plain_text="@Mira 帮我监听一下 elonmusk 的推特",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["这个需求对应 BBot 管理员命令，但我现在还没有它的管理员权限，先不能代你执行。"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_blocks_natural_language_bilibili_watch_admin_intent(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="bbot-admin-6",
+            plain_text="@Mira 把 123456 加到b站监听里",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["这个需求对应 BBot 管理员命令，但我现在还没有它的管理员权限，先不能代你执行。"]
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_explicit_group_draw_request(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 帮我画一张雨夜便利店",
+            message_id="draw-1",
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].requester_user_id == 20001
+    assert image_service.requests[0].prompt == "雨夜便利店"
+    assert llm.calls == []
+    assert sender.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_explicit_group_draw_request_with_current_image_reference(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira \u6539\u6210\u8d5b\u535a\u670b\u514b\u98ce",
+            message_id="draw-with-image-1",
+            images=[ImageAttachment(url="https://img.example.test/source.png", file_id="source.png")],
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == "\u6539\u6210\u8d5b\u535a\u670b\u514b\u98ce"
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/source.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_explicit_group_draw_request_with_recent_image_reference(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    prior_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="recent-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=prior_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="recent-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/recent.png", file_id="recent.png")],
+                reply_to_msg_id=None,
+                timestamp=prior_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira \u6539\u6210\u6cb9\u63cf\u52a8\u753b",
+            message_id="draw-with-recent-image-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == "\u6539\u6210\u6cb9\u63cf\u52a8\u753b"
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/recent.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_recent_reference_request_with_multiple_images_from_same_prior_message(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    prior_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="recent-multi-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=prior_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="recent-multi-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[
+                    ImageAttachment(url="https://img.example.test/recent-a.png", file_id="recent-a.png"),
+                    ImageAttachment(url="https://img.example.test/recent-b.png", file_id="recent-b.png"),
+                ],
+                reply_to_msg_id=None,
+                timestamp=prior_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 改成赛博废土海报",
+            message_id="draw-with-recent-multi-image-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == "改成赛博废土海报"
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/recent-a.png",
+        "https://img.example.test/recent-b.png",
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_uses_only_latest_prior_image_message_when_images_are_split_across_messages(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    first_timestamp = datetime(2026, 5, 9, 11, 58, 0, tzinfo=UTC)
+    second_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="split-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=first_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="split-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/split-a.png", file_id="split-a.png")],
+                reply_to_msg_id=None,
+                timestamp=first_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="split-image-2",
+            group_id=10001,
+            user_id=20001,
+            timestamp=second_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="split-image-2",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/split-b.png", file_id="split-b.png")],
+                reply_to_msg_id=None,
+                timestamp=second_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 改成蒸汽波封面",
+            message_id="draw-with-split-images-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == "改成蒸汽波封面"
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/split-b.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_reference_image_request_with_embedded_draw_phrase(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    quoted_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="quoted-style-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=quoted_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="quoted-style-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/quoted-style.png", file_id="quoted-style.png")],
+                reply_to_msg_id=None,
+                timestamp=quoted_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    prompt = "\u4eff\u7167\u8fd9\u4e24\u4e2a\u4eba\u7269\u52a8\u4f5c\u548c\u753b\u98ce\uff0c\u753b\u4e00\u5f20\u628a\u4eba\u7269\u6362\u6210\u8d85\u65f6\u7a7a\u8f89\u591c\u59ec\u7684\u4e24\u4e2a\u5973\u4e3b\u7684\u56fe"
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text=f"@Mira {prompt}",
+            message_id="draw-with-embedded-phrase-1",
+            reply_to_msg_id="quoted-style-image-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == prompt
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/quoted-style.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_reference_image_request_with_reference_generation_phrase(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    prompt = "\u53c2\u8003\u8fd9\u5f20\u56fe\u751f\u6210\u4e00\u5f20\u50cf\u7d20\u98ce\u7248\u672c"
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text=f"@Mira {prompt}",
+            message_id="draw-with-reference-generation-1",
+            images=[ImageAttachment(url="https://img.example.test/source-pixel.png", file_id="source-pixel.png")],
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == prompt
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/source-pixel.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_reference_image_request_for_mimic_composition_phrase(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    prompt = "模仿第二张图的构图，把第一张图六个人形成第二张图这种风格的图片，要求人脸必须保持第一张图的辨识度，其他可以灵活改变"
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text=f"@Mira {prompt}",
+            message_id="draw-mimic-composition-1",
+            images=[
+                ImageAttachment(url="https://img.example.test/first.png", file_id="first.png"),
+                ImageAttachment(url="https://img.example.test/second.png", file_id="second.png"),
+            ],
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == prompt
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/first.png",
+        "https://img.example.test/second.png",
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_reference_image_request_for_on_this_image_basis_phrase(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    quoted_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="quoted-basis-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=quoted_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="quoted-basis-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/quoted-basis.png", file_id="quoted-basis.png")],
+                reply_to_msg_id=None,
+                timestamp=quoted_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    prompt = "在这张图基础上画优化版横图，把这两个人弄到榻榻米上，修复手部异常"
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text=f"@Mira {prompt}",
+            message_id="draw-on-this-image-basis-1",
+            reply_to_msg_id="quoted-basis-image-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].prompt == prompt
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/quoted-basis.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_explicit_group_draw_request_when_replying_to_image_without_at(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+    router.reply_policy = AlwaysDirectTriggerReplyPolicy()
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    quoted_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="quoted-reply-image-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=quoted_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="quoted-reply-image-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/reply-image.png", file_id="reply-image.png")],
+                reply_to_msg_id=None,
+                timestamp=quoted_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            plain_text="在这张图基础上画优化版横图，把这两个人弄到榻榻米上，修复手部异常",
+            message_id="draw-reply-image-no-at-1",
+            reply_to_msg_id="quoted-reply-image-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/reply-image.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_auto_web_character_reference_request_with_recent_layout_image(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    search_client = FakeImageSearchClient()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=search_client,
+        group_image_service=image_service,
+    )
+
+    prior_timestamp = datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="auto-web-layout-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=prior_timestamp,
+            plain_text="",
+            raw_json=make_raw_payload(
+                message_id="auto-web-layout-1",
+                user_id=20001,
+                nickname="Alice",
+                group_card="",
+                group_id=10001,
+                plain_text="",
+                mentioned_bot=False,
+                images=[ImageAttachment(url="https://img.example.test/layout.png", file_id="layout.png")],
+                reply_to_msg_id=None,
+                timestamp=prior_timestamp,
+            ),
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 去网上找超时空辉夜姬两个女主的人设图，保留前图构图，只替换人物出图",
+            message_id="draw-auto-web-ref-1",
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].web_search_query == "超时空辉夜姬两个女主"
+    assert "保留前图构图" in image_service.requests[0].prompt
+    assert [image.url for image in image_service.requests[0].reference_images] == [
+        "https://img.example.test/layout.png"
+    ]
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_auto_web_character_reference_request_for_search_then_generate_phrase(
+    sqlite_engine,
+) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text=(
+                "@Mira 先去网上搜索超时空辉夜姬两个女主辉夜和酒寄彩叶的人设图 "
+                "然后生成一张超时空辉夜姬动画的酒寄彩叶和辉夜近距离对视"
+            ),
+            message_id="draw-auto-web-ref-search-then-generate-1",
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].web_search_query == "超时空辉夜姬两个女主辉夜和酒寄彩叶"
+    assert "生成一张超时空辉夜姬动画的酒寄彩叶和辉夜近距离对视" in image_service.requests[0].prompt
+    assert llm.calls == []
+    assert sender.sent[-1].text
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_normal_image_question_on_recognition_path(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira \u8fd9\u662f\u8c01",
+            message_id="normal-image-question-1",
+            images=[ImageAttachment(url="https://img.example.test/character.png", file_id="character.png")],
+        )
+    )
+
+    assert image_service.requests == []
+    assert len(llm.calls) == 1
+    assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/character.png"]
+
+
+@pytest.mark.asyncio
+async def test_router_replies_when_group_image_queue_is_full(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=False, reason="queue_full")
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 画个猫猫",
+            message_id="draw-full-1",
+        )
+    )
+
+    assert llm.calls == []
+    assert sender.sent[-1].text
+
+
+@pytest.mark.asyncio
 async def test_router_passes_images_for_addressed_turn_without_putting_them_in_recent_history(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
@@ -425,7 +1399,7 @@ async def test_router_passes_images_for_addressed_turn_without_putting_them_in_r
             mentioned_bot=False,
             message_id="image-addressed-1",
             plain_text="look at this",
-            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")],
+            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png", local_path="C:/tmp/cat.png")],
         )
     )
 
@@ -459,7 +1433,7 @@ async def test_router_caches_inbound_image_payload_before_persisting(sqlite_engi
             mentioned_bot=False,
             message_id="cache-persist-1",
             plain_text="",
-            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")],
+            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png", local_path="C:/tmp/cat.png")],
         )
     )
 
@@ -484,9 +1458,9 @@ async def test_router_archives_inbound_and_outbound_messages_with_identity_snaps
             mentioned_bot=True,
             message_id="archive-turn-1",
             plain_text="@Mira 今晚吃什么",
-            user_id=987654321,
-            nickname="群友乙",
-            group_card="测试备注",
+            user_id=10001,
+            nickname="不知道叫什么",
+            group_card="群友甲",
             timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
         )
     )
@@ -499,9 +1473,9 @@ async def test_router_archives_inbound_and_outbound_messages_with_identity_snaps
             "timestamp": "2026-05-09T12:00:00+00:00",
             "group_id": 10001,
             "platform_msg_id": "archive-turn-1",
-            "user_id": 987654321,
-            "nickname": "群友乙",
-            "group_card": "测试备注",
+            "user_id": 10001,
+            "nickname": "不知道叫什么",
+            "group_card": "群友甲",
             "plain_text": "@Mira 今晚吃什么",
             "msg_type": "text",
             "mentioned_bot": True,
@@ -545,7 +1519,7 @@ async def test_router_does_not_pass_images_for_unaddressed_turn_even_if_it_repli
             mentioned_bot=False,
             message_id="image-proactive-1",
             plain_text="random photo",
-            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")],
+            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png", local_path="C:/tmp/cat.png")],
         )
     )
 
@@ -555,10 +1529,11 @@ async def test_router_does_not_pass_images_for_unaddressed_turn_even_if_it_repli
 
 
 @pytest.mark.asyncio
-async def test_router_adds_image_fallback_text_for_image_only_addressed_turn(sqlite_engine) -> None:
+async def test_router_adds_image_fallback_text_for_image_only_addressed_turn(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    monkeypatch.setattr(router_module, "cache_images_in_raw_payload", _fake_cache_local_paths)
 
     await router.handle_group_message(
         make_event(
@@ -566,12 +1541,12 @@ async def test_router_adds_image_fallback_text_for_image_only_addressed_turn(sql
             mentioned_bot=True,
             message_id="image-only-1",
             plain_text="",
-            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")],
+            images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png", local_path="C:/tmp/cat.png")],
         )
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["I can see it."]
-    assert any(line == "Target message: Alice: [sent 1 image]" for line in llm.calls[0]["prompt_lines"])
+    assert sender.sent == []
+    assert llm.calls == []
 
 
 @pytest.mark.asyncio
@@ -624,6 +1599,121 @@ async def test_router_uses_referenced_image_when_addressed_turn_quotes_image(sql
 
 
 @pytest.mark.asyncio
+async def test_router_includes_quoted_text_in_group_prompt_when_replying_to_text_message(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    sender.gateway = FakeGateway(
+        responses={
+            "quoted-text-1": make_raw_payload(
+                message_id="quoted-text-1",
+                user_id=20002,
+                nickname="Bob",
+                group_card="",
+                group_id=10001,
+                plain_text="今天这句就按阴阳怪气那种语气说",
+                mentioned_bot=False,
+                images=[],
+                reply_to_msg_id=None,
+                timestamp=datetime(2026, 5, 9, 12, 1, 30, tzinfo=UTC),
+            )
+        }
+    )
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="quoted-text-trigger-1",
+            plain_text="@Mira 模仿上面的话",
+            user_id=20001,
+            nickname="Alice",
+            reply_to_msg_id="quoted-text-1",
+            timestamp=datetime(2026, 5, 9, 12, 3, 0, tzinfo=UTC),
+        )
+    )
+
+    prompt_text = "\n".join(llm.calls[0])
+    assert "今天这句就按阴阳怪气那种语气说" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_directly_reply_to_unaddressed_quote_of_non_bot_message(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20002, nickname="Bob", group_card="")
+        messages.add_group_message(
+            platform_msg_id="quoted-human-1",
+            group_id=10001,
+            user_id=20002,
+            timestamp=datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC),
+            plain_text="quoted human text",
+            raw_json={"post_type": "message", "message_id": "quoted-human-1"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="quote-human-trigger-1",
+            plain_text="确实",
+            reply_to_msg_id="quoted-human-1",
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_directly_replies_to_unaddressed_quote_of_bot_message(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=router.runtime.settings.bot_qq, nickname="Mira", group_card="")
+        messages.add_group_message(
+            platform_msg_id="quoted-bot-1",
+            group_id=10001,
+            user_id=router.runtime.settings.bot_qq,
+            timestamp=datetime(2026, 5, 9, 11, 59, 0, tzinfo=UTC),
+            plain_text="bot text",
+            raw_json={"post_type": "message", "message_id": "quoted-bot-1"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="quote-bot-trigger-1",
+            plain_text="这句呢",
+            reply_to_msg_id="quoted-bot-1",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["I am here."]
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_unresolved(
     sqlite_engine,
 ) -> None:
@@ -653,7 +1743,7 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
         messages = MessageRepository(session)
         groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
         users.upsert_user(user_id=20001, nickname="Alice", group_card="")
-        users.upsert_user(user_id=30003, nickname="Bob", group_card="")
+        users.upsert_user(user_id=20002, nickname="Bob", group_card="")
         messages.add_group_message(
             platform_msg_id="stale-user-image-1",
             group_id=10001,
@@ -679,7 +1769,7 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
         messages.add_group_message(
             platform_msg_id="other-user-image-1",
             group_id=10001,
-            user_id=30003,
+            user_id=20002,
             timestamp=datetime(2026, 5, 9, 12, 1, 0, tzinfo=UTC),
             plain_text="",
             raw_json=make_raw_payload(
@@ -701,7 +1791,7 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
         messages.add_group_message(
             platform_msg_id="interruption-text-1",
             group_id=10001,
-            user_id=30003,
+            user_id=20002,
             timestamp=datetime(2026, 5, 9, 12, 2, 0, tzinfo=UTC),
             plain_text="先别急，我插一句",
             raw_json={"post_type": "message", "message_id": "interruption-text-1"},
@@ -797,10 +1887,11 @@ async def test_router_does_not_fall_back_to_recent_image_when_quoted_remote_mess
 
 
 @pytest.mark.asyncio
-async def test_router_uses_followup_image_after_prior_addressed_turn_even_with_interruption(sqlite_engine) -> None:
+async def test_router_uses_followup_image_after_prior_addressed_turn_even_with_interruption(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    monkeypatch.setattr(router_module, "cache_images_in_raw_payload", _fake_cache_local_paths)
 
     await router.handle_group_message(
         make_event(
@@ -828,13 +1919,13 @@ async def test_router_uses_followup_image_after_prior_addressed_turn_even_with_i
             mentioned_bot=False,
             message_id="image-followup-1",
             plain_text="",
-            images=[ImageAttachment(url="https://img.example.test/followup.png", file_id="followup.png")],
+            images=[ImageAttachment(url="https://img.example.test/followup.png", file_id="followup.png", local_path="C:/tmp/followup.png")],
             timestamp=datetime(2026, 5, 9, 12, 1, 0, tzinfo=UTC),
         )
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["I can see it.", "I can see it."]
-    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/followup.png"]
+    assert [outbound.text for outbound in sender.sent] == ["I can see it."]
+    assert llm.calls[-1]["images"] is None
 
 
 @pytest.mark.asyncio
@@ -868,6 +1959,40 @@ async def test_router_uses_recent_image_when_user_addresses_bot_after_posting_im
 
 
 @pytest.mark.asyncio
+async def test_router_waits_silently_on_single_image_until_followup_text(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="recent-image-hold-1",
+            plain_text="",
+            images=[ImageAttachment(url="https://img.example.test/recent-hold.png", file_id="recent-hold.png")],
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="recent-image-hold-trigger-1",
+            plain_text="她是谁",
+            timestamp=datetime(2026, 5, 9, 12, 0, 8, tzinfo=UTC),
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["I can see it."]
+    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/recent-hold.png"]
+
+
+@pytest.mark.asyncio
 async def test_router_uses_recent_image_for_natural_phrase_about_user_posted_image(sqlite_engine) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
@@ -898,10 +2023,11 @@ async def test_router_uses_recent_image_for_natural_phrase_about_user_posted_ima
 
 
 @pytest.mark.asyncio
-async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sqlite_engine) -> None:
+async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    monkeypatch.setattr(router_module, "cache_images_in_raw_payload", _fake_cache_local_paths)
 
     await router.handle_group_message(
         make_event(
@@ -909,7 +2035,7 @@ async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sql
             mentioned_bot=False,
             message_id="stale-image-1",
             plain_text="",
-            images=[ImageAttachment(url="https://img.example.test/stale.png", file_id="stale.png")],
+            images=[ImageAttachment(url="https://img.example.test/stale.png", file_id="stale.png", local_path="C:/tmp/stale.png")],
             timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
         )
     )
@@ -924,15 +2050,16 @@ async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sql
     )
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
-    assert llm.calls[-1]["images"] is None
+    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/stale.png"]
 
 
 @pytest.mark.asyncio
-async def test_router_does_not_reuse_already_consumed_recent_image_after_intervening_user_text(sqlite_engine) -> None:
+async def test_router_does_not_reuse_already_consumed_recent_image_after_intervening_user_text(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
     router.runtime.persona["name"] = "比企谷小町"
+    monkeypatch.setattr(router_module, "cache_images_in_raw_payload", _fake_cache_local_paths)
 
     await router.handle_group_message(
         make_event(
@@ -940,7 +2067,7 @@ async def test_router_does_not_reuse_already_consumed_recent_image_after_interve
             mentioned_bot=False,
             message_id="consumed-image-1",
             plain_text="",
-            images=[ImageAttachment(url="https://img.example.test/consumed.png", file_id="consumed.png")],
+            images=[ImageAttachment(url="https://img.example.test/consumed.png", file_id="consumed.png", local_path="C:/tmp/consumed.png")],
             timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
         )
     )
@@ -1072,6 +2199,50 @@ async def test_router_ignores_duplicate_inbound_delivery(sqlite_engine) -> None:
     assert [message.plain_text for message in stored_messages] == ["@Mira hi", "I am here."]
 
 
+def test_router_ingests_historical_group_message_without_replying(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    event = make_event(group_id=10001, mentioned_bot=True, message_id="history-only-1")
+
+    persisted = router.ingest_historical_group_message(event)
+
+    with session_scope(sqlite_engine) as session:
+        stored_messages = session.execute(
+            select(Message).where(Message.group_id == 10001).order_by(Message.id)
+        ).scalars().all()
+
+    assert persisted is True
+    assert sender.sent == []
+    assert llm.calls == []
+    assert [message.platform_msg_id for message in stored_messages] == ["history-only-1"]
+
+
+def test_router_skips_image_cache_downloads_during_historical_ingest(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    event = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="history-image-1",
+        plain_text="",
+        images=[ImageAttachment(url="https://img.example.test/history.png", file_id="history.png")],
+    )
+    cache_calls: list[str] = []
+
+    def fake_cache(raw_payload, *, cache_dir) -> None:
+        del raw_payload, cache_dir
+        cache_calls.append("called")
+
+    monkeypatch.setattr(router_module, "cache_images_in_raw_payload", fake_cache)
+
+    persisted = router.ingest_historical_group_message(event)
+
+    assert persisted is True
+    assert cache_calls == []
+
+
 @pytest.mark.asyncio
 async def test_router_retries_duplicate_inbound_when_first_send_fails(sqlite_engine) -> None:
     sender = FailingSenderOnce()
@@ -1179,6 +2350,8 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
 
     sender.release_first_send.set()
     await first_task
+
+
 
 
 @pytest.mark.asyncio
@@ -1392,12 +2565,12 @@ async def test_router_uses_recent_minute_traffic_for_proactive_reply(sqlite_engi
         )
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["I am here."]
-    assert len(llm.calls) == 1
+    assert sender.sent == []
+    assert llm.calls == []
 
 
 @pytest.mark.asyncio
-async def test_router_trims_proactive_reply_into_a_short_human_interjection(sqlite_engine, monkeypatch) -> None:
+async def test_router_keeps_full_proactive_reply_content_in_one_message(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = LongReplyLlm("是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。")
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
@@ -1418,8 +2591,11 @@ async def test_router_trims_proactive_reply_into_a_short_human_interjection(sqli
         )
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。"]
-    assert any("one short sentence" in line for line in llm.calls[0] if line.startswith("Reply style: "))
+    assert [outbound.text for outbound in sender.sent] == [
+        "是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。"
+    ]
+    assert any("8-16 Chinese characters" in line for line in llm.calls[0] if line.startswith("Reply style: "))
+    assert any("Do not rely on later truncation" in line for line in llm.calls[0] if line.startswith("Reply style: "))
 
 
 @pytest.mark.asyncio
@@ -1446,8 +2622,11 @@ async def test_router_treats_unaddressed_direct_trigger_as_short_group_interject
         )
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["那日本人来一碗杨国福，算扯平了。"]
-    assert any("one short sentence" in line for line in llm.calls[0] if line.startswith("Reply style: "))
+    assert [outbound.text for outbound in sender.sent] == [
+        "那日本人来一碗杨国福，算扯平了。本质上就是互相把对方的日常饭当异国体验项目。Komachi给饮食全球化但钱包一起受苦打高分。"
+    ]
+    assert any("one complete short sentence" in line for line in llm.calls[0] if line.startswith("Reply style: "))
+    assert any("Do not rely on later truncation" in line for line in llm.calls[0] if line.startswith("Reply style: "))
 
 
 @pytest.mark.asyncio
@@ -1953,8 +3132,8 @@ async def test_router_logs_proactive_reply_decision(sqlite_engine, monkeypatch, 
             )
         )
 
-    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=True reason=proactive_score" in caplog.text
-    assert "reply_send_success group_id=10001 msg_id=proactive-log-1" in caplog.text
+    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=False reason=below_threshold" in caplog.text
+    assert "reply_send_success group_id=10001 msg_id=proactive-log-1" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2200,6 +3379,75 @@ async def test_router_persists_inline_summary_and_memories_without_breaking_repl
 
 
 @pytest.mark.asyncio
+async def test_router_handles_group_weekly_report_command(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = WeeklyReportLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="weekly-seed-1",
+            plain_text="今天这波真离谱",
+            timestamp=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
+            user_id=20001,
+            nickname="Alice",
+            group_card="Alice",
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="weekly-seed-2",
+            plain_text="这也太炸了吧",
+            timestamp=datetime(2026, 5, 14, 12, 5, tzinfo=UTC),
+            user_id=20002,
+            nickname="Bob",
+            group_card="",
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="weekly-command",
+            plain_text="@Mira 周报",
+            timestamp=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
+            user_id=20003,
+            nickname="Carol",
+            group_card="",
+        )
+    )
+
+    assert len(sender.sent) == 1
+    assert "本群近一周高能雷霆发言周报" in sender.sent[0].text
+    assert "第1名" in sender.sent[0].text
+    assert llm.conversation_keys == ["group-weekly-report:10001"]
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_full_addressed_reply_content_for_normal_group_reply(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。")
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="addressed-keep-full-1",
+            plain_text="@Mira 怎么突然变这么贵",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == [
+        "是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_router_includes_group_card_and_qq_nickname_in_recent_message_labels(sqlite_engine) -> None:
     sender = FakeSender()
     llm = FakeLlm()
@@ -2213,16 +3461,16 @@ async def test_router_includes_group_card_and_qq_nickname_in_recent_message_labe
             plain_text="@Mira 看看我是谁",
             user_id=20001,
             nickname="熟人A",
-            group_card="群友甲",
+            group_card="送外卖去了",
         )
     )
 
     assert any(
-        line == "Recent messages:\n群友甲（QQ昵称：熟人A）: @Mira 看看我是谁"
+        line == "Recent messages:\n送外卖去了（QQ昵称：熟人A）: @Mira 看看我是谁"
         for line in llm.calls[-1]
     )
     assert any(
-        line == "Target message: 群友甲（QQ昵称：熟人A）: @Mira 看看我是谁"
+        line == "Target message: 送外卖去了（QQ昵称：熟人A）: @Mira 看看我是谁"
         for line in llm.calls[-1]
     )
 
@@ -2251,13 +3499,13 @@ async def test_router_includes_named_member_history_when_asked_to_evaluate_group
         users = UserRepository(session)
         messages = MessageRepository(session)
         groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
-        users.upsert_user(user_id=20002, nickname="熟人A", group_card="群友甲")
-        users.upsert_user(user_id=987654321, nickname="群友乙", group_card="测试备注")
-        users.upsert_user(user_id=30003, nickname="Bob", group_card="")
+        users.upsert_user(user_id=10002, nickname="熟人A", group_card="送外卖去了")
+        users.upsert_user(user_id=10001, nickname="不知道叫什么", group_card="群友甲")
+        users.upsert_user(user_id=20002, nickname="Bob", group_card="")
         messages.add_group_message(
             platform_msg_id="target-old-1",
             group_id=10001,
-            user_id=20002,
+            user_id=10002,
             timestamp=datetime(2026, 5, 9, 11, 30, tzinfo=UTC),
             plain_text="今天又加班，累麻了。",
             raw_json={"post_type": "message", "message_id": "target-old-1"},
@@ -2268,7 +3516,7 @@ async def test_router_includes_named_member_history_when_asked_to_evaluate_group
         messages.add_group_message(
             platform_msg_id="target-old-2",
             group_id=10001,
-            user_id=20002,
+            user_id=10002,
             timestamp=datetime(2026, 5, 9, 11, 31, tzinfo=UTC),
             plain_text="刚送完最后一单。",
             raw_json={"post_type": "message", "message_id": "target-old-2"},
@@ -2279,7 +3527,7 @@ async def test_router_includes_named_member_history_when_asked_to_evaluate_group
         messages.add_group_message(
             platform_msg_id="other-recent-1",
             group_id=10001,
-            user_id=30003,
+            user_id=20002,
             timestamp=datetime(2026, 5, 9, 11, 58, tzinfo=UTC),
             plain_text="最近动画真不错",
             raw_json={"post_type": "message", "message_id": "other-recent-1"},
@@ -2290,7 +3538,7 @@ async def test_router_includes_named_member_history_when_asked_to_evaluate_group
         messages.add_group_message(
             platform_msg_id="other-recent-2",
             group_id=10001,
-            user_id=987654321,
+            user_id=10001,
             timestamp=datetime(2026, 5, 9, 11, 59, tzinfo=UTC),
             plain_text="还没改好吗",
             raw_json={"post_type": "message", "message_id": "other-recent-2"},
@@ -2304,17 +3552,46 @@ async def test_router_includes_named_member_history_when_asked_to_evaluate_group
             group_id=10001,
             mentioned_bot=True,
             message_id="member-eval-1",
-            plain_text="@Mira 如何评价群里叫群友甲这个人",
-            user_id=987654321,
-            nickname="群友乙",
-            group_card="测试备注",
+            plain_text="@Mira 如何评价群里叫送外卖去了这个人",
+            user_id=10001,
+            nickname="不知道叫什么",
+            group_card="群友甲",
             timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
         )
     )
 
     assert any(
-        line.startswith("Member focus:\nReferenced member: 群友甲（QQ昵称：熟人A）")
+        line.startswith("Member focus:\nReferenced member: 送外卖去了（QQ昵称：熟人A）")
         for line in llm.calls[-1]
     )
-    assert any("群友甲（QQ昵称：熟人A）: 今天又加班，累麻了。" in line for line in llm.calls[-1])
-    assert any("群友甲（QQ昵称：熟人A）: 刚送完最后一单。" in line for line in llm.calls[-1])
+    assert any("送外卖去了（QQ昵称：熟人A）: 今天又加班，累麻了。" in line for line in llm.calls[-1])
+    assert any("送外卖去了（QQ昵称：熟人A）: 刚送完最后一单。" in line for line in llm.calls[-1])
+@pytest.mark.asyncio
+async def test_router_sends_local_fallback_when_image_context_exists_but_vision_is_disabled(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.runtime.settings.llm_supports_vision_input = False
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="vision-disabled-image-1",
+            plain_text="",
+            images=[ImageAttachment(url="https://img.example.test/recent.png", file_id="recent.png")],
+            timestamp=datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC),
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="vision-disabled-trigger-1",
+            plain_text="这张图在说什么",
+            timestamp=datetime(2026, 5, 9, 12, 0, 8, tzinfo=UTC),
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["我这边这路模型现在还看不了图，得换支持识图的模型才行。"]
+    assert llm.calls == []

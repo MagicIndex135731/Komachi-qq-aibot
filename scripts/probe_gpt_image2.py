@@ -39,6 +39,13 @@ def _candidate_paths(base_url: str, *, primary: str, fallback: str) -> tuple[str
     return (primary, fallback)
 
 
+def resolve_probe_image_api_settings() -> tuple[str, str]:
+    settings = AppSettings()
+    base_url = settings.group_image_base_url.strip() or settings.llm_base_url.rstrip("/")
+    api_key = settings.group_image_api_key.strip() or settings.llm_api_key
+    return base_url.rstrip("/"), api_key
+
+
 def _model_check(base_url: str, api_key: str, http_client: httpx.Client) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"}
     last_result: dict[str, Any] = {"kind": "model_check"}
@@ -104,7 +111,6 @@ def _generation_check(base_url: str, api_key: str, http_client: httpx.Client, *,
             base_url=candidate_base_url.rstrip("/"),
             api_key=api_key,
             model="gpt-5.4",
-            image_generations_endpoint=path,
             http_client=http_client,
         )
         try:
@@ -178,12 +184,15 @@ def _generation_check(base_url: str, api_key: str, http_client: httpx.Client, *,
                     "status": "invalid_response_shape",
                 }
         else:
+            artifacts = list(getattr(result, "artifacts", []) or [])
+            raw_images = list(getattr(result, "images", []) or [])
+            usable_items = artifacts or raw_images
             last_result = {
                 "kind": "generation_check",
                 "path": path,
                 "status": 200,
-                "usable": bool(result.images),
-                "image_count": len(result.images),
+                "usable": bool(usable_items),
+                "image_count": len(usable_items),
             }
         status = last_result["status"]
         if isinstance(status, int):
@@ -203,7 +212,7 @@ def probe_gpt_image_2(
     http_client: httpx.Client | None = None,
     prompt: str = "A tiny test image with a plain background.",
 ) -> dict[str, Any]:
-    client = http_client or httpx.Client(timeout=20.0)
+    client = http_client or httpx.Client(timeout=20.0, trust_env=False)
     try:
         return {
             "base_url": base_url,
@@ -252,10 +261,10 @@ def classify_probe_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    settings = AppSettings()
+    base_url, api_key = resolve_probe_image_api_settings()
     result = classify_probe_result(probe_gpt_image_2(
-        base_url=settings.llm_base_url.rstrip("/"),
-        api_key=settings.llm_api_key,
+        base_url=base_url,
+        api_key=api_key,
     ))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

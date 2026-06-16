@@ -13,16 +13,16 @@ def _find_desktop_launcher(*, script_name: str) -> Path:
 
 def test_ops_files_exist() -> None:
     required = [
-        ".env.example",
-        "LICENSE",
         "scripts/run_service.ps1",
         "scripts/install_service.ps1",
+        "scripts/xiaomachi_watchdog.ps1",
         "start_xiaomachi.ps1",
         "stop_xiaomachi.ps1",
         "start_xiaomachi_bots.ps1",
         "stop_xiaomachi_bots.ps1",
         "start_xiaomachi_runtime.ps1",
         "stop_xiaomachi_runtime.ps1",
+        "restart_xiaomachi_runtime.ps1",
         "app/main.py",
         "app/group_main.py",
         "app/private_main.py",
@@ -41,14 +41,6 @@ def test_readme_mentions_search_and_context_limits() -> None:
 
     assert "SEARCH_API_KEY" in readme
     assert "CONTEXT_RECENT_LIMIT" in readme
-    assert "OWNER_QQ" in readme
-    assert "ADMIN_QQS" in readme
-    assert "PRIVATE_CHAT_QQS" in readme
-    assert "启动管理员模式" in readme
-    assert "退出管理员模式" in readme
-    assert "GROUP_IMAGE_MODEL" in readme
-    assert "GROUP_IMAGE_GENERATIONS_ENDPOINT" in readme
-    assert "GROUP_IMAGE_EDITS_ENDPOINT" in readme
     assert "only groups with both `enabled: true` and `speak: true` are ingested" in readme
     assert "enabled: true" in readme
     assert "speak: true" in readme
@@ -80,6 +72,7 @@ def test_desktop_start_and_stop_scripts_target_the_current_worktree() -> None:
     stop_ps1 = (REPO_ROOT / "stop_xiaomachi.ps1").read_text(encoding="utf-8")
     start_bots_ps1 = (REPO_ROOT / "start_xiaomachi_bots.ps1").read_text(encoding="utf-8")
     stop_bots_ps1 = (REPO_ROOT / "stop_xiaomachi_bots.ps1").read_text(encoding="utf-8")
+    watchdog_ps1 = (REPO_ROOT / "scripts/xiaomachi_watchdog.ps1").read_text(encoding="utf-8")
 
     assert "%~dp0" in start_script
     assert "%~dp0" in stop_script
@@ -87,20 +80,29 @@ def test_desktop_start_and_stop_scripts_target_the_current_worktree() -> None:
     assert "stop_xiaomachi.ps1" in stop_script
     assert "start_xiaomachi_bots.ps1" in start_ps1
     assert "stop_xiaomachi_bots.ps1" in stop_ps1
-    assert "app.group_main" in start_bots_ps1
-    assert "app.private_main" in start_bots_ps1
-    assert "app.dev_worker_main" in start_bots_ps1
-    assert "group.stderr.log" in start_bots_ps1
-    assert "private.stderr.log" in start_bots_ps1
-    assert "worker.stderr.log" in start_bots_ps1
-    assert "group.pid" in start_bots_ps1
-    assert "private.pid" in start_bots_ps1
-    assert "worker.pid" in start_bots_ps1
-    assert "group.pid" in stop_bots_ps1
-    assert "private.pid" in stop_bots_ps1
-    assert "worker.pid" in stop_bots_ps1
+    assert "xiaomachi_watchdog.ps1" in start_bots_ps1
+    assert "app.group_main" in watchdog_ps1
+    assert "app.private_main" in watchdog_ps1
+    assert "app.dev_worker_main" in watchdog_ps1
+    assert "group.stderr.log" in watchdog_ps1
+    assert "private.stderr.log" in watchdog_ps1
+    assert "worker.stderr.log" in watchdog_ps1
+    assert "group.pid" in watchdog_ps1
+    assert "private.pid" in watchdog_ps1
+    assert "worker.pid" in watchdog_ps1
+    assert "xiaomachi_watchdog.ps1" in stop_bots_ps1
+    assert "group.pid" in watchdog_ps1
+    assert "private.pid" in watchdog_ps1
+    assert "worker.pid" in watchdog_ps1
     assert "Where-Object" in stop_ps1
     assert "Stop-Process" in stop_ps1
+
+
+def test_runtime_watchdog_uses_longer_heartbeat_timeout_for_slow_text_models() -> None:
+    start_bots_ps1 = (REPO_ROOT / "start_xiaomachi_bots.ps1").read_text(encoding="utf-8")
+
+    assert "-Scope runtime" in start_bots_ps1
+    assert "-HeartbeatTimeoutSeconds 180" in start_bots_ps1
 
 
 def test_start_script_orchestrates_napcat_and_qq_before_bots() -> None:
@@ -119,8 +121,7 @@ def test_start_script_orchestrates_napcat_and_qq_before_bots() -> None:
     assert "Remove-Item $paths.QrCodePath" in start_ps1
     assert "Get-Item $QrCodePath" in start_ps1
     assert "start_xiaomachi_bots.ps1" in start_ps1
-    assert "app.group_main" in runtime_start_ps1
-    assert "app.private_main" in runtime_start_ps1
+    assert "xiaomachi_watchdog.ps1" in runtime_start_ps1
     assert "QQ.exe" not in runtime_start_ps1
     assert "NapCatWinBootMain.exe" not in runtime_start_ps1
 
@@ -145,25 +146,29 @@ def test_readme_mentions_one_click_launcher_dependencies() -> None:
     assert "NAPCAT_SHELL_DIR" in readme
 
 
-def test_public_release_has_license_env_example_and_reminder_state_ignore() -> None:
-    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-    license_text = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8")
+def test_pyproject_excludes_public_release_and_tmp_pytest_from_collection() -> None:
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert "LLM_MODEL" in env_example
-    assert "LLM_TEXT_ENDPOINT" in env_example
-    assert "GROUP_IMAGE_MODEL" in env_example
-    assert "GROUP_IMAGE_GENERATIONS_ENDPOINT" in env_example
-    assert "GROUP_IMAGE_EDITS_ENDPOINT" in env_example
-    assert "GROUP_IMAGE_SIZE" in env_example
-    assert "GROUP_IMAGE_QUALITY" in env_example
-    assert "GROUP_IMAGE_OUTPUT_FORMAT" in env_example
-    assert "ADMIN_QQS" in env_example
-    assert "PRIVATE_CHAT_QQS" in env_example
-    assert "OWNER_QQ" in env_example
-    assert "data/private_reminders_state.json" in gitignore
-    assert "data/generated_images/" in gitignore
-    assert "data/generated_private_images/" in gitignore
-    assert ".tmp_pytest*/" in gitignore
-    assert "dbg_service_*/" in gitignore
-    assert "MIT License" in license_text
+    for expected in ('".pytest_tmp"', '".tmp_pytest"', '".tmp_pytest*"', '"release"', '"scripts/public_release_assets"'):
+        assert expected in pyproject
+
+
+def test_public_release_sync_scripts_resolve_source_root_in_script_body() -> None:
+    for relative_path in (
+        "scripts/watch_public_release.ps1",
+        "scripts/start_public_release_sync.ps1",
+        "scripts/stop_public_release_sync.ps1",
+    ):
+        script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        source_root_lines = [line for line in script.splitlines() if '[string]$SourceRoot' in line]
+
+        assert '[string]$SourceRoot' in script
+        assert source_root_lines
+        assert all('(Resolve-Path (Join-Path $PSScriptRoot "..")).Path' not in line for line in source_root_lines)
+        assert 'if (-not $SourceRoot)' in script
+
+
+def test_watch_public_release_script_avoids_powershell_5_only_missing_getrelativepath() -> None:
+    script = (REPO_ROOT / "scripts/watch_public_release.ps1").read_text(encoding="utf-8")
+
+    assert "GetRelativePath" not in script

@@ -15,14 +15,14 @@ from app.core.router import InboundRouter
 from app.dev_control.service import DevControlService
 from app.main import build_llm_client, build_web_search_client
 from app.private_reminders import PrivateReminderScheduler, load_private_reminders
+from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all
 
 
-async def _wait_for_gateway_ready(gateway: NapCatGateway, *, timeout_seconds: float = 10.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
+async def _wait_for_gateway_ready(gateway: NapCatGateway, gateway_task: asyncio.Task) -> None:
     while gateway.websocket is None:
-        if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("private gateway did not connect in time")
+        if gateway_task.done():
+            await gateway_task
         await asyncio.sleep(0.1)
 
 
@@ -36,6 +36,7 @@ async def run() -> None:
         ws_url=settings.napcat_ws_url,
         reconnect_forever=True,
     )
+    heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "private.heartbeat.json")
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     web_search_client = build_web_search_client(settings)
@@ -46,6 +47,7 @@ async def run() -> None:
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
+        admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
         enable_local_worker=False,
@@ -75,6 +77,13 @@ async def run() -> None:
     async def handle_payload(payload: dict) -> None:
         if payload.get("post_type") != "message":
             return
+        if payload.get("message_type") == "group" and int(payload.get("group_id", 0) or 0) == 10001:
+            logging.info(
+                "private_process_observed_group_payload group_id=%s msg_id=%s user_id=%s",
+                payload.get("group_id"),
+                payload.get("message_id"),
+                payload.get("user_id"),
+            )
         if payload.get("message_type") != "private":
             return
 
@@ -84,7 +93,8 @@ async def run() -> None:
     logging.info(f"qq-ai-private starting with owner={settings.owner_qq} model={settings.llm_model}")
     gateway_task = asyncio.create_task(gateway.connect_and_consume(handle_payload))
     try:
-        await _wait_for_gateway_ready(gateway)
+        await heartbeat.start()
+        await _wait_for_gateway_ready(gateway, gateway_task)
         await dev_control_service.start()
         await reminder_scheduler.start()
         await gateway_task
@@ -93,6 +103,7 @@ async def run() -> None:
         await asyncio.gather(gateway_task, return_exceptions=True)
         await reminder_scheduler.stop()
         await dev_control_service.stop()
+        await heartbeat.stop()
 
 
 def main() -> int:

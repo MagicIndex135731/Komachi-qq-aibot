@@ -54,17 +54,17 @@ def test_dev_repositories_create_owner_session_and_queue_task(tmp_path) -> None:
         sessions = DevSessionRepository(session)
         tasks = DevTaskRepository(session)
 
-        owner_session = sessions.get_or_create_owner_session(owner_qq=987654321)
+        owner_session = sessions.get_or_create_owner_session(owner_qq=10001)
         task = tasks.add_task(
             session_id=owner_session.id,
-            requested_by_qq=987654321,
+            requested_by_qq=10001,
             raw_request_text="check logs",
             intent_type="log_investigation",
         )
 
         queued = tasks.list_tasks_by_status("queued")
 
-    assert owner_session.owner_qq == 987654321
+    assert owner_session.owner_qq == 10001
     assert task.status == "queued"
     assert [item.raw_request_text for item in queued] == ["check logs"]
 
@@ -75,9 +75,9 @@ def test_dev_repositories_can_start_new_owner_session_and_pick_latest(tmp_path) 
 
     with session_scope(engine) as session:
         sessions = DevSessionRepository(session)
-        first_session = sessions.create_owner_session(owner_qq=987654321)
-        second_session = sessions.create_owner_session(owner_qq=987654321)
-        latest_session = sessions.get_latest_owner_session(owner_qq=987654321)
+        first_session = sessions.create_owner_session(owner_qq=10001)
+        second_session = sessions.create_owner_session(owner_qq=10001)
+        latest_session = sessions.get_latest_owner_session(owner_qq=10001)
 
     assert second_session.id > first_session.id
     assert latest_session is not None
@@ -106,7 +106,7 @@ def test_create_all_backfills_dev_session_mode_for_existing_sqlite_db(tmp_path) 
             text(
                 """
                 INSERT INTO dev_sessions (owner_qq, started_at, last_active_at, summary, last_task_id)
-                VALUES (987654321, '2026-05-11 00:00:00', '2026-05-11 00:00:00', '', NULL)
+                VALUES (10001, '2026-05-11 00:00:00', '2026-05-11 00:00:00', '', NULL)
                 """
             )
         )
@@ -252,3 +252,94 @@ def test_usage_repository_normalizes_local_timezone_timestamps_to_utc_window(tmp
         "cached_input_tokens": 0,
         "output_tokens": 50,
     }
+
+
+def test_message_repository_lists_group_messages_since_for_weekly_report(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-report.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        groups.upsert_group(group_id=10002, group_name="group-2", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="Alice")
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+
+        messages.add_group_message(
+            platform_msg_id="m-old",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 1, tzinfo=UTC),
+            plain_text="too old",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-keep",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 14, tzinfo=UTC),
+            plain_text="这条要进周报",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-bot",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 14, 1, tzinfo=UTC),
+            plain_text="bot self message",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-blank",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 14, 2, tzinfo=UTC),
+            plain_text="   ",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-other-group",
+            group_id=10002,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 14, 3, tzinfo=UTC),
+            plain_text="other group",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-reserved",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 14, 4, tzinfo=UTC),
+            plain_text="reserved outbound",
+            raw_json={"delivery_state": "reserved"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+        kept = messages.list_group_messages_since(
+            group_id=10001,
+            since=datetime(2026, 5, 8, tzinfo=UTC),
+            bot_user_id=123456789,
+            limit=50,
+        )
+
+    assert [message.platform_msg_id for message in kept] == ["m-keep"]

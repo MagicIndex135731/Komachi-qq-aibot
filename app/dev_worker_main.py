@@ -9,14 +9,14 @@ from app.adapters.sender import Sender
 from app.config import AppSettings, load_runtime_config
 from app.dev_control.service import DevControlService
 from app.main import build_llm_client
+from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all
 
 
-async def _wait_for_gateway_ready(gateway: NapCatGateway, *, timeout_seconds: float = 10.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
+async def _wait_for_gateway_ready(gateway: NapCatGateway, gateway_task: asyncio.Task) -> None:
     while gateway.websocket is None:
-        if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("worker gateway did not connect in time")
+        if gateway_task.done():
+            await gateway_task
         await asyncio.sleep(0.1)
 
 
@@ -26,7 +26,8 @@ async def run() -> None:
     engine = build_engine(settings.sqlite_path)
     create_all(engine)
 
-    gateway = NapCatGateway(ws_url=settings.napcat_ws_url)
+    gateway = NapCatGateway(ws_url=settings.napcat_ws_url, reconnect_forever=True)
+    heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "worker.heartbeat.json")
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
     service = DevControlService(
@@ -43,12 +44,21 @@ async def run() -> None:
         safety=runtime.safety,
     )
 
-    async def ignore_payload(_payload: dict) -> None:
+    async def ignore_payload(payload: dict) -> None:
+        if payload.get("post_type") == "message" and payload.get("message_type") == "group":
+            if int(payload.get("group_id", 0) or 0) == 10001:
+                logging.info(
+                    "worker_process_observed_group_payload group_id=%s msg_id=%s user_id=%s",
+                    payload.get("group_id"),
+                    payload.get("message_id"),
+                    payload.get("user_id"),
+                )
         return None
 
     gateway_task = asyncio.create_task(gateway.connect_and_consume(ignore_payload))
     try:
-        await _wait_for_gateway_ready(gateway)
+        await heartbeat.start()
+        await _wait_for_gateway_ready(gateway, gateway_task)
         await service.start()
         logging.info(f"qq-ai-dev-worker starting with owner={settings.owner_qq} model={settings.llm_model}")
         await gateway_task
@@ -56,6 +66,7 @@ async def run() -> None:
         gateway_task.cancel()
         await asyncio.gather(gateway_task, return_exceptions=True)
         await service.stop()
+        await heartbeat.stop()
 
 
 def main() -> int:

@@ -5,10 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import app.main as app_main
+import httpx
 import pytest
 
 from app.config import AppSettings
 from app.main import (
+    build_group_image_llm_client,
     build_web_search_client,
     create_runtime_banner,
     sync_history_archives,
@@ -26,7 +28,13 @@ def _settings_for_search(*, provider: str, search_api_key: str) -> AppSettings:
         llm_base_url="https://api.example.test/v1",
         llm_api_key="test-key",
         llm_model="gpt-5.4",
-        llm_text_endpoint="/chat/completions",
+        llm_fallback_model="",
+        llm_text_endpoint="chat_completions",
+        group_image_base_url="",
+        group_image_api_key="",
+        group_image_generations_endpoint="/images/generations",
+        group_image_edits_endpoint="/images/edits",
+        group_image_size="auto",
         bot_qq=123456789,
         owner_qq=987654321,
         admin_qqs="",
@@ -42,6 +50,52 @@ def _settings_for_search(*, provider: str, search_api_key: str) -> AppSettings:
         config_dir=Path("configs"),
         data_dir=Path("data"),
     )
+
+
+def test_build_group_image_llm_client_reuses_primary_client_without_override() -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    primary_client = object()
+
+    assert build_group_image_llm_client(settings=settings, engine=object(), llm_client=primary_client) is primary_client
+
+
+def test_build_group_image_llm_client_builds_separate_client_with_override(monkeypatch) -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.group_image_base_url = "https://api.xbai.top/v1"
+    settings.group_image_api_key = "image-key"
+    captured: dict[str, object] = {}
+    built_client = object()
+
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+
+    result = build_group_image_llm_client(settings=settings, engine=object(), llm_client=object())
+
+    assert result is built_client
+    assert captured["base_url"] == "https://api.xbai.top/v1"
+    assert captured["api_key"] == "image-key"
+    assert captured["model"] == "gpt-5.4"
+    assert isinstance(captured["http_client"], httpx.Client)
+    assert captured["http_client"]._trust_env is False
+    captured["http_client"].close()
+
+
+def test_build_group_image_llm_client_builds_separate_client_when_custom_image_endpoints_are_configured(monkeypatch) -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.group_image_generations_endpoint = "/v1/images/generations"
+    settings.group_image_edits_endpoint = "/v1/images/edits"
+    settings.llm_model = "gpt-5.4-mini"
+    settings.llm_fallback_model = ""
+    settings.llm_text_endpoint = "chat_completions"
+    captured: dict[str, object] = {}
+    built_client = object()
+
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+
+    result = app_main.build_group_image_llm_client(settings=settings, engine=object(), llm_client=object())
+
+    assert result is built_client
+    assert captured["image_generations_endpoint"] == "/v1/images/generations"
+    assert captured["image_edits_endpoint"] == "/v1/images/edits"
 
 
 def test_runtime_banner_includes_model_and_bot_id() -> None:
@@ -167,20 +221,62 @@ def test_build_web_search_client_supports_ddgs_without_api_key() -> None:
     assert client.provider == "ddgs"
 
 
+def test_build_llm_client_preserves_primary_model_and_exposes_distinct_fallback(monkeypatch) -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_model = "gpt-5.4-mini"
+    settings.llm_fallback_model = "gpt-4o-mini"
+    settings.llm_vision_model = "gpt-4o"
+    captured: dict[str, object] = {}
+    built_client = object()
+
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+
+    result = app_main.build_llm_client(settings=settings, engine=object())
+
+    assert result is built_client
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["fallback_model"] == "gpt-4o-mini"
+    assert captured["vision_model"] == "gpt-4o"
+    assert captured["compat_model"] == "gpt-5.4-mini"
+
+
+def test_build_llm_client_enables_responses_when_text_endpoint_requests_it(monkeypatch) -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_model = "gpt-5.4-mini"
+    settings.llm_fallback_model = "gpt-4o-mini"
+    settings.llm_text_endpoint = "responses"
+    captured: dict[str, object] = {}
+    built_client = object()
+
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+
+    result = app_main.build_llm_client(settings=settings, engine=object())
+
+    assert result is built_client
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["fallback_model"] == "gpt-4o-mini"
+    assert captured["responses_model"] == "gpt-5.4-mini"
+    assert captured["compat_model"] == "gpt-5.4-mini"
+
+
 @pytest.mark.asyncio
 async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.llm_model = "gpt-5.4"
-    settings.llm_text_endpoint = "/chat/completions"
+    settings.llm_model = "cc-gpt-5.4"
+    settings.llm_fallback_model = "gpt-5.4"
     router_arguments: dict[str, object] = {}
     sync_calls: list[tuple[object, object]] = []
     llm_kwargs: dict[str, object] = {}
+    built_group_image_service = object()
 
     class FakeGateway:
-        def __init__(self, *, ws_url: str) -> None:
+        def __init__(self, *, ws_url: str, reconnect_forever: bool = False) -> None:
             self.ws_url = ws_url
+            self.reconnect_forever = reconnect_forever
 
-        async def connect_and_consume(self, handler) -> None:
+        async def connect_and_consume(self, handler, on_connect=None) -> None:
+            if on_connect is not None:
+                await on_connect()
             return None
 
     class FakeRouter:
@@ -188,43 +284,8 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
             router_arguments.update(kwargs)
 
     class FakeDevControlService:
-        def __init__(
-            self,
-            *,
-            engine,
-            sender,
-            llm_client,
-            owner_qq,
-            bot_qq=None,
-            private_chat_qqs=None,
-            repo_root,
-            data_dir,
-            codex_bridge=None,
-            command_runner=None,
-            poll_interval_seconds=1.0,
-            enable_local_worker=True,
-            private_image_followup_window_seconds=1.2,
-            web_search_client=None,
-            assistant_name="Codex",
-            persona=None,
-            safety=None,
-        ) -> None:
-            del codex_bridge, command_runner, poll_interval_seconds, private_image_followup_window_seconds
-            router_arguments["dev_control_service_init"] = {
-                "engine": engine,
-                "sender": sender,
-                "llm_client": llm_client,
-                "owner_qq": owner_qq,
-                "bot_qq": bot_qq,
-                "private_chat_qqs": private_chat_qqs,
-                "repo_root": repo_root,
-                "data_dir": data_dir,
-                "enable_local_worker": enable_local_worker,
-                "web_search_client": web_search_client,
-                "assistant_name": assistant_name,
-                "persona": persona,
-                "safety": safety,
-            }
+        def __init__(self, **kwargs) -> None:
+            router_arguments["dev_control_service_init"] = kwargs
 
         async def start(self) -> None:
             return None
@@ -249,6 +310,11 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     monkeypatch.setattr(app_main, "NapCatGateway", FakeGateway)
     monkeypatch.setattr(app_main, "Sender", lambda _gateway: object())
     monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: llm_kwargs.update(kwargs) or object())
+    monkeypatch.setattr(
+        app_main,
+        "build_group_image_service",
+        lambda *, settings, llm_client, sender, web_search_client=None: built_group_image_service,
+    )
     monkeypatch.setattr(app_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(app_main, "ContextBuilder", lambda: object())
     monkeypatch.setattr(app_main, "AdminCommandParser", lambda **_kwargs: object())
@@ -258,6 +324,9 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     await app_main.run()
 
     assert isinstance(router_arguments["web_search_client"], WebSearchClient)
+    assert router_arguments["group_image_service"] is built_group_image_service
     assert len(sync_calls) == 1
     assert llm_kwargs["model"] == "gpt-5.4"
-    assert llm_kwargs["text_endpoint"] == "/chat/completions"
+    assert llm_kwargs["fallback_model"] == ""
+    assert llm_kwargs["responses_model"] == ""
+    assert llm_kwargs["compat_model"] == "gpt-5.4"

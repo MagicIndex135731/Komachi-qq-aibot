@@ -195,3 +195,70 @@ async def test_connect_and_consume_reconnects_after_disconnect_when_enabled(monk
 
     assert seen == ["1", "2"]
     assert len(connect_attempts) >= 2
+
+
+@pytest.mark.asyncio
+async def test_connect_and_consume_runs_on_connect_for_initial_connect_and_reconnect(monkeypatch) -> None:
+    gateway = NapCatGateway(
+        ws_url="ws://example",
+        reconnect_forever=True,
+        reconnect_delay_seconds=0.0,
+    )
+    sockets = [
+        FakeIncomingWebSocket(
+            ['{"post_type":"message","message_type":"private","message_id":"1"}']
+        ),
+        FakeIncomingWebSocket(
+            ['{"post_type":"message","message_type":"private","message_id":"2"}']
+        ),
+    ]
+    on_connect_calls: list[str] = []
+    second_message_seen = asyncio.Event()
+
+    def fake_connect(*args, **kwargs):
+        del args, kwargs
+        if sockets:
+            return sockets.pop(0)
+        return BlockingIncomingWebSocket()
+
+    monkeypatch.setattr("app.adapters.napcat_ws.websockets.connect", fake_connect)
+
+    async def handler(payload: dict) -> None:
+        if payload["message_id"] == "2":
+            second_message_seen.set()
+
+    async def on_connect() -> None:
+        on_connect_calls.append("connected")
+
+    task = asyncio.create_task(gateway.connect_and_consume(handler, on_connect=on_connect))
+    await asyncio.wait_for(second_message_seen.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert on_connect_calls == ["connected", "connected"]
+
+
+@pytest.mark.asyncio
+async def test_connect_and_consume_does_not_block_live_messages_while_on_connect_runs(monkeypatch) -> None:
+    gateway = NapCatGateway(ws_url="ws://example")
+    fake_socket = FakeIncomingWebSocket(
+        ['{"post_type":"message","message_type":"group","message_id":"live-1"}']
+    )
+    handler_called = asyncio.Event()
+    release_on_connect = asyncio.Event()
+
+    monkeypatch.setattr("app.adapters.napcat_ws.websockets.connect", lambda *args, **kwargs: fake_socket)
+
+    async def handler(payload: dict) -> None:
+        if payload["message_id"] == "live-1":
+            handler_called.set()
+
+    async def on_connect() -> None:
+        await release_on_connect.wait()
+
+    task = asyncio.create_task(gateway.connect_and_consume(handler, on_connect=on_connect))
+
+    await asyncio.wait_for(handler_called.wait(), timeout=0.2)
+    release_on_connect.set()
+    await task

@@ -13,8 +13,19 @@ from typing import Callable
 from app.adapters.onebot_models import PrivateMessageEvent
 from app.adapters.sender import OutboundPrivateMessage
 from app.core.chat_style import normalize_chat_reply
+from app.core.group_image_generation import ImageJobResult, PrivateImageGenerationRequest, PrivateImageGenerationService
 from app.core.image_turn_resolver import resolve_private_images_for_turn
 from app.core.persona_engine import render_persona, render_safety_lines
+from app.core.router import (
+    AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
+    AUTO_WEB_REFERENCE_QUERY_PATTERN,
+    GROUP_IMAGE_NEGATIVE_PATTERNS,
+    GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS,
+    GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS,
+    GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS,
+    GROUP_IMAGE_REQUEST_PATTERNS,
+    LOOKUP_NORMALIZER,
+)
 from app.core.search_policy import (
     SearchDecision,
     build_current_datetime_facts,
@@ -31,6 +42,7 @@ from app.core.search_policy import (
     parse_search_decision,
 )
 from app.core.web_grounding import build_grounding_notes
+from app.dev_control.admin_agent_runtime import ADMIN_AGENT_INTENT, ADMIN_AGENT_ACK_TEXT, AdminAgentRuntime
 from app.dev_control.checkpoints import create_repo_checkpoint, restore_repo_checkpoint
 from app.dev_control.codex_bridge import CodexBridge, CodexTaskResult
 from app.dev_control.repo_context import build_repo_context_snippets
@@ -88,6 +100,21 @@ OWNER_ADMIN_CONTINUE_CONFIRMATIONS = {
     "去吧",
     "查吧",
 }
+PRIVATE_IMAGE_RETOUCH_INTENT_KEYWORDS = (
+    "轻度人像优化",
+    "人像优化",
+    "优化一下人脸",
+    "优化人脸",
+    "稍微调整一下五官",
+    "修一下鼻毛",
+    "修下鼻毛",
+    "修一下胡须",
+    "修下胡须",
+    "修图",
+    "精修",
+    "小修",
+    "润色",
+)
 
 SESSION_NEW_COMMANDS = {
     "/bot new-session",
@@ -115,6 +142,13 @@ PROJECT_SESSION_STATUS_COMMANDS = SESSION_STATUS_COMMANDS | {
     "/bot project-session-status",
     "项目会话状态",
     "查看项目会话状态",
+}
+PRIVATE_DRAW_RESET_COMMANDS = {
+    "/bot reset-draw",
+    "重置绘画",
+    "清空绘画",
+    "清空画图",
+    "重置画图",
 }
 OWNER_MODE_ENABLE_COMMANDS = {"启动管理员模式"}
 OWNER_MODE_DISABLE_COMMANDS = {
@@ -276,6 +310,35 @@ CONFIG_LOOKUP_KEYWORDS = (
     "有没有",
     "生效",
 )
+CAPABILITY_PROBE_TARGET_HINTS = (
+    "api",
+    "endpoint",
+    "model",
+    "models",
+    "image",
+    "gpt-image-2",
+    "gpt image 2",
+    "接口",
+    "模型",
+    "出图",
+    "绘图",
+)
+CAPABILITY_PROBE_ACTION_HINTS = (
+    "probe",
+    "test",
+    "run",
+    "verify",
+    "check",
+    "可用",
+    "能用",
+    "跑",
+    "测试",
+    "探测",
+    "验证",
+    "看看",
+    "查查",
+    "刚加",
+)
 PROJECT_RUNTIME_HINTS = (
     "小町",
     "群聊",
@@ -324,7 +387,10 @@ OWNER_FAST_CHAT_HINTS = (
     "我喜欢你",
     "我爱你",
 )
-ASYNC_EXECUTE_INTENTS = ("feature_work", "restart_only")
+LEGACY_ASYNC_EXECUTE_INTENTS = ("feature_work", "restart_only")
+ASYNC_EXECUTE_INTENTS = LEGACY_ASYNC_EXECUTE_INTENTS + (ADMIN_AGENT_INTENT,)
+GLOBAL_ADMIN_MUTEX_INTENTS = ASYNC_EXECUTE_INTENTS
+FEATURE_PLAN_INTENT = "feature_plan"
 SESSION_MODE_DAILY = "daily"
 SESSION_MODE_PROJECT = "project"
 PRIVATE_SCOPE_OWNER_DAILY = "owner_daily"
@@ -398,9 +464,11 @@ class DevControlService:
         engine,
         sender,
         llm_client,
+        image_llm_client=None,
         owner_qq: int,
         bot_qq: int | None = None,
         private_chat_qqs: set[int] | None = None,
+        admin_qqs: set[int] | None = None,
         repo_root: Path,
         data_dir: Path,
         codex_bridge: CodexBridge | None = None,
@@ -409,6 +477,14 @@ class DevControlService:
         enable_local_worker: bool = True,
         private_image_followup_window_seconds: float = 1.2,
         web_search_client=None,
+        image_model: str = "gpt-image-2",
+        image_size: str | None = "auto",
+        image_quality: str | None = "high",
+        image_background: str | None = None,
+        image_output_format: str | None = "png",
+        image_output_compression: int | None = 100,
+        image_moderation: str | None = "low",
+        image_queue_capacity: int = 3,
         assistant_name: str = "Codex",
         persona: dict | None = None,
         safety: dict | None = None,
@@ -416,17 +492,36 @@ class DevControlService:
         self.engine = engine
         self.sender = sender
         self.llm_client = llm_client
+        self.image_llm_client = image_llm_client or llm_client
         self.owner_qq = owner_qq
         self.bot_qq = bot_qq
+        self.admin_qqs = {qq for qq in (admin_qqs or set()) if qq != owner_qq}
         self.private_chat_qqs = {qq for qq in (private_chat_qqs or set()) if qq != owner_qq}
         self.repo_root = repo_root.resolve()
         self.data_dir = data_dir.resolve()
+        self.admin_agent_runtime = AdminAgentRuntime(engine=engine, repo_root=self.repo_root)
         self.codex_bridge = codex_bridge
         self.command_runner = command_runner or self._default_command_runner
         self.poll_interval_seconds = poll_interval_seconds
         self.enable_local_worker = enable_local_worker
         self.private_image_followup_window_seconds = max(0.0, float(private_image_followup_window_seconds))
         self.web_search_client = web_search_client
+        self.private_image_service = PrivateImageGenerationService(
+            engine=engine,
+            llm_client=self.image_llm_client,
+            sender=sender,
+            web_search_client=web_search_client,
+            output_dir=self.data_dir / "generated_private_images",
+            model=image_model,
+            size=image_size,
+            quality=image_quality,
+            background=image_background,
+            output_format=image_output_format,
+            output_compression=image_output_compression,
+            moderation=image_moderation,
+            max_slots=image_queue_capacity,
+            task_result_callback=self._finalize_private_image_task,
+        )
         self.assistant_name = assistant_name.strip() or "Codex"
         self.persona = dict(persona or {})
         self.safety = dict(safety or {})
@@ -434,6 +529,7 @@ class DevControlService:
         self._worker_task: asyncio.Task | None = None
         self._pending_private_image_turns: dict[tuple[int, str], tuple[asyncio.Task, PrivateMessageEvent]] = {}
         self._private_image_turn_overrides: dict[int, list] = {}
+        self._private_draw_context_reset_users: set[int] = set()
 
     @property
     def control_dir(self) -> Path:
@@ -455,13 +551,19 @@ class DevControlService:
     def owner_private_mode_state_path(self) -> Path:
         return self.control_dir / "owner_private_mode.json"
 
+    @property
+    def private_admin_intro_state_path(self) -> Path:
+        return self.control_dir / "private_admin_intro_state.json"
+
     async def start(self) -> None:
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.task_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_root.mkdir(parents=True, exist_ok=True)
+        await self.private_image_service.start()
+        await self._recover_running_tasks()
+        await self._maybe_send_private_admin_intro_messages()
         if not self.enable_local_worker:
             return
-        await self._recover_running_tasks()
         self._stop_event.clear()
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
@@ -469,20 +571,34 @@ class DevControlService:
     async def stop(self) -> None:
         self._cancel_pending_private_image_turns_for_user(None, preserve_for_next_turn=False)
         if not self.enable_local_worker or self._worker_task is None:
+            await self.private_image_service.stop()
             return
         self._stop_event.set()
         await self._worker_task
         self._worker_task = None
+        await self.private_image_service.stop()
 
     async def handle_private_message(self, event: PrivateMessageEvent) -> bool:
+        if getattr(event, "reply_to_msg_id", None) is not None or bool(list(getattr(event, "images", []) or [])):
+            self._private_draw_context_reset_users.discard(event.user_id)
+        if self._should_hold_private_image_for_followup(event):
+            self._cancel_pending_private_image_turns_for_user(
+                event.user_id,
+                preserve_for_next_turn=False,
+            )
+            self._private_image_turn_overrides[event.user_id] = list(event.images)
+            return True
         if self._should_defer_private_image_turn(event):
             self._private_image_turn_overrides.pop(event.user_id, None)
         self._cancel_pending_private_image_turns_for_user(
             event.user_id,
             preserve_for_next_turn=not self._should_defer_private_image_turn(event),
         )
-        if event.user_id == self.owner_qq:
-            mode_switch_reply = self._handle_owner_mode_switch_command(raw_text=event.plain_text)
+        if self._is_private_admin_user(event.user_id):
+            mode_switch_reply = self._handle_owner_mode_switch_command(
+                raw_text=event.plain_text,
+                user_id=event.user_id,
+            )
             if mode_switch_reply is not None:
                 await self._send_private_text(
                     user_id=event.user_id,
@@ -495,11 +611,23 @@ class DevControlService:
             active_session_mode = (
                 SESSION_MODE_PROJECT
                 if admin_event is not None
-                else self._get_owner_private_session_mode()
+                else self._get_owner_private_session_mode(user_id=event.user_id)
             )
             target_event = admin_event or event
+            draw_reset_reply = self._handle_private_draw_reset_command(
+                raw_text=target_event.plain_text,
+                user_id=event.user_id,
+            )
+            if draw_reset_reply is not None:
+                await self._send_private_text(
+                    user_id=event.user_id,
+                    text=draw_reset_reply,
+                    context=f"private_draw_reset:{target_event.platform_msg_id}",
+                )
+                return True
             command_reply = self._handle_private_session_command(
                 raw_text=target_event.plain_text,
+                user_id=event.user_id,
                 session_mode=active_session_mode,
                 session_label="项目对话" if active_session_mode == SESSION_MODE_PROJECT else "日常对话",
                 new_commands=(
@@ -531,6 +659,10 @@ class DevControlService:
                 return True
 
             project_event = target_event
+            if active_session_mode == SESSION_MODE_PROJECT and admin_event is None:
+                await self._handle_admin_agent_turn(project_event)
+                return True
+
             if admin_event is not None and not project_event.plain_text.strip():
                 await self._send_private_text(
                     user_id=event.user_id,
@@ -573,6 +705,7 @@ class DevControlService:
                     event=followup_event,
                     request_text=followup_text,
                     routing_text=routing_text,
+                    confirmed=True,
                 )
                 return True
 
@@ -720,9 +853,18 @@ class DevControlService:
         return True
 
     async def process_next_task_once(self) -> bool:
+        admin_work_item = self.admin_agent_runtime.claim_next_turn()
+        if admin_work_item is not None:
+            return await self._run_admin_agent_turn(
+                task_id=admin_work_item.task_id,
+                session_id=admin_work_item.session_id,
+                owner_qq=admin_work_item.user_id,
+                request_text=admin_work_item.request_text,
+            )
+
         with session_scope(self.engine) as session:
             tasks = DevTaskRepository(session)
-            task = tasks.claim_oldest_queued_task(intent_types=list(ASYNC_EXECUTE_INTENTS))
+            task = tasks.claim_oldest_queued_task(intent_types=list(LEGACY_ASYNC_EXECUTE_INTENTS))
             if task is None:
                 return False
             session_id = task.session_id
@@ -769,6 +911,40 @@ class DevControlService:
                     context=f"dev_task:{task_id}:restarting_runtime",
                     timeout_seconds=5.0,
                 )
+                if not self.enable_local_worker:
+                    final_reply_text = "已经重启完了。"
+                    self._write_saved_task_result(
+                        task_id=task_id,
+                        result=CodexTaskResult(
+                            summary=self._build_turn_summary(request_text, final_reply_text),
+                            reply_text=final_reply_text,
+                            restart_required=True,
+                        ),
+                    )
+                    restart_ok, restart_result_text = self._handoff_inline_runtime_restart()
+                    if not restart_ok:
+                        with session_scope(self.engine) as session:
+                            tasks = DevTaskRepository(session)
+                            tasks.mark_failed(
+                                task_id=task_id,
+                                failure_reason=restart_result_text,
+                                checkpoint_dir="",
+                            )
+                            self._append_session_summary(
+                                session_id=session_id,
+                                owner_text=request_text,
+                                assistant_text=f"失败：{restart_result_text}",
+                                sessions=DevSessionRepository(session),
+                            )
+                        await self._send_private_text(
+                            user_id=owner_qq,
+                            text=f"这次重启没成功：{restart_result_text}",
+                            context=f"dev_task:{task_id}:failed",
+                            timeout_seconds=8.0,
+                        )
+                    else:
+                        logger.info("dev_task_stage task_id=%s stage=restart_handed_off", task_id)
+                    return True
                 restart_ok, restart_result_text = self._restart_runtime()
                 commands_run = ["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"]
                 if not restart_ok:
@@ -822,7 +998,79 @@ class DevControlService:
                 )
                 return True
 
-            checkpoint_manifest = create_repo_checkpoint(repo_root=self.repo_root, checkpoint_dir=checkpoint_dir)
+            prompt = self._build_execute_prompt(session_id=session_id, task_id=task_id, request_text=request_text)
+            return await self._run_codex_task_with_prompt(
+                task_id=task_id,
+                session_id=session_id,
+                owner_qq=owner_qq,
+                request_text=request_text,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.exception("dev_task_failed task_id=%s", task_id)
+            failure_reason = str(exc)
+            with session_scope(self.engine) as session:
+                DevTaskRepository(session).mark_failed(
+                    task_id=task_id,
+                    failure_reason=failure_reason,
+                    checkpoint_dir="",
+                )
+                self._append_session_summary(
+                    session_id=session_id,
+                    owner_text=request_text,
+                    assistant_text=f"失败：{failure_reason}",
+                    sessions=DevSessionRepository(session),
+                )
+            await self._send_private_text(
+                user_id=owner_qq,
+                text=f"这次没跑通，我先记下来：{failure_reason}",
+                context=f"dev_task:{task_id}:failed",
+                timeout_seconds=8.0,
+            )
+            return True
+
+    async def _run_admin_agent_turn(
+        self,
+        *,
+        task_id: int,
+        session_id: int,
+        owner_qq: int,
+        request_text: str,
+    ) -> bool:
+        logger.info("admin_agent_turn_stage task_id=%s stage=claimed", task_id)
+        prompt = self.admin_agent_runtime.build_prompt(
+            session_summary=self._session_summary(session_id=session_id),
+            recent_turns=self._recent_turn_lines(session_id=session_id, exclude_task_id=task_id),
+            request_text=request_text,
+        )
+        return await self._run_codex_task_with_prompt(
+            task_id=task_id,
+            session_id=session_id,
+            owner_qq=owner_qq,
+            request_text=request_text,
+            prompt=prompt,
+        )
+
+    async def _run_codex_task_with_prompt(
+        self,
+        *,
+        task_id: int,
+        session_id: int,
+        owner_qq: int,
+        request_text: str,
+        prompt: str,
+    ) -> bool:
+        artifact_dir = self.task_dir / f"task-{task_id}"
+        checkpoint_dir = self.checkpoint_root / f"task-{task_id}"
+        checkpoint_manifest: dict[str, list[str]] | None = None
+        resume_thread_id = self._get_codex_thread_id(session_id=session_id)
+
+        try:
+            checkpoint_manifest = await asyncio.to_thread(
+                create_repo_checkpoint,
+                repo_root=self.repo_root,
+                checkpoint_dir=checkpoint_dir,
+            )
             self._write_checkpoint_manifest(checkpoint_dir=checkpoint_dir, manifest=checkpoint_manifest)
             try:
                 with session_scope(self.engine) as session:
@@ -835,8 +1083,8 @@ class DevControlService:
             except Exception:
                 logger.exception("dev_task_artifact_record_failed task_id=%s", task_id)
 
-            prompt = self._build_execute_prompt(session_id=session_id, task_id=task_id, request_text=request_text)
-            result = self._get_codex_bridge().run_task(
+            result = await asyncio.to_thread(
+                self._get_codex_bridge().run_task,
                 prompt=prompt,
                 repo_root=self.repo_root,
                 artifact_dir=artifact_dir,
@@ -847,12 +1095,26 @@ class DevControlService:
             if result.thread_id:
                 self._set_codex_thread_id(session_id=session_id, thread_id=result.thread_id)
 
-            files_changed = self._detect_changed_files(checkpoint_dir=checkpoint_dir, manifest=checkpoint_manifest)
+            files_changed = await asyncio.to_thread(
+                self._detect_changed_files,
+                checkpoint_dir=checkpoint_dir,
+                manifest=checkpoint_manifest,
+            )
             commands_run = ["codex exec resume" if resume_thread_id else "codex exec"]
             restart_required = self._should_restart_after_task(
                 request_text=request_text,
                 files_changed=files_changed,
                 model_restart_required=result.restart_required,
+            )
+            self._write_saved_task_result(
+                task_id=task_id,
+                result=CodexTaskResult(
+                    summary=result.summary,
+                    reply_text=normalized_reply_text,
+                    restart_required=restart_required,
+                    raw_last_message=result.raw_last_message,
+                    thread_id=result.thread_id,
+                ),
             )
             restart_result = "not-needed"
             if restart_required:
@@ -863,10 +1125,42 @@ class DevControlService:
                     context=f"dev_task:{task_id}:restarting_runtime",
                     timeout_seconds=5.0,
                 )
+                if not self.enable_local_worker:
+                    restart_ok, restart_result_text = self._handoff_inline_runtime_restart()
+                    if not restart_ok:
+                        await asyncio.to_thread(
+                            restore_repo_checkpoint,
+                            repo_root=self.repo_root,
+                            checkpoint_dir=checkpoint_dir,
+                            manifest=checkpoint_manifest,
+                        )
+                        with session_scope(self.engine) as session:
+                            tasks = DevTaskRepository(session)
+                            tasks.mark_failed(
+                                task_id=task_id,
+                                failure_reason=restart_result_text,
+                                checkpoint_dir=str(checkpoint_dir),
+                            )
+                            self._append_session_summary(
+                                session_id=session_id,
+                                owner_text=request_text,
+                                assistant_text=f"失败：{restart_result_text}",
+                                sessions=DevSessionRepository(session),
+                            )
+                        await self._send_private_text(
+                            user_id=owner_qq,
+                            text=f"这次改完以后，重启接管没成功：{restart_result_text}",
+                            context=f"dev_task:{task_id}:restart_failed",
+                            timeout_seconds=8.0,
+                        )
+                    else:
+                        logger.info("dev_task_stage task_id=%s stage=restart_handed_off", task_id)
+                    return True
                 restart_ok, restart_result_text = self._restart_runtime()
                 commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
                 if not restart_ok:
-                    restore_repo_checkpoint(
+                    await asyncio.to_thread(
+                        restore_repo_checkpoint,
                         repo_root=self.repo_root,
                         checkpoint_dir=checkpoint_dir,
                         manifest=checkpoint_manifest,
@@ -909,7 +1203,7 @@ class DevControlService:
                 tasks = DevTaskRepository(session)
                 tasks.mark_completed(
                     task_id=task_id,
-                    summary=result.summary,
+                    summary=result.summary or self._build_turn_summary(request_text, normalized_reply_text),
                     result_text=normalized_reply_text,
                     files_read=[],
                     files_changed=files_changed,
@@ -944,17 +1238,19 @@ class DevControlService:
                 notification_prefix="这条任务其实已经跑完了，我直接把结果给你：",
             )
             if recovered_reply is not None:
-                await self._send_private_text(
-                    user_id=owner_qq,
-                    text=recovered_reply,
-                    context=f"dev_task:{task_id}:recovered_after_exception",
-                    timeout_seconds=8.0,
-                )
+                if self._should_send_private_recovery_reply(task_id=task_id, recovery_text=recovered_reply):
+                    await self._send_private_text(
+                        user_id=owner_qq,
+                        text=recovered_reply,
+                        context=f"dev_task:{task_id}:recovered_after_exception",
+                        timeout_seconds=8.0,
+                    )
                 return True
             failure_reason = str(exc)
             if checkpoint_manifest is not None:
                 try:
-                    restore_repo_checkpoint(
+                    await asyncio.to_thread(
+                        restore_repo_checkpoint,
                         repo_root=self.repo_root,
                         checkpoint_dir=checkpoint_dir,
                         manifest=checkpoint_manifest,
@@ -1028,6 +1324,25 @@ class DevControlService:
             failure_reason = str(exc).strip() or exc.__class__.__name__
             return False, failure_reason
 
+    async def _fetch_private_quoted_message_payload(self, *, reply_to_msg_id: str | None) -> dict | None:
+        if not reply_to_msg_id:
+            return None
+        gateway = getattr(self.sender, "gateway", None)
+        if gateway is None or not hasattr(gateway, "call_api"):
+            return None
+        message_id: int | str = int(reply_to_msg_id) if str(reply_to_msg_id).isdigit() else str(reply_to_msg_id)
+        try:
+            response = await gateway.call_api("get_msg", {"message_id": message_id})
+        except Exception:
+            logger.exception("private_quoted_message_fetch_failed reply_to_msg_id=%s", reply_to_msg_id)
+            return None
+        if not isinstance(response, dict):
+            return None
+        payload = response.get("data")
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
     def _private_image_turn_key(self, *, user_id: int, private_scope: str) -> tuple[int, str]:
         return (user_id, private_scope)
 
@@ -1039,6 +1354,13 @@ class DevControlService:
         if getattr(event, "reply_to_msg_id", None) is not None:
             return False
         return bool(list(getattr(event, "images", []) or []))
+
+    def _should_hold_private_image_for_followup(self, event: PrivateMessageEvent) -> bool:
+        return (
+            getattr(event, "reply_to_msg_id", None) is None
+            and not str(event.plain_text or "").strip()
+            and len(list(getattr(event, "images", []) or [])) == 1
+        )
 
     def _cancel_pending_private_image_turns_for_user(
         self,
@@ -1062,6 +1384,11 @@ class DevControlService:
         if not override_images:
             return None
         return list(override_images)
+
+    def _reset_private_draw_state(self, *, user_id: int) -> None:
+        self._cancel_pending_private_image_turns_for_user(user_id, preserve_for_next_turn=False)
+        self._private_image_turn_overrides.pop(user_id, None)
+        self._private_draw_context_reset_users.add(user_id)
 
     async def _schedule_private_image_followup_if_needed(
         self,
@@ -1099,6 +1426,218 @@ class DevControlService:
             return "[sent 1 image]" if current_images else "[asked about 1 image]"
         return f"[sent {image_count} images]" if current_images else f"[asked about {image_count} images]"
 
+    def _normalize_private_lookup_text(self, value: str) -> str:
+        return LOOKUP_NORMALIZER.sub("", value).lower()
+
+    def _extract_auto_web_reference_query(self, *, stripped_text: str) -> str | None:
+        match = AUTO_WEB_REFERENCE_QUERY_PATTERN.search(stripped_text)
+        if match is not None:
+            query = str(match.group("query") or "").strip(" \t,\uFF0C\u3002.!?\uFF1F\uFF1B;:\uFF1A")
+            if query:
+                return query
+        marker_positions = [
+            stripped_text.find(marker)
+            for marker in ("\u7684\u4eba\u8bbe\u56fe", "\u4eba\u8bbe\u56fe", "\u8bbe\u5b9a\u56fe", "\u53c2\u8003\u56fe")
+            if stripped_text.find(marker) >= 0
+        ]
+        if not marker_positions:
+            return None
+        end = min(marker_positions)
+        action_positions = [
+            idx
+            for idx in (stripped_text.find("\u627e"), stripped_text.find("\u641c"))
+            if 0 <= idx < end
+        ]
+        if not action_positions:
+            return None
+        start = min(action_positions) + 1
+        query = stripped_text[start:end].strip(" \t,\uFF0C\u3002.!?\uFF1F\uFF1B;:\uFF1A")
+        while query.startswith(("\u7f51\u4e0a", "\u4e0a\u7f51", "\u8054\u7f51")):
+            query = query[2:].strip(" \t,\uFF0C\u3002.!?\uFF1F\uFF1B;:\uFF1A")
+        return query or None
+
+    def _build_auto_web_reference_prompt(self, *, stripped_text: str, query: str) -> str:
+        prompt = AUTO_WEB_REFERENCE_QUERY_PATTERN.sub("", stripped_text, count=1)
+        prompt = AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN.sub("", prompt).strip(" \t,\uFF0C\u3002.!?\uFF1F\uFF1B;:\uFF1A")
+        if not prompt:
+            return f"\u53c2\u8003\u641c\u7d22\u5230\u7684{query}\u4eba\u8bbe\u56fe\u751f\u6210\u4e00\u5f20\u56fe"
+        return f"\u53c2\u8003\u641c\u7d22\u5230\u7684{query}\u4eba\u8bbe\u56fe\uff0c{prompt}"
+
+    def _looks_like_private_reference_image_generation_request(
+        self,
+        *,
+        stripped_text: str,
+        target_images: list | None,
+    ) -> bool:
+        if not target_images:
+            return False
+        normalized_text = self._normalize_private_lookup_text(stripped_text)
+        if not normalized_text:
+            return False
+        has_transform_intent = any(
+            self._normalize_private_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS
+        )
+        has_reference_context = any(
+            self._normalize_private_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS
+        )
+        has_generation_intent = any(
+            self._normalize_private_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS
+        )
+        has_retouch_intent = any(
+            self._normalize_private_lookup_text(keyword) in normalized_text
+            for keyword in PRIVATE_IMAGE_RETOUCH_INTENT_KEYWORDS
+        )
+        if has_transform_intent or (has_reference_context and has_generation_intent):
+            return True
+        if has_retouch_intent:
+            return True
+        direct_text = str(stripped_text or "")
+        return (
+            ("\u6784\u56fe" in direct_text and ("\u66ff\u6362\u4eba\u7269" in direct_text or "\u6362\u6210\u4eba\u7269" in direct_text) and "\u51fa\u56fe" in direct_text)
+            or ("\u53c2\u8003" in direct_text and "\u51fa\u56fe" in direct_text)
+        )
+
+    def _build_private_image_request(
+        self,
+        *,
+        event: PrivateMessageEvent,
+        target_images: list | None,
+    ) -> PrivateImageGenerationRequest | None:
+        stripped = str(event.plain_text or "").strip()
+        if not stripped:
+            return None
+        if any(pattern.search(stripped) for pattern in GROUP_IMAGE_NEGATIVE_PATTERNS):
+            return None
+        reference_images = list(target_images or [])
+        auto_web_reference_query = self._extract_auto_web_reference_query(stripped_text=stripped)
+        if auto_web_reference_query is not None:
+            return PrivateImageGenerationRequest(
+                user_id=event.user_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=self._build_auto_web_reference_prompt(
+                    stripped_text=stripped,
+                    query=auto_web_reference_query,
+                ),
+                reference_images=reference_images,
+                web_search_query=auto_web_reference_query,
+            )
+        if self._looks_like_private_reference_image_generation_request(
+            stripped_text=stripped,
+            target_images=reference_images,
+        ):
+            return PrivateImageGenerationRequest(
+                user_id=event.user_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=stripped,
+                reference_images=reference_images,
+            )
+        for pattern in GROUP_IMAGE_REQUEST_PATTERNS:
+            match = pattern.match(stripped)
+            if match is None:
+                continue
+            prompt = match.group("prompt").strip(" \t,\uFF0C\u3002.!?\uFF1F\uFF1B;:\uFF1A")
+            if not prompt:
+                return None
+            return PrivateImageGenerationRequest(
+                user_id=event.user_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=prompt,
+                reference_images=reference_images,
+            )
+        if reference_images and any(
+            keyword in stripped
+            for keyword in ("\u51fa\u56fe", "\u753b\u56fe", "\u7ed8\u56fe", "\u751f\u6210")
+        ):
+            return PrivateImageGenerationRequest(
+                user_id=event.user_id,
+                trigger_message_id=event.platform_msg_id,
+                prompt=stripped,
+                reference_images=reference_images,
+            )
+        return None
+
+    async def _handle_admin_agent_turn(self, event: PrivateMessageEvent) -> None:
+        override_images = self._consume_private_image_turn_override(user_id=event.user_id)
+        request_text = self._private_turn_text_for_prompt(
+            event,
+            resolved_image_count=len(override_images or []),
+        )
+        conflicting_task = self._find_conflicting_admin_repo_task(requested_by_qq=event.user_id)
+        if conflicting_task is not None:
+            await self._send_admin_repo_busy_reply(user_id=event.user_id, platform_msg_id=event.platform_msg_id)
+            return
+        _session_id, task_id = self.admin_agent_runtime.enqueue_turn(
+            event=event,
+            request_text=request_text,
+        )
+        await self._send_private_text(
+            user_id=event.user_id,
+            text=ADMIN_AGENT_ACK_TEXT,
+            context=f"admin_agent:{task_id}:queued",
+        )
+
+    def _find_conflicting_admin_repo_task(self, *, requested_by_qq: int):
+        with session_scope(self.engine) as session:
+            tasks = DevTaskRepository(session).list_tasks_by_statuses(
+                statuses=["running", "queued"],
+                intent_types=list(GLOBAL_ADMIN_MUTEX_INTENTS),
+            )
+        for task in tasks:
+            if task.requested_by_qq == requested_by_qq:
+                continue
+            return task
+        return None
+
+    async def _send_admin_repo_busy_reply(self, *, user_id: int, platform_msg_id: str) -> None:
+        await self._send_private_text(
+            user_id=user_id,
+            text="当前已有管理员任务正在执行，请稍后重试。",
+            context=f"admin_busy:{platform_msg_id}",
+        )
+
+    def _finalize_private_image_task(self, task_id: int, result: ImageJobResult) -> None:
+        with session_scope(self.engine) as session:
+            tasks = DevTaskRepository(session)
+            task = tasks.get_task(task_id)
+            if task is None or task.status in {"completed", "failed", "rolled_back"}:
+                return
+            if result.success:
+                tasks.mark_completed(
+                    task_id=task_id,
+                    summary=self._build_turn_summary(task.raw_request_text, result.notice_text),
+                    result_text=result.notice_text,
+                    files_read=[],
+                    files_changed=[],
+                    commands_run=["private_image_service.completed"],
+                    restart_required=False,
+                    restart_result="not-needed",
+                    checkpoint_dir="",
+                )
+                if result.image_path is not None:
+                    DevTaskArtifactRepository(session).add_artifact(
+                        task_id=task_id,
+                        artifact_type="private_image",
+                        artifact_path=str(result.image_path),
+                        metadata_json={"notice_text": result.notice_text},
+                    )
+                self._append_session_summary(
+                    session_id=task.session_id,
+                    owner_text=task.raw_request_text,
+                    assistant_text=result.notice_text,
+                    sessions=DevSessionRepository(session),
+                )
+                return
+            tasks.mark_failed(task_id=task_id, failure_reason=result.failure_reason or result.notice_text)
+            self._append_session_summary(
+                session_id=task.session_id,
+                owner_text=task.raw_request_text,
+                assistant_text=f"失败：{result.notice_text}",
+                sessions=DevSessionRepository(session),
+            )
+
     async def _handle_private_chat_turn(self, event: PrivateMessageEvent, *, private_scope: str) -> None:
         session_mode = SESSION_MODE_PROJECT if private_scope == PRIVATE_SCOPE_OWNER_PROJECT else SESSION_MODE_DAILY
         initial_request_text = self._private_turn_text_for_prompt(event)
@@ -1124,12 +1663,23 @@ class DevControlService:
             if override_images:
                 target_images = override_images
             else:
+                quoted_raw_payload = await self._fetch_private_quoted_message_payload(
+                    reply_to_msg_id=getattr(event, "reply_to_msg_id", None)
+                )
                 with session_scope(self.engine) as session:
                     target_images_turn = resolve_private_images_for_turn(
                         event=event,
                         messages=MessageRepository(session),
+                        quoted_raw_payload=quoted_raw_payload,
                     )
-                target_images = target_images_turn.images if target_images_turn and target_images_turn.images else None
+                if (
+                    target_images_turn is not None
+                    and target_images_turn.source_kind == "recent"
+                    and event.user_id in self._private_draw_context_reset_users
+                ):
+                    target_images = None
+                else:
+                    target_images = target_images_turn.images if target_images_turn and target_images_turn.images else None
             request_text = self._private_turn_text_for_prompt(
                 event,
                 resolved_image_count=len(target_images or []),
@@ -1154,6 +1704,22 @@ class DevControlService:
                         task_id=task_id,
                         private_send=explicit_private_send,
                     )
+            private_image_request = None
+            if reply_text is None:
+                private_image_request = self._build_private_image_request(
+                    event=event,
+                    target_images=target_images,
+                )
+                if private_image_request is not None:
+                    private_image_request.dev_task_id = task_id
+            if private_image_request is not None:
+                enqueue_result = await self.private_image_service.enqueue(private_image_request)
+                if enqueue_result.accepted:
+                    reply_text = "图我接住了，开始画"
+                    with session_scope(self.engine) as session:
+                        DevTaskRepository(session).mark_status(task_id=task_id, status="running")
+                else:
+                    reply_text = "现在排队的图太多了，你等一下再发"
             if reply_text is None:
                 reply_text = self._build_unsupported_private_action_reply(
                     request_text=request_text,
@@ -1178,30 +1744,35 @@ class DevControlService:
                 if not reply_text:
                     raise ValueError("empty private project chat reply")
 
-            with session_scope(self.engine) as session:
-                tasks = DevTaskRepository(session)
-                tasks.mark_completed(
-                    task_id=task_id,
-                    summary=self._build_turn_summary(request_text, reply_text),
-                    result_text=reply_text,
-                    files_read=[],
-                    files_changed=[],
-                    commands_run=["llm_client.generate_text"],
-                    restart_required=False,
-                    restart_result="not-needed",
-                    checkpoint_dir="",
-                )
-                self._append_session_summary(
-                    session_id=session_id,
-                    owner_text=request_text,
-                    assistant_text=reply_text,
-                    sessions=DevSessionRepository(session),
-                )
+            if private_image_request is None:
+                with session_scope(self.engine) as session:
+                    tasks = DevTaskRepository(session)
+                    tasks.mark_completed(
+                        task_id=task_id,
+                        summary=self._build_turn_summary(request_text, reply_text),
+                        result_text=reply_text,
+                        files_read=[],
+                        files_changed=[],
+                        commands_run=["llm_client.generate_text"],
+                        restart_required=False,
+                        restart_result="not-needed",
+                        checkpoint_dir="",
+                    )
+                    self._append_session_summary(
+                        session_id=session_id,
+                        owner_text=request_text,
+                        assistant_text=reply_text,
+                        sessions=DevSessionRepository(session),
+                    )
 
             await self._send_private_text(
                 user_id=event.user_id,
                 text=reply_text,
-                context=f"private_chat:{task_id}:completed",
+                context=(
+                    f"private_chat:{task_id}:accepted"
+                    if private_image_request is not None
+                    else f"private_chat:{task_id}:completed"
+                ),
             )
         except Exception as exc:
             logger.exception("private_chat_failed user_id=%s scope=%s", event.user_id, private_scope)
@@ -1245,12 +1816,23 @@ class DevControlService:
             if override_images:
                 target_images = override_images
             else:
+                quoted_raw_payload = await self._fetch_private_quoted_message_payload(
+                    reply_to_msg_id=getattr(event, "reply_to_msg_id", None)
+                )
                 with session_scope(self.engine) as session:
                     target_images_turn = resolve_private_images_for_turn(
                         event=event,
                         messages=MessageRepository(session),
+                        quoted_raw_payload=quoted_raw_payload,
                     )
-                target_images = target_images_turn.images if target_images_turn and target_images_turn.images else None
+                if (
+                    target_images_turn is not None
+                    and target_images_turn.source_kind == "recent"
+                    and event.user_id in self._private_draw_context_reset_users
+                ):
+                    target_images = None
+                else:
+                    target_images = target_images_turn.images if target_images_turn and target_images_turn.images else None
             request_text = self._private_turn_text_for_prompt(
                 event,
                 resolved_image_count=len(target_images or []),
@@ -1334,7 +1916,35 @@ class DevControlService:
         event: PrivateMessageEvent,
         request_text: str,
         routing_text: str | None = None,
+        confirmed: bool = False,
+        auto_execute_after_plan: bool = False,
     ) -> None:
+        conflicting_task = self._find_conflicting_admin_repo_task(requested_by_qq=event.user_id)
+        if conflicting_task is not None:
+            await self._send_admin_repo_busy_reply(user_id=event.user_id, platform_msg_id=event.platform_msg_id)
+            return
+        active_task = self._find_reusable_active_feature_work_task(
+            owner_qq=event.user_id,
+            request_text=request_text,
+        )
+        if active_task is not None:
+            await self._reply_with_active_feature_work_status(
+                event=event,
+                request_text=request_text,
+                active_task=active_task,
+            )
+            return
+
+        if not confirmed:
+            await self._offer_feature_work_confirmation(
+                event=event,
+                request_text=request_text,
+                routing_text=routing_text,
+                require_confirmation=not auto_execute_after_plan,
+            )
+            if not auto_execute_after_plan:
+                return
+
         if self._should_use_inline_feature_workflow(request_text=request_text, routing_text=routing_text):
             await self._start_inline_execute_task(event=event, request_text=request_text)
             return
@@ -1345,6 +1955,230 @@ class DevControlService:
             request_text=request_text,
         )
         logger.info("private_project_execute_waiting task_id=%s", task_id)
+
+    def _find_reusable_active_feature_work_task(self, *, owner_qq: int, request_text: str):
+        with session_scope(self.engine) as session:
+            sessions = DevSessionRepository(session)
+            tasks = DevTaskRepository(session)
+            dev_session = sessions.get_latest_owner_session(
+                owner_qq=owner_qq,
+                session_mode=SESSION_MODE_PROJECT,
+            )
+            if dev_session is None:
+                return None
+            active_tasks = tasks.list_tasks_for_session_by_status(
+                session_id=dev_session.id,
+                statuses=["running", "queued"],
+            )
+
+        for task in reversed(active_tasks):
+            if task.intent_type != "feature_work":
+                continue
+            if self._should_reuse_active_feature_work(
+                request_text=request_text,
+                active_request_text=task.raw_request_text,
+            ):
+                return task
+        return None
+
+    def _should_reuse_active_feature_work(self, *, request_text: str, active_request_text: str) -> bool:
+        normalized_request = self._normalize_private_command_text(request_text)
+        normalized_active = self._normalize_private_command_text(active_request_text)
+        if not normalized_request or not normalized_active:
+            return False
+        if normalized_request == normalized_active:
+            return True
+        return self._looks_like_feature_work_continue_request(normalized_request)
+
+    def _looks_like_feature_work_continue_request(self, normalized_text: str) -> bool:
+        continue_hints = (
+            "那你开始完成我说的功能吧",
+            "开始完成我说的功能",
+            "开始做吧",
+            "你开始做吧",
+            "你开始做",
+            "那你开始做",
+            "继续做吧",
+            "继续做",
+            "继续处理",
+            "继续推进",
+            "按这个做",
+            "就按这个",
+            "照这个做",
+            "去做吧",
+            "开做吧",
+        )
+        return any(hint in normalized_text for hint in continue_hints)
+
+    async def _reply_with_active_feature_work_status(
+        self,
+        *,
+        event: PrivateMessageEvent,
+        request_text: str,
+        active_task,
+    ) -> None:
+        reply_text = self._build_active_feature_work_status_reply(active_task=active_task)
+        with session_scope(self.engine) as session:
+            sessions = DevSessionRepository(session)
+            tasks = DevTaskRepository(session)
+            dev_session = sessions.get_or_create_owner_session(
+                owner_qq=event.user_id,
+                session_mode=SESSION_MODE_PROJECT,
+            )
+            task = tasks.add_task(
+                session_id=dev_session.id,
+                requested_by_qq=event.user_id,
+                raw_request_text=request_text.strip() or event.plain_text.strip(),
+                intent_type="project_chat",
+            )
+            sessions.update_session(session_id=dev_session.id, last_task_id=task.id)
+            tasks.mark_completed(
+                task_id=task.id,
+                summary=self._build_turn_summary(request_text, reply_text),
+                result_text=reply_text,
+                files_read=[],
+                files_changed=[],
+                commands_run=["active_feature_work_status"],
+                restart_required=False,
+                restart_result="not-needed",
+                checkpoint_dir="",
+            )
+            self._append_session_summary(
+                session_id=dev_session.id,
+                owner_text=request_text,
+                assistant_text=reply_text,
+                sessions=sessions,
+            )
+        await self._send_private_text(
+            user_id=event.user_id,
+            text=reply_text,
+            context=f"active_feature_work:{active_task.id}:status",
+        )
+
+    def _build_active_feature_work_status_reply(self, *, active_task) -> str:
+        request_brief = self._truncate_text(" ".join(active_task.raw_request_text.strip().split()), limit=80)
+        if active_task.status == "running":
+            return (
+                "上一条开发任务还在处理，我会继续沿着那条推进，不再重复开一条。\n\n"
+                f"当前在做的是：{request_brief}\n"
+                "这条跑完后我再给你结果。"
+            )
+        return (
+            "上一条开发任务已经在队列里了，我会继续沿着那条推进，不再重复开一条。\n\n"
+            f"当前排队的是：{request_brief}\n"
+            "轮到它开始处理后，我会继续按那条往下做。"
+        )
+
+    async def _offer_feature_work_confirmation(
+        self,
+        *,
+        event: PrivateMessageEvent,
+        request_text: str,
+        routing_text: str | None = None,
+        require_confirmation: bool = True,
+    ) -> None:
+        session_id, task_id, normalized_request_text = self._create_execute_task(
+            event=event,
+            intent_type=FEATURE_PLAN_INTENT,
+            request_text=request_text,
+            status="running",
+        )
+        confirmation_text, referenced_paths = self._build_feature_work_confirmation_reply(
+            request_text=normalized_request_text,
+            routing_text=routing_text,
+            require_confirmation=require_confirmation,
+        )
+        with session_scope(self.engine) as session:
+            tasks = DevTaskRepository(session)
+            tasks.mark_completed(
+                task_id=task_id,
+                summary=self._build_turn_summary(normalized_request_text, confirmation_text),
+                result_text=confirmation_text,
+                files_read=referenced_paths,
+                files_changed=[],
+                commands_run=["feature_work_confirmation"],
+                restart_required=False,
+                restart_result="not-needed",
+                checkpoint_dir="",
+            )
+            self._append_session_summary(
+                session_id=session_id,
+                owner_text=normalized_request_text,
+                assistant_text=confirmation_text,
+                sessions=DevSessionRepository(session),
+            )
+        await self._send_private_text(
+            user_id=event.user_id,
+            text=confirmation_text,
+            context=f"feature_plan:{task_id}:completed",
+        )
+
+    def _build_feature_work_confirmation_reply(
+        self,
+        *,
+        request_text: str,
+        routing_text: str | None = None,
+        require_confirmation: bool = True,
+    ) -> tuple[str, list[str]]:
+        normalized_request = " ".join(request_text.strip().split())
+        repo_snippets = build_repo_context_snippets(
+            repo_root=self.repo_root,
+            query=routing_text or request_text,
+            max_files=2,
+            max_lines_per_file=2,
+        )
+        referenced_paths: list[str] = []
+        for snippet in repo_snippets:
+            path_line = snippet.splitlines()[0].strip()
+            if path_line and path_line not in referenced_paths:
+                referenced_paths.append(path_line)
+        if referenced_paths:
+            focus_text = "、".join(referenced_paths[:2])
+        else:
+            focus_text = "相关代码、配置和日志"
+
+        if self._looks_like_capability_probe_request(request_text):
+            action_text = f"我会先直接实测这条能力，重点看 {focus_text} 和真实返回。"
+        elif (
+            self._looks_like_restart_status_question(request_text)
+            or self._looks_like_change_status_question(request_text)
+            or self._looks_like_local_project_question(request_text)
+        ):
+            action_text = (
+                f"我会先直接核对 {focus_text} 和当前运行情况；"
+                "如果只是没接上、没生效或者差一小段逻辑，我会顺手改掉再验证。"
+            )
+        else:
+            action_text = f"我会先从 {focus_text} 入手，必要时直接改代码并跑定向验证。"
+
+        if require_confirmation:
+            return (
+                (
+                    f"我理解你的目标是：{self._truncate_text(normalized_request, limit=120)}。"
+                    f"{action_text}"
+                    "如果动到运行链路，我会在收尾时一起重启确认是否生效。"
+                    "如果你要，我下一步就直接进项目里执行；你回我“好 / 就这样 / 按这个”就行。"
+                ),
+                referenced_paths,
+            )
+
+        execution_text = (
+            "我现在就直接开始。"
+            if self._should_use_inline_feature_workflow(
+                request_text=request_text,
+                routing_text=routing_text,
+            )
+            else "我先按持续执行的方式推进，先把它排进项目处理队列。"
+        )
+        return (
+            (
+                f"我理解的是：{self._truncate_text(normalized_request, limit=120)}。"
+                f"我会这样处理：{action_text}"
+                "如果动到运行链路，我会在收尾时一起重启确认是否生效。"
+                f"{execution_text}"
+            ),
+            referenced_paths,
+        )
 
     def _create_execute_task(
         self,
@@ -1439,7 +2273,7 @@ class DevControlService:
         if any(hint in normalized_route for hint in worker_hints):
             return False
 
-        if normalized_request.startswith(self._normalize_private_command_text("继续上一条你刚才主动提出的本地修改或开发步骤")):
+        if normalized_request.startswith(self._normalize_private_command_text("继续上一条")):
             return True
 
         inline_hints = (
@@ -1626,6 +2460,8 @@ class DevControlService:
                 "- Do not restart the runtime yourself. Only inspect, edit, and run focused verification.",
                 "- If a runtime restart seems needed, set restart_required accordingly. The outer controller may perform that restart after you return.",
                 "- Do not tell the user that you lack permission to restart or cannot restart. Describe whether a restart is needed, and leave the actual restart to the outer controller.",
+                "- Do not claim a machine-wide network or HTTPS block unless the current run shows multiple independent failures and no contradictory successful API call, probe result, or control request.",
+                "- If current verification shows any successful API call or probe result, report the outcome as mixed, endpoint-specific, or transport-specific instead of escalating it into a whole-machine conclusion.",
                 "Project session summary:",
                 session_summary or "(none)",
                 "Recent private project turns:",
@@ -1658,17 +2494,75 @@ class DevControlService:
             return [
                 "Reply style: Sound like the same assistant style as Codex in this workspace.",
                 "Reply style: Be direct, concise, factual, calm, and practical.",
-                "Reply style: Private chat may use Markdown when it helps clarity. Use short headings, bullets, or numbered steps for explanations, troubleshooting, and status updates.",
+                "Reply style: Do not default to Markdown, headings, bullet lists, or multi-paragraph formatting in private chat replies.",
+                "Reply style: Prefer one compact message in one or two short paragraphs. Keep the information, but avoid splitting it into many blocks.",
+                "Reply style: Only use light structure when the user explicitly asks for steps or when collapsing it would make the answer harder to follow.",
                 "Reply style: For small acknowledgements or simple answers, do not force structure.",
                 "Reply style: If evidence is missing or conflicting, say so plainly instead of smoothing it over.",
             ]
         return [
             f"Reply style: Stay in {str(self.persona.get('name', self.assistant_name) or self.assistant_name)}'s daily-chat persona.",
             "Reply style: Keep the tone natural, lively, and human, not stiff customer-service wording.",
-            "Reply style: In private chat, Markdown is allowed when it makes an explanation clearer. You can use short headings, bullets, and spacing.",
+            "Reply style: Do not default to Markdown, headings, bullet lists, or multi-paragraph formatting in private chat replies.",
+            "Reply style: Prefer one compact message in one or two short paragraphs. Keep the information, but avoid splitting it into many blocks.",
             "Reply style: For casual back-and-forth, stay natural and do not over-structure tiny replies.",
             "Reply style: If evidence is missing or conflicting, say so plainly instead of smoothing it over.",
         ]
+
+    def _looks_like_private_model_question(self, text: str) -> bool:
+        normalized = self._normalize_private_command_text(text)
+        if not normalized or "模型" not in text:
+            return False
+        return any(keyword in normalized for keyword in ("现在", "对话", "用", "哪个", "什么", "啥"))
+
+    def _build_private_model_info_reply(self) -> str:
+        primary_model = str(getattr(self.llm_client, "model", "") or "").strip()
+        fallback_model = str(getattr(self.llm_client, "fallback_model", "") or "").strip()
+        vision_model = str(getattr(self.llm_client, "vision_model", "") or "").strip()
+        if not primary_model:
+            try:
+                settings = AppSettings()
+            except Exception:
+                settings = None
+            if settings is not None:
+                primary_model = str(settings.llm_model or "").strip()
+                fallback_model = fallback_model or str(settings.llm_fallback_model or "").strip()
+                vision_model = vision_model or str(settings.llm_vision_model or "").strip()
+        primary_model = primary_model or "unknown"
+        parts = [f"现在主模型是 {primary_model}"]
+        if fallback_model:
+            parts.append(f"副模型是 {fallback_model}")
+        if vision_model:
+            parts.append(f"看图时会单独走 {vision_model}")
+        else:
+            parts.append("看图时就直接走这套主副模型")
+        return "，".join(parts) + "。"
+
+    def _looks_like_generic_art_critique_reply(self, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        critique_keywords = ("构图", "色彩", "光影", "层次感", "细节", "风格", "配色", "插画练习", "角色设定")
+        identity_signals = ("没法确定", "不确定", "认不出来", "不知道", "出自", "来自", "原创", "同人", "动画", "游戏", "画师")
+        return any(keyword in normalized for keyword in critique_keywords) and not any(
+            signal in normalized for signal in identity_signals
+        )
+
+    def _build_private_identity_uncertain_reply(self) -> str:
+        return "我现在没法可靠认出来，不想瞎猜。你要是愿意，我可以继续根据外观特征帮你缩小范围。"
+
+    def _postprocess_private_character_reply(
+        self,
+        *,
+        request_text: str,
+        reply_text: str,
+        has_images: bool,
+    ) -> str:
+        if not has_images or not self._is_private_character_identification_request(request_text):
+            return reply_text
+        if self._looks_like_generic_art_critique_reply(reply_text):
+            return self._build_private_identity_uncertain_reply()
+        return reply_text
 
     def _is_private_character_identification_request(self, text: str) -> bool:
         normalized_text = re.sub(r"\s+", "", str(text or "").strip().lower())
@@ -1695,51 +2589,14 @@ class DevControlService:
         recent_turns: list[str],
         image_count: int,
     ) -> list[str]:
-        lines: list[str] = []
-        if image_count > 0:
-            lines.extend(
-                [
-                    f"Vision task: {image_count} attached image(s) belong to the current turn. Inspect them directly before replying.",
-                    "Vision task: Base claims about identity, source, or scene details on visible evidence in the image, not on chat memory alone.",
-                ]
-            )
-        if not self._is_private_character_identification_request(request_text):
-            return lines
-
-        work_hint = self._find_private_character_work_hint(
-            request_text=request_text,
-            recent_turns=recent_turns,
-        )
-        if image_count > 0:
-            lines.extend(
-                [
-                    "Vision task: If the user is asking who or which character it is, identify the most likely character name and franchise first.",
-                    "Vision task: Then cite the strongest visible clues such as hair, eyes, outfit, props, logo, pose, or art style.",
-                    "Vision task: If the image is too small, blurry, cropped, stylized, or fan-art-like for exact identification, say the best candidate and the uncertainty clearly.",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "Character task: No image is attached on this turn. Rely only on prior visual evidence already established in the conversation and any web evidence below.",
-                    "Character task: Do not treat prior speculative guesses as proof of the correct character name.",
-                ]
-            )
-
-        if work_hint:
-            titled_work = f"《{work_hint}》"
-            lines.extend(
-                [
-                    f"Character task: The user has indicated the character is from {titled_work}. Treat that work as a hard constraint.",
-                    f"Character task: Only name characters that actually belong to {titled_work}. Do not borrow names from other works or invent a new character name.",
-                    f"Character task: If you cannot narrow it to a specific real character from {titled_work}, say that clearly instead of guessing.",
-                ]
-            )
-        else:
-            lines.append(
-                "Character task: If you are not confident in a specific character name, do not invent one just to satisfy the request."
-            )
-        return lines
+        del request_text
+        del recent_turns
+        if image_count <= 0:
+            return []
+        return [
+            f"Vision task: {image_count} attached image(s) belong to the current turn. Inspect them directly before replying.",
+            "Vision task: Base claims about identity, source, or scene details on visible evidence in the image, not on chat memory alone.",
+        ]
 
     def _private_web_context_lines(self, web_context: PrivateWebContext) -> list[str]:
         lines: list[str] = []
@@ -1970,7 +2827,18 @@ class DevControlService:
         )
         if not has_offer_shape:
             return None
-        if any(phrase in normalized for phrase in ("重启", "重载")):
+        if any(
+            phrase in normalized
+            for phrase in (
+                "下一步就直接重启",
+                "下一步就重启",
+                "直接执行重启",
+                "先重启",
+                "去重启",
+                "我现在重启",
+                "我下一步就重启",
+            )
+        ):
             return "restart_only"
         if any(
             phrase in normalized
@@ -2014,7 +2882,7 @@ class DevControlService:
     ) -> str:
         action_line = {
             "project_inspect": "继续上一条你刚才主动提出的本地核对步骤，直接检查仓库、配置、代码或日志，并给我明确结论。",
-            "feature_work": "继续上一条你刚才主动提出的本地修改或开发步骤，直接在项目里执行。",
+            "feature_work": "继续上一条你刚才确认的本地执行步骤，直接进项目里检查、修改并验证。",
             "restart_only": "继续上一条你刚才主动提出的重启步骤，直接执行重启并告诉我结果。",
             "project_chat": "继续上一条。",
         }.get(intent_type, "继续上一条。")
@@ -2217,12 +3085,7 @@ class DevControlService:
                 grounding_notes=grounding_notes,
             )
 
-        character_reference_search = self._build_private_character_reference_search(
-            request_text=request_text,
-            recent_turns=recent_turns,
-        )
-
-        if is_search_verification_query(request_text) and character_reference_search is None:
+        if is_search_verification_query(request_text):
             return PrivateWebContext(
                 runtime_facts=runtime_facts,
                 web_results=web_results,
@@ -2246,7 +3109,6 @@ class DevControlService:
             or reference_search_request
             or external_lookup_search_request
             or contextual_followup_search is not None
-            or character_reference_search is not None
         )
         optional_search_eligible = (time_sensitive or general_search_candidate) and not forced_search_request
         if not forced_search_request and not optional_search_eligible:
@@ -2259,8 +3121,6 @@ class DevControlService:
 
         if contextual_followup_search is not None:
             parsed_search = contextual_followup_search
-        elif character_reference_search is not None:
-            parsed_search = character_reference_search
         elif forced_search_request:
             parsed_search = SearchDecision(
                 True,
@@ -2304,7 +3164,7 @@ class DevControlService:
                 grounding_notes=grounding_notes,
             )
 
-        search_result_limit = 5 if reference_search_request or external_lookup_search_request or character_reference_search is not None else 3
+        search_result_limit = 5 if reference_search_request or external_lookup_search_request else 3
         try:
             search_hits = self.web_search_client.search(parsed_search.query, max_results=search_result_limit)
         except Exception:
@@ -2404,6 +3264,8 @@ class DevControlService:
             return "project_inspect"
         if self._looks_like_change_status_question(text):
             return "project_inspect"
+        if self._looks_like_capability_probe_request(text):
+            return "feature_work"
         if any(keyword in lowered or keyword in text for keyword in EXECUTE_KEYWORDS):
             return "feature_work"
         if any(keyword in lowered or keyword in text for keyword in RESTART_KEYWORDS):
@@ -2459,6 +3321,16 @@ class DevControlService:
         if any(hint in normalized for hint in ("加上", "加入", "改好", "会提到", "会不会提到")):
             return any(hint in normalized for hint in CHANGE_STATUS_TARGET_HINTS)
         return False
+
+    def _looks_like_capability_probe_request(self, text: str) -> bool:
+        normalized = text.strip()
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        has_target = any(keyword in lowered or keyword in normalized for keyword in CAPABILITY_PROBE_TARGET_HINTS)
+        if not has_target:
+            return False
+        return any(keyword in lowered or keyword in normalized for keyword in CAPABILITY_PROBE_ACTION_HINTS)
 
     def _looks_like_fast_chat_request(self, text: str) -> bool:
         normalized = text.strip()
@@ -2692,6 +3564,38 @@ class DevControlService:
     def _private_sender_user_id(self) -> int:
         return self.bot_qq if isinstance(self.bot_qq, int) and self.bot_qq > 0 else self.owner_qq
 
+    def _private_outbound_sent_text(self, *, context: str) -> str | None:
+        platform_msg_id = self._private_outbound_platform_msg_id(context=context)
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            outbound_message = messages.get_by_platform_msg_id(platform_msg_id)
+            if outbound_message is None:
+                return None
+            raw_json = outbound_message.raw_json
+            if not isinstance(raw_json, dict) or raw_json.get("delivery_state") != "sent":
+                return None
+            return str(outbound_message.plain_text or "")
+
+    def _should_send_private_recovery_reply(
+        self,
+        *,
+        task_id: int,
+        recovery_text: str,
+    ) -> bool:
+        completed_text = self._private_outbound_sent_text(context=f"dev_task:{task_id}:completed")
+        if completed_text is None:
+            return True
+
+        normalized_completed = self._normalize_private_reply(completed_text)
+        normalized_recovery = self._normalize_private_reply(recovery_text)
+        if not normalized_completed:
+            return True
+        if normalized_recovery != normalized_completed and not normalized_recovery.endswith(normalized_completed):
+            return True
+
+        logger.info("private_reply_recovery_skip_duplicate task_id=%s", task_id)
+        return False
+
     def _reserve_private_outbound_reply(self, *, user_id: int, reply_text: str, context: str) -> bool:
         platform_msg_id = self._private_outbound_platform_msg_id(context=context)
         sender_user_id = self._private_sender_user_id()
@@ -2804,12 +3708,27 @@ class DevControlService:
             self.codex_bridge = CodexBridge()
         return self.codex_bridge
 
+    def _restart_relevant_request_text(self, text: str) -> str:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        if not lines or not lines[0].startswith("继续上一条"):
+            return str(text or "")
+        relevant_lines: list[str] = []
+        for line in lines:
+            if line.startswith("上一条助手回复：") or line.startswith("用户确认继续："):
+                continue
+            if line.startswith("上一条用户问题："):
+                relevant_lines.append(line.split("：", 1)[1].strip())
+                continue
+            relevant_lines.append(line)
+        return "\n".join(relevant_lines)
+
     def _request_wants_restart(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(keyword in lowered or keyword in text for keyword in RESTART_KEYWORDS)
+        relevant_text = self._restart_relevant_request_text(text)
+        lowered = relevant_text.lower()
+        return any(keyword in lowered or keyword in relevant_text for keyword in RESTART_KEYWORDS)
 
     def _change_requires_restart(self, files_changed: list[str]) -> bool:
-        restart_prefixes = ("app/", "configs/", "scripts/")
+        restart_prefixes = ("app/", "configs/")
         restart_files = {
             "start_xiaomachi.ps1",
             "stop_xiaomachi.ps1",
@@ -2817,6 +3736,8 @@ class DevControlService:
             "stop_xiaomachi_bots.ps1",
             "start_xiaomachi_runtime.ps1",
             "stop_xiaomachi_runtime.ps1",
+            "restart_xiaomachi_runtime.ps1",
+            "scripts/xiaomachi_process_helpers.ps1",
             ".env",
         }
         for relative_path in files_changed:
@@ -2873,10 +3794,11 @@ class DevControlService:
             running_tasks = list(DevTaskRepository(session).list_tasks_by_status("running"))
             queued_tasks = list(DevTaskRepository(session).list_tasks_by_status("queued"))
 
+        pending_private_image_task_ids = self.private_image_service.pending_dev_task_ids()
         stale_non_execute_tasks = [
             task
             for task in [*running_tasks, *queued_tasks]
-            if task.intent_type not in ASYNC_EXECUTE_INTENTS
+            if task.intent_type not in ASYNC_EXECUTE_INTENTS and task.id not in pending_private_image_task_ids
         ]
 
         for task in stale_non_execute_tasks:
@@ -2905,14 +3827,16 @@ class DevControlService:
                 owner_qq=task.requested_by_qq,
                 request_text=task.raw_request_text,
                 notification_prefix="刚才那条任务其实已经跑完了，我把结果补发给你：",
+                allow_restart=False,
             )
             if recovered_reply is not None:
-                await self._send_private_text(
-                    user_id=task.requested_by_qq,
-                    text=recovered_reply,
-                    context=f"dev_task:{task.id}:recovered_on_start",
-                    timeout_seconds=8.0,
-                )
+                if self._should_send_private_recovery_reply(task_id=task.id, recovery_text=recovered_reply):
+                    await self._send_private_text(
+                        user_id=task.requested_by_qq,
+                        text=recovered_reply,
+                        context=f"dev_task:{task.id}:recovered_on_start",
+                        timeout_seconds=8.0,
+                    )
                 continue
 
             with session_scope(self.engine) as session:
@@ -2961,8 +3885,34 @@ class DevControlService:
         normalized_files = [str(item) for item in files if item]
         return {"files": normalized_files}
 
+    def _task_last_message_path(self, *, task_id: int) -> Path:
+        return self.task_dir / f"task-{task_id}" / "codex.last_message.json"
+
+    def _write_saved_task_result(self, *, task_id: int, result: CodexTaskResult, overwrite: bool = False) -> None:
+        last_message_path = self._task_last_message_path(task_id=task_id)
+        if last_message_path.exists() and not overwrite:
+            return
+        last_message_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_last_message = str(result.raw_last_message or "").strip()
+        if raw_last_message:
+            try:
+                json.loads(raw_last_message)
+            except Exception:
+                logger.exception("dev_task_saved_result_invalid_json task_id=%s", task_id)
+            else:
+                last_message_path.write_text(raw_last_message, encoding="utf-8")
+                return
+        payload = {
+            "summary": result.summary,
+            "reply_text": result.reply_text,
+            "restart_required": bool(result.restart_required),
+        }
+        if result.thread_id:
+            payload["thread_id"] = result.thread_id
+        last_message_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
     def _load_saved_task_result(self, *, task_id: int) -> CodexTaskResult | None:
-        last_message_path = self.task_dir / f"task-{task_id}" / "codex.last_message.json"
+        last_message_path = self._task_last_message_path(task_id=task_id)
         if not last_message_path.exists():
             return None
         try:
@@ -2990,6 +3940,7 @@ class DevControlService:
         request_text: str,
         notification_prefix: str,
         checkpoint_manifest: dict[str, list[str]] | None = None,
+        allow_restart: bool = True,
     ) -> str | None:
         saved_result = self._load_saved_task_result(task_id=task_id)
         if saved_result is None:
@@ -3009,7 +3960,7 @@ class DevControlService:
         commands_run = ["artifact recovery"]
         restart_result = "not-needed"
 
-        if restart_required:
+        if restart_required and allow_restart:
             restart_ok, restart_result_text = self._restart_runtime()
             commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
             if not restart_ok:
@@ -3065,6 +4016,8 @@ class DevControlService:
                     )
                 return f"刚才那条任务代码已经跑完了，但补重启失败了：{restart_result_text}"
             restart_result = "success"
+        elif restart_required:
+            restart_result = "recovered-on-start"
 
         normalized_reply_text = self._rewrite_reply_after_successful_restart(
             saved_result.reply_text,
@@ -3092,6 +4045,15 @@ class DevControlService:
             )
         logger.info("dev_task_stage task_id=%s stage=recovered_from_saved_result", task_id)
         return f"{notification_prefix}{normalized_reply_text}"
+
+    def _handoff_inline_runtime_restart(self) -> tuple[bool, str]:
+        restart_result = self.command_runner(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(self.repo_root / "restart_xiaomachi_runtime.ps1")],
+            self.repo_root,
+        )
+        if restart_result.returncode != 0:
+            return False, restart_result.stderr or restart_result.stdout or "restart handoff script failed"
+        return True, restart_result.stdout or "restart handoff launched"
 
     def _restart_runtime(self) -> tuple[bool, str]:
         stop_result = self.command_runner(
@@ -3141,40 +4103,59 @@ class DevControlService:
     def _normalize_private_command_text(self, text: str) -> str:
         return "".join(text.strip().lower().split())
 
-    def _handle_owner_mode_switch_command(self, *, raw_text: str) -> str | None:
-        normalized = self._normalize_private_command_text(raw_text)
-        enable_commands = {self._normalize_private_command_text(item) for item in OWNER_MODE_ENABLE_COMMANDS}
-        disable_commands = {self._normalize_private_command_text(item) for item in OWNER_MODE_DISABLE_COMMANDS}
-        if normalized not in enable_commands and normalized not in disable_commands:
-            return None
+    def _is_private_admin_user(self, user_id: int) -> bool:
+        return user_id == self.owner_qq or user_id in self.admin_qqs
 
-        current_mode = self._get_owner_private_session_mode()
-        if normalized in enable_commands:
-            if current_mode == SESSION_MODE_PROJECT:
-                return "现在已经在管理员模式里了。接下来你直接说要查什么、改什么就行。"
-            self._set_owner_private_session_mode(SESSION_MODE_PROJECT)
-            return "好，已经切到管理员模式了。接下来这条私聊会进入项目对话，上下文和普通聊天分开记。"
+    async def _maybe_send_private_admin_intro_messages(self) -> None:
+        pending_user_ids = sorted(self.admin_qqs - self._load_private_admin_intro_state())
+        for user_id in pending_user_ids:
+            delivered = await self._send_private_text(
+                user_id=user_id,
+                text=self._build_private_admin_intro_text(),
+                context=f"private_admin_intro:{user_id}",
+            )
+            if delivered:
+                self._mark_private_admin_intro_sent(user_id)
 
-        if current_mode == SESSION_MODE_DAILY:
-            return "现在本来就是普通对话模式。"
-        self._set_owner_private_session_mode(SESSION_MODE_DAILY)
-        return "好，已经退出管理员模式了。后面这条私聊会回到普通聊天，上下文也和项目对话分开。"
+    def _build_private_admin_intro_text(self) -> str:
+        return (
+            "你现在已经可以用小町的私聊管理员模式了。\n\n"
+            "用法：\n"
+            "1. 先发“启动管理员模式”进入项目对话\n"
+            "2. 直接说你要查什么、改什么、排查什么\n"
+            "3. 发“重置会话”可以开一条新的项目会话\n"
+            "4. 发“结束管理员模式”或“退出管理员模式”回到普通私聊"
+        )
 
-    def _get_owner_private_session_mode(self) -> str:
-        payload = self._load_owner_private_mode_state()
-        session_mode = str(payload.get("session_mode", SESSION_MODE_DAILY) or SESSION_MODE_DAILY)
-        if session_mode not in {SESSION_MODE_DAILY, SESSION_MODE_PROJECT}:
-            return SESSION_MODE_DAILY
-        return session_mode
+    def _load_private_admin_intro_state(self) -> set[int]:
+        if not self.private_admin_intro_state_path.exists():
+            return set()
+        try:
+            payload = json.loads(self.private_admin_intro_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("private_admin_intro_state_read_failed path=%s", self.private_admin_intro_state_path)
+            return set()
+        if not isinstance(payload, dict):
+            return set()
+        raw_user_ids = payload.get("sent_user_ids", [])
+        if not isinstance(raw_user_ids, list):
+            return set()
+        sent_user_ids: set[int] = set()
+        for item in raw_user_ids:
+            try:
+                sent_user_ids.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        return sent_user_ids
 
-    def _set_owner_private_session_mode(self, session_mode: str) -> None:
-        normalized_mode = session_mode if session_mode in {SESSION_MODE_DAILY, SESSION_MODE_PROJECT} else SESSION_MODE_DAILY
+    def _mark_private_admin_intro_sent(self, user_id: int) -> None:
+        sent_user_ids = self._load_private_admin_intro_state()
+        sent_user_ids.add(user_id)
         self.control_dir.mkdir(parents=True, exist_ok=True)
-        self.owner_private_mode_state_path.write_text(
+        self.private_admin_intro_state_path.write_text(
             json.dumps(
                 {
-                    "owner_qq": self.owner_qq,
-                    "session_mode": normalized_mode,
+                    "sent_user_ids": sorted(sent_user_ids),
                     "updated_at": datetime.now().astimezone().isoformat(),
                 },
                 ensure_ascii=False,
@@ -3183,7 +4164,72 @@ class DevControlService:
             encoding="utf-8",
         )
 
-    def _load_owner_private_mode_state(self) -> dict[str, str]:
+    def _handle_owner_mode_switch_command(self, *, raw_text: str, user_id: int | None = None) -> str | None:
+        target_user_id = self.owner_qq if user_id is None else user_id
+        normalized = self._normalize_private_command_text(raw_text)
+        enable_commands = {self._normalize_private_command_text(item) for item in OWNER_MODE_ENABLE_COMMANDS}
+        disable_commands = {self._normalize_private_command_text(item) for item in OWNER_MODE_DISABLE_COMMANDS}
+        if normalized not in enable_commands and normalized not in disable_commands:
+            return None
+
+        current_mode = self._get_owner_private_session_mode(user_id=target_user_id)
+        if normalized in enable_commands:
+            if current_mode == SESSION_MODE_PROJECT:
+                return "现在已经在管理员模式里了。接下来你直接说要查什么、改什么就行。"
+            self._set_owner_private_session_mode(SESSION_MODE_PROJECT, user_id=target_user_id)
+            return "好，已经切到管理员模式了。接下来这条私聊会进入项目对话，上下文和普通聊天分开记。"
+
+        if current_mode == SESSION_MODE_DAILY:
+            return "现在本来就是普通对话模式。"
+        self._set_owner_private_session_mode(SESSION_MODE_DAILY, user_id=target_user_id)
+        return "好，已经退出管理员模式了。后面这条私聊会回到普通聊天，上下文也和项目对话分开。"
+
+    def _get_owner_private_session_mode(self, *, user_id: int | None = None) -> str:
+        target_user_id = self.owner_qq if user_id is None else user_id
+        payload = self._load_owner_private_mode_state()
+        if target_user_id == self.owner_qq:
+            session_mode = str(payload.get("session_mode", SESSION_MODE_DAILY) or SESSION_MODE_DAILY)
+        else:
+            session_mode = SESSION_MODE_DAILY
+            user_modes = payload.get("user_modes", {})
+            if isinstance(user_modes, dict):
+                user_payload = user_modes.get(str(target_user_id), {})
+                if isinstance(user_payload, dict):
+                    session_mode = str(user_payload.get("session_mode", SESSION_MODE_DAILY) or SESSION_MODE_DAILY)
+        if session_mode not in {SESSION_MODE_DAILY, SESSION_MODE_PROJECT}:
+            return SESSION_MODE_DAILY
+        return session_mode
+
+    def _set_owner_private_session_mode(self, session_mode: str, *, user_id: int | None = None) -> None:
+        target_user_id = self.owner_qq if user_id is None else user_id
+        normalized_mode = session_mode if session_mode in {SESSION_MODE_DAILY, SESSION_MODE_PROJECT} else SESSION_MODE_DAILY
+        payload = self._load_owner_private_mode_state()
+        if not isinstance(payload, dict):
+            payload = {}
+        now_text = datetime.now().astimezone().isoformat()
+        if target_user_id == self.owner_qq:
+            payload["owner_qq"] = self.owner_qq
+            payload["session_mode"] = normalized_mode
+            payload["updated_at"] = now_text
+        else:
+            user_modes = payload.get("user_modes", {})
+            if not isinstance(user_modes, dict):
+                user_modes = {}
+            user_modes[str(target_user_id)] = {
+                "session_mode": normalized_mode,
+                "updated_at": now_text,
+            }
+            payload["user_modes"] = user_modes
+            payload.setdefault("owner_qq", self.owner_qq)
+            payload.setdefault("session_mode", SESSION_MODE_DAILY)
+            payload.setdefault("updated_at", now_text)
+        self.control_dir.mkdir(parents=True, exist_ok=True)
+        self.owner_private_mode_state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_owner_private_mode_state(self) -> dict[str, object]:
         if not self.owner_private_mode_state_path.exists():
             return {}
         try:
@@ -3252,7 +4298,7 @@ class DevControlService:
         task_id: int,
         private_send: ExplicitPrivateSendRequest,
     ) -> str:
-        allowed_targets = {self.owner_qq, *self.private_chat_qqs}
+        allowed_targets = {self.owner_qq, *self.private_chat_qqs, *self.admin_qqs}
         if private_send.target_user_id not in allowed_targets:
             return (
                 f"QQ {private_send.target_user_id} 现在不在私聊白名单里，这条不能直接发。"
@@ -3414,13 +4460,24 @@ class DevControlService:
         )
         if not has_offer_shape:
             return None
-        if any(phrase in normalized for phrase in ("重启", "重载")):
+        if any(
+            phrase in normalized
+            for phrase in (
+                "下一步就直接重启",
+                "下一步就重启",
+                "直接执行重启",
+                "先重启",
+                "去重启",
+                "我现在重启",
+                "我下一步就重启",
+            )
+        ):
             return "restart_only"
         if any(
             phrase in normalized
             for phrase in ("去查", "核对", "确认", "去看", "进仓库", "查配置", "查代码", "查日志", "看代码", "看配置")
         ):
-            return "project_inspect"
+            return "feature_work"
         if any(
             phrase in normalized
             for phrase in ("去改", "帮你改", "实现", "开发", "加进去", "加上", "修掉", "修好")
@@ -3465,7 +4522,7 @@ class DevControlService:
 
         followup_intent = self._infer_owner_followup_intent_from_offer(previous_task.result_text)
         if followup_intent is None:
-            if previous_task.intent_type == "feature_work" and self._is_feature_followup_confirmation_prompt(
+            if previous_task.intent_type in {FEATURE_PLAN_INTENT, "feature_work"} and self._is_feature_followup_confirmation_prompt(
                 previous_task.result_text
             ):
                 followup_intent = "feature_work"
@@ -3490,11 +4547,13 @@ class DevControlService:
         self,
         *,
         raw_text: str,
+        user_id: int | None = None,
         session_mode: str,
         session_label: str,
         new_commands: set[str],
         status_commands: set[str],
     ) -> str | None:
+        target_user_id = self.owner_qq if user_id is None else user_id
         normalized = self._normalize_private_command_text(raw_text)
         normalized_new_commands = {self._normalize_private_command_text(item) for item in new_commands}
         normalized_status_commands = {self._normalize_private_command_text(item) for item in status_commands}
@@ -3505,7 +4564,7 @@ class DevControlService:
             sessions = DevSessionRepository(session)
             tasks = DevTaskRepository(session)
             active_session = sessions.get_or_create_owner_session(
-                owner_qq=self.owner_qq,
+                owner_qq=target_user_id,
                 session_mode=session_mode,
             )
             open_tasks = tasks.list_tasks_for_session_by_status(
@@ -3516,7 +4575,7 @@ class DevControlService:
             if normalized in normalized_new_commands:
                 if open_tasks:
                     return f"现在还有正在处理的{session_label}任务，等它跑完我再给你开新的{session_label}。"
-                sessions.create_owner_session(owner_qq=self.owner_qq, session_mode=session_mode)
+                sessions.create_owner_session(owner_qq=target_user_id, session_mode=session_mode)
                 opened_label = "项目会话" if session_mode == SESSION_MODE_PROJECT else "日常会话"
                 return f"好，这里给你重新开了一条新的{opened_label}。"
 
@@ -3526,6 +4585,20 @@ class DevControlService:
                 f"当前{session_label} #{active_session.id}，排队 {queued_count}，进行中 {running_count}。"
                 "要重开就发“清空上下文”或者“开新对话”。"
             )
+
+    def _handle_private_draw_reset_command(
+        self,
+        *,
+        raw_text: str,
+        user_id: int | None = None,
+    ) -> str | None:
+        target_user_id = self.owner_qq if user_id is None else user_id
+        normalized = self._normalize_private_command_text(raw_text)
+        normalized_commands = {self._normalize_private_command_text(item) for item in PRIVATE_DRAW_RESET_COMMANDS}
+        if normalized not in normalized_commands:
+            return None
+        self._reset_private_draw_state(user_id=target_user_id)
+        return "好，绘画上下文已经清空。要重新参考哪张图，直接再发图或重新说。"
 
     def _build_private_chat_prompt(
         self,
@@ -3594,22 +4667,12 @@ class DevControlService:
         ]
 
     def _normalize_private_reply(self, text: str) -> str:
-        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not normalized:
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
             return ""
 
-        lines = [line.rstrip() for line in normalized.split("\n")]
-        compact_lines: list[str] = []
-        previous_blank = False
-        for line in lines:
-            if not line.strip():
-                if compact_lines and not previous_blank:
-                    compact_lines.append("")
-                previous_blank = True
-                continue
-            compact_lines.append(line)
-            previous_blank = False
-        return "\n".join(compact_lines).strip()
+        normalized = normalize_chat_reply(raw).strip()
+        return normalized
 
     def _default_command_runner(self, command: list[str], cwd: Path) -> ScriptRunResult:
         run_kwargs = {
@@ -3636,6 +4699,7 @@ class DevControlService:
             "start_xiaomachi.ps1",
             "start_xiaomachi_bots.ps1",
             "start_xiaomachi_runtime.ps1",
+            "restart_xiaomachi_runtime.ps1",
         }
         normalized_parts = [str(part).replace("\\", "/").lower() for part in command]
         return any(part.endswith(script_name) for part in normalized_parts for script_name in launch_script_names)

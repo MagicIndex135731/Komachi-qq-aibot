@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 
 from app.adapters.sender import OutboundMessage, OutboundPrivateMessage
 from app.core.message_content import ImageAttachment
+from app.providers.image_adapter import coerce_image_artifact
 from app.storage.db import session_scope
 from app.storage.repositories import JobRepository
 
@@ -360,7 +361,10 @@ class GroupImageGenerationService:
                 max_attempts=self.image_max_attempts,
                 timeout_seconds=self.image_timeout_seconds,
             )
-        image_bytes, suffix = self._extract_image_bytes(result.images)
+        image_items = list(getattr(result, "artifacts", []) or [])
+        if not image_items:
+            image_items = list(getattr(result, "images", []) or [])
+        image_bytes, suffix = self._extract_image_bytes(image_items)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if not suffix.startswith("."):
             suffix = f".{suffix}"
@@ -408,13 +412,17 @@ class GroupImageGenerationService:
             deduped.append(image)
         return deduped
 
-    def _extract_image_bytes(self, images: list[dict[str, Any]]) -> tuple[bytes, str]:
+    def _extract_image_bytes(self, images: list[Any]) -> tuple[bytes, str]:
         for item in images:
-            b64_value = str(item.get("b64_json", "")).strip()
+            artifact = coerce_image_artifact(item)
+            if artifact is None:
+                continue
+
+            b64_value = str(artifact.b64_json or "").strip()
             if b64_value:
                 return self._decode_b64_image_bytes(b64_value), self._preferred_suffix(item=item)
 
-            url_value = str(item.get("url", "")).strip()
+            url_value = str(artifact.url or "").strip()
             if url_value:
                 response = self.http_client.get(url_value)
                 response.raise_for_status()
@@ -429,12 +437,12 @@ class GroupImageGenerationService:
         normalized += "=" * (-len(normalized) % 4)
         return base64.b64decode(normalized)
 
-    def _preferred_suffix(self, *, item: dict[str, Any], url: str | None = None) -> str:
+    def _preferred_suffix(self, *, item: Any, url: str | None = None) -> str:
         if self.output_format:
             return self.output_format
-        response_format = str(item.get("output_format", "")).strip()
-        if response_format:
-            return response_format
+        artifact = coerce_image_artifact(item)
+        if artifact is not None and artifact.output_format:
+            return artifact.output_format
         if url:
             suffix = Path(urlparse(url).path).suffix
             if suffix:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 import logging
 from pathlib import Path
@@ -15,7 +15,12 @@ from app.core.bbot_listener_cache import (
     resolve_cached_command_target,
     upsert_listener_cache_entries,
 )
-from app.core.chat_style import build_human_chat_style_lines, normalize_chat_reply, normalize_proactive_chat_reply
+from app.core.chat_style import (
+    build_human_chat_style_lines,
+    normalize_brief_group_interjection_reply,
+    normalize_chat_reply,
+    normalize_proactive_chat_reply,
+)
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
 from app.core.group_weekly_report import build_group_weekly_report
@@ -81,6 +86,7 @@ GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS = (
     "替换为",
 )
 GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS = (
+    "模仿",
     "参考",
     "参照",
     "仿照",
@@ -116,6 +122,8 @@ GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS = (
     "前面那张图基础上",
 )
 GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS = (
+    "图片",
+    "图",
     "画",
     "画一张",
     "来一张",
@@ -141,6 +149,7 @@ AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN = re.compile(r"^(?:然后|再|并�
 class PreparedGroupReply:
     should_reply: bool
     prompt_lines: list[str] | None = None
+    prebuilt_reply_text: str | None = None
     group_image_request: GroupImageGenerationRequest | None = None
     target_images: list[ImageAttachment] | None = None
     requires_user_visible_failure_reply: bool = False
@@ -159,6 +168,7 @@ class InboundRouter:
     web_search_client: WebSearchClient | None = None
     dev_control_service: object | None = None
     group_image_service: object | None = None
+    pending_group_image_turns: dict[tuple[int, int], tuple[datetime, list[ImageAttachment]]] = field(default_factory=dict)
 
     @classmethod
     def build_for_test(
@@ -176,6 +186,8 @@ class InboundRouter:
             llm_base_url="https://api.example.test/v1",
             llm_api_key="test-key",
             llm_model="gpt-5.4",
+            llm_text_endpoint="chat_completions",
+            llm_supports_vision_input=True,
             bot_qq=123456789,
             owner_qq=987654321,
             admin_qqs="",
@@ -261,6 +273,32 @@ class InboundRouter:
     def _outbound_platform_msg_id(self, inbound_platform_msg_id: str) -> str:
         return f"bot-reply-{inbound_platform_msg_id}"
 
+    def _should_hold_group_image_for_followup(self, event) -> bool:
+        return not event.plain_text.strip() and len(event.images) == 1
+
+    def _remember_group_image_for_followup(self, event) -> None:
+        self.pending_group_image_turns[(event.group_id, event.user_id)] = (
+            self._normalize_timestamp(event.timestamp),
+            list(event.images),
+        )
+
+    def _consume_group_image_for_followup(self, event) -> list[ImageAttachment] | None:
+        key = (event.group_id, event.user_id)
+        pending = self.pending_group_image_turns.get(key)
+        if pending is None:
+            return None
+        pending_timestamp, images = pending
+        if self._normalize_timestamp(event.timestamp) - pending_timestamp > timedelta(minutes=3):
+            self.pending_group_image_turns.pop(key, None)
+            return None
+        if event.images:
+            self.pending_group_image_turns.pop(key, None)
+            return None
+        if not event.plain_text.strip():
+            return None
+        self.pending_group_image_turns.pop(key, None)
+        return list(images)
+
     def _private_inbound_platform_msg_id(self, event) -> str:
         return f"private-inbound-{event.user_id}-{event.platform_msg_id}"
 
@@ -334,6 +372,9 @@ class InboundRouter:
             return "我这边刚刚图没读出来，你再发一下或者再叫我一次。"
         return "我这边刚刚卡了一下，结果没拿到。你再叫我一次，我马上接上。"
 
+    def _build_vision_unavailable_reply(self) -> str:
+        return "我这边这路模型现在还看不了图，得换支持识图的模型才行。"
+
     def _is_group_weekly_report_request(self, event) -> bool:
         if not event.mentioned_bot:
             return False
@@ -366,16 +407,34 @@ class InboundRouter:
             else:
                 await self._send_prebuilt_reply(event, "周报生成失败，稍后再试")
             return True
-        await self._send_prebuilt_reply(event, result.reply_text)
+        await self._send_prebuilt_reply(event, result.reply_text, allow_chunking=True)
         return True
 
-    async def _send_prebuilt_reply(self, event, reply_text: str) -> None:
+    def ingest_historical_group_message(self, event) -> bool:
+        persisted = self._persist_inbound_message(event, cache_images=False)
+        if not persisted:
+            return False
+        self._archive_inbound_message(event)
+        self._ingest_bbot_listener_cache(event)
+        return True
+
+    def ingest_live_group_message(self, event) -> bool:
+        persisted = self._persist_inbound_message(event, cache_images=True)
+        if not persisted:
+            return False
+        self._archive_inbound_message(event)
+        self._ingest_bbot_listener_cache(event)
+        return True
+
+    async def _send_prebuilt_reply(self, event, reply_text: str, *, allow_chunking: bool = False) -> None:
         reserved = self._reserve_outbound_reply(event, reply_text)
         if not reserved:
             return
 
         try:
-            await self.sender.send_group_text(OutboundMessage(group_id=event.group_id, text=reply_text))
+            await self.sender.send_group_text(
+                OutboundMessage(group_id=event.group_id, text=reply_text, allow_chunking=allow_chunking)
+            )
         except Exception:
             logger.exception(
                 "reply_send_failed group_id=%s msg_id=%s",
@@ -442,6 +501,49 @@ class InboundRouter:
 
     def _format_message_line(self, *, user_id: int, plain_text: str, users_by_id: dict[int, object]) -> str:
         return f"{self._member_label_for_user(user_id=user_id, users_by_id=users_by_id)}: {plain_text}"
+
+    def _flatten_raw_message_text(self, raw_payload: dict | None) -> str:
+        if not isinstance(raw_payload, dict):
+            return ""
+        message = raw_payload.get("message", raw_payload.get("raw_message", ""))
+        if isinstance(message, str):
+            return message.strip()
+        parts: list[str] = []
+        for item in message:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = str(item.get("data", {}).get("text", ""))
+            if text:
+                parts.append(text)
+        return "".join(parts).strip()
+
+    def _quoted_message_line_for_prompt(self, *, quoted_raw_payload: dict | None) -> str | None:
+        quoted_text = self._flatten_raw_message_text(quoted_raw_payload)
+        if not quoted_text:
+            return None
+        sender = quoted_raw_payload.get("sender", {}) if isinstance(quoted_raw_payload, dict) else {}
+        label = self._format_member_label(
+            nickname=str(sender.get("nickname", "")),
+            group_card=str(sender.get("card", "")),
+            fallback=str(quoted_raw_payload.get("user_id", "quoted-user")) if isinstance(quoted_raw_payload, dict) else "quoted-user",
+        )
+        return f"{label}: {quoted_text}"
+
+    def _is_reply_to_bot(self, *, event, messages: MessageRepository, quoted_raw_payload: dict | None) -> bool:
+        if event.reply_to_msg_id is None:
+            return False
+
+        quoted_message = messages.get_by_platform_msg_id(event.reply_to_msg_id)
+        if quoted_message is not None:
+            return quoted_message.user_id == self.runtime.settings.bot_qq
+
+        if isinstance(quoted_raw_payload, dict):
+            try:
+                return int(quoted_raw_payload.get("user_id", 0)) == self.runtime.settings.bot_qq
+            except (TypeError, ValueError):
+                return False
+
+        return False
 
     def _target_message_text_for_prompt(self, *, event, resolved_image_count: int = 0) -> str:
         if event.plain_text.strip():
@@ -778,7 +880,7 @@ class InboundRouter:
                 event.platform_msg_id,
             )
 
-    def _persist_inbound_message(self, event) -> bool:
+    def _persist_inbound_message(self, event, *, cache_images: bool) -> bool:
         with session_scope(self.engine) as session:
             groups = GroupRepository(session)
             users = UserRepository(session)
@@ -812,7 +914,7 @@ class InboundRouter:
                 groups.session.add(group)
             current_user = users.upsert_user(user_id=event.user_id, nickname=event.nickname, group_card=event.group_card)
             current_users_by_id = {event.user_id: current_user}
-            if event.images:
+            if cache_images and event.images:
                 cache_images_in_raw_payload(
                     event.raw_payload,
                     cache_dir=self.runtime.settings.data_dir / "image_cache",
@@ -956,10 +1058,15 @@ class InboundRouter:
             lowered_message = event.plain_text.lower()
             persona_name = str(self.runtime.persona.get("name", "")).strip()
             bot_names = self._build_bot_names(persona_name)
+            reply_to_bot = self._is_reply_to_bot(
+                event=event,
+                messages=messages,
+                quoted_raw_payload=quoted_raw_payload,
+            )
             address_decision = detect_address_intent(
                 text=lowered_message,
                 bot_names=bot_names,
-                reply_to_bot=False,
+                reply_to_bot=reply_to_bot,
                 quoted_bot=False,
                 bot_recently_participated=bot_recently_participated,
                 recent_bot_message_count=recent_bot_message_count,
@@ -968,6 +1075,7 @@ class InboundRouter:
             named_bot = address_decision.reason == "named_bot"
             addressed_turn = event.mentioned_bot or address_decision.is_addressed
             addressed_without_at = address_decision.is_addressed and not event.mentioned_bot and not named_bot
+            pending_group_images = self._consume_group_image_for_followup(event)
             resolved_image_turn = resolve_images_for_turn(
                 event=event,
                 addressed_turn=addressed_turn,
@@ -975,6 +1083,12 @@ class InboundRouter:
                 messages=messages,
                 quoted_raw_payload=quoted_raw_payload,
             )
+            if resolved_image_turn is None and pending_group_images:
+                resolved_image_turn = ResolvedImageTurn(
+                    images=pending_group_images,
+                    source_msg_id="pending-group-image",
+                    source_kind="pending",
+                )
             group_image_resolved_turn = resolved_image_turn
             if group_image_resolved_turn is None:
                 group_image_resolved_turn = resolve_images_for_turn(
@@ -1002,7 +1116,7 @@ class InboundRouter:
                     mentioned_bot=event.mentioned_bot,
                     named_bot=named_bot,
                     direct_question=("?" in event.plain_text) or ("？" in event.plain_text),
-                    same_thread_followup=(event.reply_to_msg_id is not None) or image_followup_trigger,
+                    same_thread_followup=reply_to_bot or image_followup_trigger,
                     recent_bot_reply_at=messages.last_bot_reply_at(
                         group_id=event.group_id,
                         bot_user_id=self.runtime.settings.bot_qq,
@@ -1070,6 +1184,13 @@ class InboundRouter:
             search_hits = []
             page_reads = []
             target_images = resolved_image_turn.images if resolved_image_turn is not None else []
+            if target_images and not self.runtime.settings.llm_supports_vision_input:
+                return PreparedGroupReply(
+                    should_reply=True,
+                    prebuilt_reply_text=self._build_vision_unavailable_reply(),
+                    target_images=target_images,
+                    requires_user_visible_failure_reply=True,
+                )
             search_reference_time = self._normalize_timestamp(event.timestamp).astimezone()
             explicit_search_request = is_explicit_search_request(event.plain_text)
             reference_search_request = needs_reference_search(event.plain_text)
@@ -1198,6 +1319,13 @@ class InboundRouter:
                     )
 
             proactive_turn = not addressed_turn
+            quoted_message_line = self._quoted_message_line_for_prompt(quoted_raw_payload=quoted_raw_payload)
+            prompt_target_text = self._target_message_text_for_prompt(
+                event=event,
+                resolved_image_count=len(target_images),
+            )
+            if quoted_message_line is not None:
+                prompt_target_text = f"{prompt_target_text}\nQuoted message: {quoted_message_line}"
             prompt_lines = self.context_builder.build(
                 persona_text=render_persona(self.runtime.persona),
                 safety_rules=render_safety_lines(self.runtime.safety),
@@ -1213,10 +1341,7 @@ class InboundRouter:
                 web_pages=web_pages,
                 target_message=self._format_message_line(
                     user_id=event.user_id,
-                    plain_text=self._target_message_text_for_prompt(
-                        event=event,
-                        resolved_image_count=len(target_images),
-                    ),
+                    plain_text=prompt_target_text,
                     users_by_id=users_by_id,
                 ),
             )
@@ -1297,11 +1422,12 @@ class InboundRouter:
             session.add(outbound_message)
 
     async def handle_group_message(self, event) -> None:
-        persisted = self._persist_inbound_message(event)
+        persisted = self.ingest_live_group_message(event)
         if not persisted:
             return
-        self._archive_inbound_message(event)
-        self._ingest_bbot_listener_cache(event)
+        if self._should_hold_group_image_for_followup(event):
+            self._remember_group_image_for_followup(event)
+            return
         if self._is_group_weekly_report_request(event):
             handled = await self._handle_group_weekly_report_request(event)
             if handled:
@@ -1329,6 +1455,9 @@ class InboundRouter:
         if prepared_reply.group_image_request is not None:
             await self._handle_group_image_request(event, prepared_reply.group_image_request)
             return
+        if prepared_reply.prebuilt_reply_text is not None:
+            await self._send_prebuilt_reply(event, prepared_reply.prebuilt_reply_text)
+            return
         if prepared_reply.prompt_lines is None:
             return
 
@@ -1346,7 +1475,7 @@ class InboundRouter:
                     conversation_key=conversation_key,
                 )
             reply_text = (
-                normalize_proactive_chat_reply(raw_reply)
+                normalize_brief_group_interjection_reply(raw_reply)
                 if prepared_reply.proactive_turn
                 else normalize_chat_reply(raw_reply)
             )

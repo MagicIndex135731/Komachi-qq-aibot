@@ -62,11 +62,11 @@ def test_repo_context_prefers_runtime_config_files_over_tests_for_permission_loo
         encoding="utf-8",
     )
     (repo_root / "tests" / "test_config.py").write_text(
-        "def test_private_chat_whitelist():\n    assert '20002'\n",
+        "def test_private_chat_whitelist():\n    assert '10002'\n",
         encoding="utf-8",
     )
 
-    snippets = build_repo_context_snippets(repo_root=repo_root, query="帮我查一下到底给没给20002私聊权限")
+    snippets = build_repo_context_snippets(repo_root=repo_root, query="帮我查一下到底给没给10002私聊权限")
 
     assert snippets
     assert "app/config.py" in snippets[0]

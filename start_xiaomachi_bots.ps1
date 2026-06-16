@@ -3,38 +3,16 @@ $ErrorActionPreference = "Stop"
 $OutputEncoding = [Console]::OutputEncoding
 
 $workdir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$logDir = Join-Path $workdir "data\logs"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$watchdogScript = Join-Path $workdir "scripts\xiaomachi_watchdog.ps1"
 
-. (Join-Path $workdir "scripts\xiaomachi_process_helpers.ps1")
+& powershell -NoProfile -ExecutionPolicy Bypass -File $watchdogScript -Action start -Scope runtime -HeartbeatTimeoutSeconds 180
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
-$pythonExe = Resolve-PythonExecutable $workdir
-$processSpecs = @(
-    @{
-        Name = "group"
-        Module = "app.group_main"
-        PidFile = Join-Path $logDir "group.pid"
-        Stdout = Join-Path $logDir "group.stdout.log"
-        Stderr = Join-Path $logDir "group.stderr.log"
-    },
-    @{
-        Name = "private"
-        Module = "app.private_main"
-        PidFile = Join-Path $logDir "private.pid"
-        Stdout = Join-Path $logDir "private.stdout.log"
-        Stderr = Join-Path $logDir "private.stderr.log"
-    },
-    @{
-        Name = "worker"
-        Module = "app.dev_worker_main"
-        PidFile = Join-Path $logDir "worker.pid"
-        Stdout = Join-Path $logDir "worker.stdout.log"
-        Stderr = Join-Path $logDir "worker.stderr.log"
-    }
-)
-
-foreach ($spec in $processSpecs) {
-    Start-BotSpec -Workdir $workdir -PythonExe $pythonExe -Spec $spec
+& powershell -NoProfile -ExecutionPolicy Bypass -File $watchdogScript -Action start -Scope worker
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
 
 exit 0

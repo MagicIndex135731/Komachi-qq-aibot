@@ -123,7 +123,7 @@ def test_parse_private_message_event_extracts_plain_text() -> None:
         "message_type": "private",
         "sub_type": "friend",
         "message_id": 47,
-        "user_id": 987654321,
+        "user_id": 10001,
         "raw_message": "check logs",
         "message": [{"type": "text", "data": {"text": "check logs"}}],
         "sender": {"nickname": "owner"},
@@ -133,7 +133,7 @@ def test_parse_private_message_event_extracts_plain_text() -> None:
     event = parse_private_message_event(payload)
 
     assert event.platform_msg_id == "47"
-    assert event.user_id == 987654321
+    assert event.user_id == 10001
     assert event.nickname == "owner"
     assert event.plain_text == "check logs"
 
@@ -144,7 +144,7 @@ def test_parse_private_message_event_extracts_images_and_reply_to_msg_id() -> No
         "message_type": "private",
         "sub_type": "friend",
         "message_id": 48,
-        "user_id": 987654321,
+        "user_id": 10001,
         "raw_message": "[CQ:reply,id=765262399][CQ:image,file=cat.png]",
         "message": [
             {"type": "reply", "data": {"id": "765262399"}},

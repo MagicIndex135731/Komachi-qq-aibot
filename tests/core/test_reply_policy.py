@@ -138,6 +138,15 @@ def test_reply_policy_time_sensitive_turn_stays_silent_when_group_is_idle() -> N
     assert decision.score == 0
 
 
+def test_reply_policy_interjection_opportunity_alone_stays_silent_in_active_group() -> None:
+    policy = ReplyPolicy(proactive_threshold=4)
+    decision = policy.decide(make_policy_input(group_traffic_last_minute=9, has_interjection_opportunity=True))
+
+    assert decision.should_reply is False
+    assert decision.reason == "below_threshold"
+    assert decision.score == 3
+
+
 def test_reply_policy_blocks_proactive_turn_inside_active_interval() -> None:
     policy = ReplyPolicy(proactive_threshold=4)
     now = datetime(2026, 5, 8, 12, 4, tzinfo=UTC)

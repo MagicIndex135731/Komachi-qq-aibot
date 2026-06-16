@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import Field
@@ -15,8 +15,14 @@ class AppSettings(BaseSettings):
     napcat_ws_url: str = Field(alias="NAPCAT_WS_URL")
     llm_base_url: str = Field(alias="LLM_BASE_URL")
     llm_api_key: str = Field(alias="LLM_API_KEY")
-    llm_model: str = Field(alias="LLM_MODEL")
-    llm_text_endpoint: str = Field(default="/chat/completions", alias="LLM_TEXT_ENDPOINT")
+    llm_model: str = Field(default="gpt-5.4-mini", alias="LLM_MODEL")
+    llm_fallback_model: str = Field(default="gpt-5.4", alias="LLM_FALLBACK_MODEL")
+    llm_text_endpoint: Literal["chat_completions", "responses"] = Field(
+        default="chat_completions",
+        alias="LLM_TEXT_ENDPOINT",
+    )
+    llm_supports_vision_input: bool = Field(default=True, alias="LLM_SUPPORTS_VISION_INPUT")
+    llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
     group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")
     group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
