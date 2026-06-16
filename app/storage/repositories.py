@@ -228,6 +228,37 @@ class MessageRepository:
                 break
         return list(reversed(recent_messages))
 
+    def list_group_messages_since(
+        self,
+        *,
+        group_id: int,
+        since: datetime,
+        bot_user_id: int,
+        limit: int,
+    ) -> list[Message]:
+        if limit <= 0:
+            return []
+        stmt = (
+            select(Message)
+            .where(
+                Message.group_id == group_id,
+                Message.timestamp >= since,
+            )
+            .order_by(Message.timestamp.asc(), Message.id.asc())
+        )
+        kept_messages = []
+        for message in self.session.scalars(stmt):
+            if self._is_reserved_outbound(message):
+                continue
+            if message.user_id == bot_user_id:
+                continue
+            if str(message.plain_text or "").strip() == "":
+                continue
+            kept_messages.append(message)
+            if len(kept_messages) >= limit:
+                break
+        return kept_messages
+
     def list_recent_group_user_ids(self, *, group_id: int, limit: int) -> list[int]:
         latest_message_at = func.max(Message.timestamp).label("latest_message_at")
         stmt = (

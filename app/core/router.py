@@ -18,6 +18,7 @@ from app.core.bbot_listener_cache import (
 from app.core.chat_style import build_human_chat_style_lines, normalize_chat_reply, normalize_proactive_chat_reply
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
+from app.core.group_weekly_report import build_group_weekly_report
 from app.core.image_cache import cache_images_in_raw_payload
 from app.core.message_archive import append_group_message_archive
 from app.core.image_turn_resolver import ResolvedImageTurn, resolve_images_for_turn
@@ -332,6 +333,41 @@ class InboundRouter:
         if target_images:
             return "我这边刚刚图没读出来，你再发一下或者再叫我一次。"
         return "我这边刚刚卡了一下，结果没拿到。你再叫我一次，我马上接上。"
+
+    def _is_group_weekly_report_request(self, event) -> bool:
+        if not event.mentioned_bot:
+            return False
+        stripped = self._strip_group_image_prefix(event.plain_text)
+        normalized = re.sub(r"\s+", "", stripped)
+        return normalized == "周报"
+
+    async def _handle_group_weekly_report_request(self, event) -> bool:
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            users = UserRepository(session)
+            since = self._normalize_timestamp(event.timestamp) - timedelta(days=7)
+            weekly_messages = messages.list_group_messages_since(
+                group_id=event.group_id,
+                since=since,
+                bot_user_id=self.runtime.settings.bot_qq,
+                limit=400,
+            )
+            users_by_id = users.get_users_by_ids([message.user_id for message in weekly_messages])
+        result = build_group_weekly_report(
+            group_id=event.group_id,
+            now=event.timestamp,
+            messages=weekly_messages,
+            users_by_id=users_by_id,
+            llm_client=self.llm_client,
+        )
+        if not result.ok:
+            if result.error_code == "insufficient_data":
+                await self._send_prebuilt_reply(event, "这周素材太少，周报凑不出来")
+            else:
+                await self._send_prebuilt_reply(event, "周报生成失败，稍后再试")
+            return True
+        await self._send_prebuilt_reply(event, result.reply_text)
+        return True
 
     async def _send_prebuilt_reply(self, event, reply_text: str) -> None:
         reserved = self._reserve_outbound_reply(event, reply_text)
@@ -1266,6 +1302,10 @@ class InboundRouter:
             return
         self._archive_inbound_message(event)
         self._ingest_bbot_listener_cache(event)
+        if self._is_group_weekly_report_request(event):
+            handled = await self._handle_group_weekly_report_request(event)
+            if handled:
+                return
         if self._is_admin_usage_query(event):
             await self._send_prebuilt_reply(event, self._build_admin_usage_report(event))
             return
