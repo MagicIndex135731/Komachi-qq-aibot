@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 import logging
@@ -324,6 +325,11 @@ class InboundRouter:
         except ValueError:
             return None
 
+    def _group_policy_bool(self, *, group_id: int, key: str, default: bool) -> bool:
+        defaults = self.runtime.group_policy.get("default_group_behavior", {})
+        configured = self.runtime.group_policy.get("groups", {}).get(str(group_id), {})
+        return bool(configured.get(key, defaults.get(key, default)))
+
     def _normalize_timestamp(self, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
@@ -394,7 +400,8 @@ class InboundRouter:
                 limit=400,
             )
             users_by_id = users.get_users_by_ids([message.user_id for message in weekly_messages])
-        result = build_group_weekly_report(
+        result = await asyncio.to_thread(
+            build_group_weekly_report,
             group_id=event.group_id,
             now=event.timestamp,
             messages=weekly_messages,
@@ -619,6 +626,8 @@ class InboundRouter:
     ) -> GroupImageGenerationRequest | None:
         if self.group_image_service is None:
             return None
+        if not self._group_policy_bool(group_id=event.group_id, key="image_generation", default=True):
+            return None
         stripped = self._strip_group_image_prefix(event.plain_text)
         if not stripped:
             return None
@@ -833,6 +842,8 @@ class InboundRouter:
         return enabled, speak_enabled, proactive_enabled, proactive_interval, quiet_hours, group_policy_lines
 
     def _archive_inbound_message(self, event) -> None:
+        if not self._group_policy_bool(group_id=event.group_id, key="archive", default=False):
+            return
         try:
             append_group_message_archive(
                 history_dir=self.runtime.settings.data_dir / "history",
@@ -857,6 +868,8 @@ class InboundRouter:
             )
 
     def _archive_outbound_reply(self, event, reply_text: str) -> None:
+        if not self._group_policy_bool(group_id=event.group_id, key="archive", default=False):
+            return
         try:
             append_group_message_archive(
                 history_dir=self.runtime.settings.data_dir / "history",
@@ -1421,6 +1434,25 @@ class InboundRouter:
             }
             session.add(outbound_message)
 
+    def _generate_group_reply_text(self, *, event, prepared_reply: PreparedGroupReply) -> str:
+        conversation_key = f"group:{event.group_id}"
+        if prepared_reply.target_images:
+            raw_reply = self.llm_client.generate_text(
+                prepared_reply.prompt_lines,
+                images=prepared_reply.target_images,
+                conversation_key=conversation_key,
+            )
+        else:
+            raw_reply = self.llm_client.generate_text(
+                prepared_reply.prompt_lines,
+                conversation_key=conversation_key,
+            )
+        return (
+            normalize_brief_group_interjection_reply(raw_reply)
+            if prepared_reply.proactive_turn
+            else normalize_chat_reply(raw_reply)
+        )
+
     async def handle_group_message(self, event) -> None:
         persisted = self.ingest_live_group_message(event)
         if not persisted:
@@ -1449,7 +1481,11 @@ class InboundRouter:
                 await self._send_prebuilt_reply(event, build_bbot_outbound_message(rewritten_command))
                 return
         quoted_raw_payload = await self._fetch_quoted_message_payload(reply_to_msg_id=event.reply_to_msg_id)
-        prepared_reply = self._prepare_group_reply(event, quoted_raw_payload=quoted_raw_payload)
+        prepared_reply = await asyncio.to_thread(
+            self._prepare_group_reply,
+            event,
+            quoted_raw_payload=quoted_raw_payload,
+        )
         if not prepared_reply.should_reply:
             return
         if prepared_reply.group_image_request is not None:
@@ -1462,22 +1498,10 @@ class InboundRouter:
             return
 
         try:
-            conversation_key = f"group:{event.group_id}"
-            if prepared_reply.target_images:
-                raw_reply = self.llm_client.generate_text(
-                    prepared_reply.prompt_lines,
-                    images=prepared_reply.target_images,
-                    conversation_key=conversation_key,
-                )
-            else:
-                raw_reply = self.llm_client.generate_text(
-                    prepared_reply.prompt_lines,
-                    conversation_key=conversation_key,
-                )
-            reply_text = (
-                normalize_brief_group_interjection_reply(raw_reply)
-                if prepared_reply.proactive_turn
-                else normalize_chat_reply(raw_reply)
+            reply_text = await asyncio.to_thread(
+                self._generate_group_reply_text,
+                event=event,
+                prepared_reply=prepared_reply,
             )
         except Exception:
             logger.exception(

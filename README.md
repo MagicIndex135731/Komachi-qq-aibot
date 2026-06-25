@@ -60,7 +60,7 @@ PRIVATE_CHAT_QQS=
 - `LLM_BASE_URL`
   文本主聊天的 API 根地址。常见写法是 `https://api.openai.com/v1` 或你自己的代理地址 `https://your-host/v1`。
 - `LLM_TEXT_ENDPOINT`
-  主文本聊天链路。当前公开版统一走 OpenAI 兼容的 `/chat/completions`。
+  主文本聊天链路。可选 `chat_completions` 或 `responses`。大多数 OpenAI 兼容接口用 `chat_completions`。
 - `LLM_API_KEY`
   文本聊天用的 key。
 - `LLM_MODEL`
@@ -92,7 +92,10 @@ PRIVATE_CHAT_QQS=
 - `GROUP_IMAGE_MODERATION`
 - `GROUP_IMAGE_QUEUE_CAPACITY`
 - `SEARCH_PROVIDER`
+- `SEARCH_BASE_URL`
 - `SEARCH_API_KEY`
+- `SEARCH_REGION`
+- `SEARCH_BACKEND`
 - `CONTEXT_RECENT_LIMIT`
 - `CONTEXT_SUMMARY_LIMIT`
 - `CONTEXT_HISTORY_LIMIT`
@@ -100,6 +103,7 @@ PRIVATE_CHAT_QQS=
 - `NAPCAT_SHELL_DIR`
 - `NAPCAT_BOOT_PATH`
 - `NAPCAT_INJECT_DLL_PATH`
+- `NAPCAT_WAIT_TIMEOUT_SECONDS`
 
 ### 3. 检查示例配置
 
@@ -117,7 +121,7 @@ PRIVATE_CHAT_QQS=
 - 只给你真正想让机器人开口的群设置 `speak: true`
 - 如果不想使用默认人设，就改 `configs/persona.yaml`
 
-only groups with both `enabled: true` and `speak: true` are ingested
+只有同时设置 `enabled: true` 和 `speak: true` 的群，才会进入群聊处理链路。
 
 ### 4. 启动
 
@@ -134,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File start_xiaomachi.ps1
 ```
 
 如果你喜欢双击启动，仓库根目录也带了 `.bat` 启动器。
-`启动小町.bat` starts QQ, NapCat, and the Python bot together，`关闭小町.bat` 用来关闭这一套本地启动栈。
+`启动小町.bat` 会一起拉起 QQ、NapCat 和小町的 Python 进程，`关闭小町.bat` 用来关闭这一套本地启动栈。
 
 ## 主聊天与生图接口怎么配
 
@@ -143,18 +147,18 @@ powershell -ExecutionPolicy Bypass -File start_xiaomachi.ps1
 这个公开版的主文本聊天链路已经统一成：
 
 ```text
-OpenAI-compatible /chat/completions
+OpenAI 兼容聊天接口
 ```
 
 对应配置就是：
 
 ```env
 LLM_BASE_URL=https://api.openai.com/v1
-LLM_TEXT_ENDPOINT=/chat/completions
+LLM_TEXT_ENDPOINT=chat_completions
 LLM_MODEL=gpt-5.4
 ```
 
-如果你的供应商不是标准路径，只改 `LLM_TEXT_ENDPOINT` 即可，不需要再改代码。
+如果你的供应商支持 Responses API，可以把 `LLM_TEXT_ENDPOINT` 改成 `responses`。如果是常见兼容 `/chat/completions` 的代理，保持 `chat_completions` 即可。
 
 ### 群聊生图
 
@@ -310,8 +314,70 @@ Bot: 我先补触发分支和回归测试，跑完后给你结果。
   只跑本地开发 worker
 - `powershell -ExecutionPolicy Bypass -File start_xiaomachi_runtime.ps1`
   分进程启动脚本
+- `powershell -ExecutionPolicy Bypass -File start_xiaomachi_bots.ps1`
+  只启动小町的群聊、私聊和开发 worker，不负责 QQ/NapCat
+- `powershell -ExecutionPolicy Bypass -File stop_xiaomachi_runtime.ps1`
+  停止分进程运行时和对应 watchdog
 - `powershell -ExecutionPolicy Bypass -File scripts/install_service.ps1`
   安装为 Windows 服务
+
+## Watchdog 和心跳机制
+
+现在推荐使用分进程运行模式。`start_xiaomachi_runtime.ps1` 会启动多个 watchdog，每个 watchdog 负责一个范围：
+
+- `group`
+  群聊进程，入口是 `python -m app.group_main`
+- `private`
+  私聊和管理员模式进程，入口是 `python -m app.private_main`
+- `worker`
+  本地开发任务 worker，入口是 `python -m app.dev_worker_main`
+
+每个 Python 进程都会定期写心跳文件到 `data/logs/`：
+
+- `group.heartbeat.json`
+- `private.heartbeat.json`
+- `worker.heartbeat.json`
+
+群聊进程还会额外写：
+
+- `group.onebot_health.json`
+  记录 OneBot 登录态是否在线
+- `group.stream_health.json`
+  记录群消息流是否长时间没有推进
+
+如果要让 watchdog 监控指定群的消息流，在 `.env` 中设置：
+
+```env
+GROUP_STREAM_WATCH_GROUP_ID=10001
+GROUP_STREAM_MAX_LAG_SECONDS=1800
+```
+
+`GROUP_STREAM_WATCH_GROUP_ID=0` 表示不绑定具体群号，只依赖进程心跳和 OneBot 在线状态。
+
+watchdog 的主要作用：
+
+- 发现进程退出后自动拉起对应组件
+- 发现心跳过期、PID 不匹配或启动失败时重启对应组件
+- 发现群消息流卡住时优先重启 NapCat/群聊链路
+- 发现 OneBot 登录态离线时进入人工登录模式，弹出桌面提示，并停止小町运行侧，避免一直弹二维码或无限重启
+- 写入 `*.watchdog.log`，方便排查为什么重启
+- 使用 stop marker 配合停止脚本，避免你主动停止时又被 watchdog 拉起来
+
+常用脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start_xiaomachi_runtime.ps1
+powershell -ExecutionPolicy Bypass -File stop_xiaomachi_runtime.ps1
+powershell -ExecutionPolicy Bypass -File scripts/xiaomachi_watchdog.ps1 -Scope group -Action status
+```
+
+如果 QQ/NapCat 被踢下线，推荐流程是：
+
+1. 先看桌面提示或 `data/logs/xiaomachi.alert.json`
+2. 重新登录 QQ/NapCat
+3. 再运行 `启动小町.bat` 或 `start_xiaomachi_runtime.ps1`
+
+一般不要同时用管理员权限和普通权限混着启动/停止。不同权限级别的进程互相看不到或关不掉，容易留下高权限旧进程。
 
 ## 配置文件说明
 
@@ -332,9 +398,14 @@ Bot: 我先补触发分支和回归测试，跑完后给你结果。
 
 - `enabled`
 - `archive`
+  是否把群消息额外写成 `data/history/group-*/YYYY-MM-DD.jsonl` 本地归档。关闭后仍可保留数据库里的近期上下文。
 - `speak`
 - `proactive_reply`
+  是否允许未点名时主动插话。
 - `proactive_interval_seconds`
+  主动插话冷却区间。
+- `image_generation`
+  是否允许这个群触发生图队列。关闭后不影响普通文字聊天，也不影响已有的近期上下文。
 
 默认策略是白名单外一律不启用。
 
