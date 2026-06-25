@@ -15,6 +15,9 @@ data/generated_private_images/
 data/image_cache/
 data/logs/*
 !data/logs/.gitkeep
+data/napcat/
+.codex_tmp*/
+.tmp*/
 .pytest_tmp/
 .tmp_pytest*/
 dbg_service_*/

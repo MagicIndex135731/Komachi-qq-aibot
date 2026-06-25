@@ -13,7 +13,7 @@ import app.private_main as private_main
 from app.config import AppSettings
 
 
-def _settings() -> AppSettings:
+def _settings(tmp_path: Path) -> AppSettings:
     return AppSettings.model_construct(
         napcat_ws_url="ws://127.0.0.1:3001",
         llm_base_url="https://api.example.test/v1",
@@ -36,8 +36,8 @@ def _settings() -> AppSettings:
         context_recent_limit=60,
         context_summary_limit=3,
         context_history_limit=8,
-        config_dir=Path("configs"),
-        data_dir=Path("data"),
+        config_dir=tmp_path / "configs",
+        data_dir=tmp_path / "data",
     )
 
 
@@ -65,8 +65,8 @@ class FakeGateway:
 
 
 @pytest.mark.asyncio
-async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None:
-    settings = _settings()
+async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
     captured: dict[str, object] = {}
     FakeGateway.instances.clear()
 
@@ -106,8 +106,8 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch) -> None
     assert FakeGateway.instances[0].reconnect_forever is True
 
 
-async def test_private_main_disables_local_worker(monkeypatch) -> None:
-    settings = _settings()
+async def test_private_main_disables_local_worker(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
     captured: dict[str, object] = {}
     search_client = object()
     reminder_events: list[str] = []
@@ -175,8 +175,8 @@ async def test_private_main_disables_local_worker(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_main_waits_for_gateway_before_starting_services(monkeypatch) -> None:
-    settings = _settings()
+async def test_private_main_waits_for_gateway_before_starting_services(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
     events: list[str] = []
     search_client = object()
     FakeGateway.instances.clear()
@@ -250,8 +250,8 @@ async def test_private_main_waits_for_gateway_before_starting_services(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dev_worker_main_enables_local_worker(monkeypatch) -> None:
-    settings = _settings()
+async def test_dev_worker_main_enables_local_worker(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
     captured: dict[str, object] = {}
 
     def fake_llm_client(**kwargs):

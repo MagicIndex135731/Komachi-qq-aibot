@@ -41,7 +41,7 @@ def test_readme_mentions_search_and_context_limits() -> None:
 
     assert "SEARCH_API_KEY" in readme
     assert "CONTEXT_RECENT_LIMIT" in readme
-    assert "only groups with both `enabled: true` and `speak: true` are ingested" in readme
+    assert "只有同时设置 `enabled: true` 和 `speak: true` 的群" in readme
     assert "enabled: true" in readme
     assert "speak: true" in readme
 
@@ -141,7 +141,7 @@ def test_stop_script_can_close_launcher_managed_stack() -> None:
 def test_readme_mentions_one_click_launcher_dependencies() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "starts QQ, NapCat, and the Python bot together" in readme
+    assert "一起拉起 QQ、NapCat 和小町的 Python 进程" in readme
     assert "QQ_EXE_PATH" in readme
     assert "NAPCAT_SHELL_DIR" in readme
 

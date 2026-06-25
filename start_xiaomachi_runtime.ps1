@@ -4,6 +4,6 @@ $OutputEncoding = [Console]::OutputEncoding
 
 $workdir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $watchdogScript = Join-Path $workdir "scripts\xiaomachi_watchdog.ps1"
-& powershell -NoProfile -ExecutionPolicy Bypass -File $watchdogScript -Action start -Scope runtime
+& powershell -NoProfile -ExecutionPolicy Bypass -File $watchdogScript -Action start -Scope runtime -HeartbeatTimeoutSeconds 180 -OneBotStatusProbeIntervalSeconds 15 -OneBotGroupStreamProbeIntervalSeconds 60
 
 exit 0

@@ -46,11 +46,16 @@ def should_speak_in_group(*, group_id: int, group_policy: dict[str, Any]) -> boo
     return bool(entry.get("enabled", False) and entry.get("speak", False))
 
 
+def should_archive_group_history(*, group_id: int, group_policy: dict[str, Any]) -> bool:
+    entry = _group_policy_entry(group_id=group_id, group_policy=group_policy)
+    return bool(entry.get("enabled", False) and entry.get("speak", False) and entry.get("archive", False))
+
+
 def sync_history_archives(engine, runtime) -> dict[int, int]:
     allowed_group_ids = {
         int(group_id)
         for group_id in runtime.group_policy.get("groups", {})
-        if should_ingest_group_message(group_id=int(group_id), group_policy=runtime.group_policy)
+        if should_archive_group_history(group_id=int(group_id), group_policy=runtime.group_policy)
     }
     return sync_group_message_archives_from_db(
         engine=engine,
@@ -182,104 +187,107 @@ def build_group_image_service(
 async def run() -> None:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
-    engine = build_engine(settings.sqlite_path)
-    create_all(engine)
-    sync_history_archives(engine, runtime)
-
-    gateway = NapCatGateway(ws_url=settings.napcat_ws_url, reconnect_forever=True)
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "app.heartbeat.json")
-    sender = Sender(gateway)
-    llm_client = build_llm_client(settings=settings, engine=engine)
-    group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
-    web_search_client = build_web_search_client(settings)
-    group_image_service = build_group_image_service(
-        settings=settings,
-        llm_client=group_image_llm_client,
-        sender=sender,
-        web_search_client=web_search_client,
-    )
-    persistent_group_engine = engine if hasattr(engine, "connect") else None
-    if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
-        group_image_service.engine = persistent_group_engine
-    if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
-        await group_image_service.start()
-    dev_control_service = DevControlService(
-        engine=engine,
-        sender=sender,
-        llm_client=llm_client,
-        image_llm_client=group_image_llm_client,
-        owner_qq=settings.owner_qq,
-        bot_qq=settings.bot_qq,
-        private_chat_qqs=settings.private_chat_whitelist,
-        admin_qqs=settings.admin_whitelist,
-        repo_root=Path(__file__).resolve().parent.parent,
-        data_dir=settings.data_dir,
-        web_search_client=web_search_client,
-        image_model=settings.group_image_model,
-        image_size=settings.group_image_size,
-        image_quality=settings.group_image_quality,
-        image_background=settings.group_image_background,
-        image_output_format=settings.group_image_output_format,
-        image_output_compression=settings.group_image_output_compression,
-        image_moderation=settings.group_image_moderation,
-        image_queue_capacity=settings.group_image_queue_capacity,
-        assistant_name=str(runtime.persona.get("name", "Codex")),
-        persona=runtime.persona,
-        safety=runtime.safety,
-    )
-    await dev_control_service.start()
-    router = InboundRouter(
-        engine=engine,
-        runtime=runtime,
-        sender=sender,
-        llm_client=llm_client,
-        reply_policy=ReplyPolicy(),
-        context_builder=ContextBuilder(),
-        admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
-        web_search_client=web_search_client,
-        dev_control_service=dev_control_service,
-        group_image_service=group_image_service,
-    )
-
-    async def handle_payload(payload: dict) -> None:
-        if payload.get("post_type") != "message":
-            return
-
-        message_type = payload.get("message_type")
-        if message_type == "private":
-            event = parse_private_message_event(payload)
-            await router.handle_private_message(event)
-            return
-
-        if message_type != "group":
-            return
-        group_id = int(payload["group_id"])
-        if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):
-            return
-
-        event = parse_group_message_event(
-            payload,
-            bot_qq=settings.bot_qq,
-            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
-        )
-        await router.handle_group_message(event)
-
-    async def backfill_group_history_on_connect() -> None:
-        await backfill_recent_group_history(
-            router=router,
-            gateway=gateway,
-            bot_qq=settings.bot_qq,
-            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
-        )
-
-    logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=settings.llm_model))
+    group_image_service = None
+    dev_control_service = None
     try:
         await heartbeat.start()
+        engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
+        await asyncio.to_thread(create_all, engine)
+        await asyncio.to_thread(sync_history_archives, engine, runtime)
+
+        gateway = NapCatGateway(ws_url=settings.napcat_ws_url, reconnect_forever=True)
+        sender = Sender(gateway)
+        llm_client = build_llm_client(settings=settings, engine=engine)
+        group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+        web_search_client = build_web_search_client(settings)
+        group_image_service = build_group_image_service(
+            settings=settings,
+            llm_client=group_image_llm_client,
+            sender=sender,
+            web_search_client=web_search_client,
+        )
+        persistent_group_engine = engine if hasattr(engine, "connect") else None
+        if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
+            group_image_service.engine = persistent_group_engine
+        if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
+            await group_image_service.start()
+        dev_control_service = DevControlService(
+            engine=engine,
+            sender=sender,
+            llm_client=llm_client,
+            image_llm_client=group_image_llm_client,
+            owner_qq=settings.owner_qq,
+            bot_qq=settings.bot_qq,
+            private_chat_qqs=settings.private_chat_whitelist,
+            admin_qqs=settings.admin_whitelist,
+            repo_root=Path(__file__).resolve().parent.parent,
+            data_dir=settings.data_dir,
+            web_search_client=web_search_client,
+            image_model=settings.group_image_model,
+            image_size=settings.group_image_size,
+            image_quality=settings.group_image_quality,
+            image_background=settings.group_image_background,
+            image_output_format=settings.group_image_output_format,
+            image_output_compression=settings.group_image_output_compression,
+            image_moderation=settings.group_image_moderation,
+            image_queue_capacity=settings.group_image_queue_capacity,
+            assistant_name=str(runtime.persona.get("name", "Codex")),
+            persona=runtime.persona,
+            safety=runtime.safety,
+        )
+        await dev_control_service.start()
+        router = InboundRouter(
+            engine=engine,
+            runtime=runtime,
+            sender=sender,
+            llm_client=llm_client,
+            reply_policy=ReplyPolicy(),
+            context_builder=ContextBuilder(),
+            admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
+            web_search_client=web_search_client,
+            dev_control_service=dev_control_service,
+            group_image_service=group_image_service,
+        )
+
+        async def handle_payload(payload: dict) -> None:
+            if payload.get("post_type") != "message":
+                return
+
+            message_type = payload.get("message_type")
+            if message_type == "private":
+                event = parse_private_message_event(payload)
+                await router.handle_private_message(event)
+                return
+
+            if message_type != "group":
+                return
+            group_id = int(payload["group_id"])
+            if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):
+                return
+
+            event = parse_group_message_event(
+                payload,
+                bot_qq=settings.bot_qq,
+                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+            )
+            await router.handle_group_message(event)
+
+        async def backfill_group_history_on_connect() -> None:
+            await backfill_recent_group_history(
+                router=router,
+                gateway=gateway,
+                bot_qq=settings.bot_qq,
+                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+            )
+
+        logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=settings.llm_model))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
-        if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
+        if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
-        await dev_control_service.stop()
+        if dev_control_service is not None:
+            await dev_control_service.stop()
         await heartbeat.stop()
 
 

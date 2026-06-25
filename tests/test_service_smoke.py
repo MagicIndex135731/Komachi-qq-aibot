@@ -61,7 +61,7 @@ def test_build_group_image_llm_client_reuses_primary_client_without_override() -
 
 def test_build_group_image_llm_client_builds_separate_client_with_override(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.group_image_base_url = "https://api.xbai.top/v1"
+    settings.group_image_base_url = "https://images.example.test/v1"
     settings.group_image_api_key = "image-key"
     captured: dict[str, object] = {}
     built_client = object()
@@ -71,7 +71,7 @@ def test_build_group_image_llm_client_builds_separate_client_with_override(monke
     result = build_group_image_llm_client(settings=settings, engine=object(), llm_client=object())
 
     assert result is built_client
-    assert captured["base_url"] == "https://api.xbai.top/v1"
+    assert captured["base_url"] == "https://images.example.test/v1"
     assert captured["api_key"] == "image-key"
     assert captured["model"] == "gpt-5.4"
     assert isinstance(captured["http_client"], httpx.Client)
@@ -151,7 +151,7 @@ def test_group_helpers_distinguish_ingest_and_speak() -> None:
     assert should_speak_in_group(group_id=40004, group_policy=group_policy) is False
 
 
-def test_sync_history_archives_only_targets_speak_enabled_groups(monkeypatch) -> None:
+def test_sync_history_archives_only_targets_archive_enabled_speaking_groups(monkeypatch) -> None:
     captured = {}
 
     monkeypatch.setattr(
@@ -168,7 +168,8 @@ def test_sync_history_archives_only_targets_speak_enabled_groups(monkeypatch) ->
         group_policy={
             "default_group_behavior": {"enabled": False, "speak": False},
             "groups": {
-                "10001": {"enabled": True, "speak": True},
+                "10001": {"enabled": True, "archive": True, "speak": True},
+                "10002": {"enabled": True, "archive": False, "speak": True},
                 "20002": {"enabled": True, "speak": False},
                 "30003": {"enabled": False, "speak": True},
             },

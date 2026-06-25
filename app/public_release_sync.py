@@ -221,7 +221,6 @@ class PublicReleaseSync:
             ".venv",
             ".pytest_cache",
             ".pytest_tmp",
-            ".tmp_pytest",
             ".worktrees",
             "__pycache__",
             "docs",
@@ -230,7 +229,7 @@ class PublicReleaseSync:
         }
         if top_level in ignored_top_levels:
             return True
-        if top_level.startswith(".tmp_pytest"):
+        if top_level.startswith(".tmp") or top_level.startswith(".codex_tmp"):
             return True
         if top_level.startswith("dbg_service_"):
             return True
@@ -247,9 +246,15 @@ class PublicReleaseSync:
         if top_level == "data":
             if len(parts) == 1:
                 return True
-            if parts[1] in {"history", "dev_control", "image_cache", "generated_images", "generated_private_images"}:
-                return True
-            if len(parts) > 1 and parts[1] == "logs":
+            if parts[1] in {
+                "history",
+                "dev_control",
+                "image_cache",
+                "generated_images",
+                "generated_private_images",
+                "logs",
+                "napcat",
+            }:
                 return True
             if relative_path.name in {
                 "bot.db",
