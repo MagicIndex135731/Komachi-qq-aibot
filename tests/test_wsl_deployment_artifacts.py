@@ -19,10 +19,7 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/scripts/onebot_watchdog.py",
         "infra/wsl/scripts/notify_windows.ps1",
         "infra/wsl/scripts/keepalive.sh",
-        "infra/wsl/scripts/run_entry.ps1",
         "infra/wsl/scripts/xiaomachi-wsl-entry.sh",
-        "infra/wsl/scripts/sync_from_windows.ps1",
-        "infra/wsl/scripts/redact_env.ps1",
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
@@ -47,7 +44,6 @@ def test_windows_bat_entries_use_ascii_only_wsl_repo_discovery() -> None:
         assert "wsl.exe bash -lc" not in content
         assert "%~dp0" not in content
         assert "powershell" not in content.lower()
-        assert "run_entry.ps1" not in content
 
     entry = (REPO_ROOT / "infra/wsl/scripts/xiaomachi-wsl-entry.sh").read_text(encoding="utf-8")
     assert "for base in /mnt/d /mnt/e /mnt/c" in entry

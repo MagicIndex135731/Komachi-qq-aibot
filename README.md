@@ -1,525 +1,127 @@
-﻿# QQ AI Bot
+# 小町 QQ AI Bot（WSL/Docker）
 
-基于 NapCat 的本地 QQ AI Bot 公开版，支持群聊陪聊、私聊记忆、联网搜索、群内生图，以及仅限 `OWNER_QQ` 的项目管理员模式。
+当前支持的部署方式是 WSL2 + Docker：NapCat、QQ 登录态和小町 Python 进程都运行在 WSL/Docker 中，Windows 只保留四个操作入口。
 
-## 功能概览
+## 日常操作
 
-- 群聊自然回复，尽量像群成员而不是客服机器人
-- 私聊连续上下文
-- 识图、跟图追问、引用图片继续聊
-- 文生图和参考图重绘
-- 可选实时联网搜索
-- 白名单管理员指令
-- 仅 `OWNER_QQ` 可进入的项目管理员模式
-- Windows 一键启动脚本
+在资源管理器中双击：
 
-## 环境要求
+- `start-xiaomachi-wsl.bat`：启动 NapCat、小町和 watchdog。QQ 未登录时会自动打开 NapCat WebUI。
+- `stop-xiaomachi-wsl.bat`：停止当前 WSL 小町栈。
+- `status-xiaomachi-wsl.bat`：检查容器、OneBot 会话和小町心跳。
+- `open-napcat-webui.bat`：手动打开 NapCat 登录页面，不启动或重启容器。
 
-- Windows
-- QQ 桌面端
-- NapCat / NapCat Shell
-- Python `>=3.12`
-- 一个 OpenAI 兼容接口
+不要删除 `D:\xiaomachi-wsl-entry.sh`。三个 WSL BAT 通过这个固定 ASCII 路径查找仓库，避免中文路径经过 CMD/WSL 参数传递时乱码。
 
-## 快速开始
+## 首次配置
 
-### 1. 安装依赖
+要求：Windows 11、WSL2、Docker，以及一个可用的 Ubuntu WSL 发行版。
+
+1. 在 WSL 中初始化目录和探针环境：
+
+   ```bash
+   cd "/mnt/d/qq群ai小人"
+   bash infra/wsl/scripts/bootstrap_wsl.sh
+   ```
+
+2. 编辑本地文件 `infra/wsl/.env`。至少填写：
+
+   ```dotenv
+   BOT_QQ=
+   OWNER_QQ=
+   LLM_BASE_URL=
+   LLM_API_KEY=
+   LLM_MODEL=gpt-5.6-terra
+   LLM_TEXT_ENDPOINT=responses
+   LLM_REASONING_EFFORT=medium
+   ```
+
+3. 如果固定入口丢失，从仓库恢复：
+
+   ```powershell
+   Copy-Item .\infra\wsl\scripts\xiaomachi-wsl-entry.sh D:\xiaomachi-wsl-entry.sh
+   ```
+
+`.env`、API key、QQ 密码、WebUI token 和验证码链接不得提交 Git。
+
+## 配置
+
+### 群和人格
+
+- `configs/groups.yaml`：控制群是否接收、发言、主动回复、归档和生图。
+- `configs/persona.yaml`：人格、称呼和回复风格。
+- `configs/safety.yaml`：安全限制。
+
+群配置只有同时设置 `enabled: true` 和 `speak: true` 才允许小町在该群回复。
+
+### 文本、搜索和上下文
+
+常用环境变量位于 `infra/wsl/.env.example`：
+
+- `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`
+- `LLM_TEXT_ENDPOINT`、`LLM_REASONING_EFFORT`
+- `SEARCH_API_KEY`、`SEARCH_PROVIDER`、`SEARCH_TIMEOUT_SECONDS`
+- `CONTEXT_RECENT_LIMIT`、`CONTEXT_SUMMARY_LIMIT`、`CONTEXT_HISTORY_LIMIT`
+- `GROUP_IMAGE_MODEL` 及相关生图端点配置
+
+修改 `infra/wsl/.env` 后，需要重建小町容器才能加载新环境变量：
+
+```bash
+cd "/mnt/d/qq群ai小人/infra/wsl"
+docker compose up -d --force-recreate xiaomachi
+```
+
+## 运行结构
+
+- `xiaomachi-napcat`：NapCat 和 NTQQ，端口仅映射到本机 `127.0.0.1:6099`、`127.0.0.1:3001`。
+- `xiaomachi-bot`：运行 `python -m app.group_main`。
+- `.venv-wsl`：供 keepalive、OneBot 探针和登录 watchdog 使用，不是旧 Windows 虚拟环境。
+- `infra/wsl/scripts/onebot_watchdog.py`：主动调用 `get_status` 和 `get_group_list(no_cache=true)`；连续异常时只重启 NapCat 一次，仍需登录时通知 Windows。
+
+## 不能删除的数据
+
+以下内容不进入 Git，但属于当前运行态：
+
+- `infra/wsl/.env`
+- `infra/wsl/runtime/napcat/ntqq`：QQ 登录态
+- `infra/wsl/runtime/napcat/config`：NapCat/OneBot 配置
+- `infra/wsl/runtime/logs` 和 watchdog 状态
+- `.venv-wsl`
+- `data/bot.db*`：聊天数据库
+- `data/history`：群消息归档
+- `data/image_cache`：收到的图片缓存
+- `data/generated_images`：生成图片
+
+Git 只能恢复已跟踪源码，不能恢复这些本地状态。
+
+## 故障排查
+
+先运行 `status-xiaomachi-wsl.bat`。常见情况：
+
+- 容器 healthy 但 OneBot 离线：运行 `open-napcat-webui.bat` 完成验证码或重新登录。
+- WebSocket 持续握手失败：通常是 QQ 未登录，不代表模型配置失败。
+- 修改模型后未生效：重建 `xiaomachi` 容器，并从容器环境确认非敏感变量。
+- 登录反复失效：保留 `infra/wsl/runtime/napcat/ntqq`，查看 NapCat 日志和 watchdog 状态，不要删除登录态目录。
+
+## 开发与测试
+
+本地开发环境可随时重建：
 
 ```powershell
-python -m venv .venv
-. .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-### 2. 创建 `.env`
+提交前至少运行受影响测试、`docker compose config`、PowerShell/Bash 语法检查和 `git diff --check`。
 
-把 `.env.example` 复制成 `.env`，至少先填这些值：
+## Git 回退
 
-```env
-NAPCAT_WS_URL=ws://127.0.0.1:3001
-
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_TEXT_ENDPOINT=/chat/completions
-LLM_API_KEY=replace-me
-LLM_MODEL=gpt-5.4
-
-GROUP_IMAGE_BASE_URL=
-GROUP_IMAGE_API_KEY=
-GROUP_IMAGE_MODEL=gpt-image-2
-GROUP_IMAGE_GENERATIONS_ENDPOINT=/images/generations
-GROUP_IMAGE_EDITS_ENDPOINT=/images/edits
-
-BOT_QQ=123456789
-OWNER_QQ=987654321
-ADMIN_QQS=
-PRIVATE_CHAT_QQS=
-```
-
-推荐按下面理解这几个关键项：
-
-- `LLM_BASE_URL`
-  文本主聊天的 API 根地址。常见写法是 `https://api.openai.com/v1` 或你自己的代理地址 `https://your-host/v1`。
-- `LLM_TEXT_ENDPOINT`
-  主文本聊天链路。可选 `chat_completions` 或 `responses`。大多数 OpenAI 兼容接口用 `chat_completions`。
-- `LLM_API_KEY`
-  文本聊天用的 key。
-- `LLM_MODEL`
-  主文本聊天模型名，例如 `gpt-5.4`。
-- `GROUP_IMAGE_BASE_URL`
-  生图接口根地址。留空时复用 `LLM_BASE_URL`。
-- `GROUP_IMAGE_API_KEY`
-  生图接口 key。留空时复用 `LLM_API_KEY`。
-- `GROUP_IMAGE_MODEL`
-  生图模型名，默认 `gpt-image-2`。
-- `GROUP_IMAGE_GENERATIONS_ENDPOINT`
-  文生图接口路径，默认 `/images/generations`。
-- `GROUP_IMAGE_EDITS_ENDPOINT`
-  参考图重绘或编辑接口路径，默认 `/images/edits`。
-- `OWNER_QQ`
-  机器人拥有者 QQ。这个 QQ 永远拥有私聊权限，也只有它能进入项目管理员模式。
-- `ADMIN_QQS`
-  额外管理员 QQ 列表，多个 QQ 用英文逗号分隔。
-- `PRIVATE_CHAT_QQS`
-  允许私聊机器人的 QQ 列表，多个 QQ 用英文逗号分隔。`OWNER_QQ` 会自动加入，不用重复写。
-
-常用可选项也都已经放进 `.env.example` 了，包括：
-
-- `GROUP_IMAGE_SIZE`
-- `GROUP_IMAGE_QUALITY`
-- `GROUP_IMAGE_BACKGROUND`
-- `GROUP_IMAGE_OUTPUT_FORMAT`
-- `GROUP_IMAGE_OUTPUT_COMPRESSION`
-- `GROUP_IMAGE_MODERATION`
-- `GROUP_IMAGE_QUEUE_CAPACITY`
-- `SEARCH_PROVIDER`
-- `SEARCH_BASE_URL`
-- `SEARCH_API_KEY`
-- `SEARCH_REGION`
-- `SEARCH_BACKEND`
-- `CONTEXT_RECENT_LIMIT`
-- `CONTEXT_SUMMARY_LIMIT`
-- `CONTEXT_HISTORY_LIMIT`
-- `QQ_EXE_PATH`
-- `NAPCAT_SHELL_DIR`
-- `NAPCAT_BOOT_PATH`
-- `NAPCAT_INJECT_DLL_PATH`
-- `NAPCAT_WAIT_TIMEOUT_SECONDS`
-
-### 3. 检查示例配置
-
-你至少需要看这几个文件：
-
-- `configs/groups.yaml`
-- `configs/persona.yaml`
-- `configs/private_reminders.yaml`
-- `configs/safety.yaml`
-
-使用前建议做这几件事：
-
-- 把 `configs/groups.yaml` 里的示例群号换成你自己的
-- 只给你真正想启用的群设置 `enabled: true`
-- 只给你真正想让机器人开口的群设置 `speak: true`
-- 如果不想使用默认人设，就改 `configs/persona.yaml`
-
-只有同时设置 `enabled: true` 和 `speak: true` 的群，才会进入群聊处理链路。
-
-### 4. 启动
-
-前台直接跑：
+旧 Windows 运行栈清理前的回退点是 `f63efe1`。查看或恢复已跟踪文件：
 
 ```powershell
-python -m app.main
+git show --stat f63efe1
+git restore --source f63efe1 -- path\to\file
 ```
 
-PowerShell 启动脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File start_xiaomachi.ps1
-```
-
-如果你喜欢双击启动，仓库根目录也带了 `.bat` 启动器。
-`启动小町.bat` 会一起拉起 QQ、NapCat 和小町的 Python 进程，`关闭小町.bat` 用来关闭这一套本地启动栈。
-
-## 主聊天与生图接口怎么配
-
-### 主文本聊天
-
-这个公开版的主文本聊天链路已经统一成：
-
-```text
-OpenAI 兼容聊天接口
-```
-
-对应配置就是：
-
-```env
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_TEXT_ENDPOINT=chat_completions
-LLM_MODEL=gpt-5.4
-```
-
-如果你的供应商支持 Responses API，可以把 `LLM_TEXT_ENDPOINT` 改成 `responses`。如果是常见兼容 `/chat/completions` 的代理，保持 `chat_completions` 即可。
-
-### 群聊生图
-
-生图链路单独走下面这些变量：
-
-```env
-GROUP_IMAGE_BASE_URL=
-GROUP_IMAGE_API_KEY=
-GROUP_IMAGE_MODEL=gpt-image-2
-GROUP_IMAGE_GENERATIONS_ENDPOINT=/images/generations
-GROUP_IMAGE_EDITS_ENDPOINT=/images/edits
-```
-
-说明：
-
-- 想让文生图和主聊天共用同一个 host/key，就把 `GROUP_IMAGE_BASE_URL` 和 `GROUP_IMAGE_API_KEY` 留空
-- `GROUP_IMAGE_GENERATIONS_ENDPOINT` 负责纯提示词生成
-- `GROUP_IMAGE_EDITS_ENDPOINT` 负责拿已有图片做重绘或编辑
-- 如果你的接口根地址已经写成 `.../v1`，这里通常仍然写 `/images/generations` 和 `/images/edits`
-
-## QQ 权限配置说明
-
-这三个变量的作用不一样：
-
-### `OWNER_QQ`
-
-- 永远拥有私聊权限
-- 永远拥有管理员指令权限
-- 只有它可以进入项目管理员模式
-- 只有它能持续和机器人进行“查仓库 / 改代码 / 跑测试 / 重启交接”这类项目对话
-
-### `ADMIN_QQS`
-
-- 是额外管理员白名单
-- 这些 QQ 可以使用白名单管理员指令
-- 但它们不会自动获得私聊权限
-- 它们也不会自动获得 `OWNER_QQ` 的项目管理员模式能力
-
-如果你希望某个管理员既能用管理员指令，又能和机器人私聊，就要同时把它写进：
-
-- `ADMIN_QQS`
-- `PRIVATE_CHAT_QQS`
-
-### `PRIVATE_CHAT_QQS`
-
-- 这是允许和机器人私聊的 QQ 白名单
-- `OWNER_QQ` 自动包含在内
-- 其它 QQ 必须显式写进来才可以私聊
-
-如果你后续打算让 `OWNER_QQ` 在管理员模式里要求机器人“给某个 QQ 发私聊”，目标 QQ 也需要在这个白名单里。
-
-示例：
-
-```env
-OWNER_QQ=10001
-ADMIN_QQS=10002,10003
-PRIVATE_CHAT_QQS=10002,20001,20002
-```
-
-这表示：
-
-- `10001` 是 owner
-- `10002` 和 `10003` 能用管理员指令
-- `10002`、`20001`、`20002` 能和机器人私聊
-- `10002` 同时拥有“管理员指令 + 私聊权限”
-- `10003` 只有管理员指令，没有私聊权限
-
-## 管理员指令怎么用
-
-白名单管理员指令不走 LLM 解析，只对白名单生效。
-
-当前可用的管理员指令有：
-
-- `/bot status`
-- `/bot on`
-- `/bot off`
-- `/bot group allow <group_id>`
-- `/bot group deny <group_id>`
-
-其中：
-
-- `/bot status` 用来查看当前状态
-- `/bot on` 和 `/bot off` 用来开关机器人
-- `/bot group allow <group_id>` 与 `/bot group deny <group_id>` 需要在私聊里用
-
-## 项目管理员模式怎么用
-
-这部分和上面的“管理员指令”不是一回事。
-
-项目管理员模式只对 `OWNER_QQ` 开放，用法如下：
-
-### 进入管理员模式
-
-给机器人私聊：
-
-```text
-启动管理员模式
-```
-
-进入后，后续这条私聊会变成一个独立的“项目对话”上下文，和普通日常私聊分开记。
-
-### 退出管理员模式
-
-这几个口令都可以：
-
-```text
-结束管理员模式
-退出管理员模式
-关闭管理员模式
-```
-
-### 进入后能做什么
-
-- 查当前仓库代码
-- 看配置和运行脚本
-- 修改代码
-- 跑定向测试
-- 在可用脚本范围内做重启交接
-
-### 进入后怎么提需求
-
-示例：
-
-```text
-启动管理员模式
-把群聊里的生图触发补全一下，顺手跑相关测试
-```
-
-或者不切长期模式，直接单条前缀触发：
-
-```text
-管理员权限 帮我查一下 private chat 白名单里有没有 20002
-```
-
-更直观的完整例子：
-
-```text
-Owner: 启动管理员模式
-Bot: 好，已经切到管理员模式了。接下来这条私聊会进入项目对话。
-Owner: 把群聊修图触发补全一下，跑相关测试，改完后重启生效
-Bot: 我先补触发分支和回归测试，跑完后给你结果。
-```
-
-## 运行模式
-
-- `python -m app.main`
-  全功能运行，包含群聊、私聊、管理员能力
-- `python -m app.group_main`
-  只跑群聊
-- `python -m app.private_main`
-  只跑私聊
-- `python -m app.dev_worker_main`
-  只跑本地开发 worker
-- `powershell -ExecutionPolicy Bypass -File start_xiaomachi_runtime.ps1`
-  分进程启动脚本
-- `powershell -ExecutionPolicy Bypass -File start_xiaomachi_bots.ps1`
-  只启动小町的群聊、私聊和开发 worker，不负责 QQ/NapCat
-- `powershell -ExecutionPolicy Bypass -File stop_xiaomachi_runtime.ps1`
-  停止分进程运行时和对应 watchdog
-- `powershell -ExecutionPolicy Bypass -File scripts/install_service.ps1`
-  安装为 Windows 服务
-
-## Watchdog 和心跳机制
-
-现在推荐使用分进程运行模式。`start_xiaomachi_runtime.ps1` 会启动多个 watchdog，每个 watchdog 负责一个范围：
-
-- `group`
-  群聊进程，入口是 `python -m app.group_main`
-- `private`
-  私聊和管理员模式进程，入口是 `python -m app.private_main`
-- `worker`
-  本地开发任务 worker，入口是 `python -m app.dev_worker_main`
-
-每个 Python 进程都会定期写心跳文件到 `data/logs/`：
-
-- `group.heartbeat.json`
-- `private.heartbeat.json`
-- `worker.heartbeat.json`
-
-群聊进程还会额外写：
-
-- `group.onebot_health.json`
-  记录 OneBot 登录态是否在线
-- `group.stream_health.json`
-  记录群消息流是否长时间没有推进
-
-如果要让 watchdog 监控指定群的消息流，在 `.env` 中设置：
-
-```env
-GROUP_STREAM_WATCH_GROUP_ID=10001
-GROUP_STREAM_MAX_LAG_SECONDS=1800
-```
-
-`GROUP_STREAM_WATCH_GROUP_ID=0` 表示不绑定具体群号，只依赖进程心跳和 OneBot 在线状态。
-
-watchdog 的主要作用：
-
-- 发现进程退出后自动拉起对应组件
-- 发现心跳过期、PID 不匹配或启动失败时重启对应组件
-- 发现群消息流卡住时优先重启 NapCat/群聊链路
-- 发现 OneBot 登录态离线时进入人工登录模式，弹出桌面提示，并停止小町运行侧，避免一直弹二维码或无限重启
-- 写入 `*.watchdog.log`，方便排查为什么重启
-- 使用 stop marker 配合停止脚本，避免你主动停止时又被 watchdog 拉起来
-
-常用脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File start_xiaomachi_runtime.ps1
-powershell -ExecutionPolicy Bypass -File stop_xiaomachi_runtime.ps1
-powershell -ExecutionPolicy Bypass -File scripts/xiaomachi_watchdog.ps1 -Scope group -Action status
-```
-
-如果 QQ/NapCat 被踢下线，推荐流程是：
-
-1. 先看桌面提示或 `data/logs/xiaomachi.alert.json`
-2. 重新登录 QQ/NapCat
-3. 再运行 `启动小町.bat` 或 `start_xiaomachi_runtime.ps1`
-
-一般不要同时用管理员权限和普通权限混着启动/停止。不同权限级别的进程互相看不到或关不掉，容易留下高权限旧进程。
-
-## 配置文件说明
-
-### `configs/persona.yaml`
-
-这里控制：
-
-- 名字
-- 人设
-- 说话风格
-- 句子长短
-- 口头习惯
-- 禁止词和回避表达
-
-### `configs/groups.yaml`
-
-按群配置：
-
-- `enabled`
-- `archive`
-  是否把群消息额外写成 `data/history/group-*/YYYY-MM-DD.jsonl` 本地归档。关闭后仍可保留数据库里的近期上下文。
-- `speak`
-- `proactive_reply`
-  是否允许未点名时主动插话。
-- `proactive_interval_seconds`
-  主动插话冷却区间。
-- `image_generation`
-  是否允许这个群触发生图队列。关闭后不影响普通文字聊天，也不影响已有的近期上下文。
-
-默认策略是白名单外一律不启用。
-
-### `configs/private_reminders.yaml`
-
-用于私聊提醒，例如：
-
-- 起床提醒
-- 一次性待办提醒
-- 每日固定提醒
-
-### `configs/safety.yaml`
-
-用于约束：
-
-- 敏感内容处理
-- prompt 泄露防护
-- 语气边界
-- 回复限制
-
-## 搜索与上下文相关配置
-
-README 和 `.env.example` 中已经放了这些常用项：
-
-- `SEARCH_PROVIDER`
-- `SEARCH_BASE_URL`
-- `SEARCH_API_KEY`
-- `SEARCH_TIMEOUT_SECONDS`
-- `SEARCH_REGION`
-- `SEARCH_BACKEND`
-- `CONTEXT_RECENT_LIMIT`
-- `CONTEXT_SUMMARY_LIMIT`
-- `CONTEXT_HISTORY_LIMIT`
-
-说明：
-
-- `SEARCH_PROVIDER=ddgs` 时通常可以不填 `SEARCH_API_KEY`
-- `SEARCH_PROVIDER=tavily` 时需要填 `SEARCH_API_KEY`
-
-## 一键启动路径相关配置
-
-如果脚本自动探测不到 QQ 或 NapCat，可以在 `.env` 中手动设置：
-
-- `QQ_EXE_PATH`
-- `NAPCAT_SHELL_DIR`
-- `NAPCAT_BOOT_PATH`
-- `NAPCAT_INJECT_DLL_PATH`
-- `NAPCAT_WAIT_TIMEOUT_SECONDS`
-
-## WSL 隔离部署
-
-推荐长期运行使用 WSL 版入口：
-
-- `start-xiaomachi-wsl.bat`
-- `stop-xiaomachi-wsl.bat`
-- `status-xiaomachi-wsl.bat`
-
-WSL 版会把 NapCat、QQ 登录态、小町 Python 进程放在 WSL2/Docker 内运行，避免与 Windows 本机个人 QQ 共用数据目录。原有 `启动小町.bat` / `关闭小町.bat` 仍保留为 Windows 版回滚入口，确认 WSL 版稳定前不要覆盖它们。
-
-首次使用：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\infra\wsl\scripts\sync_from_windows.ps1
-wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && bash infra/wsl/scripts/bootstrap_wsl.sh"
-wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && bash infra/wsl/scripts/start.sh"
-```
-
-如果容器下载 Python 依赖需要代理，只在被忽略的 `infra/wsl/.env` 中设置：
-
-```env
-DOCKER_HTTP_PROXY=http://127.0.0.1:7897
-DOCKER_HTTPS_PROXY=http://127.0.0.1:7897
-PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-验收：
-
-```powershell
-wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && .venv-wsl/bin/python infra/wsl/scripts/onebot_probe.py --ws-url ws://127.0.0.1:3001"
-```
-
-## 仓库结构
-
-- `app/`
-  运行时逻辑、路由、模型客户端、存储、搜索和管理员能力
-- `configs/`
-  示例配置文件
-- `scripts/`
-  Windows 启动、服务安装和辅助脚本
-- `tests/`
-  回归测试与 smoke tests
-- `data/`
-  公开版只保留占位目录，不带真实运行数据
-
-## 公开版安全说明
-
-这个 GitHub release 版本是清理过的公开版，默认不包含：
-
-- `.env`
-- 本地数据库
-- 群聊历史归档
-- 私聊历史
-- runtime 日志
-- 图片缓存
-- 本地 dev-control 状态
-
-保留在仓库里的只有示例文件：
-
-- `.env.example`
-- `configs/` 下的示例配置
-
-## 限制与说明
-
-- 这是本地自部署项目，不是 SaaS
-- 你仍然需要先把 QQ 和 NapCat 跑通
-- 生图和识图效果依赖模型能力、接口兼容度和你给的上下文
-- 本项目不是腾讯官方项目，也不是 NapCat 官方项目
+不要用 `git reset --hard` 处理包含本地运行数据的工作区。

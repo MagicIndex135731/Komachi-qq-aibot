@@ -946,7 +946,7 @@ class DevControlService:
                         logger.info("dev_task_stage task_id=%s stage=restart_handed_off", task_id)
                     return True
                 restart_ok, restart_result_text = self._restart_runtime()
-                commands_run = ["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"]
+                commands_run = ["xiaomachi-wsl-entry.sh stop", "xiaomachi-wsl-entry.sh start"]
                 if not restart_ok:
                     with session_scope(self.engine) as session:
                         tasks = DevTaskRepository(session)
@@ -1157,7 +1157,7 @@ class DevControlService:
                         logger.info("dev_task_stage task_id=%s stage=restart_handed_off", task_id)
                     return True
                 restart_ok, restart_result_text = self._restart_runtime()
-                commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
+                commands_run.extend(["xiaomachi-wsl-entry.sh stop", "xiaomachi-wsl-entry.sh start"])
                 if not restart_ok:
                     await asyncio.to_thread(
                         restore_repo_checkpoint,
@@ -1166,7 +1166,7 @@ class DevControlService:
                         manifest=checkpoint_manifest,
                     )
                     rollback_ok, rollback_result_text = self._restart_runtime()
-                    commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
+                    commands_run.extend(["xiaomachi-wsl-entry.sh stop", "xiaomachi-wsl-entry.sh start"])
                     with session_scope(self.engine) as session:
                         tasks = DevTaskRepository(session)
                         if rollback_ok:
@@ -3730,15 +3730,12 @@ class DevControlService:
     def _change_requires_restart(self, files_changed: list[str]) -> bool:
         restart_prefixes = ("app/", "configs/")
         restart_files = {
-            "start_xiaomachi.ps1",
-            "stop_xiaomachi.ps1",
-            "start_xiaomachi_bots.ps1",
-            "stop_xiaomachi_bots.ps1",
-            "start_xiaomachi_runtime.ps1",
-            "stop_xiaomachi_runtime.ps1",
-            "restart_xiaomachi_runtime.ps1",
-            "scripts/xiaomachi_process_helpers.ps1",
-            ".env",
+            "start-xiaomachi-wsl.bat",
+            "stop-xiaomachi-wsl.bat",
+            "infra/wsl/docker-compose.yml",
+            "infra/wsl/scripts/start.sh",
+            "infra/wsl/scripts/stop.sh",
+            "infra/wsl/.env",
         }
         for relative_path in files_changed:
             normalized = relative_path.replace("\\", "/")
@@ -3962,7 +3959,7 @@ class DevControlService:
 
         if restart_required and allow_restart:
             restart_ok, restart_result_text = self._restart_runtime()
-            commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
+            commands_run.extend(["xiaomachi-wsl-entry.sh stop", "xiaomachi-wsl-entry.sh start"])
             if not restart_ok:
                 if manifest is not None and (checkpoint_dir / "snapshot").exists():
                     restore_repo_checkpoint(
@@ -3971,7 +3968,7 @@ class DevControlService:
                         manifest=manifest,
                     )
                     rollback_ok, rollback_result_text = self._restart_runtime()
-                    commands_run.extend(["stop_xiaomachi_runtime.ps1", "start_xiaomachi_runtime.ps1"])
+                    commands_run.extend(["xiaomachi-wsl-entry.sh stop", "xiaomachi-wsl-entry.sh start"])
                     with session_scope(self.engine) as session:
                         tasks = DevTaskRepository(session)
                         if rollback_ok:
@@ -4048,7 +4045,12 @@ class DevControlService:
 
     def _handoff_inline_runtime_restart(self) -> tuple[bool, str]:
         restart_result = self.command_runner(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(self.repo_root / "restart_xiaomachi_runtime.ps1")],
+            [
+                "wsl.exe",
+                "bash",
+                "-lc",
+                "bash /mnt/d/xiaomachi-wsl-entry.sh stop && bash /mnt/d/xiaomachi-wsl-entry.sh start",
+            ],
             self.repo_root,
         )
         if restart_result.returncode != 0:
@@ -4057,11 +4059,11 @@ class DevControlService:
 
     def _restart_runtime(self) -> tuple[bool, str]:
         stop_result = self.command_runner(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(self.repo_root / "stop_xiaomachi_runtime.ps1")],
+            ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "stop"],
             self.repo_root,
         )
         start_result = self.command_runner(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(self.repo_root / "start_xiaomachi_runtime.ps1")],
+            ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "start"],
             self.repo_root,
         )
         if stop_result.returncode != 0:
@@ -4696,10 +4698,10 @@ class DevControlService:
 
     def _should_detach_command_stdio(self, command: list[str]) -> bool:
         launch_script_names = {
-            "start_xiaomachi.ps1",
-            "start_xiaomachi_bots.ps1",
-            "start_xiaomachi_runtime.ps1",
-            "restart_xiaomachi_runtime.ps1",
+            "start-xiaomachi-wsl.bat",
         }
         normalized_parts = [str(part).replace("\\", "/").lower() for part in command]
-        return any(part.endswith(script_name) for part in normalized_parts for script_name in launch_script_names)
+        if any(part.endswith(script_name) for part in normalized_parts for script_name in launch_script_names):
+            return True
+        command_text = " ".join(normalized_parts)
+        return "xiaomachi-wsl-entry.sh" in command_text and "start" in command_text
