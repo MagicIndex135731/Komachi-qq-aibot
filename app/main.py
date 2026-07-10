@@ -65,6 +65,8 @@ def sync_history_archives(engine, runtime) -> dict[int, int]:
 
 
 def build_web_search_client(settings: AppSettings) -> WebSearchClient | None:
+    if settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses":
+        return None
     provider = settings.search_provider.strip().lower()
     if provider != "ddgs" and not settings.search_api_key.strip():
         return None
@@ -130,6 +132,9 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         vision_model=(settings.llm_vision_model or "").strip(),
         responses_model=responses_model,
         compat_model=chat_model,
+        builtin_web_search=settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses",
+        web_search_context_size=settings.llm_builtin_web_search_context_size,
+        reasoning_effort=settings.llm_reasoning_effort if settings.llm_text_endpoint == "responses" else "",
         usage_recorder=build_usage_recorder(engine),
     )
 
@@ -156,6 +161,9 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
         compat_model=compat_model,
         image_generations_endpoint=settings.group_image_generations_endpoint,
         image_edits_endpoint=settings.group_image_edits_endpoint,
+        builtin_web_search=settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses",
+        web_search_context_size=settings.llm_builtin_web_search_context_size,
+        reasoning_effort=settings.llm_reasoning_effort if settings.llm_text_endpoint == "responses" else "",
         http_client=httpx.Client(timeout=30.0, trust_env=False),
         usage_recorder=build_usage_recorder(engine),
     )

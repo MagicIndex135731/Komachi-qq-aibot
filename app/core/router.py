@@ -64,11 +64,13 @@ from app.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
+GROUP_IMAGE_REQUEST_FLAGS = re.IGNORECASE | re.DOTALL
 GROUP_IMAGE_REQUEST_PATTERNS = (
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:个|一张|张)?(?P<prompt>.+)$", re.IGNORECASE),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?来张(?P<prompt>.+)$", re.IGNORECASE),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?出图(?P<prompt>.+)$", re.IGNORECASE),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?生成(?:一张)?(?:图片|图像|图)?(?P<prompt>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:一张|张)?(?:图片|图像|图)[\s,，。.!?？；;:：]*(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:个|一张|张)?(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?来张(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?出图(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
+    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?生成(?:一张)?(?:图片|图像|图)?(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
 )
 GROUP_IMAGE_NEGATIVE_PATTERNS = (
     re.compile(r"会画图吗|能画图吗|会不会画图", re.IGNORECASE),

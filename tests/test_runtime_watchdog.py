@@ -11,6 +11,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPERS_PATH = REPO_ROOT / "scripts" / "xiaomachi_process_helpers.ps1"
+WATCHDOG_PATH = REPO_ROOT / "scripts" / "xiaomachi_watchdog.ps1"
+START_SCRIPT_PATH = REPO_ROOT / "start_xiaomachi.ps1"
 
 
 def _ps_quote(value: str) -> str:
@@ -294,6 +296,73 @@ def test_start_bot_spec_waits_for_matching_heartbeat_before_returning(tmp_path) 
     assert payload["heartbeat_pid"] == payload["pid_file"]
 
 
+def test_start_bot_spec_tracks_heartbeat_pid_when_launcher_pid_differs(tmp_path) -> None:
+    package_name = f"fakeapp_start_child_pid_{tmp_path.name.replace('-', '_')}"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    heartbeat_file = tmp_path / "group.heartbeat.json"
+    heartbeat_literal = str(heartbeat_file).replace("\\", "\\\\")
+    (package_dir / "group_main.py").write_text(
+        "import json\n"
+        "import os\n"
+        "import time\n"
+        "from datetime import UTC, datetime\n"
+        "from pathlib import Path\n"
+        f"Path(r'{heartbeat_literal}').write_text(json.dumps({{'pid': os.getpid(), 'updated_at': datetime.now(UTC).isoformat()}}), encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    (package_dir / "launcher_main.py").write_text(
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        f"child = subprocess.Popen([sys.executable, '-m', '{package_name}.group_main'], cwd=os.getcwd())\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    pid_file = tmp_path / "group.pid"
+    stdout_file = tmp_path / "group.stdout.log"
+    stderr_file = tmp_path / "group.stderr.log"
+    script = textwrap.dedent(
+        f"""
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
+        $OutputEncoding = [Console]::OutputEncoding
+        . {_ps_quote(str(HELPERS_PATH))}
+        $spec = @{{
+            Name = 'test'
+            Module = {_ps_quote(f'{package_name}.launcher_main')}
+            PidFile = {_ps_quote(str(pid_file))}
+            Stdout = {_ps_quote(str(stdout_file))}
+            Stderr = {_ps_quote(str(stderr_file))}
+            HeartbeatFile = {_ps_quote(str(heartbeat_file))}
+        }}
+        try {{
+            Start-BotSpec -Workdir {_ps_quote(str(tmp_path))} -PythonExe {_ps_quote(sys.executable)} -Spec $spec
+            $heartbeat = Get-Content -Raw -LiteralPath $spec.HeartbeatFile | ConvertFrom-Json
+            [pscustomobject]@{{
+                heartbeat_pid = [int]$heartbeat.pid
+                pid_file = [int](Get-Content -LiteralPath $spec.PidFile | Select-Object -First 1)
+            }} | ConvertTo-Json -Compress
+        }} finally {{
+            Stop-BotSpec -Spec $spec
+            Get-CimInstance Win32_Process | Where-Object {{ $_.Name -like 'python*' -and ($_.CommandLine -like '*{package_name}.group_main*' -or $_.CommandLine -like '*{package_name}.launcher_main*') }} | ForEach-Object {{
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }}
+        }}
+        """
+    ).strip()
+
+    result = _run_powershell(script, cwd=REPO_ROOT)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["heartbeat_pid"] == payload["pid_file"]
+
+
 def test_stop_bot_spec_keeps_tracking_files_when_process_survives_stop(tmp_path) -> None:
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=tmp_path)
     try:
@@ -444,6 +513,46 @@ def test_watchdog_probe_interval_state_tracks_each_spec_independently() -> None:
     }
 
 
+def test_get_bot_processes_for_module_prefers_leaf_child_process() -> None:
+    script = textwrap.dedent(
+        f"""
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
+        $OutputEncoding = [Console]::OutputEncoding
+        . {_ps_quote(str(HELPERS_PATH))}
+        function Get-CimInstance {{
+            @(
+                [pscustomobject]@{{
+                    Name = 'python.exe'
+                    ProcessId = 100
+                    ParentProcessId = 50
+                    CommandLine = 'python.exe -m fakeapp.group_main'
+                    CreationDate = $null
+                }},
+                [pscustomobject]@{{
+                    Name = 'python.exe'
+                    ProcessId = 101
+                    ParentProcessId = 100
+                    CommandLine = 'python.exe -m fakeapp.group_main'
+                    CreationDate = $null
+                }}
+            )
+        }}
+        $process = Get-BotProcessesForModule 'fakeapp.group_main' | Select-Object -First 1
+        [pscustomobject]@{{
+            process_id = [int]$process.ProcessId
+            parent_process_id = [int]$process.ParentProcessId
+        }} | ConvertTo-Json -Compress
+        """
+    ).strip()
+
+    result = _run_powershell_json(script, cwd=REPO_ROOT)
+
+    assert result == {
+        "process_id": 101,
+        "parent_process_id": 100,
+    }
+
+
 def test_onebot_status_payload_online_requires_account_online() -> None:
     script = textwrap.dedent(
         f"""
@@ -464,6 +573,46 @@ def test_onebot_status_payload_online_requires_account_online() -> None:
     result = _run_powershell_json(script, cwd=REPO_ROOT)
 
     assert result == {"online": True, "degraded": False, "offline": False}
+
+
+def test_watchdog_auto_restarts_on_group_stream_stale_instead_of_manual_stop() -> None:
+    watchdog = WATCHDOG_PATH.read_text(encoding="utf-8")
+    branch_start = watchdog.index('if ($status.restart_reason -eq "onebot_group_stream_stale")')
+    branch_end = watchdog.index('$restartResult = Restart-BotSpecSafely', branch_start)
+    branch = watchdog[branch_start:branch_end]
+
+    assert "Restart-LauncherManagedNapCat $CurrentScope" in branch
+    assert "Enter-OneBotManualLoginMode" not in branch
+
+
+def test_start_script_isolates_qq_appdata_for_napcat_launch() -> None:
+    start_script = START_SCRIPT_PATH.read_text(encoding="utf-8")
+    function_start = start_script.index("function Set-IsolatedQQEnvironment")
+    function_end = start_script.index("function Restore-ProcessEnvironment", function_start)
+    function_block = start_script[function_start:function_end]
+    launch_start = start_script.index("$bootArguments = @($qqPath, $paths.InjectPath) + $qqExtraArgs")
+    launch_end = start_script.index("$ready = Wait-ForNapCatEndpoint", launch_start)
+    launch_block = start_script[launch_start:launch_end]
+
+    assert "Set-IsolatedQQEnvironment" in launch_block
+    assert "Restore-ProcessEnvironment" in launch_block
+    assert '"APPDATA"' in function_block
+    assert '"LOCALAPPDATA"' in function_block
+
+
+def test_launcher_managed_qq_stop_uses_xiaomachi_filtered_processes() -> None:
+    watchdog = WATCHDOG_PATH.read_text(encoding="utf-8")
+    first_branch_start = watchdog.index("if ($state.qq_started_by_launcher)")
+    first_branch_end = watchdog.index("Start-Sleep -Seconds 2", first_branch_start)
+    first_branch = watchdog[first_branch_start:first_branch_end]
+    second_branch_start = watchdog.index("if ($state.qq_started_by_launcher)", first_branch_end)
+    second_branch_end = watchdog.index("Remove-Item $stateFile", second_branch_start)
+    second_branch = watchdog[second_branch_start:second_branch_end]
+
+    assert "Get-XiaomachiQQProcesses" in first_branch
+    assert "Get-QQProcesses" not in first_branch
+    assert "Get-XiaomachiQQProcesses" in second_branch
+    assert "Get-QQProcesses" not in second_branch
 
 
 def test_onebot_python_probes_emit_ascii_json_for_windows_stdout() -> None:
@@ -493,7 +642,7 @@ def test_group_history_payload_staleness_uses_latest_message_time() -> None:
     assert result == {"fresh": True, "stale": False}
 
 
-def test_group_history_ok_payload_with_old_messages_does_not_mark_stream_stale() -> None:
+def test_group_history_ok_payload_with_old_messages_marks_stream_stale() -> None:
     script = textwrap.dedent(
         f"""
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
@@ -517,10 +666,41 @@ def test_group_history_ok_payload_with_old_messages_does_not_mark_stream_stale()
 
     result = _run_powershell_json(script, cwd=REPO_ROOT)
 
-    assert result["stale"] is False
-    assert result["stale_count"] == 0
+    assert result["stale"] is True
+    assert result["stale_count"] == 3
     assert result["latest_message_time"] == 1100
     assert result["lag_seconds"] == 900
+    assert "group_history_stale" in result["error"]
+
+
+def test_group_history_ok_payload_with_recent_messages_marks_stream_healthy() -> None:
+    script = textwrap.dedent(
+        f"""
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
+        $OutputEncoding = [Console]::OutputEncoding
+        . {_ps_quote(str(HELPERS_PATH))}
+        $payload = '{{"status":"ok","retcode":0,"data":{{"messages":[{{"time":1980}},{{"time":1995}}]}}}}' | ConvertFrom-Json
+        $healthPath = Join-Path $env:TEMP ('group-stream-health-' + [guid]::NewGuid().ToString() + '.json')
+        try {{
+            Write-OneBotGroupStreamHealthFromPayload `
+                -Path $healthPath `
+                -Payload $payload `
+                -PreviousStaleCount 2 `
+                -MaxLagSeconds 60 `
+                -NowUtc ([datetimeoffset]::FromUnixTimeSeconds(2000).UtcDateTime)
+            Get-Content -Raw -LiteralPath $healthPath
+        }} finally {{
+            Remove-Item $healthPath -Force -ErrorAction SilentlyContinue
+        }}
+        """
+    ).strip()
+
+    result = _run_powershell_json(script, cwd=REPO_ROOT)
+
+    assert result["stale"] is False
+    assert result["stale_count"] == 0
+    assert result["latest_message_time"] == 1995
+    assert result["lag_seconds"] == 5
 
 
 def test_get_bot_spec_status_marks_missing_process_as_stale_pid(tmp_path) -> None:

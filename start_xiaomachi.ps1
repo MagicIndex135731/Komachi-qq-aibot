@@ -198,6 +198,21 @@ function Get-QQProcesses {
     }
 }
 
+function Get-XiaomachiQQProcesses {
+    $qqPath = Get-ConfigValue "QQ_EXE_PATH" ""
+    $workdirPrefix = ($workdir.TrimEnd("\") + "\")
+    @(Get-QQProcesses) | Where-Object {
+        $exePath = [string]$_.ExecutablePath
+        $commandLine = [string]$_.CommandLine
+        (
+            (-not [string]::IsNullOrWhiteSpace($qqPath) -and $exePath -ieq $qqPath) -or
+            $exePath.StartsWith($workdirPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $commandLine.IndexOf($workdir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $commandLine.IndexOf("xiaomachi-qq-", [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        )
+    }
+}
+
 function Stop-LauncherManagedNapCatStack {
     $state = Read-LauncherState
     if (-not $state) {
@@ -227,7 +242,7 @@ function Stop-LauncherManagedNapCatStack {
     }
 
     if ($state.qq_started_by_launcher) {
-        $qqTargets = @(Get-QQProcesses)
+        $qqTargets = @(Get-XiaomachiQQProcesses)
         $qqIds = @($qqTargets | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
         if ($qqIds.Count -gt 0) {
             Stop-TrackedProcesses -Ids $qqIds
@@ -298,6 +313,47 @@ function Repair-StartProcessEnvironment {
         [Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
     }
     [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
+}
+
+function Resolve-IsolatedQQUserDataDir([string[]]$QQExtraArgs) {
+    $prefix = "--user-data-dir="
+    foreach ($arg in @($QQExtraArgs)) {
+        if ($arg -and $arg.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $userDataDir = $arg.Substring($prefix.Length).Trim('"')
+            if (-not [string]::IsNullOrWhiteSpace($userDataDir)) {
+                if (-not [System.IO.Path]::IsPathRooted($userDataDir)) {
+                    $userDataDir = Join-Path $workdir $userDataDir
+                }
+                return [System.IO.Path]::GetFullPath($userDataDir)
+            }
+        }
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $workdir "data\napcat\qq-userdata"))
+}
+
+function Set-IsolatedQQEnvironment([string]$QQUserDataDir) {
+    $snapshot = @{
+        APPDATA = [Environment]::GetEnvironmentVariable("APPDATA", "Process")
+        LOCALAPPDATA = [Environment]::GetEnvironmentVariable("LOCALAPPDATA", "Process")
+    }
+
+    $roamingDir = Join-Path $QQUserDataDir "AppData\Roaming"
+    $localDir = Join-Path $QQUserDataDir "AppData\Local"
+    New-Item -ItemType Directory -Force -Path $roamingDir, $localDir | Out-Null
+    [Environment]::SetEnvironmentVariable("APPDATA", $roamingDir, "Process")
+    [Environment]::SetEnvironmentVariable("LOCALAPPDATA", $localDir, "Process")
+    return $snapshot
+}
+
+function Restore-ProcessEnvironment([hashtable]$Snapshot) {
+    if (-not $Snapshot) {
+        return
+    }
+
+    foreach ($name in @("APPDATA", "LOCALAPPDATA")) {
+        [Environment]::SetEnvironmentVariable($name, $Snapshot[$name], "Process")
+    }
 }
 
 function Test-IsAdministrator {
@@ -792,20 +848,26 @@ function Ensure-NapCatReady([string]$TargetHost, [int]$Port, [int]$WaitSeconds) 
     $launchStartedAt = Get-Date
 
     $bootArguments = @($qqPath, $paths.InjectPath) + $qqExtraArgs
-    Ensure-NapCatStartupAdministrator
-    Repair-StartProcessEnvironment
-    $bootProc = Start-Process `
-        -FilePath $paths.BootPath `
-        -ArgumentList $bootArguments `
-        -WorkingDirectory $paths.ShellDir `
-        -WindowStyle Hidden `
-        -PassThru
+    $qqUserDataDir = Resolve-IsolatedQQUserDataDir -QQExtraArgs $qqExtraArgs
+    $environmentSnapshot = Set-IsolatedQQEnvironment -QQUserDataDir $qqUserDataDir
+    try {
+        Ensure-NapCatStartupAdministrator
+        Repair-StartProcessEnvironment
+        $bootProc = Start-Process `
+            -FilePath $paths.BootPath `
+            -ArgumentList $bootArguments `
+            -WorkingDirectory $paths.ShellDir `
+            -WindowStyle Hidden `
+            -PassThru
+    } finally {
+        Restore-ProcessEnvironment -Snapshot $environmentSnapshot
+    }
 
     $ready = Wait-ForNapCatEndpoint -TargetHost $TargetHost -Port $Port -TimeoutSeconds $WaitSeconds -QrCodePath $paths.QrCodePath -LaunchStartedAt $launchStartedAt -BootProcessId $bootProc.Id
     return @{
         PortReady = $ready
         Started = $true
-        QqStarted = (-not $qqWasRunningBefore)
+        QqStarted = $true
         BootPid = $bootProc.Id
         ShellDir = $paths.ShellDir
         QrCodePath = $paths.QrCodePath

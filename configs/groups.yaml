@@ -4,12 +4,21 @@ default_group_behavior:
   speak: false
   proactive_reply: true
   proactive_interval_seconds: "180-480"
+  image_generation: true
 
 groups:
-  # Replace this example group id with a real QQ group id before production use.
-  "10001":
+  "515267906":
     enabled: true
     archive: true
     speak: true
     proactive_reply: true
     proactive_interval_seconds: "180-480"
+    image_generation: true
+
+  "300520120":
+    enabled: true
+    archive: false
+    speak: true
+    proactive_reply: false
+    proactive_interval_seconds: "180-480"
+    image_generation: false

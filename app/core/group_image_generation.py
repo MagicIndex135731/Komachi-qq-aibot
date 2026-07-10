@@ -83,7 +83,7 @@ class GroupImageGenerationService:
         output_compression: int | None = None,
         moderation: str | None = None,
         max_slots: int = 3,
-        image_max_attempts: int = 1,
+        image_max_attempts: int = 5,
         image_timeout_seconds: float | None = None,
         failure_reply_text: str = "这张没跑出来，你换个说法试试",
     ) -> None:

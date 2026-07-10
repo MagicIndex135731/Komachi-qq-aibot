@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -47,11 +49,20 @@ def test_readme_mentions_search_and_context_limits() -> None:
 
 
 def test_groups_manifest_enables_target_group() -> None:
-    groups = (REPO_ROOT / "configs/groups.yaml").read_text(encoding="utf-8")
+    groups = yaml.safe_load((REPO_ROOT / "configs/groups.yaml").read_text(encoding="utf-8"))
+    primary = groups["groups"]["515267906"]
+    limited = groups["groups"]["300520120"]
 
-    assert "10001" in groups
-    assert "enabled: true" in groups
-    assert "speak: true" in groups
+    assert primary["enabled"] is True
+    assert primary["speak"] is True
+    assert primary["archive"] is True
+    assert primary["proactive_reply"] is True
+    assert primary["image_generation"] is True
+    assert limited["enabled"] is True
+    assert limited["speak"] is True
+    assert limited["archive"] is False
+    assert limited["proactive_reply"] is False
+    assert limited["image_generation"] is False
 
 
 def test_install_service_script_handles_existing_service() -> None:

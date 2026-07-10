@@ -222,6 +222,14 @@ def test_build_web_search_client_supports_ddgs_without_api_key() -> None:
     assert client.provider == "ddgs"
 
 
+def test_build_web_search_client_is_disabled_when_builtin_llm_web_search_is_enabled() -> None:
+    settings = _settings_for_search(provider="ddgs", search_api_key="   ")
+    settings.llm_builtin_web_search = True
+    settings.llm_text_endpoint = "responses"
+
+    assert build_web_search_client(settings) is None
+
+
 def test_build_llm_client_preserves_primary_model_and_exposes_distinct_fallback(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
     settings.llm_model = "gpt-5.4-mini"
@@ -258,6 +266,21 @@ def test_build_llm_client_enables_responses_when_text_endpoint_requests_it(monke
     assert captured["fallback_model"] == "gpt-4o-mini"
     assert captured["responses_model"] == "gpt-5.4-mini"
     assert captured["compat_model"] == "gpt-5.4-mini"
+
+
+def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_text_endpoint = "responses"
+    settings.llm_reasoning_effort = "medium"
+    captured: dict[str, object] = {}
+    built_client = object()
+
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+
+    result = app_main.build_llm_client(settings=settings, engine=object())
+
+    assert result is built_client
+    assert captured["reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio

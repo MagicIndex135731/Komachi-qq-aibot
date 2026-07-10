@@ -1,5 +1,6 @@
 import json
 import base64
+import logging
 from pathlib import Path
 
 import httpx
@@ -1103,6 +1104,107 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert recorded[0].output_tokens == 45
 
 
+def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_search_1", text="grounded reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        web_search_context_size="high",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    text = client.generate_text(["Target message: Alice: 今天有什么新闻"])
+
+    assert text == "grounded reply"
+    assert captured["payload"]["tools"] == [
+        {"type": "web_search", "search_context_size": "high"}
+    ]
+
+
+def test_llm_client_can_attach_reasoning_effort_to_responses() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_reasoning_1", text="reasoned reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        reasoning_effort="medium",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    text = client.generate_text(["Target message: Alice: think carefully"])
+
+    assert text == "reasoned reply"
+    assert captured["payload"]["reasoning"] == {"effort": "medium"}
+
+
+def test_llm_client_logs_responses_tool_events_from_sse(caplog) -> None:
+    body = (
+        'event: response.created\n'
+        f'data: {json.dumps({"type": "response.created", "response": {"id": "resp_tool_1"}})}\n\n'
+        'event: response.output_item.added\n'
+        f'data: {json.dumps({"type": "response.output_item.added", "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"}})}\n\n'
+        'event: response.web_search_call.completed\n'
+        f'data: {json.dumps({"type": "response.web_search_call.completed", "item_id": "ws_1"})}\n\n'
+        'event: response.output_text.delta\n'
+        f'data: {json.dumps({"type": "response.output_text.delta", "delta": "grounded"})}\n\n'
+        'event: response.completed\n'
+        f'data: {json.dumps({"type": "response.completed", "response": {"id": "resp_tool_1", "status": "completed"}})}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.providers.llm_client"):
+        text = client.generate_text(["Target message: Alice: search this"])
+
+    assert text == "grounded"
+    assert any(
+        record.message.startswith("responses_tool_event")
+        and "response.web_search_call.completed" in record.message
+        for record in caplog.records
+    )
+
+
 def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoint() -> None:
     captured_payloads: list[dict] = []
     responses = iter(
@@ -1749,6 +1851,16 @@ def test_llm_client_generate_image_omits_compression_for_png() -> None:
         "output_format": "png",
         "moderation": "low",
     }
+
+
+def test_llm_client_default_http_client_disables_environment_proxy() -> None:
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+    )
+
+    assert client.http_client.trust_env is False
 
 
 def test_llm_client_falls_back_to_url_image_response_format_when_b64_json_is_rejected() -> None:
