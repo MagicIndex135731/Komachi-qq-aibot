@@ -78,6 +78,30 @@ def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() ->
     assert "local-test-token" not in launcher_content
 
 
+def test_wsl_start_opens_napcat_login_only_when_needed_before_status_probe() -> None:
+    start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
+    launcher = (REPO_ROOT / "infra/wsl/scripts/open_napcat_webui.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    compose_up = start_script.index("docker compose up -d")
+    conditional_open = start_script.index("\nopen_napcat_login_if_needed\n")
+    status_probe = start_script.index('bash "${WSL_DIR}/scripts/status.sh"')
+    assert compose_up < conditional_open < status_probe
+    assert "http://127.0.0.1:6099/" in start_script
+    assert "wslpath -w" in start_script
+    assert "powershell.exe" in start_script
+    assert "-OnlyWhenLoginRequired" in start_script
+    assert "|| true" in start_script
+
+    assert "param(" in launcher
+    assert "OnlyWhenLoginRequired" in launcher
+    assert "/api/auth/login" in launcher
+    assert "/api/QQLogin/CheckLoginStatus" in launcher
+    assert "AllowAutoRedirect = $false" in launcher
+    assert "isLogin" in launcher
+
+
 def test_wsl_env_example_has_no_real_secrets() -> None:
     env_example = (REPO_ROOT / "infra/wsl/.env.example").read_text(encoding="utf-8")
     bot_account = "398" + "301" + "0865"
