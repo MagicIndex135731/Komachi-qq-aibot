@@ -42,10 +42,16 @@ function Get-BotProcessesForModule([string]$ModuleName) {
         return @()
     }
 
-    $processes | Where-Object {
+    $leafProcesses = @($processes | Where-Object {
         $process = $_
-        -not ($processes | Where-Object { $_.ProcessId -eq $process.ParentProcessId })
+        -not ($processes | Where-Object { [int]$_.ParentProcessId -eq [int]$process.ProcessId })
+    })
+
+    if ($leafProcesses.Count -gt 0) {
+        return $leafProcesses
     }
+
+    return $processes
 }
 
 function Get-BotProcessFromPidFile([string]$PidFile) {
@@ -95,9 +101,11 @@ function Get-BotProcessFromHeartbeat([string]$HeartbeatFile) {
 }
 
 function Get-BotProcessesForSpec([hashtable]$Spec) {
-    $running = @(Get-BotProcessesForModule $Spec.Module)
-    if ($running.Count -gt 0) {
-        return $running
+    if ($Spec.ContainsKey("HeartbeatFile") -and $Spec.HeartbeatFile) {
+        $heartbeatProcess = Get-BotProcessFromHeartbeat $Spec.HeartbeatFile
+        if ($heartbeatProcess) {
+            return @($heartbeatProcess)
+        }
     }
 
     $pidProcess = Get-BotProcessFromPidFile $Spec.PidFile
@@ -105,11 +113,9 @@ function Get-BotProcessesForSpec([hashtable]$Spec) {
         return @($pidProcess)
     }
 
-    if ($Spec.ContainsKey("HeartbeatFile") -and $Spec.HeartbeatFile) {
-        $heartbeatProcess = Get-BotProcessFromHeartbeat $Spec.HeartbeatFile
-        if ($heartbeatProcess) {
-            return @($heartbeatProcess)
-        }
+    $running = @(Get-BotProcessesForModule $Spec.Module)
+    if ($running.Count -gt 0) {
+        return $running
     }
 
     return @()
@@ -176,24 +182,29 @@ function Wait-BotSpecHeartbeat(
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-        if (-not $process) {
-            return [pscustomobject]@{
-                ready = $false
-                error = ("{0} exited before publishing heartbeat. Check log: {1}" -f $Spec.Name, $Spec.Stderr)
-            }
-        }
+        $launcherProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
 
         $heartbeatState = Read-HeartbeatState $Spec.HeartbeatFile
         if ($heartbeatState -and $heartbeatState.updated_at) {
             try {
-                if ([int]$heartbeatState.pid -eq $ProcessId) {
+                $heartbeatPid = [int]$heartbeatState.pid
+                $heartbeatProcess = Get-Process -Id $heartbeatPid -ErrorAction SilentlyContinue
+                if ($heartbeatProcess -and $heartbeatProcess.ProcessName -like "python*") {
                     return [pscustomobject]@{
                         ready = $true
                         error = ""
+                        process_id = $heartbeatPid
                     }
                 }
             } catch {
+            }
+        }
+
+        if (-not $launcherProcess) {
+            return [pscustomobject]@{
+                ready = $false
+                error = ("{0} exited before publishing heartbeat. Check log: {1}" -f $Spec.Name, $Spec.Stderr)
+                process_id = 0
             }
         }
 
@@ -203,6 +214,7 @@ function Wait-BotSpecHeartbeat(
     return [pscustomobject]@{
         ready = $false
         error = ("{0} started but did not publish matching heartbeat within {1} seconds. Check log: {2}" -f $Spec.Name, $TimeoutSeconds, $Spec.Stderr)
+        process_id = 0
     }
 }
 
@@ -254,7 +266,19 @@ function Start-BotSpec(
         Remove-Item $Spec.PidFile -Force -ErrorAction SilentlyContinue
         throw $heartbeatReady.error
     }
-    Write-Host "$($Spec.Name) started. PID: $($proc.Id)"
+
+    $trackedPid = [int]$proc.Id
+    if ($heartbeatReady.process_id) {
+        try {
+            $trackedPid = [int]$heartbeatReady.process_id
+        } catch {
+            $trackedPid = [int]$proc.Id
+        }
+    }
+    if ($trackedPid -ne [int]$proc.Id) {
+        Set-Content -Path $Spec.PidFile -Value $trackedPid -Encoding ascii
+    }
+    Write-Host "$($Spec.Name) started. PID: $trackedPid"
 }
 
 function Restart-BotSpecSafely(
@@ -575,7 +599,13 @@ function Write-OneBotGroupStreamHealthFromPayload(
     }
 
     if ($Payload -and [string]$Payload.status -eq "ok") {
-        Write-OneBotGroupStreamHealthState -Path $Path -Stale $false -StaleCount 0 -LatestMessageTime $latest -LagSeconds $lagSeconds
+        if (Test-OneBotGroupHistoryPayloadFresh -Payload $Payload -MaxLagSeconds $MaxLagSeconds -NowUtc $NowUtc) {
+            Write-OneBotGroupStreamHealthState -Path $Path -Stale $false -StaleCount 0 -LatestMessageTime $latest -LagSeconds $lagSeconds
+            return
+        }
+
+        $detail = "group_history_stale latest_message_time={0} lag_seconds={1} max_lag_seconds={2}" -f $latest, $lagSeconds, $MaxLagSeconds
+        Write-OneBotGroupStreamHealthState -Path $Path -Stale $true -StaleCount ($PreviousStaleCount + 1) -LatestMessageTime $latest -LagSeconds $lagSeconds -ErrorMessage $detail
         return
     }
 

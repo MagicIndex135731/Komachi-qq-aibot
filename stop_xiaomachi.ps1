@@ -241,7 +241,7 @@ if ($state) {
     }
 
     if ($state.qq_started_by_launcher) {
-        $qqTargets = @(Get-QQProcesses)
+        $qqTargets = @(Get-XiaomachiQQProcesses)
         $qqIds = @($qqTargets | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
         if ($qqIds.Count -gt 0) {
             Stop-TrackedProcesses -Ids $qqIds

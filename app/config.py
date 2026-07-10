@@ -21,6 +21,15 @@ class AppSettings(BaseSettings):
         default="chat_completions",
         alias="LLM_TEXT_ENDPOINT",
     )
+    llm_builtin_web_search: bool = Field(default=False, alias="LLM_BUILTIN_WEB_SEARCH")
+    llm_builtin_web_search_context_size: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        alias="LLM_BUILTIN_WEB_SEARCH_CONTEXT_SIZE",
+    )
+    llm_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+        default="",
+        alias="LLM_REASONING_EFFORT",
+    )
     llm_supports_vision_input: bool = Field(default=True, alias="LLM_SUPPORTS_VISION_INPUT")
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")

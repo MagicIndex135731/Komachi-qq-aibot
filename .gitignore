@@ -1,9 +1,11 @@
 .venv/
+.venv-wsl/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
 data/bot.db
+data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.usage-backup-*
@@ -24,3 +26,13 @@ dbg_service_*/
 .env
 .worktrees/
 release/
+
+# WSL/Docker deployment runtime state
+infra/wsl/.env
+infra/wsl/runtime/
+infra/wsl/.cache/
+
+# Local bot runtime state
+data/logs/
+*.qrcode.png
+qrcode.png

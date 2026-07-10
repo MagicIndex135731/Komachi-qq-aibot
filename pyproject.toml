@@ -33,8 +33,11 @@ norecursedirs = [
   "__pycache__",
   ".pytest_cache",
   ".pytest_tmp",
+  ".worktrees",
+  ".tmp*",
   ".tmp_pytest",
   ".tmp_pytest*",
+  "tmp_*",
   "release",
   "scripts/public_release_assets",
 ]

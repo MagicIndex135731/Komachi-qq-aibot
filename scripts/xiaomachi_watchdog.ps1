@@ -471,13 +471,14 @@ function Restart-LauncherManagedNapCat([string]$CurrentScope) {
         }
         $bootIds = @($bootTargets | Where-Object { $_ } | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
         if ($bootIds.Count -gt 0) {
-            Stop-TrackedProcesses -Ids $bootIds
-            $stopped += ("NapCatWinBootMain=" + ($bootIds -join ","))
+            $targetIds = @($bootIds + @(Get-ProcessDescendantIds -ParentIds $bootIds) | Select-Object -Unique)
+            Stop-TrackedProcesses -Ids $targetIds
+            $stopped += ("NapCatWinBootMain=" + ($targetIds -join ","))
         }
     }
 
     if ($state.qq_started_by_launcher) {
-        $qqTargets = @(Get-QQProcesses)
+        $qqTargets = @(Get-XiaomachiQQProcesses)
         $qqIds = @($qqTargets | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
         if ($qqIds.Count -gt 0) {
             Stop-TrackedProcesses -Ids $qqIds
@@ -532,7 +533,7 @@ function Stop-LauncherManagedNapCatStack([string]$CurrentScope, [switch]$FullTre
     }
 
     if ($state.qq_started_by_launcher) {
-        $qqTargets = @(Get-QQProcesses)
+        $qqTargets = @(Get-XiaomachiQQProcesses)
         $qqIds = @($qqTargets | ForEach-Object { $_.ProcessId } | Select-Object -Unique)
         if ($qqIds.Count -gt 0) {
             Stop-TrackedProcesses -Ids $qqIds
@@ -544,9 +545,18 @@ function Stop-LauncherManagedNapCatStack([string]$CurrentScope, [switch]$FullTre
     return $stopped
 }
 
-function Enter-OneBotManualLoginMode([string]$CurrentScope, [array]$ProcessSpecs) {
-    $message = "QQ account is offline. Xiaomachi has stopped its runtime and QQ/NapCat stack. Start Xiaomachi again with the startup BAT, then finish QQ login if prompted."
-    Show-XiaomachiDesktopAlert -CurrentScope $CurrentScope -Title "Xiaomachi needs QQ login" -Message $message
+function Enter-OneBotManualLoginMode(
+    [string]$CurrentScope,
+    [array]$ProcessSpecs,
+    [string]$Title = "Xiaomachi needs QQ login",
+    [string]$Message = "",
+    [string]$AlertReason = "manual_login_required",
+    [string]$AlertDetail = "QQ account is offline. Use the Xiaomachi startup BAT to start again."
+) {
+    if (-not $Message) {
+        $Message = "QQ account is offline. Xiaomachi has stopped its runtime and QQ/NapCat stack. Start Xiaomachi again with the startup BAT, then finish QQ login if prompted."
+    }
+    Show-XiaomachiDesktopAlert -CurrentScope $CurrentScope -Title $Title -Message $Message
 
     $stopped = @(Stop-LauncherManagedNapCatStack -CurrentScope $CurrentScope -FullTree)
     $stopped += @(Stop-OrphanedXiaomachiQQProcesses)
@@ -558,7 +568,7 @@ function Enter-OneBotManualLoginMode([string]$CurrentScope, [array]$ProcessSpecs
     }
 
     Write-WatchdogLog $CurrentScope ("onebot_offline_manual_reset_requested stopped={0}" -f (($stopped -join ";") -replace "\s+", "_"))
-    Write-XiaomachiAlert -Reason "manual_login_required" -Detail "QQ account is offline. Use the Xiaomachi startup BAT to start again."
+    Write-XiaomachiAlert -Reason $AlertReason -Detail $AlertDetail
 }
 
 function Start-Watchdog([string]$CurrentScope) {
@@ -665,6 +675,7 @@ function Run-Watchdog([string]$CurrentScope) {
                     }
                     if ($status.restart_reason -eq "onebot_group_stream_stale") {
                         Restart-LauncherManagedNapCat $CurrentScope
+                        return
                     }
                     $restartResult = Restart-BotSpecSafely `
                         -Workdir $workdir `

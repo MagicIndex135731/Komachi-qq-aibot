@@ -71,6 +71,9 @@ class LlmClient:
         compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
         image_edits_endpoint: str = "/images/edits",
+        builtin_web_search: bool = False,
+        web_search_context_size: str = "high",
+        reasoning_effort: str = "",
         http_client: httpx.Client | None = None,
         usage_recorder=None,
     ) -> None:
@@ -89,7 +92,10 @@ class LlmClient:
             image_edits_endpoint,
             default="/images/edits",
         )
-        self.http_client = http_client or httpx.Client(timeout=30.0)
+        self.builtin_web_search = bool(builtin_web_search)
+        self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
+        self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
+        self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=False)
         self.usage_recorder = usage_recorder
         self._conversation_response_ids: dict[str, str] = {}
         self._base_host = (urlparse(self.base_url).hostname or "").lower()
@@ -103,6 +109,18 @@ class LlmClient:
         if self.base_url.endswith("/v1") and normalized.startswith("/v1/"):
             normalized = normalized[3:]
         return normalized
+
+    def _normalize_web_search_context_size(self, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+        return "high"
+
+    def _normalize_reasoning_effort(self, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in {"minimal", "low", "medium", "high"}:
+            return normalized
+        return ""
 
     def _uses_anthropic_messages_api(self, *, model: str | None = None) -> bool:
         active_model = (model or self.model).strip()
@@ -174,6 +192,15 @@ class LlmClient:
             payload["instructions"] = "\n\n".join(instructions)
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
+        if self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        if self.builtin_web_search:
+            payload["tools"] = [
+                {
+                    "type": "web_search",
+                    "search_context_size": self.web_search_context_size,
+                }
+            ]
         return payload
 
     def _build_chat_completions_payload(
@@ -550,6 +577,53 @@ class LlmClient:
             payload["usage"] = usage
         return payload
 
+    def _log_responses_tool_event(self, payload: dict[str, Any], *, response_id: str | None) -> None:
+        payload_type = payload.get("type")
+        if not isinstance(payload_type, str) or not payload_type:
+            return
+
+        item = payload.get("item")
+        item_type = item.get("type") if isinstance(item, dict) else None
+        is_tool_event = (
+            "web_search_call" in payload_type
+            or "tool_call" in payload_type
+            or (isinstance(item_type, str) and (item_type.endswith("_call") or item_type == "web_search_call"))
+        )
+        if not is_tool_event:
+            return
+
+        item_id = payload.get("item_id")
+        status = payload.get("status")
+        query = payload.get("query")
+        title = payload.get("title")
+        url = payload.get("url")
+        if isinstance(item, dict):
+            item_id = item_id or item.get("id")
+            status = status or item.get("status")
+            query = query or item.get("query")
+            title = title or item.get("title")
+            url = url or item.get("url")
+
+        logger.info(
+            "responses_tool_event response_id=%s event=%s item_id=%s item_type=%s status=%s query=%r title=%r url=%r",
+            response_id or "",
+            payload_type,
+            item_id or "",
+            item_type or "",
+            status or "",
+            self._truncate_log_value(query),
+            self._truncate_log_value(title),
+            self._truncate_log_value(url),
+        )
+
+    def _truncate_log_value(self, value: Any, *, limit: int = 240) -> str:
+        if value is None:
+            return ""
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
     def _extract_responses_result_from_sse(
         self,
         response_text: str,
@@ -586,6 +660,7 @@ class LlmClient:
                     response_id = maybe_response_id
 
             payload_type = payload.get("type")
+            self._log_responses_tool_event(payload, response_id=response_id)
             if payload_type == "response.output_text.delta":
                 delta = payload.get("delta")
                 if isinstance(delta, str) and delta:

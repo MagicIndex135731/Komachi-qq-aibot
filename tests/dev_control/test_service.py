@@ -1207,6 +1207,43 @@ async def test_owner_private_daily_image_generation_request_sends_private_image(
 
 
 @pytest.mark.asyncio
+async def test_owner_private_daily_positive_negative_prompt_template_sends_private_image(sqlite_engine, tmp_path) -> None:
+    sender = FakeSender()
+    chat_llm = FakeLlmClient(reply_text="should not be used")
+    image_llm = FakeImageGenerationLlm()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    service = DevControlService(
+        engine=sqlite_engine,
+        sender=sender,
+        llm_client=chat_llm,
+        image_llm_client=image_llm,
+        owner_qq=10001,
+        repo_root=repo_root,
+        data_dir=tmp_path / "data",
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-private-image-prompt-template",
+            user_id=10001,
+            text=(
+                "画一张图，正面提示词为:masterpiece, best quality, 1girl\n"
+                "负面提示词为：worst quality, low quality"
+            ),
+        )
+    )
+
+    assert handled is True
+    await service.private_image_service.wait_for_idle()
+    assert chat_llm.prompts == []
+    assert len(image_llm.generate_calls) == 1
+    assert "masterpiece, best quality, 1girl" in image_llm.generate_calls[0]["prompt"]
+    assert sender.private_image_sent and sender.private_image_sent[0]["user_id"] == 10001
+    assert [outbound.text for outbound in sender.private_sent] == ["图我接住了，开始画", "图好了"]
+
+
+@pytest.mark.asyncio
 async def test_owner_private_image_then_followup_generation_only_replies_once_with_private_image(
     sqlite_engine, tmp_path
 ) -> None:

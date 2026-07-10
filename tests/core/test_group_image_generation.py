@@ -747,7 +747,7 @@ async def test_group_image_service_start_recovers_running_job_from_persistent_qu
 
 
 @pytest.mark.asyncio
-async def test_group_image_service_fast_fails_transport_timeout_and_suggests_simpler_prompt(tmp_path) -> None:
+async def test_group_image_service_retries_transport_timeout_and_suggests_simpler_prompt(tmp_path) -> None:
     sender = FakeGroupImageSender()
     llm = TimeoutImageLlm()
     service = GroupImageGenerationService(
@@ -772,6 +772,6 @@ async def test_group_image_service_fast_fails_transport_timeout_and_suggests_sim
     assert llm.calls[0]["output_format"] == "jpeg"
     assert llm.calls[0]["output_compression"] == 70
     assert llm.calls[0]["moderation"] == "low"
-    assert llm.calls[0]["max_attempts"] == 1
+    assert llm.calls[0]["max_attempts"] == 5
     assert llm.calls[0]["timeout_seconds"] is None
     assert "短" in sender.text_calls[-1]["text"]

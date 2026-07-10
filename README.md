@@ -455,6 +455,38 @@ README 和 `.env.example` 中已经放了这些常用项：
 - `NAPCAT_INJECT_DLL_PATH`
 - `NAPCAT_WAIT_TIMEOUT_SECONDS`
 
+## WSL 隔离部署
+
+推荐长期运行使用 WSL 版入口：
+
+- `start-xiaomachi-wsl.bat`
+- `stop-xiaomachi-wsl.bat`
+- `status-xiaomachi-wsl.bat`
+
+WSL 版会把 NapCat、QQ 登录态、小町 Python 进程放在 WSL2/Docker 内运行，避免与 Windows 本机个人 QQ 共用数据目录。原有 `启动小町.bat` / `关闭小町.bat` 仍保留为 Windows 版回滚入口，确认 WSL 版稳定前不要覆盖它们。
+
+首次使用：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\infra\wsl\scripts\sync_from_windows.ps1
+wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && bash infra/wsl/scripts/bootstrap_wsl.sh"
+wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && bash infra/wsl/scripts/start.sh"
+```
+
+如果容器下载 Python 依赖需要代理，只在被忽略的 `infra/wsl/.env` 中设置：
+
+```env
+DOCKER_HTTP_PROXY=http://127.0.0.1:7897
+DOCKER_HTTPS_PROXY=http://127.0.0.1:7897
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+验收：
+
+```powershell
+wsl.exe bash -lc "cd '/mnt/d/qq群ai小人' && .venv-wsl/bin/python infra/wsl/scripts/onebot_probe.py --ws-url ws://127.0.0.1:3001"
+```
+
 ## 仓库结构
 
 - `app/`
