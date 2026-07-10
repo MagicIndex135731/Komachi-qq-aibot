@@ -218,6 +218,8 @@ class LlmClient:
         *,
         prompt: str,
         images: list[ImageAttachment] | None = None,
+        size: str | None = None,
+        quality: str | None = None,
     ) -> dict[str, Any]:
         payload = self._build_responses_payload(
             model=self.image_responses_model,
@@ -225,7 +227,15 @@ class LlmClient:
             input_lines=[prompt],
             images=images,
         )
-        payload["tools"] = [{"type": "image_generation"}]
+        image_tool: dict[str, Any] = {"type": "image_generation"}
+        normalized_size = str(size or "").strip()
+        if normalized_size and normalized_size != "auto":
+            image_tool["size"] = normalized_size
+        normalized_quality = str(quality or "").strip()
+        if normalized_quality:
+            image_tool["quality"] = normalized_quality
+        payload["tools"] = [image_tool]
+        payload["tool_choice"] = {"type": "image_generation"}
         return payload
 
     def _build_chat_completions_payload(
@@ -1475,9 +1485,13 @@ class LlmClient:
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
         if self.image_responses_model:
-            del model, size, quality, background, output_format, output_compression, moderation, response_format
+            del model, background, output_format, output_compression, moderation, response_format
             responses_result = self._request_responses_image_result(
-                responses_payload=self._build_responses_image_payload(prompt=prompt),
+                responses_payload=self._build_responses_image_payload(
+                    prompt=prompt,
+                    size=size,
+                    quality=quality,
+                ),
                 model=self.image_responses_model,
                 max_attempts=max_attempts,
                 timeout_seconds=timeout_seconds,
@@ -1521,11 +1535,16 @@ class LlmClient:
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
         if self.image_responses_model:
-            del model, size, quality, background, output_format, output_compression, moderation, response_format
+            del model, background, output_format, output_compression, moderation, response_format
             if not images:
                 raise ValueError("image edit request did not include a usable input image")
             responses_result = self._request_responses_image_result(
-                responses_payload=self._build_responses_image_payload(prompt=prompt, images=images),
+                responses_payload=self._build_responses_image_payload(
+                    prompt=prompt,
+                    images=images,
+                    size=size,
+                    quality=quality,
+                ),
                 model=self.image_responses_model,
                 max_attempts=max_attempts,
                 timeout_seconds=timeout_seconds,

@@ -24,8 +24,8 @@ from app.storage.repositories import JobRepository
 logger = logging.getLogger(__name__)
 
 AUTO_IMAGE_SIZE = "auto"
-LANDSCAPE_IMAGE_SIZE = "3840x2160"
-PORTRAIT_IMAGE_SIZE = "2160x3840"
+LANDSCAPE_IMAGE_SIZE = "1536x1024"
+PORTRAIT_IMAGE_SIZE = "1024x1536"
 LANDSCAPE_IMAGE_SIZE_KEYWORDS = ("横图", "横版")
 PORTRAIT_IMAGE_SIZE_KEYWORDS = ("竖图", "竖版")
 

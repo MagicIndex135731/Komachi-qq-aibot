@@ -62,7 +62,7 @@
 - `LLM_TEXT_ENDPOINT`、`LLM_REASONING_EFFORT`
 - `SEARCH_API_KEY`、`SEARCH_PROVIDER`、`SEARCH_TIMEOUT_SECONDS`
 - `CONTEXT_RECENT_LIMIT`、`CONTEXT_SUMMARY_LIMIT`、`CONTEXT_HISTORY_LIMIT`
-- 生图直接复用主模型的 Responses `image_generation` 工具；仅单独配置 `GROUP_IMAGE_QUEUE_CAPACITY` 和 `GROUP_IMAGE_TIMEOUT_SECONDS`
+- 生图直接复用主模型的 Responses `image_generation` 工具；横图使用 `1536x1024`，竖图使用 `1024x1536`，质量固定为 `high`；仅单独配置 `GROUP_IMAGE_QUEUE_CAPACITY` 和 `GROUP_IMAGE_TIMEOUT_SECONDS`
 
 修改 `infra/wsl/.env` 后，需要重建小町容器才能加载新环境变量：
 
