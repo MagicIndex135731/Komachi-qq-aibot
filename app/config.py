@@ -32,24 +32,8 @@ class AppSettings(BaseSettings):
     )
     llm_supports_vision_input: bool = Field(default=True, alias="LLM_SUPPORTS_VISION_INPUT")
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
-    group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
-    group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")
-    group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
-    group_image_generations_endpoint: str = Field(
-        default="/images/generations",
-        alias="GROUP_IMAGE_GENERATIONS_ENDPOINT",
-    )
-    group_image_edits_endpoint: str = Field(
-        default="/images/edits",
-        alias="GROUP_IMAGE_EDITS_ENDPOINT",
-    )
-    group_image_size: str = Field(default="auto", alias="GROUP_IMAGE_SIZE")
-    group_image_quality: str = Field(default="high", alias="GROUP_IMAGE_QUALITY")
-    group_image_background: str = Field(default="", alias="GROUP_IMAGE_BACKGROUND")
-    group_image_output_format: str = Field(default="png", alias="GROUP_IMAGE_OUTPUT_FORMAT")
-    group_image_output_compression: int = Field(default=100, alias="GROUP_IMAGE_OUTPUT_COMPRESSION")
-    group_image_moderation: str = Field(default="low", alias="GROUP_IMAGE_MODERATION")
     group_image_queue_capacity: int = Field(default=3, alias="GROUP_IMAGE_QUEUE_CAPACITY")
+    group_image_timeout_seconds: float = Field(default=900.0, alias="GROUP_IMAGE_TIMEOUT_SECONDS")
     bot_qq: int = Field(alias="BOT_QQ")
     owner_qq: int = Field(alias="OWNER_QQ")
     admin_qqs: str = Field(default="", alias="ADMIN_QQS")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -41,8 +42,8 @@ def _candidate_paths(base_url: str, *, primary: str, fallback: str) -> tuple[str
 
 def resolve_probe_image_api_settings() -> tuple[str, str]:
     settings = AppSettings()
-    base_url = settings.group_image_base_url.strip() or settings.llm_base_url.rstrip("/")
-    api_key = settings.group_image_api_key.strip() or settings.llm_api_key
+    base_url = os.getenv("GROUP_IMAGE_BASE_URL", "").strip() or settings.llm_base_url.rstrip("/")
+    api_key = os.getenv("GROUP_IMAGE_API_KEY", "").strip() or settings.llm_api_key
     return base_url.rstrip("/"), api_key
 
 

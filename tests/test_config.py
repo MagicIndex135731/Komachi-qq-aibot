@@ -145,31 +145,18 @@ def test_app_settings_exposes_group_image_defaults(tmp_path, monkeypatch) -> Non
 
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
-    assert settings.group_image_model == "gpt-image-2"
-    assert settings.group_image_size == "auto"
-    assert settings.group_image_quality == "high"
-    assert settings.group_image_background == ""
-    assert settings.group_image_output_format == "png"
-    assert settings.group_image_output_compression == 100
-    assert settings.group_image_moderation == "low"
-    assert settings.group_image_base_url == ""
-    assert settings.group_image_api_key == ""
-    assert settings.group_image_generations_endpoint == "/images/generations"
-    assert settings.group_image_edits_endpoint == "/images/edits"
     assert settings.group_image_queue_capacity == 3
+    assert settings.group_image_timeout_seconds == 900.0
 
 
-def test_app_settings_reads_group_image_endpoints(tmp_path, monkeypatch) -> None:
+def test_app_settings_reads_group_image_timeout(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
-    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
-    monkeypatch.setenv("GROUP_IMAGE_GENERATIONS_ENDPOINT", "/v1/images/generations")
-    monkeypatch.setenv("GROUP_IMAGE_EDITS_ENDPOINT", "/v1/images/edits")
+    monkeypatch.setenv("GROUP_IMAGE_TIMEOUT_SECONDS", "600")
     monkeypatch.setenv("BOT_QQ", "123456789")
     monkeypatch.setenv("OWNER_QQ", "987654321")
 
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
-    assert settings.group_image_generations_endpoint == "/v1/images/generations"
-    assert settings.group_image_edits_endpoint == "/v1/images/edits"
+    assert settings.group_image_timeout_seconds == 600.0
