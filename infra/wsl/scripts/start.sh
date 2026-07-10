@@ -33,6 +33,31 @@ start_keepalive() {
     >/dev/null 2>&1 &
 }
 
+open_napcat_login_if_needed() {
+  local launcher_windows=""
+
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 http://127.0.0.1:6099/ >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+
+  if ! curl -fsS --max-time 2 http://127.0.0.1:6099/ >/dev/null 2>&1; then
+    echo "NapCat WebUI is not ready; automatic login page was skipped."
+    return 0
+  fi
+  if ! command -v powershell.exe >/dev/null 2>&1; then
+    echo "Windows PowerShell is unavailable; automatic login page was skipped."
+    return 0
+  fi
+
+  launcher_windows="$(wslpath -w "${WSL_DIR}/scripts/open_napcat_webui.ps1")"
+  powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "${launcher_windows}" -OnlyWhenLoginRequired >/dev/null 2>&1 || true
+}
+
 start_keepalive
 docker compose up -d
+open_napcat_login_if_needed
 bash "${WSL_DIR}/scripts/status.sh"
