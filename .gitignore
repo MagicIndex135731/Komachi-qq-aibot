@@ -15,8 +15,7 @@ data/dev_control/
 data/generated_images/
 data/generated_private_images/
 data/image_cache/
-data/logs/*
-!data/logs/.gitkeep
+data/logs/
 data/napcat/
 .codex_tmp*/
 .tmp*/
@@ -33,6 +32,5 @@ infra/wsl/runtime/
 infra/wsl/.cache/
 
 # Local bot runtime state
-data/logs/
 *.qrcode.png
 qrcode.png
