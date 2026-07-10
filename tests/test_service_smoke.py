@@ -75,6 +75,7 @@ def test_build_group_image_service_uses_primary_model_and_finite_timeout(monkeyp
 
     assert result is built_service
     assert captured["model"] == "gpt-5.6-terra"
+    assert captured["quality"] == "high"
     assert captured["image_max_attempts"] == 1
     assert captured["image_timeout_seconds"] == 900.0
 

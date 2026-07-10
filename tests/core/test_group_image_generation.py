@@ -415,7 +415,7 @@ async def test_group_image_service_uses_edit_path_when_reference_images_are_pres
 
 
 @pytest.mark.asyncio
-async def test_group_image_service_uses_4k_landscape_size_when_prompt_mentions_landscape(tmp_path) -> None:
+async def test_group_image_service_uses_max_landscape_size_when_prompt_mentions_landscape(tmp_path) -> None:
     sender = FakeGroupImageSender()
     llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
     service = GroupImageGenerationService(
@@ -435,11 +435,12 @@ async def test_group_image_service_uses_4k_landscape_size_when_prompt_mentions_l
     await service.wait_for_idle()
 
     assert result.accepted is True
-    assert llm.generate_calls[0]["size"] == "3840x2160"
+    assert llm.generate_calls[0]["size"] == "1536x1024"
+    assert llm.generate_calls[0]["quality"] == "high"
 
 
 @pytest.mark.asyncio
-async def test_group_image_service_uses_4k_portrait_size_when_prompt_mentions_portrait(tmp_path) -> None:
+async def test_group_image_service_uses_max_portrait_size_when_prompt_mentions_portrait(tmp_path) -> None:
     sender = FakeGroupImageSender()
     llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
     service = GroupImageGenerationService(
@@ -466,7 +467,8 @@ async def test_group_image_service_uses_4k_portrait_size_when_prompt_mentions_po
 
     assert result.accepted is True
     assert llm.generate_calls == []
-    assert llm.edit_calls[0]["size"] == "2160x3840"
+    assert llm.edit_calls[0]["size"] == "1024x1536"
+    assert llm.edit_calls[0]["quality"] == "high"
 
 
 @pytest.mark.asyncio

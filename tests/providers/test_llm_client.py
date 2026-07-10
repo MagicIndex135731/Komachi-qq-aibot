@@ -1160,6 +1160,8 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     result = client.generate_image(
         prompt="draw a cheerful pig",
         model="gpt-image-2",
+        size="1536x1024",
+        quality="high",
         timeout_seconds=900.0,
     )
 
@@ -1174,7 +1176,8 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
             }
         ],
         "reasoning": {"effort": "medium"},
-        "tools": [{"type": "image_generation"}],
+        "tools": [{"type": "image_generation", "size": "1536x1024", "quality": "high"}],
+        "tool_choice": {"type": "image_generation"},
     }
     assert captured["timeout"]["read"] == 900.0
     assert result.images == [{"b64_json": "aW1hZ2U="}]
@@ -1212,6 +1215,8 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
         prompt="turn this into watercolor",
         model="gpt-image-2",
         images=[ImageAttachment(url="", local_path=str(source_path), file_id="source.png")],
+        size="1024x1536",
+        quality="high",
         timeout_seconds=900.0,
     )
 
@@ -1221,7 +1226,10 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
         "type": "input_image",
         "image_url": "data:image/png;base64," + base64.b64encode(b"reference-bytes").decode("ascii"),
     }
-    assert captured["payload"]["tools"] == [{"type": "image_generation"}]
+    assert captured["payload"]["tools"] == [
+        {"type": "image_generation", "size": "1024x1536", "quality": "high"}
+    ]
+    assert captured["payload"]["tool_choice"] == {"type": "image_generation"}
     assert result.images == [{"b64_json": "ZWRpdGVk"}]
 
 
