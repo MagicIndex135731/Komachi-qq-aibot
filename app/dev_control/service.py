@@ -485,6 +485,8 @@ class DevControlService:
         image_output_compression: int | None = 100,
         image_moderation: str | None = "low",
         image_queue_capacity: int = 3,
+        image_max_attempts: int = 1,
+        image_timeout_seconds: float = 900.0,
         assistant_name: str = "Codex",
         persona: dict | None = None,
         safety: dict | None = None,
@@ -520,6 +522,8 @@ class DevControlService:
             output_compression=image_output_compression,
             moderation=image_moderation,
             max_slots=image_queue_capacity,
+            image_max_attempts=image_max_attempts,
+            image_timeout_seconds=image_timeout_seconds,
             task_result_callback=self._finalize_private_image_task,
         )
         self.assistant_name = assistant_name.strip() or "Codex"

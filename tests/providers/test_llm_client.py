@@ -39,6 +39,32 @@ def _responses_stream_body(
     )
 
 
+def _responses_image_stream_body(*, response_id: str, image_b64: str) -> str:
+    item = {
+        "id": "ig_1",
+        "type": "image_generation_call",
+        "status": "completed",
+        "result": image_b64,
+    }
+    completed_response = {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": [item],
+        "usage": {
+            "input_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 2},
+            "output_tokens": 4,
+        },
+    }
+    return (
+        f'data: {json.dumps({"type": "response.created", "response": {"id": response_id}})}\n\n'
+        f'data: {json.dumps({"type": "response.image_generation_call.in_progress", "item_id": "ig_1"})}\n\n'
+        f'data: {json.dumps({"type": "response.output_item.done", "item": item})}\n\n'
+        f'data: {json.dumps({"type": "response.completed", "response": completed_response})}\n\n'
+    )
+
+
 def test_llm_client_posts_to_chat_completions_endpoint_with_bearer_auth() -> None:
     captured = {}
 
@@ -1102,6 +1128,101 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert recorded[0].input_tokens == 120
     assert recorded[0].cached_input_tokens == 20
     assert recorded[0].output_tokens == 45
+
+
+def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
+    captured = {}
+    recorded = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        captured["timeout"] = request.extensions.get("timeout")
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_image_stream_body(response_id="resp_image_1", image_b64="aW1hZ2U="),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-terra",
+        responses_model="gpt-5.6-terra",
+        image_responses_model="gpt-5.6-terra",
+        reasoning_effort="medium",
+        http_client=httpx.Client(transport=transport),
+        usage_recorder=recorded.append,
+    )
+
+    result = client.generate_image(
+        prompt="draw a cheerful pig",
+        model="gpt-image-2",
+        timeout_seconds=900.0,
+    )
+
+    assert captured["url"] == "https://api.example.test/v1/responses"
+    assert captured["payload"] == {
+        "model": "gpt-5.6-terra",
+        "stream": True,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "draw a cheerful pig"}],
+            }
+        ],
+        "reasoning": {"effort": "medium"},
+        "tools": [{"type": "image_generation"}],
+    }
+    assert captured["timeout"]["read"] == 900.0
+    assert result.images == [{"b64_json": "aW1hZ2U="}]
+    assert result.artifacts[0].b64_json == "aW1hZ2U="
+    assert len(recorded) == 1
+    assert recorded[0].model == "gpt-5.6-terra"
+    assert recorded[0].endpoint == "responses"
+
+
+def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> None:
+    captured = {}
+    source_path = tmp_path / "source.png"
+    source_path.write_bytes(b"reference-bytes")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_image_stream_body(response_id="resp_image_edit_1", image_b64="ZWRpdGVk"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-terra",
+        responses_model="gpt-5.6-terra",
+        image_responses_model="gpt-5.6-terra",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    result = client.edit_image(
+        prompt="turn this into watercolor",
+        model="gpt-image-2",
+        images=[ImageAttachment(url="", local_path=str(source_path), file_id="source.png")],
+        timeout_seconds=900.0,
+    )
+
+    content = captured["payload"]["input"][0]["content"]
+    assert content[0] == {"type": "input_text", "text": "turn this into watercolor"}
+    assert content[1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(b"reference-bytes").decode("ascii"),
+    }
+    assert captured["payload"]["tools"] == [{"type": "image_generation"}]
+    assert result.images == [{"b64_json": "ZWRpdGVk"}]
 
 
 def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:

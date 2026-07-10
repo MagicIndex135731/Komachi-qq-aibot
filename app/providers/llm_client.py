@@ -16,6 +16,7 @@ import httpx
 from app.core.message_content import ImageAttachment
 from app.providers.image_adapter import (
     FALLBACK_IMAGE_RESPONSE_FORMAT,
+    ImageArtifact,
     ImageGenerationResult,
     build_image_edit_data,
     build_image_generation_payload,
@@ -54,6 +55,13 @@ class ResponsesStreamResult:
     usage: LlmUsage | None
 
 
+@dataclass(slots=True)
+class ResponsesImageResult:
+    result: ImageGenerationResult
+    response_id: str | None
+    usage: LlmUsage | None
+
+
 class LlmClient:
     ANTHROPIC_MAX_TOKENS = 1024
     REQUEST_MAX_ATTEMPTS = 5
@@ -68,6 +76,7 @@ class LlmClient:
         fallback_model: str | None = None,
         vision_model: str | None = None,
         responses_model: str | None = None,
+        image_responses_model: str | None = None,
         compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
         image_edits_endpoint: str = "/images/edits",
@@ -83,6 +92,7 @@ class LlmClient:
         self.fallback_model = (fallback_model or "").strip()
         self.vision_model = (vision_model or "").strip()
         self.responses_model = (responses_model or "").strip()
+        self.image_responses_model = (image_responses_model or "").strip()
         self.compat_model = (compat_model or model).strip() or model
         self.image_generations_endpoint = self._normalize_endpoint(
             image_generations_endpoint,
@@ -201,6 +211,21 @@ class LlmClient:
                     "search_context_size": self.web_search_context_size,
                 }
             ]
+        return payload
+
+    def _build_responses_image_payload(
+        self,
+        *,
+        prompt: str,
+        images: list[ImageAttachment] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._build_responses_payload(
+            model=self.image_responses_model,
+            instructions=[],
+            input_lines=[prompt],
+            images=images,
+        )
+        payload["tools"] = [{"type": "image_generation"}]
         return payload
 
     def _build_chat_completions_payload(
@@ -680,6 +705,130 @@ class LlmClient:
         usage = self._extract_responses_usage({"usage": usage_payload}, model=model) if usage_payload else None
         return ResponsesStreamResult(text=extracted_text, response_id=response_id, usage=usage)
 
+    def _extract_responses_image_artifacts(self, payload: Any) -> list[ImageArtifact]:
+        artifacts: list[ImageArtifact] = []
+        seen: set[tuple[str, str]] = set()
+
+        def append_result(value: Any) -> None:
+            if isinstance(value, str):
+                normalized = value.strip()
+                if not normalized:
+                    return
+                if normalized.startswith(("http://", "https://", "data:")):
+                    artifact = ImageArtifact(url=normalized, output_format="png")
+                    key = ("url", normalized)
+                else:
+                    artifact = ImageArtifact(b64_json=normalized, output_format="png")
+                    key = ("b64", normalized)
+                if key not in seen:
+                    seen.add(key)
+                    artifacts.append(artifact)
+                return
+            if isinstance(value, dict):
+                b64_value = str(value.get("b64_json", "") or "").strip()
+                url_value = str(value.get("url", "") or "").strip()
+                if b64_value:
+                    append_result(b64_value)
+                elif url_value:
+                    append_result(url_value)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    append_result(item)
+
+        def visit(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+            if value.get("type") == "image_generation_call":
+                append_result(value.get("result"))
+            item = value.get("item")
+            if isinstance(item, dict):
+                visit(item)
+            response = value.get("response")
+            if isinstance(response, dict):
+                visit(response.get("output"))
+            output = value.get("output")
+            if isinstance(output, list):
+                visit(output)
+
+        visit(payload)
+        return artifacts
+
+    def _build_responses_image_result(
+        self,
+        *,
+        artifacts: list[ImageArtifact],
+        response_id: str | None,
+        usage: LlmUsage | None,
+    ) -> ResponsesImageResult:
+        if not artifacts:
+            raise ValueError("responses image generation did not include an image result")
+        images: list[dict[str, Any]] = []
+        for artifact in artifacts:
+            if artifact.b64_json:
+                images.append({"b64_json": artifact.b64_json})
+            elif artifact.url:
+                images.append({"url": artifact.url})
+        return ResponsesImageResult(
+            result=ImageGenerationResult(created=None, images=images, artifacts=artifacts),
+            response_id=response_id,
+            usage=usage,
+        )
+
+    def _extract_responses_image_result_from_sse(
+        self,
+        response_text: str,
+        *,
+        model: str,
+    ) -> ResponsesImageResult:
+        artifacts: list[ImageArtifact] = []
+        response_id: str | None = None
+        usage_payload: dict[str, Any] | None = None
+
+        for raw_line in response_text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload_text = line[5:].strip()
+            if not payload_text or payload_text == "[DONE]":
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            response = payload.get("response")
+            if response_id is None and isinstance(response, dict):
+                maybe_response_id = response.get("id")
+                if isinstance(maybe_response_id, str) and maybe_response_id:
+                    response_id = maybe_response_id
+            self._log_responses_tool_event(payload, response_id=response_id)
+            artifacts.extend(self._extract_responses_image_artifacts(payload))
+            if payload.get("type") == "response.completed" and isinstance(response, dict):
+                usage = response.get("usage")
+                if isinstance(usage, dict):
+                    usage_payload = usage
+
+        deduped: list[ImageArtifact] = []
+        seen: set[tuple[str | None, str | None]] = set()
+        for artifact in artifacts:
+            key = (artifact.b64_json, artifact.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(artifact)
+        usage = self._extract_responses_usage({"usage": usage_payload}, model=model) if usage_payload else None
+        return self._build_responses_image_result(
+            artifacts=deduped,
+            response_id=response_id,
+            usage=usage,
+        )
+
     def _record_usage(self, usage: LlmUsage | None) -> None:
         if usage is None or self.usage_recorder is None:
             return
@@ -917,6 +1066,76 @@ class LlmClient:
         if last_error is None:
             raise ValueError("responses request failed without a captured exception")
         raise ValueError("responses request failed after retries") from last_error
+
+    def _request_responses_image_result(
+        self,
+        *,
+        responses_payload: dict[str, Any],
+        model: str,
+        max_attempts: int | None = None,
+        timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
+    ) -> ResponsesImageResult:
+        last_error: Exception | None = None
+        attempt_limit = max(1, int(max_attempts or 1))
+
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                request_kwargs: dict[str, Any] = {
+                    "headers": {"Authorization": f"Bearer {self.api_key}"},
+                    "json": responses_payload,
+                }
+                if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
+                    request_kwargs["timeout"] = timeout_seconds
+                response = self.http_client.post(
+                    f"{self.base_url}/responses",
+                    **request_kwargs,
+                )
+                response.raise_for_status()
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = exc
+                logger.warning(
+                    "responses_image_transport_retry attempt=%s reason=%s",
+                    attempt,
+                    type(exc).__name__,
+                )
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if not self._is_retryable_status_code(status_code):
+                    raise
+                last_error = exc
+                logger.warning("responses_image_status_retry attempt=%s status=%s", attempt, status_code)
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+                continue
+
+            content_type = response.headers.get("content-type", "")
+            try:
+                if "text/event-stream" in content_type:
+                    return self._extract_responses_image_result_from_sse(response.text, model=model)
+                response_data = response.json()
+                if not isinstance(response_data, dict):
+                    raise ValueError("responses image generation returned a non-object response")
+                usage = self._extract_responses_usage(response_data, model=model)
+                response_id = response_data.get("id")
+                return self._build_responses_image_result(
+                    artifacts=self._extract_responses_image_artifacts(response_data),
+                    response_id=response_id if isinstance(response_id, str) else None,
+                    usage=usage,
+                )
+            except ValueError as exc:
+                last_error = exc
+                logger.warning(
+                    "responses_image_invalid_result attempt=%s status=%s content_type=%s",
+                    attempt,
+                    response.status_code,
+                    content_type,
+                )
+                self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
+
+        if last_error is None:
+            raise ValueError("responses image request failed without a captured exception")
+        raise ValueError("responses image request failed after retries") from last_error
 
     def _request_images_generations_json(
         self,
@@ -1255,6 +1474,17 @@ class LlmClient:
         max_attempts: int | None = None,
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
+        if self.image_responses_model:
+            del model, size, quality, background, output_format, output_compression, moderation, response_format
+            responses_result = self._request_responses_image_result(
+                responses_payload=self._build_responses_image_payload(prompt=prompt),
+                model=self.image_responses_model,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
+            self._record_usage(responses_result.usage)
+            return responses_result.result
+
         payload = build_image_generation_payload(
             model=model,
             prompt=prompt,
@@ -1290,6 +1520,19 @@ class LlmClient:
         max_attempts: int | None = None,
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> ImageGenerationResult:
+        if self.image_responses_model:
+            del model, size, quality, background, output_format, output_compression, moderation, response_format
+            if not images:
+                raise ValueError("image edit request did not include a usable input image")
+            responses_result = self._request_responses_image_result(
+                responses_payload=self._build_responses_image_payload(prompt=prompt, images=images),
+                model=self.image_responses_model,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            )
+            self._record_usage(responses_result.usage)
+            return responses_result.result
+
         files = self._load_edit_input_images(images)
         if not files:
             raise ValueError("image edit request did not include a usable input image")

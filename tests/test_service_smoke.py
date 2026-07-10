@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import app.main as app_main
-import httpx
 import pytest
 
 from app.config import AppSettings
@@ -30,11 +29,8 @@ def _settings_for_search(*, provider: str, search_api_key: str) -> AppSettings:
         llm_model="gpt-5.4",
         llm_fallback_model="",
         llm_text_endpoint="chat_completions",
-        group_image_base_url="",
-        group_image_api_key="",
-        group_image_generations_endpoint="/images/generations",
-        group_image_edits_endpoint="/images/edits",
-        group_image_size="auto",
+        group_image_queue_capacity=3,
+        group_image_timeout_seconds=900.0,
         bot_qq=123456789,
         owner_qq=987654321,
         admin_qqs="",
@@ -59,43 +55,28 @@ def test_build_group_image_llm_client_reuses_primary_client_without_override() -
     assert build_group_image_llm_client(settings=settings, engine=object(), llm_client=primary_client) is primary_client
 
 
-def test_build_group_image_llm_client_builds_separate_client_with_override(monkeypatch) -> None:
+def test_build_group_image_service_uses_primary_model_and_finite_timeout(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.group_image_base_url = "https://images.example.test/v1"
-    settings.group_image_api_key = "image-key"
+    settings.llm_model = "gpt-5.6-terra"
     captured: dict[str, object] = {}
-    built_client = object()
+    built_service = object()
 
-    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
+    monkeypatch.setattr(
+        app_main,
+        "GroupImageGenerationService",
+        lambda **kwargs: captured.update(kwargs) or built_service,
+    )
 
-    result = build_group_image_llm_client(settings=settings, engine=object(), llm_client=object())
+    result = app_main.build_group_image_service(
+        settings=settings,
+        llm_client=object(),
+        sender=object(),
+    )
 
-    assert result is built_client
-    assert captured["base_url"] == "https://images.example.test/v1"
-    assert captured["api_key"] == "image-key"
-    assert captured["model"] == "gpt-5.4"
-    assert isinstance(captured["http_client"], httpx.Client)
-    assert captured["http_client"]._trust_env is False
-    captured["http_client"].close()
-
-
-def test_build_group_image_llm_client_builds_separate_client_when_custom_image_endpoints_are_configured(monkeypatch) -> None:
-    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.group_image_generations_endpoint = "/v1/images/generations"
-    settings.group_image_edits_endpoint = "/v1/images/edits"
-    settings.llm_model = "gpt-5.4-mini"
-    settings.llm_fallback_model = ""
-    settings.llm_text_endpoint = "chat_completions"
-    captured: dict[str, object] = {}
-    built_client = object()
-
-    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: captured.update(kwargs) or built_client)
-
-    result = app_main.build_group_image_llm_client(settings=settings, engine=object(), llm_client=object())
-
-    assert result is built_client
-    assert captured["image_generations_endpoint"] == "/v1/images/generations"
-    assert captured["image_edits_endpoint"] == "/v1/images/edits"
+    assert result is built_service
+    assert captured["model"] == "gpt-5.6-terra"
+    assert captured["image_max_attempts"] == 1
+    assert captured["image_timeout_seconds"] == 900.0
 
 
 def test_runtime_banner_includes_model_and_bot_id() -> None:
@@ -246,6 +227,7 @@ def test_build_llm_client_preserves_primary_model_and_exposes_distinct_fallback(
     assert captured["model"] == "gpt-5.4-mini"
     assert captured["fallback_model"] == "gpt-4o-mini"
     assert captured["vision_model"] == "gpt-4o"
+    assert captured["image_responses_model"] == "gpt-5.4-mini"
     assert captured["compat_model"] == "gpt-5.4-mini"
 
 

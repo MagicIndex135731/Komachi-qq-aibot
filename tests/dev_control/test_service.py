@@ -1202,6 +1202,8 @@ async def test_owner_private_daily_image_generation_request_sends_private_image(
     assert chat_llm.prompts == []
     assert len(image_llm.edit_calls) == 1
     assert image_llm.edit_calls[0]["images"][0].file_id == "layout.png"
+    assert image_llm.edit_calls[0]["max_attempts"] == 1
+    assert image_llm.edit_calls[0]["timeout_seconds"] == 900.0
     assert sender.private_image_sent and sender.private_image_sent[0]["user_id"] == 10001
     assert [outbound.text for outbound in sender.private_sent] == ["图我接住了，开始画", "图好了"]
 
