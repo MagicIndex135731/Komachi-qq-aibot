@@ -577,6 +577,9 @@ def test_stop_cleans_watchdog_state_even_when_compose_down_fails() -> None:
     stop_script = (REPO_ROOT / "infra/wsl/scripts/stop.sh").read_text(encoding="utf-8")
 
     assert "compose_exit=0" in stop_script
-    assert "docker compose down || compose_exit=$?" in stop_script
-    assert stop_script.index("stop_keepalive") > stop_script.index("docker compose down")
+    assert "docker compose -f docker-compose.yml down --remove-orphans || compose_exit=$?" in stop_script
+    assert "docker compose -f docker-compose.llbot.yml down --remove-orphans || compose_exit=$?" in stop_script
+    assert stop_script.index('rm -f "${flag_file}"') > stop_script.index(
+        "docker compose -f docker-compose.llbot.yml down"
+    )
     assert 'exit "${compose_exit}"' in stop_script

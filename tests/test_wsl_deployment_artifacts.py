@@ -24,6 +24,10 @@ def test_wsl_required_files_exist() -> None:
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
         "open-napcat-webui.bat",
+        "open-llbot-webui.bat",
+        "infra/wsl/docker-compose.llbot.yml",
+        "infra/wsl/scripts/bootstrap_llbot_runtime.py",
+        "infra/wsl/scripts/open_llbot_webui.ps1",
     ]
     missing = [path for path in required if not (REPO_ROOT / path).exists()]
     assert missing == []
@@ -74,17 +78,18 @@ def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() ->
     assert "local-test-token" not in launcher_content
 
 
-def test_wsl_start_opens_napcat_login_only_when_needed_before_status_probe() -> None:
+def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
     launcher = (REPO_ROOT / "infra/wsl/scripts/open_napcat_webui.ps1").read_text(
         encoding="utf-8"
     )
 
-    compose_up = start_script.index("docker compose up -d")
-    conditional_open = start_script.index("\nopen_napcat_login_if_needed\n")
-    status_probe = start_script.index('bash "${WSL_DIR}/scripts/status.sh"')
+    compose_up = start_script.index('docker compose -f "${compose_file}" up -d')
+    conditional_open = start_script.index("\nopen_login_page\n")
+    status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"')
     assert compose_up < conditional_open < status_probe
-    assert "http://127.0.0.1:6099/" in start_script
+    assert "webui_port=6099" in start_script
+    assert "webui_port=3080" in start_script
     assert "wslpath -w" in start_script
     assert "powershell.exe" in start_script
     assert "-OnlyWhenLoginRequired" in start_script
@@ -175,8 +180,8 @@ def test_xiaomachi_startup_installs_dependencies_with_proxy_friendly_timeouts() 
 
 def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
-    assert "Waiting for NapCat healthcheck" in script
-    assert "Waiting for OneBot websocket..." in script
+    assert 'Waiting for ${service_name} healthcheck' in script
+    assert "OneBot probe (${platform})" in script
     assert "Waiting for xiaomachi bot heartbeat..." in script
     assert "group.heartbeat.json" in script
     assert "heartbeat_age_seconds" in script
@@ -186,13 +191,13 @@ def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
     assert "docker inspect" in script
     assert "onebot_probe.py" in script
     assert "--ws-url ws://127.0.0.1:3001" in script
-    assert "docker compose logs --tail=80 napcat" in script
-    assert "docker compose logs --tail=80 xiaomachi" in script
+    assert 'docker compose -f "${compose_file}" logs --tail=80 "${service_name}"' in script
+    assert 'docker compose -f "${compose_file}" logs --tail=80 xiaomachi' in script
 
 
 def test_start_script_waits_for_status_readiness() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
-    assert 'bash "${WSL_DIR}/scripts/status.sh"' in script
+    assert 'bash "${SCRIPT_DIR}/status.sh"' in script
 
 
 def test_start_and_stop_manage_wsl_keepalive_anchor() -> None:
@@ -216,5 +221,5 @@ def test_stop_terminates_the_keepalive_process_group_before_state_cleanup() -> N
 
     remove_flag = stop_script.index('rm -f "${flag_file}"')
     kill_group = stop_script.index('kill -- "-${existing_pid}"')
-    remove_state = stop_script.index('"${runtime_dir}/onebot-watchdog.json"')
+    remove_state = stop_script.index('"${runtime_dir}"/onebot-watchdog-*.json')
     assert remove_flag < kill_group < remove_state

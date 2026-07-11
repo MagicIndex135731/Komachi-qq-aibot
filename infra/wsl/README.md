@@ -1,6 +1,6 @@
 # WSL/Docker 运行目录
 
-这里是小町当前唯一受支持的运行栈。NapCat 保存 QQ 登录态，小町容器运行群聊入口，Windows BAT 只负责调用 WSL 脚本。
+这里是小町当前唯一受支持的运行栈。`QQ_PLATFORM=llbot` 使用 LLBot，`QQ_PLATFORM=napcat` 回退到原 NapCat；两者共享同一套小町业务、数据库和模型配置，但登录态各自独立保存。
 
 ## 启动链路
 
@@ -9,7 +9,7 @@ start-xiaomachi-wsl.bat
   -> D:\xiaomachi-wsl-entry.sh
   -> infra/wsl/scripts/start.sh
   -> docker compose up -d
-  -> 条件打开 NapCat WebUI
+  -> 条件打开当前 QQ 平台 WebUI
   -> OneBot 与小町心跳检查
 ```
 

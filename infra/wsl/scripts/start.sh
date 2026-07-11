@@ -3,11 +3,31 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
 cd "${WSL_DIR}"
+
 if [[ ! -f .env ]]; then
   echo "Missing ${WSL_DIR}/.env. Run bootstrap_wsl.sh and fill required secrets."
   exit 1
+fi
+
+platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+platform="${platform:-napcat}"
+if [[ "${platform}" != "napcat" && "${platform}" != "llbot" ]]; then
+  echo "QQ_PLATFORM must be napcat or llbot."
+  exit 1
+fi
+
+if [[ "${platform}" == "llbot" ]]; then
+  compose_file="docker-compose.llbot.yml"
+  other_compose_file="docker-compose.yml"
+  webui_port=3080
+  launcher="open_llbot_webui.ps1"
+  python3 "${SCRIPT_DIR}/bootstrap_llbot_runtime.py" --wsl-dir "${WSL_DIR}"
+else
+  compose_file="docker-compose.yml"
+  other_compose_file="docker-compose.llbot.yml"
+  webui_port=6099
+  launcher="open_napcat_webui.ps1"
 fi
 
 start_keepalive() {
@@ -15,49 +35,33 @@ start_keepalive() {
   local flag_file="${runtime_dir}/keepalive.enabled"
   local pid_file="${runtime_dir}/keepalive.pid"
   local existing_pid=""
-
   mkdir -p "${runtime_dir}"
   touch "${flag_file}"
-
   if [[ -f "${pid_file}" ]]; then
     existing_pid="$(cat "${pid_file}" 2>/dev/null || true)"
     if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
       return 0
     fi
   fi
-
   nohup setsid bash -c 'exec -a xiaomachi-wsl-keepalive bash "$@"' _ \
-    "${WSL_DIR}/scripts/keepalive.sh" \
-    "${flag_file}" \
-    "${pid_file}" \
+    "${SCRIPT_DIR}/keepalive.sh" "${flag_file}" "${pid_file}" "${platform}" \
     >/dev/null 2>&1 &
 }
 
-open_napcat_login_if_needed() {
-  local launcher_windows=""
-
+open_login_page() {
   for _ in $(seq 1 30); do
-    if curl -fsS --max-time 2 http://127.0.0.1:6099/ >/dev/null 2>&1; then
-      break
-    fi
+    curl -fsS --max-time 2 "http://127.0.0.1:${webui_port}/" >/dev/null 2>&1 && break
     sleep 2
   done
-
-  if ! curl -fsS --max-time 2 http://127.0.0.1:6099/ >/dev/null 2>&1; then
-    echo "NapCat WebUI is not ready; automatic login page was skipped."
-    return 0
+  if curl -fsS --max-time 2 "http://127.0.0.1:${webui_port}/" >/dev/null 2>&1 \
+      && command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -File "$(wslpath -w "${SCRIPT_DIR}/${launcher}")" -OnlyWhenLoginRequired >/dev/null 2>&1 || true
   fi
-  if ! command -v powershell.exe >/dev/null 2>&1; then
-    echo "Windows PowerShell is unavailable; automatic login page was skipped."
-    return 0
-  fi
-
-  launcher_windows="$(wslpath -w "${WSL_DIR}/scripts/open_napcat_webui.ps1")"
-  powershell.exe -NoProfile -ExecutionPolicy Bypass \
-    -File "${launcher_windows}" -OnlyWhenLoginRequired >/dev/null 2>&1 || true
 }
 
+docker compose -f "${other_compose_file}" down --remove-orphans || true
+docker compose -f "${compose_file}" up -d
 start_keepalive
-docker compose up -d
-open_napcat_login_if_needed
-bash "${WSL_DIR}/scripts/status.sh"
+open_login_page
+bash "${SCRIPT_DIR}/status.sh"
