@@ -1,0 +1,59 @@
+name: xiaomachi-llbot-stack
+
+services:
+  llbot:
+    image: linyuchen/llbot:8.0.8
+    container_name: xiaomachi-llbot
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - QQ=${BOT_QQ:-}
+      - WEBUI_PORT=3080
+      - HTTP_PROXY=${DOCKER_HTTP_PROXY:-}
+      - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
+      - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
+    volumes:
+      - ./runtime/llbot/data:/app/llbot/data
+      - ../../data/generated_images:/workspace/data/generated_images:ro
+      - ../../data/generated_private_images:/workspace/data/generated_private_images:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3080').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 20s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  xiaomachi:
+    image: python:3.12-slim
+    container_name: xiaomachi-bot
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /workspace
+    env_file:
+      - ./.env
+    environment:
+      - NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3001}
+      - PYTHONUNBUFFERED=1
+      - TZ=${TZ:-Asia/Shanghai}
+      - HTTP_PROXY=${DOCKER_HTTP_PROXY:-}
+      - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
+      - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
+      - PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-120}
+      - PIP_RETRIES=${PIP_RETRIES:-10}
+      - PIP_INDEX_URL=${PIP_INDEX_URL:-}
+      - PIP_DISABLE_PIP_VERSION_CHECK=1
+    volumes:
+      - ../../:/workspace
+      - ./runtime/logs:/workspace/data/logs
+      - ./runtime/cache:/workspace/data/cache
+      - ./runtime/pip-cache:/root/.cache/pip
+    depends_on:
+      llbot:
+        condition: service_healthy
+    command: >
+      bash -lc "
+      python -m pip install --timeout ${PIP_DEFAULT_TIMEOUT:-120} --retries ${PIP_RETRIES:-10} -U pip setuptools wheel &&
+      python -m pip install --timeout ${PIP_DEFAULT_TIMEOUT:-120} --retries ${PIP_RETRIES:-10} --no-build-isolation -e . &&
+      python -m app.group_main
+      "

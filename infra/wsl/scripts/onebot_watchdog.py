@@ -280,9 +280,9 @@ def is_explicit_webui_login_error(status: dict[str, bool | None | str]) -> bool:
     return status["isLogin"] is False and bool(status["loginError"])
 
 
-def restart_napcat(compose_file: Path) -> tuple[bool, str]:
+def restart_service(compose_file: Path, service_name: str) -> tuple[bool, str]:
     result = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "restart", "napcat"],
+        ["docker", "compose", "-f", str(compose_file), "restart", service_name],
         cwd=compose_file.parent,
         capture_output=True,
         text=True,
@@ -291,6 +291,10 @@ def restart_napcat(compose_file: Path) -> tuple[bool, str]:
     )
     detail = (result.stderr or result.stdout or "").strip().replace("\n", " ")
     return result.returncode == 0, detail[:500]
+
+
+def restart_napcat(compose_file: Path) -> tuple[bool, str]:
+    return restart_service(compose_file, "napcat")
 
 
 def notify_windows(script_path: Path, reason: str) -> tuple[bool, str]:
@@ -333,13 +337,19 @@ def run_once(
     log_file: Path,
     compose_file: Path,
     notifier: Path,
+    service_name: str = "napcat",
+    platform: str = "napcat",
     webui_config: Path | None = None,
     webui_url: str = "http://127.0.0.1:6099",
 ) -> int:
     state = load_state(state_file)
     online, active_session_ok, probe_detail = asyncio.run(probe_onebot(ws_url))
-    webui_status = probe_webui(
-        webui_config or compose_file.parent / "runtime/napcat/config/webui.json", webui_url
+    webui_status = (
+        probe_webui(
+            webui_config or compose_file.parent / "runtime/napcat/config/webui.json", webui_url
+        )
+        if platform == "napcat"
+        else {"isLogin": None, "isOffline": None, "loginError": ""}
     )
     webui_login_error = is_explicit_webui_login_error(webui_status)
     next_state, action = evaluate_state(
@@ -362,12 +372,16 @@ def run_once(
     append_log(log_file, probe_event, probe_detail)
 
     if action == ACTION_RESTART:
-        ok, detail = restart_napcat(compose_file)
-        append_log(log_file, "napcat_restart_requested" if ok else "napcat_restart_failed", detail)
+        ok, detail = (
+            restart_napcat(compose_file)
+            if service_name == "napcat"
+            else restart_service(compose_file, service_name)
+        )
+        append_log(log_file, f"{service_name}_restart_requested" if ok else f"{service_name}_restart_failed", detail)
         if not ok:
             failed_state = replace(next_state, alerted=True)
             save_state(state_file, failed_state)
-            notified, notify_detail = notify_windows(notifier, "napcat_restart_failed")
+            notified, notify_detail = notify_windows(notifier, "qq_platform_restart_failed")
             append_log(log_file, "windows_alert_started" if notified else "windows_alert_failed", notify_detail)
             if not notified:
                 save_state(state_file, replace(failed_state, alerted=False))
@@ -400,6 +414,8 @@ def main() -> int:
     parser.add_argument("--state-file", type=Path, default=wsl_dir / "runtime/onebot-watchdog.json")
     parser.add_argument("--log-file", type=Path, default=wsl_dir / "runtime/logs/onebot-watchdog.log")
     parser.add_argument("--compose-file", type=Path, default=wsl_dir / "docker-compose.yml")
+    parser.add_argument("--service-name", default="napcat")
+    parser.add_argument("--platform", choices=("napcat", "llbot"), default="napcat")
     parser.add_argument("--notifier", type=Path, default=script_dir / "notify_windows.ps1")
     parser.add_argument("--webui-config", type=Path, default=wsl_dir / "runtime/napcat/config/webui.json")
     parser.add_argument("--webui-url", default="http://127.0.0.1:6099")
@@ -417,6 +433,8 @@ def main() -> int:
             log_file=args.log_file,
             compose_file=args.compose_file,
             notifier=args.notifier,
+            service_name=args.service_name,
+            platform=args.platform,
             webui_config=args.webui_config,
             webui_url=args.webui_url,
         )

@@ -1,15 +1,16 @@
 # 小町 QQ AI Bot（WSL/Docker）
 
-当前支持的部署方式是 WSL2 + Docker：NapCat、QQ 登录态和小町 Python 进程都运行在 WSL/Docker 中，Windows 只保留四个操作入口。
+当前支持的部署方式是 WSL2 + Docker。QQ 平台可在 LLBot 与 NapCat 间切换，小町 Python 进程、数据库、模型配置和业务代码保持同一套。
 
 ## 日常操作
 
 在资源管理器中双击：
 
-- `start-xiaomachi-wsl.bat`：启动 NapCat、小町和 watchdog。QQ 未登录时会自动打开 NapCat WebUI。
+- `start-xiaomachi-wsl.bat`：启动 `infra/wsl/.env` 中 `QQ_PLATFORM` 选择的平台、小町和 watchdog；启动前会关闭另一平台，避免同号并行。
 - `stop-xiaomachi-wsl.bat`：停止当前 WSL 小町栈。
 - `status-xiaomachi-wsl.bat`：检查容器、OneBot 会话和小町心跳。
 - `open-napcat-webui.bat`：手动打开 NapCat 登录页面，不启动或重启容器。
+- `open-llbot-webui.bat`：手动打开 LLBot WebUI，并把本地 WebUI 密码复制到剪贴板。
 
 不要删除 `D:\xiaomachi-wsl-entry.sh`。三个 WSL BAT 通过这个固定 ASCII 路径查找仓库，避免中文路径经过 CMD/WSL 参数传递时乱码。
 
@@ -73,10 +74,11 @@ docker compose up -d --force-recreate xiaomachi
 
 ## 运行结构
 
-- `xiaomachi-napcat`：NapCat 和 NTQQ，端口仅映射到本机 `127.0.0.1:6099`、`127.0.0.1:3001`。
+- `xiaomachi-llbot`：默认测试平台，WebUI 与 OneBot 端口仅映射到本机 `127.0.0.1:3080`、`127.0.0.1:3001`。
+- `xiaomachi-napcat`：保留的回退平台，登录态目录不删除。
 - `xiaomachi-bot`：运行 `python -m app.group_main`。
 - `.venv-wsl`：供 keepalive、OneBot 探针和登录 watchdog 使用，不是旧 Windows 虚拟环境。
-- `infra/wsl/scripts/onebot_watchdog.py`：主动调用 `get_status` 和 `get_group_list(no_cache=true)`；连续异常时只重启 NapCat 一次，仍需登录时通知 Windows。
+- `infra/wsl/scripts/onebot_watchdog.py`：主动调用 `get_status` 和 `get_group_list(no_cache=true)`；连续异常时只重启当前 QQ 平台一次，仍需登录时通知 Windows。
 
 ## 不能删除的数据
 
