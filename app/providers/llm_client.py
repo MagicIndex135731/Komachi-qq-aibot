@@ -227,6 +227,10 @@ class LlmClient:
             input_lines=[prompt],
             images=images,
         )
+        if images:
+            for content in payload["input"][0]["content"]:
+                if content.get("type") == "input_image":
+                    content["detail"] = "high"
         image_tool: dict[str, Any] = {"type": "image_generation"}
         normalized_size = str(size or "").strip()
         if normalized_size and normalized_size != "auto":
@@ -632,15 +636,17 @@ class LlmClient:
         query = payload.get("query")
         title = payload.get("title")
         url = payload.get("url")
+        error = payload.get("error")
         if isinstance(item, dict):
             item_id = item_id or item.get("id")
             status = status or item.get("status")
             query = query or item.get("query")
             title = title or item.get("title")
             url = url or item.get("url")
+            error = error or item.get("error")
 
         logger.info(
-            "responses_tool_event response_id=%s event=%s item_id=%s item_type=%s status=%s query=%r title=%r url=%r",
+            "responses_tool_event response_id=%s event=%s item_id=%s item_type=%s status=%s query=%r title=%r url=%r error=%r",
             response_id or "",
             payload_type,
             item_id or "",
@@ -649,6 +655,7 @@ class LlmClient:
             self._truncate_log_value(query),
             self._truncate_log_value(title),
             self._truncate_log_value(url),
+            self._truncate_log_value(error),
         )
 
     def _truncate_log_value(self, value: Any, *, limit: int = 240) -> str:
