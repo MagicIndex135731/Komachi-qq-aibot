@@ -1225,6 +1225,7 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     assert content[1] == {
         "type": "input_image",
         "image_url": "data:image/png;base64," + base64.b64encode(b"reference-bytes").decode("ascii"),
+        "detail": "high",
     }
     assert captured["payload"]["tools"] == [
         {"type": "image_generation", "size": "1024x1536", "quality": "high"}
