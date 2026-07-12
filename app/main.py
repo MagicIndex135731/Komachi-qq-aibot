@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -122,6 +124,13 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
     if fallback_model == chat_model:
         fallback_model = ""
     responses_model = chat_model if settings.llm_text_endpoint == "responses" else ""
+    tool_event_log = settings.log_dir / "responses-tool-events.jsonl"
+
+    def record_tool_event(event: dict) -> None:
+        payload = {"timestamp": datetime.now().astimezone().isoformat(), **event}
+        with tool_event_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
     return LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
@@ -135,6 +144,7 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         web_search_context_size=settings.llm_builtin_web_search_context_size,
         reasoning_effort=settings.llm_reasoning_effort if settings.llm_text_endpoint == "responses" else "",
         usage_recorder=build_usage_recorder(engine),
+        tool_event_recorder=record_tool_event,
     )
 
 

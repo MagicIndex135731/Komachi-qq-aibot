@@ -8,7 +8,7 @@ import logging
 import mimetypes
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -66,6 +66,7 @@ class LlmClient:
     ANTHROPIC_MAX_TOKENS = 1024
     REQUEST_MAX_ATTEMPTS = 5
     IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
+    supports_forced_web_search = True
 
     def __init__(
         self,
@@ -85,6 +86,7 @@ class LlmClient:
         reasoning_effort: str = "",
         http_client: httpx.Client | None = None,
         usage_recorder=None,
+        tool_event_recorder: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -107,6 +109,7 @@ class LlmClient:
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=False)
         self.usage_recorder = usage_recorder
+        self.tool_event_recorder = tool_event_recorder
         self._conversation_response_ids: dict[str, str] = {}
         self._base_host = (urlparse(self.base_url).hostname or "").lower()
 
@@ -172,6 +175,7 @@ class LlmClient:
         input_lines: list[str],
         images: list[ImageAttachment] | None = None,
         previous_response_id: str | None = None,
+        force_web_search: bool = False,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
             {
@@ -211,6 +215,8 @@ class LlmClient:
                     "search_context_size": self.web_search_context_size,
                 }
             ]
+            if force_web_search:
+                payload["tool_choice"] = {"type": "web_search"}
         return payload
 
     def _build_responses_image_payload(
@@ -657,6 +663,24 @@ class LlmClient:
             self._truncate_log_value(url),
             self._truncate_log_value(error),
         )
+        if self.tool_event_recorder is not None and (
+            "web_search_call" in payload_type or item_type == "web_search_call"
+        ):
+            try:
+                self.tool_event_recorder(
+                    {
+                        "response_id": response_id or "",
+                        "event": payload_type,
+                        "item_id": str(item_id or ""),
+                        "status": str(status or ""),
+                        "query": self._truncate_log_value(query),
+                        "title": self._truncate_log_value(title),
+                        "url": self._truncate_log_value(url),
+                        "error": self._truncate_log_value(error),
+                    }
+                )
+            except Exception:
+                logger.exception("responses_tool_event_record_failed")
 
     def _truncate_log_value(self, value: Any, *, limit: int = 240) -> str:
         if value is None:
@@ -1438,6 +1462,7 @@ class LlmClient:
         *,
         images: list[ImageAttachment] | None = None,
         conversation_key: str | None = None,
+        force_web_search: bool = False,
     ) -> str:
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
 
@@ -1449,6 +1474,7 @@ class LlmClient:
                 input_lines=input_lines,
                 images=images,
                 previous_response_id=self._responses_previous_response_id(conversation_key=conversation_key),
+                force_web_search=force_web_search,
             )
             try:
                 responses_result = self._request_responses_stream_result(
