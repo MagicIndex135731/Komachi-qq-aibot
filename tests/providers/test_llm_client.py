@@ -1265,6 +1265,31 @@ def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:
     ]
 
 
+def test_llm_client_can_force_builtin_web_search_tool_choice() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_search_force_1", text="grounded reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_text(["Target message: Alice: 联网查天气"], force_web_search=True) == "grounded reply"
+    assert captured["payload"]["tool_choice"] == {"type": "web_search"}
+
+
 def test_llm_client_can_attach_reasoning_effort_to_responses() -> None:
     captured = {}
 
@@ -1333,6 +1358,32 @@ def test_llm_client_logs_responses_tool_events_from_sse(caplog) -> None:
         and "response.web_search_call.completed" in record.message
         for record in caplog.records
     )
+
+
+def test_llm_client_records_web_search_tool_events_from_sse() -> None:
+    events: list[dict] = []
+    body = (
+        f'data: {json.dumps({"type": "response.created", "response": {"id": "resp_audit_1"}})}\n\n'
+        f'data: {json.dumps({"type": "response.output_item.added", "item": {"id": "ws_audit_1", "type": "web_search_call", "status": "in_progress", "query": "Xi an weather"}})}\n\n'
+        f'data: {json.dumps({"type": "response.web_search_call.completed", "item_id": "ws_audit_1"})}\n\n'
+        f'data: {json.dumps({"type": "response.output_text.delta", "delta": "grounded"})}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, text=body, headers={"content-type": "text/event-stream"})
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        tool_event_recorder=events.append,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_text(["Target message: Alice: search weather"]) == "grounded"
+    assert events[0]["query"] == "Xi an weather"
+    assert events[-1]["event"] == "response.web_search_call.completed"
 
 
 def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoint() -> None:

@@ -157,6 +157,7 @@ class PreparedGroupReply:
     target_images: list[ImageAttachment] | None = None
     requires_user_visible_failure_reply: bool = False
     proactive_turn: bool = False
+    force_web_search: bool = False
 
 
 @dataclass(slots=True)
@@ -1368,6 +1369,7 @@ class InboundRouter:
                     addressed_turn or image_followup_trigger or event.reply_to_msg_id is not None
                 ),
                 proactive_turn=proactive_turn,
+                force_web_search=forced_search_request and self.web_search_client is None,
             )
 
     def _reserve_outbound_reply(self, event, reply_text: str) -> bool:
@@ -1438,16 +1440,23 @@ class InboundRouter:
 
     def _generate_group_reply_text(self, *, event, prepared_reply: PreparedGroupReply) -> str:
         conversation_key = f"group:{event.group_id}"
+        force_web_search = (
+            prepared_reply.force_web_search
+            and bool(getattr(self.llm_client, "supports_forced_web_search", False))
+        )
+        generation_kwargs = {"force_web_search": True} if force_web_search else {}
         if prepared_reply.target_images:
             raw_reply = self.llm_client.generate_text(
                 prepared_reply.prompt_lines,
                 images=prepared_reply.target_images,
                 conversation_key=conversation_key,
+                **generation_kwargs,
             )
         else:
             raw_reply = self.llm_client.generate_text(
                 prepared_reply.prompt_lines,
                 conversation_key=conversation_key,
+                **generation_kwargs,
             )
         return (
             normalize_brief_group_interjection_reply(raw_reply)
