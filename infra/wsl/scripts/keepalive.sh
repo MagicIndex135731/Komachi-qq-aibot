@@ -12,9 +12,13 @@ watchdog_python="${repo_root}/.venv-wsl/bin/python"
 if [[ "${platform}" == "llbot" ]]; then
   compose_file="${wsl_dir}/docker-compose.llbot.yml"
   service_name="llbot"
+  llbot_ws_port="$(sed -n 's/^[[:space:]]*LLBOT_WS_PORT[[:space:]]*=[[:space:]]*//p' "${wsl_dir}/.env" | tail -n 1 | tr -d '\r')"
+  llbot_ws_port="${llbot_ws_port:-3002}"
+  onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"
 else
   compose_file="${wsl_dir}/docker-compose.yml"
   service_name="napcat"
+  onebot_ws_url="ws://127.0.0.1:3001"
 fi
 
 mkdir -p "$(dirname "${pid_file}")"
@@ -26,6 +30,7 @@ while [[ -f "${flag_file}" ]]; do
   [[ -f "${flag_file}" ]] || break
   if [[ -x "${watchdog_python}" ]]; then
     "${watchdog_python}" "${script_dir}/onebot_watchdog.py" --once \
+      --ws-url "${onebot_ws_url}" \
       --compose-file "${compose_file}" --service-name "${service_name}" \
       --state-file "${wsl_dir}/runtime/onebot-watchdog-${platform}.json" \
       --log-file "${wsl_dir}/runtime/logs/onebot-watchdog-${platform}.log" \

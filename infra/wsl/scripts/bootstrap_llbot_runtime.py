@@ -31,6 +31,12 @@ def main() -> int:
     qq = env.get("BOT_QQ", "").strip()
     if not qq.isdigit():
         raise SystemExit("BOT_QQ must be configured in infra/wsl/.env")
+    try:
+        onebot_port = int(env.get("LLBOT_WS_PORT", "3002"))
+    except ValueError as exc:
+        raise SystemExit("LLBOT_WS_PORT must be an integer") from exc
+    if not 1 <= onebot_port <= 65535:
+        raise SystemExit("LLBOT_WS_PORT must be between 1 and 65535")
 
     data_dir = args.wsl_dir / "runtime" / "llbot" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -55,7 +61,7 @@ def main() -> int:
                         "type": "ws",
                         "enable": True,
                         "host": "",
-                        "port": 3001,
+                        "port": onebot_port,
                         "token": "",
                         "reportSelfMessage": False,
                         "reportOfflineMessage": False,
@@ -67,6 +73,13 @@ def main() -> int:
             },
             "webui": {"enable": True, "host": "", "port": 3080},
         }
+        write_private(config_path, json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+    else:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        connections = payload.get("ob11", {}).get("connect", [])
+        for connection in connections:
+            if connection.get("type") == "ws" and connection.get("enable") is True:
+                connection["port"] = onebot_port
         write_private(config_path, json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
     return 0
 

@@ -110,6 +110,7 @@ def test_wsl_env_example_has_no_real_secrets() -> None:
     forbidden = ["sk-", "Bearer ", "OPENAI_API_KEY=", bot_account, personal_account]
     assert not any(token in env_example for token in forbidden)
     assert "NAPCAT_WS_URL=ws://napcat:3001" in env_example
+    assert "LLBOT_WS_PORT=3002" in env_example
     assert "NAPCAT_QUICK_PASSWORD=" in env_example
     assert "NAPCAT_QUICK_PASSWORD_MD5=" in env_example
     assert "GROUP_STREAM_WATCH_GROUP_ID=" in env_example
@@ -190,7 +191,10 @@ def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
     assert 'probe_output="$(mktemp)"' in script
     assert "docker inspect" in script
     assert "onebot_probe.py" in script
-    assert "--ws-url ws://127.0.0.1:3001" in script
+    assert 'onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"' in script
+    assert '--ws-url "${onebot_ws_url}" --request-timeout 8' in script
+    assert "probe_ok=false" in script
+    assert "waiting for OneBot" in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 "${service_name}"' in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 xiaomachi' in script
 
