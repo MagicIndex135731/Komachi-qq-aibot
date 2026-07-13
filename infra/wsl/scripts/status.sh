@@ -18,6 +18,18 @@ else
   container_name="xiaomachi-napcat"
 fi
 
+llbot_ws_port="$(sed -n 's/^[[:space:]]*LLBOT_WS_PORT[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+llbot_ws_port="${llbot_ws_port:-3002}"
+if ! [[ "${llbot_ws_port}" =~ ^[0-9]+$ ]] || (( llbot_ws_port < 1 || llbot_ws_port > 65535 )); then
+  echo "LLBOT_WS_PORT must be between 1 and 65535."
+  exit 1
+fi
+if [[ "${platform}" == "llbot" ]]; then
+  onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"
+else
+  onebot_ws_url="ws://127.0.0.1:3001"
+fi
+
 docker compose -f "${compose_file}" ps
 status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_name}" 2>/dev/null || true)"
 if [[ "${status}" != "healthy" && "${status}" != "running" ]]; then
@@ -37,16 +49,19 @@ fi
 echo "OneBot probe (${platform}):"
 probe_output="$(mktemp)"
 trap 'rm -f "${probe_output}"' EXIT
-for _ in $(seq 1 30); do
-  if "${REPO_ROOT}/.venv-wsl/bin/python" "${SCRIPT_DIR}/onebot_probe.py" --ws-url ws://127.0.0.1:3001 >"${probe_output}" 2>&1; then
+probe_ok=false
+for attempt in $(seq 1 12); do
+  if "${REPO_ROOT}/.venv-wsl/bin/python" "${SCRIPT_DIR}/onebot_probe.py" --ws-url "${onebot_ws_url}" --request-timeout 8 >"${probe_output}" 2>&1; then
     cat "${probe_output}"
+    probe_ok=true
     break
   fi
+  echo "  waiting for OneBot (${attempt}/12)"
   sleep 5
 done
-if ! "${REPO_ROOT}/.venv-wsl/bin/python" "${SCRIPT_DIR}/onebot_probe.py" --ws-url ws://127.0.0.1:3001 >/dev/null 2>&1; then
+if [[ "${probe_ok}" != true ]]; then
   sed -n '1,40p' "${probe_output}"
-  echo "QQ may require login. Open the ${service_name} WebUI."
+  echo "OneBot did not become ready. Check the ${service_name} logs and WebUI."
   exit 1
 fi
 

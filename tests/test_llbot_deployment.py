@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import yaml
@@ -38,7 +41,7 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     assert "./runtime/logs:/workspace/data/logs" in xiaomachi["volumes"]
     assert "./runtime/cache:/workspace/data/cache" in xiaomachi["volumes"]
     assert "./runtime/pip-cache:/root/.cache/pip" in xiaomachi["volumes"]
-    assert "NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3001}" in xiaomachi[
+    assert "NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3002}" in xiaomachi[
         "environment"
     ]
     assert xiaomachi["depends_on"]["llbot"]["condition"] == "service_healthy"
@@ -49,10 +52,43 @@ def test_llbot_runtime_bootstrap_configures_onebot_and_webui() -> None:
 
     assert '"ob11"' in script
     assert '"type": "ws"' in script
-    assert '"port": 3001' in script
+    assert '"port": onebot_port' in script
+    assert 'env.get("LLBOT_WS_PORT", "3002")' in script
+    assert "connections = payload.get" in script
     assert '"webui"' in script
     assert '"port": 3080' in script
     assert "webui_token.txt" in script
+
+
+def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wsl_dir = tmp_path
+    (wsl_dir / ".env").write_text("BOT_QQ=123456\n", encoding="utf-8")
+    data_dir = wsl_dir / "runtime/llbot/data"
+    data_dir.mkdir(parents=True)
+    config_path = data_dir / "config_123456.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "ob11": {"connect": [{"type": "ws", "enable": True, "port": 3001}]},
+                "webui": {"enable": True, "port": 3080},
+            }
+        ),
+        encoding="utf-8",
+    )
+    module_path = SCRIPTS_DIR / "bootstrap_llbot_runtime.py"
+    spec = importlib.util.spec_from_file_location("bootstrap_llbot_runtime", module_path)
+    assert spec and spec.loader
+    bootstrap = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bootstrap)
+    monkeypatch.setattr(sys, "argv", [str(module_path), "--wsl-dir", str(wsl_dir)])
+
+    assert bootstrap.main() == 0
+
+    migrated = json.loads(config_path.read_text(encoding="utf-8"))
+    assert migrated["ob11"]["connect"][0]["port"] == 3002
+    assert migrated["webui"]["port"] == 3080
 
 
 def test_open_llbot_webui_shortcut_checks_local_webui_without_starting_stack() -> None:
@@ -108,6 +144,7 @@ def test_stop_status_keepalive_and_watchdog_are_platform_aware() -> None:
     assert 'platform="${3:-napcat}"' in keepalive_script
     assert 'compose_file="${wsl_dir}/docker-compose.llbot.yml"' in keepalive_script
     assert 'service_name="llbot"' in keepalive_script
+    assert 'onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"' in keepalive_script
     assert 'compose_file="${wsl_dir}/docker-compose.yml"' in keepalive_script
     assert 'service_name="napcat"' in keepalive_script
     assert 'onebot-watchdog-${platform}.json' in keepalive_script

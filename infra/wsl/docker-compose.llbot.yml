@@ -18,7 +18,7 @@ services:
       - ../../data/generated_images:/workspace/data/generated_images:ro
       - ../../data/generated_private_images:/workspace/data/generated_private_images:ro
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3080').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"const net=require('net'); Promise.all([fetch('http://127.0.0.1:3080').then(r=>{if(!r.ok)throw Error('webui')}),new Promise((resolve,reject)=>{const s=net.connect(${LLBOT_WS_PORT:-3002},'127.0.0.1');s.once('connect',()=>{s.destroy();resolve()});s.once('error',reject)})]).catch(()=>process.exit(1))\""]
       interval: 20s
       timeout: 5s
       retries: 12
@@ -33,7 +33,7 @@ services:
     env_file:
       - ./.env
     environment:
-      - NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3001}
+      - NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3002}
       - PYTHONUNBUFFERED=1
       - TZ=${TZ:-Asia/Shanghai}
       - HTTP_PROXY=${DOCKER_HTTP_PROXY:-}
