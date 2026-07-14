@@ -7,4 +7,5 @@ exit /b %errorlevel%
 
 :unavailable
 echo LLBot WebUI is not available. Run start-xiaomachi-wsl.bat first.
+pause
 exit /b 1

@@ -16,8 +16,12 @@ try {
 if (Test-Path -LiteralPath $tokenPath) {
     $token = (Get-Content -Raw -LiteralPath $tokenPath).Trim()
     if ($token) {
-        Set-Clipboard -Value $token
-        Write-Host "LLBot WebUI password copied to the clipboard."
+        try {
+            Set-Clipboard -Value $token
+            Write-Host "LLBot WebUI password copied to the clipboard."
+        } catch {
+            Write-Warning "Could not copy the LLBot WebUI password to the clipboard."
+        }
     }
 }
 
