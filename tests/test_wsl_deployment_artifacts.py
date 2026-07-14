@@ -114,6 +114,7 @@ def test_wsl_env_example_has_no_real_secrets() -> None:
     forbidden = ["sk-", "Bearer ", "OPENAI_API_KEY=", bot_account, personal_account]
     assert not any(token in env_example for token in forbidden)
     assert "NAPCAT_WS_URL=ws://napcat:3001" in env_example
+    assert "QQ_PLATFORM=llbot" in env_example
     assert "LLBOT_WS_PORT=3002" in env_example
     assert "NAPCAT_QUICK_PASSWORD=" in env_example
     assert "NAPCAT_QUICK_PASSWORD_MD5=" in env_example

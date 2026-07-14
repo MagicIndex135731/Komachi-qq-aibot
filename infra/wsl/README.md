@@ -1,6 +1,6 @@
 # WSL/Docker 运行目录
 
-这里是小町当前唯一受支持的运行栈。`QQ_PLATFORM=llbot` 使用 LLBot，`QQ_PLATFORM=napcat` 回退到原 NapCat；两者共享同一套小町业务、数据库和模型配置，但登录态各自独立保存。
+这里是小町当前唯一受支持的运行栈。默认 `QQ_PLATFORM=llbot` 使用 LLBot；`QQ_PLATFORM=napcat` 是本地回退选项。两者共享同一套小町业务、数据库和模型配置，但登录态各自独立保存。
 
 ## 启动链路
 
@@ -8,8 +8,9 @@
 start-xiaomachi-wsl.bat
   -> D:\xiaomachi-wsl-entry.sh
   -> infra/wsl/scripts/start.sh
-  -> docker compose up -d
+  -> 启动当前 QQ 平台容器
   -> 条件打开当前 QQ 平台 WebUI
+  -> 无依赖启动小町（OneBot 未就绪时自动重连）
   -> OneBot 与小町心跳检查
 ```
 
@@ -41,13 +42,16 @@ bash infra/wsl/scripts/status.sh
 bash infra/wsl/scripts/stop.sh
 ```
 
-`start.sh` 在 WebUI 就绪后检查 QQ 登录状态。明确已登录时不打开浏览器；未登录、需要验证或无法确认状态时打开登录页面。浏览器启动失败不会阻断容器。
+`start.sh` 先启动 QQ 平台并尝试打开 WebUI，再启动小町，避免 Compose 的健康依赖阻塞登录页面。LLBot WebUI 为 `http://127.0.0.1:3080/`，OneBot 为 `ws://127.0.0.1:3002`；NapCat 回退平台仍使用 `6099` 与 `3001`。浏览器启动失败不会阻断容器。
+
+文本模型使用 Responses 端点时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true` 启用主模型内置联网检索。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存到 `runtime/logs/responses-tool-events.jsonl`，不进入 Git。
 
 ## 运行态保护
 
 不要删除：
 
 - `.env`
+- `runtime/llbot/data`
 - `runtime/napcat/ntqq`
 - `runtime/napcat/config`
 - `runtime/logs`
@@ -63,4 +67,4 @@ docker compose ps
 bash scripts/status.sh
 ```
 
-正常在线时应看到 NapCat healthy、OneBot `online=true`、主动群列表探针成功，以及新鲜的小町心跳。若 QQ 本身已离线，先完成 WebUI 登录，再重复状态检查。
+正常在线时应看到当前 QQ 平台 healthy、OneBot `online=true`、主动群列表探针成功，以及新鲜的小町心跳。若 QQ 本身已离线，先完成对应 WebUI 登录，再重复状态检查。
