@@ -35,6 +35,11 @@ status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{
 if [[ "${status}" != "healthy" && "${status}" != "running" ]]; then
   echo "Waiting for ${service_name} healthcheck..."
   for _ in $(seq 1 24); do
+    if [[ "${platform}" == "llbot" ]] \
+        && docker logs --tail 80 "${container_name}" 2>&1 | grep -Fq "replay protection unavailable"; then
+      echo "LLBot signing backend is unavailable; quick login and QR login cannot proceed yet."
+      exit 1
+    fi
     sleep 5
     status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_name}" 2>/dev/null || true)"
     [[ "${status}" == "healthy" || "${status}" == "running" ]] && break

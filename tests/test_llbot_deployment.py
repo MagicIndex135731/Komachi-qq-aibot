@@ -100,10 +100,12 @@ def test_open_llbot_webui_shortcut_checks_local_webui_without_starting_stack() -
     assert "http://127.0.0.1:3080/" in shortcut
     assert "open_llbot_webui.ps1" in shortcut
     assert "start-xiaomachi-wsl.bat" in shortcut
+    assert "pause" in shortcut
     assert "wsl.exe" not in shortcut.lower()
     assert "docker" not in shortcut.lower()
     assert '"http://127.0.0.1:3080/"' in launcher
     assert "webui_token.txt" in launcher
+    assert "Could not copy the LLBot WebUI password" in launcher
     assert "Start-Process" in launcher
 
 

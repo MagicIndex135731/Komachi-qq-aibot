@@ -195,6 +195,8 @@ def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
     assert '--ws-url "${onebot_ws_url}" --request-timeout 8' in script
     assert "probe_ok=false" in script
     assert "waiting for OneBot" in script
+    assert "replay protection unavailable" in script
+    assert "quick login and QR login cannot proceed yet" in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 "${service_name}"' in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 xiaomachi' in script
 
