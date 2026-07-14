@@ -96,6 +96,8 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     assert "powershell.exe" in start_script
     assert "-OnlyWhenLoginRequired" in start_script
     assert "|| true" in start_script
+    assert "Waiting for ${service_name} WebUI (${attempt}/10)" in start_script
+    assert "continuing to status diagnostics" in start_script
 
     assert "param(" in launcher
     assert "OnlyWhenLoginRequired" in launcher
