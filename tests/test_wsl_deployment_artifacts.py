@@ -84,10 +84,12 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
         encoding="utf-8"
     )
 
-    compose_up = start_script.index('docker compose -f "${compose_file}" up -d')
+    compose_up = start_script.index('docker compose -f "${compose_file}" up -d "${service_name}"')
     conditional_open = start_script.index("\nopen_login_page\n")
+    bot_up = start_script.index('docker compose -f "${compose_file}" up -d --no-deps xiaomachi')
     status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"')
-    assert compose_up < conditional_open < status_probe
+    assert compose_up < conditional_open < bot_up < status_probe
+    assert 'docker compose -f "${compose_file}" up -d --no-deps xiaomachi' in start_script
     assert "webui_port=6099" in start_script
     assert "webui_port=3080" in start_script
     assert "wslpath -w" in start_script
