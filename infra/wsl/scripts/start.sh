@@ -51,14 +51,20 @@ start_keepalive() {
 }
 
 open_login_page() {
-  for _ in $(seq 1 30); do
-    curl -fsS --max-time 2 "http://127.0.0.1:${webui_port}/" >/dev/null 2>&1 && break
+  local webui_ready=false
+  for attempt in $(seq 1 10); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${webui_port}/" >/dev/null 2>&1; then
+      webui_ready=true
+      break
+    fi
+    echo "Waiting for ${service_name} WebUI (${attempt}/10)..."
     sleep 2
   done
-  if curl -fsS --max-time 2 "http://127.0.0.1:${webui_port}/" >/dev/null 2>&1 \
-      && command -v powershell.exe >/dev/null 2>&1; then
+  if [[ "${webui_ready}" == true ]] && command -v powershell.exe >/dev/null 2>&1; then
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
       -File "$(wslpath -w "${SCRIPT_DIR}/${launcher}")" -OnlyWhenLoginRequired >/dev/null 2>&1 || true
+  else
+    echo "${service_name} WebUI is not ready yet; continuing to status diagnostics."
   fi
 }
 
