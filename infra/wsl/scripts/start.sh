@@ -20,12 +20,14 @@ fi
 if [[ "${platform}" == "llbot" ]]; then
   compose_file="docker-compose.llbot.yml"
   other_compose_file="docker-compose.yml"
+  service_name="llbot"
   webui_port=3080
   launcher="open_llbot_webui.ps1"
   python3 "${SCRIPT_DIR}/bootstrap_llbot_runtime.py" --wsl-dir "${WSL_DIR}"
 else
   compose_file="docker-compose.yml"
   other_compose_file="docker-compose.llbot.yml"
+  service_name="napcat"
   webui_port=6099
   launcher="open_napcat_webui.ps1"
 fi
@@ -61,7 +63,10 @@ open_login_page() {
 }
 
 docker compose -f "${other_compose_file}" down --remove-orphans || true
-docker compose -f "${compose_file}" up -d
-start_keepalive
+# Do not let Compose's `depends_on: service_healthy` block the login page.
+# The bot reconnects to OneBot on its own while the QQ platform finishes login.
+docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
+docker compose -f "${compose_file}" up -d --no-deps xiaomachi
+start_keepalive
 bash "${SCRIPT_DIR}/status.sh"

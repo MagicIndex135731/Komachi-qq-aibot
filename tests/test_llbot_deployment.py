@@ -121,6 +121,10 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
     assert 'other_compose_file="docker-compose.llbot.yml"' in script
     assert 'launcher="open_llbot_webui.ps1"' in script
     assert 'launcher="open_napcat_webui.ps1"' in script
+    assert 'service_name="llbot"' in script
+    assert 'service_name="napcat"' in script
+    assert 'up -d "${service_name}"' in script
+    assert 'up -d --no-deps xiaomachi' in script
     assert script.index('compose_file="docker-compose.llbot.yml"') < script.index(
         'compose_file="docker-compose.yml"'
     )
