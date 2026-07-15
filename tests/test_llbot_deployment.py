@@ -37,10 +37,17 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     services = compose["services"]
     xiaomachi = services["xiaomachi"]
 
+    assert xiaomachi["image"] == "xiaomachi-bot:local"
+    assert xiaomachi["build"]["context"] == "."
+    assert xiaomachi["build"]["dockerfile"] == "Dockerfile.xiaomachi"
+    assert xiaomachi["build"]["network"] == "host"
+    assert xiaomachi["build"]["args"]["HTTP_PROXY"] == "${DOCKER_HTTP_PROXY:-}"
+    assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
     assert "../../:/workspace" in xiaomachi["volumes"]
     assert "./runtime/logs:/workspace/data/logs" in xiaomachi["volumes"]
     assert "./runtime/cache:/workspace/data/cache" in xiaomachi["volumes"]
-    assert "./runtime/pip-cache:/root/.cache/pip" in xiaomachi["volumes"]
+    assert "./runtime/pip-cache:/root/.cache/pip" not in xiaomachi["volumes"]
+    assert xiaomachi["command"] == ["python", "-m", "app.group_main"]
     assert "NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3002}" in xiaomachi[
         "environment"
     ]
@@ -72,7 +79,7 @@ def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
         json.dumps(
             {
                 "ob11": {"connect": [{"type": "ws", "enable": True, "port": 3001}]},
-                "webui": {"enable": True, "port": 3080},
+                "webui": {"enable": True, "port": 3087},
             }
         ),
         encoding="utf-8",
@@ -89,6 +96,8 @@ def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
     migrated = json.loads(config_path.read_text(encoding="utf-8"))
     assert migrated["ob11"]["connect"][0]["port"] == 3002
     assert migrated["webui"]["port"] == 3080
+    assert migrated["webui"]["host"] == ""
+    assert migrated["webui"]["enable"] is True
 
 
 def test_open_llbot_webui_shortcut_checks_local_webui_without_starting_stack() -> None:
@@ -123,6 +132,11 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
     assert 'launcher="open_napcat_webui.ps1"' in script
     assert 'service_name="llbot"' in script
     assert 'service_name="napcat"' in script
+    assert 'docker compose -f "${compose_file}" build xiaomachi' in script
+    assert "cleanup_failed_start" in script
+    assert "pkill -f xiaomachi-wsl-keepalive" in script
+    assert 'flock -n 8' in script
+    assert "startup is already in progress" in script
     assert 'up -d "${service_name}"' in script
     assert 'up -d --no-deps xiaomachi' in script
     assert script.index('compose_file="docker-compose.llbot.yml"') < script.index(

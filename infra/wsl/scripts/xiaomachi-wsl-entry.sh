@@ -3,9 +3,9 @@ set -euo pipefail
 
 ACTION="${1:-status}"
 case "${ACTION}" in
-  start|stop|status) ;;
+  start|stop|status|anchor) ;;
   *)
-    echo "Usage: $0 {start|stop|status}" >&2
+    echo "Usage: $0 {start|stop|status|anchor}" >&2
     exit 2
     ;;
 esac
