@@ -48,7 +48,6 @@ from app.core.search_policy import (
     SearchDecision,
 )
 from app.core.summarizer import summarize_window
-from app.core.usage_meter import UsageTotals, build_local_day_utc_window, format_daily_admin_usage_report
 from app.core.web_grounding import build_grounding_notes
 from app.jobs.summary_jobs import format_summary_source_lines, should_schedule_window_summary
 from app.providers.web_search import WebSearchClient
@@ -59,7 +58,6 @@ from app.storage.repositories import (
     MessageRepository,
     BbotListenerCacheRepository,
     SummaryRepository,
-    UsageRepository,
     UserRepository,
 )
 
@@ -337,44 +335,6 @@ class InboundRouter:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
-
-    def _is_admin_usage_query(self, event) -> bool:
-        if event.user_id not in self.runtime.settings.admin_whitelist:
-            return False
-        if not event.mentioned_bot:
-            return False
-        normalized = event.plain_text.lower()
-        return any(
-            keyword in normalized
-            for keyword in (
-                "token",
-                "tokens",
-                "多少钱",
-                "多少刀",
-                "花了多少",
-                "花费",
-                "成本",
-                "费用",
-                "消耗",
-            )
-        )
-
-    def _build_admin_usage_report(self, event) -> str:
-        current_time = self._normalize_timestamp(event.timestamp)
-        start_of_day, end_of_window = build_local_day_utc_window(current_time)
-        with session_scope(self.engine) as session:
-            usage_summary = UsageRepository(session).summarize_usage(
-                start_at=start_of_day,
-                end_at=end_of_window,
-                model=self.runtime.settings.llm_model,
-            )
-        totals = UsageTotals(
-            call_count=usage_summary["call_count"],
-            input_tokens=usage_summary["input_tokens"],
-            cached_input_tokens=usage_summary["cached_input_tokens"],
-            output_tokens=usage_summary["output_tokens"],
-        )
-        return format_daily_admin_usage_report(totals)
 
     def _build_local_generation_failure_reply(self, *, target_images: list[ImageAttachment] | None) -> str:
         if target_images:
@@ -1475,9 +1435,6 @@ class InboundRouter:
             handled = await self._handle_group_weekly_report_request(event)
             if handled:
                 return
-        if self._is_admin_usage_query(event):
-            await self._send_prebuilt_reply(event, self._build_admin_usage_report(event))
-            return
         bbot_match = resolve_bbot_command(
             group_id=event.group_id,
             mentioned_bot=event.mentioned_bot,
