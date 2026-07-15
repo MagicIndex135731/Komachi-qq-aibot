@@ -14,7 +14,7 @@ from app.core.reply_policy import ReplyDecision
 from app.core.search_policy import AddressDecision
 from app.storage.db import session_scope
 from app.storage.models import MemoryItem, Message, Summary
-from app.storage.repositories import GroupRepository, MessageRepository, UsageRepository, UserRepository
+from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
 
 
 class FakeSender:
@@ -2136,47 +2136,23 @@ async def test_router_replies_to_short_persona_alias_without_at(sqlite_engine) -
 
 
 @pytest.mark.asyncio
-async def test_router_admin_usage_query_returns_deterministic_cost_report(sqlite_engine) -> None:
+async def test_router_does_not_special_case_token_or_cost_keywords(sqlite_engine) -> None:
     sender = FakeSender()
     llm = FakeLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
-
-    with session_scope(sqlite_engine) as session:
-        usage = UsageRepository(session)
-        usage.add_usage(
-            timestamp=datetime(2026, 5, 9, 10, 0, tzinfo=UTC),
-            model="gpt-5.4",
-            endpoint="responses",
-            input_tokens=1000,
-            cached_input_tokens=100,
-            output_tokens=200,
-        )
-        usage.add_usage(
-            timestamp=datetime(2026, 5, 9, 11, 0, tzinfo=UTC),
-            model="gpt-5.4",
-            endpoint="chat_completions",
-            input_tokens=500,
-            cached_input_tokens=0,
-            output_tokens=300,
-        )
 
     await router.handle_group_message(
         make_event(
             group_id=10001,
             mentioned_bot=True,
-            message_id="usage-1",
+            message_id="token-keywords-1",
             user_id=987654321,
-            plain_text="@Mira 今天花了多少钱",
-            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+            plain_text="@Mira 查询 token 用量、消耗和花费",
         )
     )
 
-    assert len(llm.calls) == 0
-    assert len(sender.sent) == 1
-    assert sender.sent[0].text == (
-        "今天截至你这次@我为止，模型调用 2 次，输入 1500 token，其中缓存输入 100 token，"
-        "输出 500 token，按 OpenAI GPT-5.4 官方价格估算约 $0.011025 USD。"
-    )
+    assert [outbound.text for outbound in sender.sent] == ["I am here."]
+    assert len(llm.calls) == 1
 
 
 @pytest.mark.asyncio
