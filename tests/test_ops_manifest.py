@@ -19,6 +19,7 @@ def test_supported_wsl_operations_files_exist() -> None:
         "infra/wsl/scripts/stop.sh",
         "infra/wsl/scripts/status.sh",
         "infra/wsl/scripts/keepalive.sh",
+        "infra/wsl/scripts/anchor.sh",
         "infra/wsl/scripts/onebot_watchdog.py",
         "app/group_main.py",
         "README.md",

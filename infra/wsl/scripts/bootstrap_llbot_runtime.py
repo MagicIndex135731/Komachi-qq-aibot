@@ -80,6 +80,8 @@ def main() -> int:
         for connection in connections:
             if connection.get("type") == "ws" and connection.get("enable") is True:
                 connection["port"] = onebot_port
+        webui = payload.setdefault("webui", {})
+        webui.update({"enable": True, "host": "", "port": 3080})
         write_private(config_path, json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
     return 0
 

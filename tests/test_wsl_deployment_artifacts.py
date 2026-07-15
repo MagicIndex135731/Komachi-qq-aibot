@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 
@@ -11,6 +12,8 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/README.md",
         "infra/wsl/.env.example",
         "infra/wsl/docker-compose.yml",
+        "infra/wsl/Dockerfile.xiaomachi",
+        "infra/wsl/requirements.xiaomachi.txt",
         "infra/wsl/scripts/bootstrap_wsl.sh",
         "infra/wsl/scripts/start.sh",
         "infra/wsl/scripts/stop.sh",
@@ -19,6 +22,7 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/scripts/onebot_watchdog.py",
         "infra/wsl/scripts/notify_windows.ps1",
         "infra/wsl/scripts/keepalive.sh",
+        "infra/wsl/scripts/anchor.sh",
         "infra/wsl/scripts/xiaomachi-wsl-entry.sh",
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
@@ -47,13 +51,16 @@ def test_windows_bat_entries_use_ascii_only_wsl_repo_discovery() -> None:
         assert "wsl.exe bash /mnt/d/xiaomachi-wsl-entry.sh" in content
         assert "wsl.exe bash -lc" not in content
         assert "%~dp0" not in content
-        assert "powershell" not in content.lower()
+        if bat_file.name == "start-xiaomachi-wsl.bat":
+            assert "Start-Process" in content
+            assert "anchor" in content
 
     entry = (REPO_ROOT / "infra/wsl/scripts/xiaomachi-wsl-entry.sh").read_text(encoding="utf-8")
     assert "for base in /mnt/d /mnt/e /mnt/c" in entry
     assert "find \"${base}\"" in entry
     assert "pyproject.toml" in entry
     assert "infra/wsl/scripts/${ACTION}.sh" in entry
+    assert "start|stop|status|anchor" in entry
 
 
 def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() -> None:
@@ -85,10 +92,11 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     )
 
     compose_up = start_script.index('docker compose -f "${compose_file}" up -d "${service_name}"')
+    image_build = start_script.index('docker compose -f "${compose_file}" build xiaomachi')
     conditional_open = start_script.index("\nopen_login_page\n")
     bot_up = start_script.index('docker compose -f "${compose_file}" up -d --no-deps xiaomachi')
     status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"')
-    assert compose_up < conditional_open < bot_up < status_probe
+    assert image_build < compose_up < conditional_open < bot_up < status_probe
     assert 'docker compose -f "${compose_file}" up -d --no-deps xiaomachi' in start_script
     assert "webui_port=6099" in start_script
     assert "webui_port=3080" in start_script
@@ -166,22 +174,43 @@ def test_napcat_mounts_generated_images_at_the_sender_file_uri_path() -> None:
     assert "../../data/generated_images:/workspace/data/generated_images:ro" in compose
 
 
-def test_xiaomachi_container_uses_host_network_and_optional_proxy_for_dependencies() -> None:
+def test_xiaomachi_container_uses_prebuilt_local_image() -> None:
     compose = (REPO_ROOT / "infra/wsl/docker-compose.yml").read_text(encoding="utf-8")
     assert "network_mode: host" in compose
     assert "NAPCAT_WS_URL=ws://127.0.0.1:3001" in compose
     assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in compose
     assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in compose
-    assert "PIP_INDEX_URL=${PIP_INDEX_URL:-}" in compose
+    assert "image: xiaomachi-bot:local" in compose
+    assert "dockerfile: Dockerfile.xiaomachi" in compose
+    assert "network: host" in compose
+    assert "command: [\"python\", \"-m\", \"app.group_main\"]" in compose
+    assert "python -m pip install" not in compose
+    assert "./runtime/pip-cache:/root/.cache/pip" not in compose
 
 
-def test_xiaomachi_startup_installs_dependencies_with_proxy_friendly_timeouts() -> None:
-    compose = (REPO_ROOT / "infra/wsl/docker-compose.yml").read_text(encoding="utf-8")
-    assert "pip setuptools wheel" in compose
-    assert "--timeout ${PIP_DEFAULT_TIMEOUT:-120}" in compose
-    assert "--retries ${PIP_RETRIES:-10}" in compose
-    assert "python -m pip install --timeout ${PIP_DEFAULT_TIMEOUT:-120} --retries ${PIP_RETRIES:-10} --no-build-isolation -e ." in compose
-    assert "./runtime/pip-cache:/root/.cache/pip" in compose
+def test_xiaomachi_dockerfile_installs_dependencies_at_build_time() -> None:
+    dockerfile = (REPO_ROOT / "infra/wsl/Dockerfile.xiaomachi").read_text(encoding="utf-8")
+    assert "FROM python:3.12-slim" in dockerfile
+    assert "COPY requirements.xiaomachi.txt" in dockerfile
+    assert "python -m pip install" in dockerfile
+    assert "ARG HTTP_PROXY" in dockerfile
+    assert "ARG HTTPS_PROXY" in dockerfile
+    assert "PIP_INDEX_URL=${PIP_INDEX_URL}" not in dockerfile
+    assert 'CMD ["python", "-m", "app.group_main"]' in dockerfile
+
+
+def test_xiaomachi_image_requirements_match_pyproject() -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    expected = set(project["project"]["dependencies"])
+    expected.update(project["project"]["optional-dependencies"]["dev"])
+    actual = {
+        line.strip()
+        for line in (REPO_ROOT / "infra/wsl/requirements.xiaomachi.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert actual == expected
 
 
 def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
@@ -215,16 +244,23 @@ def test_start_and_stop_manage_wsl_keepalive_anchor() -> None:
     start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
     stop_script = (REPO_ROOT / "infra/wsl/scripts/stop.sh").read_text(encoding="utf-8")
     keepalive_script = (REPO_ROOT / "infra/wsl/scripts/keepalive.sh").read_text(encoding="utf-8")
+    anchor_script = (REPO_ROOT / "infra/wsl/scripts/anchor.sh").read_text(encoding="utf-8")
 
     assert "keepalive.enabled" in start_script
-    assert "xiaomachi-wsl-keepalive" in start_script
-    assert 'nohup setsid bash -c' in start_script
-    assert 'bash "${WSL_DIR}/scripts/keepalive.sh"' not in start_script
+    assert 'touch "${flag_file}"' in start_script
+    assert 'nohup setsid bash -c' not in start_script
     assert "keepalive.enabled" in stop_script
     assert "keepalive.pid" in stop_script
     assert "xiaomachi-wsl-keepalive" in stop_script
     assert 'while [[ -f "${flag_file}" ]]' in keepalive_script
     assert 'echo "$$" >"${pid_file}"' in keepalive_script
+    assert 'exec -a xiaomachi-wsl-keepalive' in anchor_script
+    assert 'keepalive.sh' in anchor_script
+    assert 'keepalive.enabled' in anchor_script
+    assert 'flock -n 9' in anchor_script
+    assert 'trap cleanup_failed_start EXIT' in start_script
+    assert 'pkill -f xiaomachi-wsl-keepalive' in start_script
+    assert 'flock -n 8' in start_script
 
 
 def test_stop_terminates_the_keepalive_process_group_before_state_cleanup() -> None:

@@ -5,6 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${WSL_DIR}"
 
+mkdir -p "${WSL_DIR}/runtime"
+exec 8>"${WSL_DIR}/runtime/start.lock"
+if ! flock -n 8; then
+  echo "Xiaomachi startup is already in progress."
+  exit 0
+fi
+
 if [[ ! -f .env ]]; then
   echo "Missing ${WSL_DIR}/.env. Run bootstrap_wsl.sh and fill required secrets."
   exit 1
@@ -32,22 +39,26 @@ else
   launcher="open_napcat_webui.ps1"
 fi
 
-start_keepalive() {
+startup_complete=false
+
+cleanup_failed_start() {
+  local status=$?
+  trap - EXIT
+  if [[ "${startup_complete}" != true ]]; then
+    rm -f "${WSL_DIR}/runtime/keepalive.enabled"
+    pkill -f xiaomachi-wsl-keepalive 2>/dev/null || true
+    rm -f "${WSL_DIR}/runtime/keepalive.pid"
+  fi
+  exit "${status}"
+}
+
+trap cleanup_failed_start EXIT
+
+enable_keepalive() {
   local runtime_dir="${WSL_DIR}/runtime"
   local flag_file="${runtime_dir}/keepalive.enabled"
-  local pid_file="${runtime_dir}/keepalive.pid"
-  local existing_pid=""
   mkdir -p "${runtime_dir}"
   touch "${flag_file}"
-  if [[ -f "${pid_file}" ]]; then
-    existing_pid="$(cat "${pid_file}" 2>/dev/null || true)"
-    if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
-      return 0
-    fi
-  fi
-  nohup setsid bash -c 'exec -a xiaomachi-wsl-keepalive bash "$@"' _ \
-    "${SCRIPT_DIR}/keepalive.sh" "${flag_file}" "${pid_file}" "${platform}" \
-    >/dev/null 2>&1 &
 }
 
 open_login_page() {
@@ -68,11 +79,15 @@ open_login_page() {
   fi
 }
 
+enable_keepalive
 docker compose -f "${other_compose_file}" down --remove-orphans || true
+# This is a cache check on normal starts. Dependency installation only runs when
+# the Dockerfile or requirements file changed, or when the local image is absent.
+docker compose -f "${compose_file}" build xiaomachi
 # Do not let Compose's `depends_on: service_healthy` block the login page.
 # The bot reconnects to OneBot on its own while the QQ platform finishes login.
 docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
 docker compose -f "${compose_file}" up -d --no-deps xiaomachi
-start_keepalive
 bash "${SCRIPT_DIR}/status.sh"
+startup_complete=true
