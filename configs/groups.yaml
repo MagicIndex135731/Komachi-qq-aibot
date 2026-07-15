@@ -14,6 +14,7 @@ groups:
     proactive_reply: true
     proactive_interval_seconds: "180-480"
     image_generation: true
+    long_context_history: true
 
   "300520120":
     enabled: true

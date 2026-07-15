@@ -2328,6 +2328,103 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
     await first_task
 
 
+@pytest.mark.asyncio
+async def test_router_uses_complete_chronological_history_when_group_policy_enables_it(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.runtime.group_policy["groups"]["10001"]["long_context_history"] = True
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+        messages.add_group_message(
+            platform_msg_id="history-early",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 9, 11, 0, tzinfo=UTC),
+            plain_text="earliest message",
+            raw_json={"sender": {"nickname": "Alice", "card": "Group Alice"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="history-bot",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 9, 11, 30, tzinfo=UTC),
+            plain_text="middle bot reply",
+            raw_json={"direction": "outbound", "delivery_state": "sent"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="history-latest",
+            plain_text="@Mira latest message",
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+        )
+    )
+
+    history_section = next(
+        line for line in llm.calls[-1] if line.startswith("Full group conversation history (chronological")
+    )
+    assert history_section.index("20001: earliest message") < history_section.index("123456789: middle bot reply")
+    assert "Participants (group-local display names; messages below remain in timestamp/id order):" in history_section
+    assert "20001=Group Alice" in history_section
+    assert "@Mira latest message" not in history_section
+
+
+@pytest.mark.asyncio
+async def test_router_marks_history_as_partial_when_it_exceeds_model_input_budget(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.runtime.group_policy["groups"]["10001"]["long_context_history"] = True
+    router.runtime.settings.llm_context_window_tokens = 300
+    router.runtime.settings.llm_max_output_tokens = 40
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        for index in range(3):
+            messages.add_group_message(
+                platform_msg_id=f"long-history-{index}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 10, index, tzinfo=UTC),
+                plain_text="old " + ("word " * 20),
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="long-history-target",
+            plain_text="@Mira latest",
+            timestamp=datetime(2026, 5, 9, 12, tzinfo=UTC),
+        )
+    )
+
+    history_section = next(line for line in llm.calls[-1] if line.startswith("Recent contiguous group history"))
+    assert "older records exceed the configured model window" in history_section
+
+
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,7 @@ class LlmClient:
     REQUEST_MAX_ATTEMPTS = 5
     IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
     supports_forced_web_search = True
+    supports_selective_web_search = True
 
     def __init__(
         self,
@@ -84,6 +85,7 @@ class LlmClient:
         builtin_web_search: bool = False,
         web_search_context_size: str = "high",
         reasoning_effort: str = "",
+        max_output_tokens: int = 8192,
         http_client: httpx.Client | None = None,
         usage_recorder=None,
         tool_event_recorder: Callable[[dict[str, Any]], None] | None = None,
@@ -107,6 +109,7 @@ class LlmClient:
         self.builtin_web_search = bool(builtin_web_search)
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
+        self.max_output_tokens = max(1, int(max_output_tokens))
         self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=False)
         self.usage_recorder = usage_recorder
         self.tool_event_recorder = tool_event_recorder
@@ -176,6 +179,8 @@ class LlmClient:
         images: list[ImageAttachment] | None = None,
         previous_response_id: str | None = None,
         force_web_search: bool = False,
+        allow_web_search: bool | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
             {
@@ -208,7 +213,9 @@ class LlmClient:
             payload["previous_response_id"] = previous_response_id
         if self.reasoning_effort:
             payload["reasoning"] = {"effort": self.reasoning_effort}
-        if self.builtin_web_search:
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        if self.builtin_web_search and (allow_web_search is not False or force_web_search):
             payload["tools"] = [
                 {
                     "type": "web_search",
@@ -1463,6 +1470,7 @@ class LlmClient:
         images: list[ImageAttachment] | None = None,
         conversation_key: str | None = None,
         force_web_search: bool = False,
+        allow_web_search: bool | None = None,
     ) -> str:
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
 
@@ -1475,6 +1483,8 @@ class LlmClient:
                 images=images,
                 previous_response_id=self._responses_previous_response_id(conversation_key=conversation_key),
                 force_web_search=force_web_search,
+                allow_web_search=allow_web_search,
+                max_output_tokens=self.max_output_tokens,
             )
             try:
                 responses_result = self._request_responses_stream_result(

@@ -46,6 +46,59 @@ def test_repositories_store_groups_users_and_messages(tmp_path) -> None:
     assert message_count == 1
 
 
+def test_message_repository_lists_all_delivered_group_messages_chronologically(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="test-group", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+        messages.add_group_message(
+            platform_msg_id="late",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 9, 12, 1, tzinfo=UTC),
+            plain_text="later",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="early-bot",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+            plain_text="earlier bot reply",
+            raw_json={"direction": "outbound", "delivery_state": "sent"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="reserved",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 9, 12, 2, tzinfo=UTC),
+            plain_text="not delivered",
+            raw_json={"direction": "outbound", "delivery_state": "reserved"},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+        history = messages.list_group_messages_chronological(
+            group_id=10001,
+            exclude_platform_msg_id="late",
+        )
+
+    assert [message.platform_msg_id for message in history] == ["early-bot"]
+
+
 def test_dev_repositories_create_owner_session_and_queue_task(tmp_path) -> None:
     engine = build_engine(tmp_path / "bot.db")
     create_all(engine)

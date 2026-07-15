@@ -158,6 +158,24 @@ class MessageRepository:
                 break
         return list(reversed(recent_messages))
 
+    def list_group_messages_chronological(
+        self,
+        *,
+        group_id: int,
+        exclude_platform_msg_id: str | None = None,
+    ) -> list[Message]:
+        """Return every delivered group message in its original order."""
+        stmt = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .order_by(Message.timestamp.asc(), Message.id.asc())
+        )
+        return [
+            message
+            for message in self.session.scalars(stmt)
+            if not self._is_reserved_outbound(message) and message.platform_msg_id != exclude_platform_msg_id
+        ]
+
     def count_group_messages(self, group_id: int) -> int:
         stmt = select(func.count()).select_from(Message).where(Message.group_id == group_id)
         return self.session.scalar(stmt) or 0
