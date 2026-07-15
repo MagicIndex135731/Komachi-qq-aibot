@@ -1105,6 +1105,7 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert captured["payload"] == {
         "model": "gpt-5.4",
         "stream": True,
+        "max_output_tokens": 8192,
         "instructions": (
             "System persona: You are Mira.\n\n"
             "Safety rules: Stay safe.\n\n"
@@ -1265,6 +1266,31 @@ def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:
     ]
 
 
+def test_llm_client_does_not_expose_builtin_web_search_without_current_turn_eligibility() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_no_search_1", text="normal reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.generate_text(["Target message: Alice: 聊点日常"], allow_web_search=False) == "normal reply"
+    assert "tools" not in captured["payload"]
+
+
 def test_llm_client_can_force_builtin_web_search_tool_choice() -> None:
     captured = {}
 
@@ -1286,7 +1312,11 @@ def test_llm_client_can_force_builtin_web_search_tool_choice() -> None:
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    assert client.generate_text(["Target message: Alice: 联网查天气"], force_web_search=True) == "grounded reply"
+    assert client.generate_text(
+        ["Target message: Alice: 联网查天气"],
+        allow_web_search=True,
+        force_web_search=True,
+    ) == "grounded reply"
     assert captured["payload"]["tool_choice"] == {"type": "web_search"}
 
 
@@ -1421,6 +1451,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
     assert captured_payloads[0] == {
         "model": "gpt-5.4",
         "stream": True,
+        "max_output_tokens": 8192,
         "input": [
             {
                 "role": "user",
@@ -1431,6 +1462,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
     assert captured_payloads[1] == {
         "model": "gpt-5.4",
         "stream": True,
+        "max_output_tokens": 8192,
         "input": [
             {
                 "role": "user",
@@ -1480,6 +1512,7 @@ def test_llm_client_routes_images_to_responses_with_input_image_when_configured(
     assert captured["payload"] == {
         "model": "gpt-5.4",
         "stream": True,
+        "max_output_tokens": 8192,
         "input": [
             {
                 "role": "user",

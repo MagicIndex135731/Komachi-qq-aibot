@@ -143,6 +143,7 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         builtin_web_search=settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses",
         web_search_context_size=settings.llm_builtin_web_search_context_size,
         reasoning_effort=settings.llm_reasoning_effort if settings.llm_text_endpoint == "responses" else "",
+        max_output_tokens=settings.llm_max_output_tokens,
         usage_recorder=build_usage_recorder(engine),
         tool_event_recorder=record_tool_event,
     )

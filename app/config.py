@@ -47,6 +47,10 @@ class AppSettings(BaseSettings):
     context_recent_limit: int = Field(default=60, alias="CONTEXT_RECENT_LIMIT")
     context_summary_limit: int = Field(default=3, alias="CONTEXT_SUMMARY_LIMIT")
     context_history_limit: int = Field(default=8, alias="CONTEXT_HISTORY_LIMIT")
+    llm_context_window_tokens: int = Field(default=258000, alias="LLM_CONTEXT_WINDOW_TOKENS")
+    llm_max_output_tokens: int = Field(default=8192, alias="LLM_MAX_OUTPUT_TOKENS")
+    llm_context_safety_margin_tokens: int = Field(default=32768, alias="LLM_CONTEXT_SAFETY_MARGIN_TOKENS")
+    llm_tool_context_reserve_tokens: int = Field(default=32768, alias="LLM_TOOL_CONTEXT_RESERVE_TOKENS")
     config_dir: Path = Path("configs")
     data_dir: Path = Path("data")
 
