@@ -20,7 +20,7 @@ services:
       - ./runtime/napcat/logs:/app/napcat/logs
       - ./runtime/napcat/cache:/app/napcat/cache
       - ./runtime/napcat/ntqq:/app/.config/QQ
-      - ../../data/generated_images:/workspace/data/generated_images:ro
+      - xiaomachi_data:/workspace/data:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6099/ >/dev/null"]
       interval: 20s
@@ -56,9 +56,15 @@ services:
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
     volumes:
       - ../../:/workspace
+      - xiaomachi_data:/workspace/data
       - ./runtime/logs:/workspace/data/logs
       - ./runtime/cache:/workspace/data/cache
     depends_on:
       napcat:
         condition: service_healthy
     command: ["python", "-m", "app.group_main"]
+
+volumes:
+  xiaomachi_data:
+    external: true
+    name: xiaomachi-bot-data
