@@ -11,4 +11,4 @@ def test_summarize_window_formats_recent_dialogue() -> None:
         ]
     )
 
-    assert summary == "Recent chat summary: Alice: are you online tonight? | Bob: later | Bot: me too"
+    assert summary == "Recent chat summary: Alice: are you online tonight? | Bob: later | Bot: me too | Carol: sounds good"

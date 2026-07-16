@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.storage.models import (
@@ -276,6 +276,36 @@ class MessageRepository:
             if len(kept_messages) >= limit:
                 break
         return kept_messages
+
+    def list_group_messages_matching_terms(
+        self,
+        *,
+        group_id: int,
+        terms: list[str],
+        exclude_platform_msg_ids: set[str],
+        limit: int,
+    ) -> list[Message]:
+        normalized_terms = list(dict.fromkeys(term.strip().lower() for term in terms if len(term.strip()) >= 2))
+        if limit <= 0 or not normalized_terms:
+            return []
+        stmt = (
+            select(Message)
+            .where(
+                Message.group_id == group_id,
+                Message.plain_text.is_not(None),
+                or_(*(Message.plain_text.ilike(f"%{term}%") for term in normalized_terms)),
+            )
+            .order_by(Message.timestamp.desc(), Message.id.desc())
+            .limit(max(limit * 4, limit))
+        )
+        matched: list[Message] = []
+        for message in self.session.scalars(stmt):
+            if message.platform_msg_id in exclude_platform_msg_ids or self._is_reserved_outbound(message):
+                continue
+            matched.append(message)
+            if len(matched) >= limit:
+                break
+        return matched
 
     def list_recent_group_user_ids(self, *, group_id: int, limit: int) -> list[int]:
         latest_message_at = func.max(Message.timestamp).label("latest_message_at")

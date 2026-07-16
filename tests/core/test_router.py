@@ -2428,6 +2428,46 @@ async def test_router_marks_history_as_partial_when_it_exceeds_model_input_budge
 
 
 @pytest.mark.asyncio
+async def test_router_uses_bounded_relevant_older_history_when_full_history_is_disabled(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.runtime.group_policy["groups"]["10001"]["long_context_history"] = False
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="older-messi", group_id=10001, user_id=20001,
+            timestamp=datetime(2026, 5, 9, 10, 0, tzinfo=UTC),
+            plain_text="\u6885\u897f\u5728\u5df4\u8428\u65f6\u671f\u8e22\u5f97\u7279\u522b\u597d\u3002", raw_json={}, msg_type="text",
+            reply_to_msg_id=None, mentioned_bot=False,
+        )
+        for index in range(65):
+            messages.add_group_message(
+                platform_msg_id=f"recent-unrelated-{index}", group_id=10001, user_id=20001,
+                timestamp=datetime(2026, 5, 9, 11, index % 60, tzinfo=UTC),
+                plain_text=f"unrelated chat {index}", raw_json={}, msg_type="text",
+                reply_to_msg_id=None, mentioned_bot=False,
+            )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001, mentioned_bot=True, message_id="bounded-history-target",
+            plain_text="@Mira \u6885\u897f\u5728\u5df4\u8428\u600e\u4e48\u6837", timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+        )
+    )
+
+    prompt = "\n".join(llm.calls[-1])
+    assert "Full group conversation history" not in prompt
+    assert "Relevant earlier group messages" in prompt
+    assert "\u6885\u897f\u5728\u5df4\u8428\u65f6\u671f\u8e22\u5f97\u7279\u522b\u597d\u3002" in prompt
+
+
+@pytest.mark.asyncio
 async def test_router_fallback_marks_delivered_reply_visible_for_cooldown(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = FakeLlm()
