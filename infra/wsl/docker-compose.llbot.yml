@@ -15,8 +15,7 @@ services:
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
     volumes:
       - ./runtime/llbot/data:/app/llbot/data
-      - ../../data/generated_images:/workspace/data/generated_images:ro
-      - ../../data/generated_private_images:/workspace/data/generated_private_images:ro
+      - xiaomachi_data:/workspace/data:ro
     healthcheck:
       test: ["CMD-SHELL", "node -e \"const net=require('net'); Promise.all([fetch('http://127.0.0.1:3080').then(r=>{if(!r.ok)throw Error('webui')}),new Promise((resolve,reject)=>{const s=net.connect(${LLBOT_WS_PORT:-3002},'127.0.0.1');s.once('connect',()=>{s.destroy();resolve()});s.once('error',reject)})]).catch(()=>process.exit(1))\""]
       interval: 20s
@@ -52,9 +51,15 @@ services:
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
     volumes:
       - ../../:/workspace
+      - xiaomachi_data:/workspace/data
       - ./runtime/logs:/workspace/data/logs
       - ./runtime/cache:/workspace/data/cache
     depends_on:
       llbot:
         condition: service_healthy
     command: ["python", "-m", "app.group_main"]
+
+volumes:
+  xiaomachi_data:
+    external: true
+    name: xiaomachi-bot-data

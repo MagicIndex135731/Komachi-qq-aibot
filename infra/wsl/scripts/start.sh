@@ -84,6 +84,7 @@ docker compose -f "${other_compose_file}" down --remove-orphans || true
 # This is a cache check on normal starts. Dependency installation only runs when
 # the Dockerfile or requirements file changed, or when the local image is absent.
 docker compose -f "${compose_file}" build xiaomachi
+bash "${SCRIPT_DIR}/migrate_xiaomachi_data_volume.sh" "${compose_file}"
 # Do not let Compose's `depends_on: service_healthy` block the login page.
 # The bot reconnects to OneBot on its own while the QQ platform finishes login.
 docker compose -f "${compose_file}" up -d "${service_name}"

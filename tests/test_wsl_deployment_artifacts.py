@@ -31,6 +31,7 @@ def test_wsl_required_files_exist() -> None:
         "open-llbot-webui.bat",
         "infra/wsl/docker-compose.llbot.yml",
         "infra/wsl/scripts/bootstrap_llbot_runtime.py",
+        "infra/wsl/scripts/migrate_xiaomachi_data_volume.sh",
         "infra/wsl/scripts/open_llbot_webui.ps1",
     ]
     missing = [path for path in required if not (REPO_ROOT / path).exists()]
@@ -168,10 +169,10 @@ def test_compose_uses_docker_safe_napcat_login_and_healthcheck() -> None:
     assert "node -e" not in compose
 
 
-def test_napcat_mounts_generated_images_at_the_sender_file_uri_path() -> None:
+def test_napcat_mounts_shared_runtime_data_at_the_sender_file_uri_path() -> None:
     compose = (REPO_ROOT / "infra/wsl/docker-compose.yml").read_text(encoding="utf-8")
 
-    assert "../../data/generated_images:/workspace/data/generated_images:ro" in compose
+    assert "xiaomachi_data:/workspace/data:ro" in compose
 
 
 def test_xiaomachi_container_uses_prebuilt_local_image() -> None:

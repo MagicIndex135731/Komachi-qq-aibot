@@ -8,6 +8,8 @@ data/bot.db
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/.bot.db.*
+data/bot.db.unreadable-backup-*
 data/*.usage-backup-*
 data/private_reminders_state.json
 data/history/

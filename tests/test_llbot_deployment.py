@@ -26,6 +26,7 @@ def test_llbot_compose_uses_pinned_image_host_network_and_persistent_data() -> N
     assert llbot["network_mode"] == "host"
     assert "ports" not in llbot
     assert "./runtime/llbot/data:/app/llbot/data" in llbot["volumes"]
+    assert "xiaomachi_data:/workspace/data:ro" in llbot["volumes"]
     assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in llbot["environment"]
     assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in llbot["environment"]
 
@@ -44,6 +45,7 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     assert xiaomachi["build"]["args"]["HTTP_PROXY"] == "${DOCKER_HTTP_PROXY:-}"
     assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
     assert "../../:/workspace" in xiaomachi["volumes"]
+    assert "xiaomachi_data:/workspace/data" in xiaomachi["volumes"]
     assert "./runtime/logs:/workspace/data/logs" in xiaomachi["volumes"]
     assert "./runtime/cache:/workspace/data/cache" in xiaomachi["volumes"]
     assert "./runtime/pip-cache:/root/.cache/pip" not in xiaomachi["volumes"]
@@ -52,6 +54,19 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
         "environment"
     ]
     assert xiaomachi["depends_on"]["llbot"]["condition"] == "service_healthy"
+    assert compose["volumes"]["xiaomachi_data"]["external"] is True
+    assert compose["volumes"]["xiaomachi_data"]["name"] == "xiaomachi-bot-data"
+
+
+def test_llbot_data_volume_migration_stops_writer_copies_and_checks_database() -> None:
+    script = read_script("migrate_xiaomachi_data_volume.sh")
+
+    assert "xiaomachi-bot-data" in script
+    assert 'docker compose -f "${compose_file}" stop xiaomachi' in script
+    assert '"${repo_root}/data:/source:ro"' in script
+    assert "cp -a /source/. /target/" in script
+    assert "PRAGMA integrity_check" in script
+    assert ".migration-complete" in script
 
 
 def test_llbot_runtime_bootstrap_configures_onebot_and_webui() -> None:
@@ -133,6 +148,7 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
     assert 'service_name="llbot"' in script
     assert 'service_name="napcat"' in script
     assert 'docker compose -f "${compose_file}" build xiaomachi' in script
+    assert 'migrate_xiaomachi_data_volume.sh' in script
     assert "cleanup_failed_start" in script
     assert "pkill -f xiaomachi-wsl-keepalive" in script
     assert 'flock -n 8' in script
