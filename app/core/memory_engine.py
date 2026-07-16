@@ -80,3 +80,37 @@ def retrieve_relevant_memories(query: str, memories: list[dict[str, Any]], *, li
 
     ranked = sorted(memories, key=score, reverse=True)
     return ranked[:limit]
+
+
+def history_search_terms(query: str, *, limit: int = 12) -> list[str]:
+    """Return compact lexical terms suitable for bounded SQL history recall."""
+    normalized = str(query or "").lower()
+    terms: list[str] = []
+    for chinese_run in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        terms.extend(chinese_run[index : index + 2] for index in range(len(chinese_run) - 1))
+    terms.extend(token for token in re.findall(r"[a-z0-9_]{2,}", normalized) if len(token) >= 2)
+    unique_terms = list(dict.fromkeys(term for term in terms if len(term) >= 2))
+    return unique_terms[:limit]
+
+
+def retrieve_relevant_history(query: str, messages: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    """Rank already-bounded historical candidates and omit zero-signal fallback data."""
+    if limit <= 0:
+        return []
+
+    query_counts = Counter(tokenize_text(query))
+    phrases = history_search_terms(query)
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for message in messages:
+        text = str(message.get("plain_text", "")).strip()
+        if not text:
+            continue
+        phrase_hits = sum(1 for phrase in phrases if phrase in text.lower())
+        token_overlap = sum((query_counts & Counter(tokenize_text(text))).values())
+        if phrase_hits == 0 and token_overlap < 2:
+            continue
+        score = phrase_hits * 10 + token_overlap
+        ranked.append((score, int(message.get("id", 0)), message))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [message for _score, _message_id, message in ranked[:limit]]

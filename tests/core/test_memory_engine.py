@@ -1,4 +1,8 @@
-from app.core.memory_engine import extract_memory_candidates, retrieve_relevant_memories
+from app.core.memory_engine import (
+    extract_memory_candidates,
+    retrieve_relevant_history,
+    retrieve_relevant_memories,
+)
 from app.providers.embeddings import tokenize_text
 
 
@@ -69,6 +73,24 @@ def test_retrieve_relevant_memories_supports_chinese_keyword_overlap() -> None:
     ranked = retrieve_relevant_memories("\u4f60\u8fd8\u559c\u6b22\u706b\u9505\u5417", memories, limit=1)
 
     assert ranked == [{"content": "Alice likes \u706b\u9505.", "importance": 4}]
+
+
+def test_retrieve_relevant_history_prefers_exact_chinese_phrase_without_unrelated_fallback() -> None:
+    messages = [
+        {"plain_text": "\u6885\u897f\u62ff\u8fc7\u4e16\u754c\u676f\u51a0\u519b\u3002", "id": 1},
+        {"plain_text": "\u4eca\u665a\u5403\u706b\u9505\u3002", "id": 2},
+        {"plain_text": "\u6211\u89c9\u5f97\u6885\u897f\u5728\u5df4\u8428\u65f6\u671f\u6700\u5f3a\u3002", "id": 3},
+    ]
+
+    ranked = retrieve_relevant_history("\u6885\u897f\u5728\u5df4\u8428\u600e\u4e48\u6837", messages, limit=2)
+
+    assert [message["id"] for message in ranked] == [3, 1]
+
+
+def test_retrieve_relevant_history_returns_empty_when_nothing_matches() -> None:
+    messages = [{"plain_text": "\u4eca\u665a\u5403\u706b\u9505\u3002", "id": 1}]
+
+    assert retrieve_relevant_history("\u6885\u897f\u5728\u5df4\u8428\u600e\u4e48\u6837", messages, limit=3) == []
 
 
 def test_tokenize_text_normalizes_case_and_punctuation() -> None:

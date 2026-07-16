@@ -2,7 +2,10 @@ from __future__ import annotations
 
 
 def summarize_window(lines: list[str]) -> str:
-    topic_preview = " | ".join(line.strip() for line in lines[:3] if line.strip())
-    if not topic_preview:
+    normalized = [line.strip() for line in lines if line.strip()]
+    if not normalized:
         return "Recent chat summary: (empty)"
-    return f"Recent chat summary: {topic_preview}"
+    sample_count = min(6, len(normalized))
+    indices = sorted({round(index * (len(normalized) - 1) / max(1, sample_count - 1)) for index in range(sample_count)})
+    highlights = " | ".join(normalized[index] for index in indices)
+    return f"Recent chat summary: {highlights}"
