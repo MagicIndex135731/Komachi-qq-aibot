@@ -150,8 +150,28 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
 
 
 def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
-    del settings, engine
-    return llm_client
+    del llm_client
+    required = {
+        "GROUP_IMAGE_BASE_URL": settings.group_image_base_url.strip(),
+        "GROUP_IMAGE_API_KEY": settings.group_image_api_key.strip(),
+        "GROUP_IMAGE_MODEL": settings.group_image_model.strip(),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(f"Dedicated image generation configuration is missing: {', '.join(missing)}")
+
+    return LlmClient(
+        base_url=required["GROUP_IMAGE_BASE_URL"],
+        api_key=required["GROUP_IMAGE_API_KEY"],
+        model=required["GROUP_IMAGE_MODEL"],
+        responses_model="",
+        image_responses_model="",
+        compat_model=required["GROUP_IMAGE_MODEL"],
+        image_generations_endpoint=settings.group_image_generations_endpoint,
+        image_edits_endpoint=settings.group_image_edits_endpoint,
+        max_output_tokens=settings.llm_max_output_tokens,
+        usage_recorder=build_usage_recorder(engine),
+    )
 
 
 def build_group_image_service(
@@ -166,11 +186,11 @@ def build_group_image_service(
         sender=sender,
         web_search_client=web_search_client,
         output_dir=settings.data_dir / "generated_images",
-        model=settings.llm_model,
-        size="auto",
-        quality="high",
+        model=settings.group_image_model,
+        size=settings.group_image_size,
+        quality=settings.group_image_quality,
         background=None,
-        output_format="png",
+        output_format=settings.group_image_output_format,
         output_compression=None,
         moderation=None,
         max_slots=settings.group_image_queue_capacity,
