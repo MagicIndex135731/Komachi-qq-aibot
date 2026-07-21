@@ -55,7 +55,7 @@ class AppSettings(BaseSettings):
     search_timeout_seconds: float = Field(default=8.0, alias="SEARCH_TIMEOUT_SECONDS")
     search_region: str = Field(default="wt-wt", alias="SEARCH_REGION")
     search_backend: str = Field(default="auto", alias="SEARCH_BACKEND")
-    context_recent_limit: int = Field(default=60, alias="CONTEXT_RECENT_LIMIT")
+    context_recent_limit: int = Field(default=100, alias="CONTEXT_RECENT_LIMIT")
     context_summary_limit: int = Field(default=3, alias="CONTEXT_SUMMARY_LIMIT")
     context_history_limit: int = Field(default=8, alias="CONTEXT_HISTORY_LIMIT")
     memory_compaction_enabled: bool = Field(default=True, alias="MEMORY_COMPACTION_ENABLED")

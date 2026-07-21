@@ -2,6 +2,7 @@ from app.core.memory_engine import (
     extract_memory_candidates,
     extract_structured_memory_candidates,
     is_history_detail_query,
+    history_recall_limits,
     retrieve_relevant_history,
     retrieve_relevant_memories,
 )
@@ -147,7 +148,15 @@ def test_extract_structured_memory_candidates_keeps_explicit_plan_with_source() 
 
 def test_is_history_detail_query_detects_temporal_followup() -> None:
     assert is_history_detail_query("\u4ed6\u4eec\u4e4b\u524d\u5230\u5e95\u51b3\u5b9a\u4e86\u4ec0\u4e48\uff1f") is True
+    assert is_history_detail_query("\u90a3\u4e2a\u4eba\u540e\u6765\u600e\u4e48\u6837\u4e86\uff1f") is True
+    assert is_history_detail_query("\u8fd9\u4ef6\u4e8b\u6700\u540e\u600e\u4e48\u5904\u7406\u7684\uff1f") is True
+    assert is_history_detail_query("\u521a\u624d\u8bf4\u7684\u897f\u7535\u662f\u8c01\u63d0\u7684\uff1f") is True
     assert is_history_detail_query("\u4eca\u5929\u5403\u4ec0\u4e48\uff1f") is False
+
+
+def test_history_recall_limits_double_raw_history_for_detail_queries() -> None:
+    assert history_recall_limits(8, history_detail=False) == (32, 8)
+    assert history_recall_limits(8, history_detail=True) == (64, 16)
 
 
 def test_extract_structured_memory_candidates_marks_explicit_cancellation_for_supersession() -> None:
