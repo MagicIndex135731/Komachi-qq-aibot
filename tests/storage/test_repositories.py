@@ -99,6 +99,54 @@ def test_message_repository_lists_all_delivered_group_messages_chronologically(t
     assert [message.platform_msg_id for message in history] == ["early-bot"]
 
 
+def test_qq_blocked_reply_stays_in_context_but_not_memory_compaction_sources(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="test-group", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+        blocked = messages.add_group_message(
+            platform_msg_id="blocked-1",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+            plain_text="blocked sensitive reply\n\n[system delivery note]",
+            raw_json={
+                "direction": "outbound",
+                "delivery_state": "blocked",
+                "failure_kind": "qq_sensitive_content",
+            },
+            msg_type="text",
+            reply_to_msg_id="inbound-1",
+            mentioned_bot=False,
+        )
+        session.flush()
+
+        recent = messages.list_recent_group_messages(group_id=10001, limit=10)
+        summary_recent = messages.list_recent_group_messages_for_summarization(group_id=10001, limit=10)
+        chronological = messages.list_group_messages_chronological(group_id=10001)
+        compaction_windows = messages.list_recent_group_message_windows(
+            group_id=10001,
+            batch_size=1,
+            limit_windows=10,
+        )
+        compaction_range = messages.list_group_messages_by_id_range(
+            group_id=10001,
+            start_id=blocked.id,
+            end_id=blocked.id,
+        )
+
+    assert [message.platform_msg_id for message in recent] == ["blocked-1"]
+    assert summary_recent == []
+    assert [message.platform_msg_id for message in chronological] == ["blocked-1"]
+    assert compaction_windows == []
+    assert compaction_range == []
+
+
 def test_dev_repositories_create_owner_session_and_queue_task(tmp_path) -> None:
     engine = build_engine(tmp_path / "bot.db")
     create_all(engine)

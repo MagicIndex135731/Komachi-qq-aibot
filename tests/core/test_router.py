@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from app.adapters.onebot_models import GroupMessageEvent
+from app.adapters.sender import QQMessageBlockedError
 from app.core.message_content import ImageAttachment
 import app.core.router as router_module
 from app.core.router import InboundRouter
@@ -53,6 +54,29 @@ class BlockingSender:
         if len(self.calls) == 1:
             self.first_send_started.set()
             await self.release_first_send.wait()
+
+
+class QQBlockingSender:
+    def __init__(self) -> None:
+        self.sent = []
+
+    async def send_group_text(self, outbound) -> None:
+        self.sent.append(outbound)
+        if len(self.sent) == 1:
+            raise QQMessageBlockedError(
+                "send_group_msg failed: status=failed retcode=1200 message=waitForSelfEcho timeout"
+            )
+
+
+class AlwaysQQBlockingSender:
+    def __init__(self) -> None:
+        self.sent = []
+
+    async def send_group_text(self, outbound) -> None:
+        self.sent.append(outbound)
+        raise QQMessageBlockedError(
+            "send_group_msg failed: status=failed retcode=1200 message=waitForSelfEcho timeout"
+        )
 
 
 class FakeLlm:
@@ -2240,6 +2264,82 @@ async def test_router_retries_duplicate_inbound_when_first_send_fails(sqlite_eng
     assert [outbound.text for outbound in sender.sent] == ["I am here."]
     assert len(llm.calls) == 2
     assert [message.plain_text for message in stored_messages] == ["@Mira hi", "I am here."]
+
+
+@pytest.mark.asyncio
+async def test_router_persists_qq_blocked_reply_and_sends_safe_notice(sqlite_engine) -> None:
+    sender = QQBlockingSender()
+    llm = LongReplyLlm("sensitive generated detail")
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(group_id=10001, mentioned_bot=True, message_id="qq-blocked-1", plain_text="@Mira explain")
+    )
+
+    with session_scope(sqlite_engine) as session:
+        stored_messages = session.execute(
+            select(Message).where(Message.group_id == 10001).order_by(Message.id)
+        ).scalars().all()
+
+    assert [outbound.text for outbound in sender.sent] == [
+        "sensitive generated detail",
+        "刚刚的回复可能包含敏感信息，被 QQ 拦截了，无法发送。",
+    ]
+    assert [message.platform_msg_id for message in stored_messages] == [
+        "qq-blocked-1",
+        "bot-reply-qq-blocked-1",
+        "bot-reply-notice-qq-blocked-1",
+    ]
+    blocked = stored_messages[1]
+    assert blocked.raw_json["delivery_state"] == "blocked"
+    assert blocked.raw_json["failure_kind"] == "qq_sensitive_content"
+    assert blocked.raw_json["delivery_reason"] == "wait_for_self_echo_timeout"
+    assert blocked.raw_json["delivery_attempts"] == 3
+    assert blocked.plain_text.startswith("sensitive generated detail")
+    assert "以上回复未在 QQ 群中送达" in blocked.plain_text
+    assert "后续回答不得复述其中的敏感细节" in blocked.plain_text
+    assert stored_messages[2].raw_json["delivery_state"] == "sent"
+
+    router.runtime.settings.context_recent_limit = 1
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="qq-blocked-2",
+            plain_text="@Mira sensitive continue",
+        )
+    )
+
+    next_prompt = "\n".join(llm.calls[-1])
+    assert "sensitive generated detail" in next_prompt
+    assert "以上回复未在 QQ 群中送达" in next_prompt
+    assert "Do not repeat sensitive details from replies marked as blocked by QQ" in next_prompt
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_recurse_when_qq_block_notice_is_also_blocked(sqlite_engine) -> None:
+    sender = AlwaysQQBlockingSender()
+    llm = LongReplyLlm("sensitive generated detail")
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(group_id=10001, mentioned_bot=True, message_id="qq-blocked-twice", plain_text="@Mira explain")
+    )
+
+    with session_scope(sqlite_engine) as session:
+        stored_messages = session.execute(
+            select(Message).where(Message.group_id == 10001).order_by(Message.id)
+        ).scalars().all()
+
+    assert [outbound.text for outbound in sender.sent] == [
+        "sensitive generated detail",
+        "刚刚的回复可能包含敏感信息，被 QQ 拦截了，无法发送。",
+    ]
+    assert [message.platform_msg_id for message in stored_messages] == [
+        "qq-blocked-twice",
+        "bot-reply-qq-blocked-twice",
+    ]
+    assert stored_messages[1].raw_json["delivery_state"] == "blocked"
 
 
 @pytest.mark.asyncio

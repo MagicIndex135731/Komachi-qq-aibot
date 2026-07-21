@@ -9,6 +9,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class QQMessageBlockedError(RuntimeError):
+    """QQ accepted the request but never echoed the bot message back."""
+
+
 @dataclass(slots=True)
 class OutboundMessage:
     group_id: int
@@ -87,7 +91,11 @@ class Sender:
                 return
             except Exception as exc:
                 last_error = exc
-                if attempt >= self.MAX_SEND_ATTEMPTS or not self._is_retryable_send_failure(exc):
+                if attempt >= self.MAX_SEND_ATTEMPTS:
+                    if self._is_qq_message_blocked_failure(exc, action=action):
+                        raise QQMessageBlockedError(str(exc)) from exc
+                    raise
+                if not self._is_retryable_send_failure(exc):
                     raise
                 logger.warning(
                     "sender_retry action=%s attempt=%s reason=%s",
@@ -118,6 +126,10 @@ class Sender:
             return True
         return "timeout" in text.lower()
 
+    def _is_qq_message_blocked_failure(self, error: Exception, *, action: str) -> bool:
+        text = str(error).lower()
+        return action == "send_group_msg" and "retcode=1200" in text and "waitforselfecho timeout" in text
+
     async def _send_text_message(self, *, action: str, target_params: dict, text: str, allow_chunking: bool) -> None:
         normalized = str(text).strip()
         if allow_chunking:
@@ -134,6 +146,8 @@ class Sender:
                 params={**target_params, "message": normalized},
             )
         except Exception as exc:
+            if isinstance(exc, QQMessageBlockedError):
+                raise
             if not normalized or len(normalized) <= self.MAX_TEXT_CHUNK_LENGTH or not self._is_retryable_send_failure(exc):
                 raise
             for chunk in self._split_text_chunks(normalized):
