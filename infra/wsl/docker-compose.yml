@@ -1,8 +1,10 @@
+name: xiaomachi-linux-napcat-stack
+
 services:
   napcat:
     image: mlikiowa/napcat-docker:latest
     container_name: xiaomachi-napcat
-    restart: unless-stopped
+    restart: "no"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - NAPCAT_GID=${NAPCAT_GID:-1000}
@@ -16,23 +18,17 @@ services:
       - "127.0.0.1:${NAPCAT_HTTP_PORT:-6099}:6099"
       - "127.0.0.1:${NAPCAT_WS_PORT:-3001}:3001"
     volumes:
-      - ./runtime/napcat/config:/app/napcat/config
-      - ./runtime/napcat/logs:/app/napcat/logs
-      - ./runtime/napcat/cache:/app/napcat/cache
-      - ./runtime/napcat/ntqq:/app/.config/QQ
+      - napcat_config:/app/napcat/config
+      - napcat_logs:/app/napcat/logs
+      - napcat_cache:/app/napcat/cache
+      - napcat_ntqq:/app/.config/QQ
       - xiaomachi_data:/workspace/data:ro
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6099/ >/dev/null"]
-      interval: 20s
-      timeout: 5s
-      retries: 6
-      start_period: 60s
 
   xiaomachi:
     image: xiaomachi-bot:local
     build:
-      context: .
-      dockerfile: Dockerfile.xiaomachi
+      context: ../..
+      dockerfile: infra/wsl/Dockerfile.xiaomachi
       network: host
       args:
         PIP_DEFAULT_TIMEOUT: ${PIP_DEFAULT_TIMEOUT:-120}
@@ -42,7 +38,7 @@ services:
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
         NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
     container_name: xiaomachi-bot
-    restart: unless-stopped
+    restart: "no"
     network_mode: host
     working_dir: /workspace
     env_file:
@@ -55,16 +51,21 @@ services:
       - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
     volumes:
-      - ../../:/workspace
       - xiaomachi_data:/workspace/data
-      - ./runtime/logs:/workspace/data/logs
-      - ./runtime/cache:/workspace/data/cache
     depends_on:
       napcat:
-        condition: service_healthy
+        condition: service_started
     command: ["python", "-m", "app.group_main"]
 
 volumes:
+  napcat_config:
+    name: xiaomachi-napcat-config
+  napcat_logs:
+    name: xiaomachi-napcat-logs
+  napcat_cache:
+    name: xiaomachi-napcat-cache
+  napcat_ntqq:
+    name: xiaomachi-napcat-ntqq
   xiaomachi_data:
     external: true
     name: xiaomachi-bot-data

@@ -3484,11 +3484,76 @@ async def test_router_persists_inline_summary_and_memories_without_breaking_repl
 
     assert [outbound.text for outbound in sender.sent] == ["I am here."]
     assert len(llm.calls) == 1
-    assert [summary.summary_level for summary in summaries] == ["window"]
+    assert [summary.summary_level for summary in summaries] == ["window", "daily"]
     assert summaries[0].source_count == 25
     assert summaries[0].content.startswith("Recent chat summary:")
+    assert summaries[0].source_start_msg_id == "seed-1"
+    assert summaries[0].source_end_msg_id == "summary-25"
+    assert summaries[1].summary_key == "daily:2026-05-09"
+    assert summaries[1].content.startswith("Rolling group memory:")
     assert [memory.subject_id for memory in memories] == ["20001"]
     assert [memory.content for memory in memories] == ["Alice likes hotpot."]
+
+
+@pytest.mark.asyncio
+async def test_router_persists_explicit_plan_as_source_backed_current_memory(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="plan-memory-1",
+            plain_text="I plan to visit Shanghai next week.",
+        )
+    )
+
+    with session_scope(sqlite_engine) as session:
+        memory = session.execute(
+            select(MemoryItem).where(MemoryItem.source_msg_id == "plan-memory-1", MemoryItem.memory_kind == "plan")
+        ).scalar_one()
+
+    assert memory.status == "active"
+    assert memory.subject_id == "20001"
+    assert memory.content == "Alice: I plan to visit Shanghai next week."
+    assert memory.valid_from is not None
+
+
+@pytest.mark.asyncio
+async def test_router_supersedes_cancelled_plan_instead_of_prompting_both_versions(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="plan-before-cancel",
+            plain_text="I plan to visit Shanghai next week.",
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="plan-cancelled",
+            plain_text="I cancelled my plan to visit Shanghai next week.",
+        )
+    )
+
+    with session_scope(sqlite_engine) as session:
+        plans = session.execute(
+            select(MemoryItem)
+            .where(MemoryItem.memory_kind == "plan")
+            .order_by(MemoryItem.id)
+        ).scalars().all()
+
+    assert [plan.status for plan in plans] == ["superseded", "active"]
+    assert plans[0].superseded_by_id == plans[1].id
+    assert plans[1].supersedes_id == plans[0].id
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,9 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/scripts/keepalive.sh",
         "infra/wsl/scripts/anchor.sh",
         "infra/wsl/scripts/xiaomachi-wsl-entry.sh",
+        "infra/wsl/scripts/install_linux_runtime.sh",
+        "infra/wsl/systemd/xiaomachi-stack.service",
+        "infra/wsl/systemd/xiaomachi-watchdog.service",
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
@@ -38,7 +41,7 @@ def test_wsl_required_files_exist() -> None:
     assert missing == []
 
 
-def test_windows_bat_entries_use_ascii_only_wsl_repo_discovery() -> None:
+def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
     bat_files = [
         REPO_ROOT / "start-xiaomachi-wsl.bat",
         REPO_ROOT / "stop-xiaomachi-wsl.bat",
@@ -49,19 +52,79 @@ def test_windows_bat_entries_use_ascii_only_wsl_repo_discovery() -> None:
     for bat_file in bat_files:
         content = bat_file.read_text(encoding="utf-8")
         assert content.isascii()
-        assert "wsl.exe bash /mnt/d/xiaomachi-wsl-entry.sh" in content
+        assert "/usr/local/bin/xiaomachi-wsl-entry" in content
+        assert 'wsl.exe --user root --exec "%ENTRY%"' in content
         assert "wsl.exe bash -lc" not in content
-        assert "%~dp0" not in content
         if bat_file.name == "start-xiaomachi-wsl.bat":
+            assert '--user root --cd "%~dp0" --exec bash infra/wsl/scripts/xiaomachi-wsl-entry.sh install' in content
             assert "Start-Process" in content
-            assert "anchor" in content
+            assert "'/usr/local/bin/xiaomachi-wsl-entry','anchor'" in content
+            assert "Xiaomachi started successfully." in content
+        assert "schtasks.exe" not in content
+
+    status_entry = (REPO_ROOT / "status-xiaomachi-wsl.bat").read_text(encoding="utf-8")
+    assert 'set "STATUS_EXIT_CODE=%ERRORLEVEL%"' in status_entry
+    assert "exit /b %STATUS_EXIT_CODE%" in status_entry
 
     entry = (REPO_ROOT / "infra/wsl/scripts/xiaomachi-wsl-entry.sh").read_text(encoding="utf-8")
+    assert 'install_root="${XIAOMACHI_INSTALL_ROOT:-/opt/xiaomachi}"' in entry
+    assert 'runtime_entry="${install_root}/current/infra/wsl/scripts/${ACTION}.sh"' in entry
+    assert "systemctl start xiaomachi-watchdog.service" in entry
+    assert "run_systemd_with_output start xiaomachi-stack.service" in entry
+    assert "journalctl --no-pager --follow --output=cat" in entry
+    assert "run_systemd_with_output stop xiaomachi-stack.service" in entry
     assert "for base in /mnt/d /mnt/e /mnt/c" in entry
     assert "find \"${base}\"" in entry
     assert "pyproject.toml" in entry
-    assert "infra/wsl/scripts/${ACTION}.sh" in entry
-    assert "start|stop|status|anchor" in entry
+    assert "install_linux_runtime.sh" in entry
+    assert "start|stop|status|anchor|install" in entry
+
+
+def test_linux_runtime_installer_copies_allowlist_to_ext4_release_tree() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'XIAOMACHI_INSTALL_ROOT:-/opt/xiaomachi' in script
+    assert '"${INSTALL_ROOT}/current"' in script
+    assert '"${shared_dir}/.env"' in script
+    assert '"${shared_runtime}"' in script
+    assert "app configs infra/wsl .dockerignore pyproject.toml README.md LICENSE" in script
+    source_copy = script.split('if [[ ! -f "${shared_dir}/.env" ]]', 1)[0]
+    assert "-cf - ." not in source_copy
+    assert "--exclude='infra/wsl/runtime'" in script
+    assert "systemctl daemon-reload" in script
+    assert "install_windows_autostart.ps1" not in script
+    assert 'install -m 0600 "${SOURCE_ROOT}/infra/wsl/.env" "${shared_dir}/.env.next"' in script
+    assert 'docker rename "${original_name}" "${legacy_name}"' in script
+    assert 'docker rename "${legacy_names[$index]}" "${legacy_original_names[$index]}"' in script
+    assert 'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi' in script
+
+
+def test_systemd_uses_persistent_supervision_without_windows_autostart() -> None:
+    stack = (REPO_ROOT / "infra/wsl/systemd/xiaomachi-stack.service").read_text(
+        encoding="utf-8"
+    )
+    watchdog = (REPO_ROOT / "infra/wsl/systemd/xiaomachi-watchdog.service").read_text(
+        encoding="utf-8"
+    )
+    entry = (REPO_ROOT / "infra/wsl/scripts/xiaomachi-wsl-entry.sh").read_text(
+        encoding="utf-8"
+    )
+    anchor = (REPO_ROOT / "infra/wsl/scripts/anchor.sh").read_text(encoding="utf-8")
+
+    assert "WorkingDirectory=/opt/xiaomachi/current/infra/wsl" in stack
+    assert "RemainAfterExit=yes" in stack
+    assert "Description=Xiaomachi persistent OneBot watchdog" in watchdog
+    assert "Restart=on-failure" in watchdog
+    assert "anchor.sh watchdog" in watchdog
+    assert "WantedBy=" not in stack
+    assert "WantedBy=" not in watchdog
+    assert "systemctl enable" not in anchor
+    assert "systemctl start xiaomachi-stack.service xiaomachi-watchdog.service" in anchor
+    assert "while systemctl is-active --quiet xiaomachi-stack.service" in anchor
+    assert "systemctl is-active --quiet xiaomachi-stack.service" in entry
+    assert "Xiaomachi systemd supervision is not active." in entry
 
 
 def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() -> None:
@@ -143,11 +206,11 @@ def test_gitignore_excludes_wsl_runtime_state() -> None:
         assert pattern in gitignore
 
 
-def test_bootstrap_allows_probe_venv_on_ubuntu_2204_python() -> None:
+def test_bootstrap_installs_watchdog_venv_on_linux_ext4() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/bootstrap_wsl.sh").read_text(encoding="utf-8")
-    assert "sys.version_info >= (3, 12)" in script
-    assert "./.venv-wsl/bin/python -m pip install websockets" in script
-    assert "python -m pip install -e ." in script
+    assert "/opt/xiaomachi/shared/venv" in script
+    assert '"${watchdog_venv}/bin/python" -m pip install websockets' in script
+    assert "pip install -e ." not in script
 
 
 def test_bootstrap_preconfigures_napcat_onebot_websocket_server() -> None:
@@ -159,14 +222,16 @@ def test_bootstrap_preconfigures_napcat_onebot_websocket_server() -> None:
     assert '"enable": true' in script
 
 
-def test_compose_uses_docker_safe_napcat_login_and_healthcheck() -> None:
+def test_compose_uses_linux_volumes_and_no_periodic_napcat_health_process() -> None:
     compose = (REPO_ROOT / "infra/wsl/docker-compose.yml").read_text(encoding="utf-8")
     assert "image: mlikiowa/napcat-docker:latest" in compose
     assert "ACCOUNT=${BOT_QQ:-}" in compose
     assert "NAPCAT_QUICK_PASSWORD=${NAPCAT_QUICK_PASSWORD:-}" in compose
     assert "NAPCAT_QUICK_PASSWORD_MD5=${NAPCAT_QUICK_PASSWORD_MD5:-}" in compose
-    assert "curl -fsS http://127.0.0.1:6099/" in compose
-    assert "node -e" not in compose
+    assert "healthcheck:" not in compose
+    assert "./runtime/napcat" not in compose
+    assert "napcat_config:/app/napcat/config" in compose
+    assert "napcat_ntqq:/app/.config/QQ" in compose
 
 
 def test_napcat_mounts_shared_runtime_data_at_the_sender_file_uri_path() -> None:
@@ -182,7 +247,8 @@ def test_xiaomachi_container_uses_prebuilt_local_image() -> None:
     assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in compose
     assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in compose
     assert "image: xiaomachi-bot:local" in compose
-    assert "dockerfile: Dockerfile.xiaomachi" in compose
+    assert "context: ../.." in compose
+    assert "dockerfile: infra/wsl/Dockerfile.xiaomachi" in compose
     assert "network: host" in compose
     assert "command: [\"python\", \"-m\", \"app.group_main\"]" in compose
     assert "python -m pip install" not in compose
@@ -192,7 +258,9 @@ def test_xiaomachi_container_uses_prebuilt_local_image() -> None:
 def test_xiaomachi_dockerfile_installs_dependencies_at_build_time() -> None:
     dockerfile = (REPO_ROOT / "infra/wsl/Dockerfile.xiaomachi").read_text(encoding="utf-8")
     assert "FROM python:3.12-slim" in dockerfile
-    assert "COPY requirements.xiaomachi.txt" in dockerfile
+    assert "COPY infra/wsl/requirements.xiaomachi.txt" in dockerfile
+    assert "COPY app ./app" in dockerfile
+    assert "COPY configs ./configs" in dockerfile
     assert "python -m pip install" in dockerfile
     assert "ARG HTTP_PROXY" in dockerfile
     assert "ARG HTTPS_PROXY" in dockerfile
@@ -214,9 +282,12 @@ def test_xiaomachi_image_requirements_match_pyproject() -> None:
     assert actual == expected
 
 
-def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
+def test_status_script_uses_on_demand_probes_before_logs() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
-    assert 'Waiting for ${service_name} healthcheck' in script
+    assert 'Waiting for ${service_name} container' in script
+    assert "LLBot WebUI probe:" in script
+    assert "curl -fsS --max-time 8 http://127.0.0.1:3080/ >/dev/null" in script
+    assert "waiting for LLBot WebUI" in script
     assert "OneBot probe (${platform})" in script
     assert "Waiting for xiaomachi bot heartbeat..." in script
     assert "group.heartbeat.json" in script
@@ -225,6 +296,9 @@ def test_status_script_waits_for_health_and_uses_probe_before_logs() -> None:
     assert "from datetime import UTC" not in script
     assert 'probe_output="$(mktemp)"' in script
     assert "docker inspect" in script
+    assert 'bot_container_name="xiaomachi-bot"' in script
+    assert 'bot_status="$(docker inspect' in script
+    assert '"${bot_status}" != "running"' in script
     assert "onebot_probe.py" in script
     assert 'onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"' in script
     assert '--ws-url "${onebot_ws_url}" --request-timeout 8' in script

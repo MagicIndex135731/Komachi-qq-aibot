@@ -1,0 +1,14 @@
+[Unit]
+Description=Xiaomachi QQ bot stack
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/xiaomachi/current/infra/wsl
+ExecStart=/bin/bash /opt/xiaomachi/current/infra/wsl/scripts/start.sh
+ExecStop=/bin/bash /opt/xiaomachi/current/infra/wsl/scripts/stop.sh
+TimeoutStartSec=15min
+TimeoutStopSec=3min

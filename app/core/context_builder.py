@@ -26,7 +26,7 @@ def _trim_lines_to_budget(lines: list[str], budget_tokens: int, *, keep_latest: 
         if selected and running_total + cost > budget_tokens:
             continue
         if not selected and cost > budget_tokens:
-            selected.append(line)
+            selected.append(_trim_text_to_budget(line, budget_tokens, keep_latest=keep_latest))
             break
         if running_total + cost > budget_tokens:
             break
@@ -38,18 +38,50 @@ def _trim_lines_to_budget(lines: list[str], budget_tokens: int, *, keep_latest: 
     return selected
 
 
+def _trim_text_to_budget(text: str, budget_tokens: int, *, keep_latest: bool) -> str:
+    if budget_tokens <= 0:
+        return ""
+    matches = list(TOKENISH_PATTERN.finditer(text))
+    if len(matches) <= budget_tokens:
+        return text
+    marker = "..."
+    marker_cost = _estimate_tokens(marker)
+    if budget_tokens <= marker_cost:
+        if keep_latest:
+            return text[matches[-budget_tokens].start() :]
+        return text[: matches[budget_tokens - 1].end()]
+    content_budget = max(1, budget_tokens - marker_cost)
+    if keep_latest:
+        start = matches[-content_budget].start()
+        return marker + text[start:]
+    end = matches[content_budget - 1].end()
+    return text[:end] + marker
+
+
+def _trim_prompt_section(text: str, budget_tokens: int, *, keep_latest: bool) -> str:
+    """Trim a labelled multi-line prompt section without dropping its header."""
+    if not keep_latest or "\n" not in text:
+        return _trim_text_to_budget(text, budget_tokens, keep_latest=keep_latest)
+    header, body = text.split("\n", maxsplit=1)
+    header_cost = _estimate_tokens(header)
+    if header_cost >= budget_tokens:
+        return _trim_text_to_budget(header, budget_tokens, keep_latest=False)
+    return header + "\n" + _trim_text_to_budget(body, budget_tokens - header_cost, keep_latest=True)
+
+
 class ContextBuilder:
     def __init__(
         self,
         *,
-        recent_messages_budget_tokens: int = 2200,
-        summaries_budget_tokens: int = 900,
-        relevant_history_budget_tokens: int = 1400,
-        memories_budget_tokens: int = 700,
+        recent_messages_budget_tokens: int = 3600,
+        summaries_budget_tokens: int = 1200,
+        relevant_history_budget_tokens: int = 2800,
+        memories_budget_tokens: int = 1400,
         runtime_facts_budget_tokens: int = 250,
         grounding_notes_budget_tokens: int = 350,
         web_results_budget_tokens: int = 1000,
         web_pages_budget_tokens: int = 1800,
+        max_prompt_tokens: int = 200000,
     ) -> None:
         self.recent_messages_budget_tokens = recent_messages_budget_tokens
         self.summaries_budget_tokens = summaries_budget_tokens
@@ -59,6 +91,7 @@ class ContextBuilder:
         self.grounding_notes_budget_tokens = grounding_notes_budget_tokens
         self.web_results_budget_tokens = web_results_budget_tokens
         self.web_pages_budget_tokens = web_pages_budget_tokens
+        self.max_prompt_tokens = max(1, max_prompt_tokens)
 
     @staticmethod
     def estimate_prompt_tokens(prompt_lines: list[str]) -> int:
@@ -100,6 +133,7 @@ class ContextBuilder:
         grounding_notes: list[str] | None = None,
         web_results: list[str] | None = None,
         web_pages: list[str] | None = None,
+        history_detail: bool = False,
         target_message: str,
     ) -> list[str]:
         prompt = [f"System persona: {persona_text}"]
@@ -120,19 +154,20 @@ class ContextBuilder:
             self.recent_messages_budget_tokens,
             keep_latest=True,
         )
+        detail_multiplier = 2 if history_detail else 1
         trimmed_summaries = _trim_lines_to_budget(
             summaries,
-            self.summaries_budget_tokens,
+            self.summaries_budget_tokens * detail_multiplier,
             keep_latest=True,
         )
         trimmed_relevant_history = _trim_lines_to_budget(
             relevant_history_messages or [],
-            self.relevant_history_budget_tokens,
+            self.relevant_history_budget_tokens * detail_multiplier,
             keep_latest=False,
         )
         trimmed_memories = _trim_lines_to_budget(
             memories,
-            self.memories_budget_tokens,
+            self.memories_budget_tokens * detail_multiplier,
             keep_latest=False,
         )
         trimmed_runtime_facts = _trim_lines_to_budget(
@@ -192,5 +227,71 @@ class ContextBuilder:
         if trimmed_web_pages:
             prompt.append("Web pages:\n" + "\n".join(trimmed_web_pages))
 
-        prompt.append(f"Target message: {target_message}")
-        return prompt
+        prompt.append(
+            "Target message: "
+            + _trim_text_to_budget(target_message, 1400, keep_latest=False)
+        )
+        return self._trim_prompt_to_budget(prompt)
+
+    def _trim_prompt_to_budget(self, prompt: list[str]) -> list[str]:
+        """Enforce one total cap after all independently budgeted sections."""
+        total = self.estimate_prompt_tokens(prompt)
+        if total <= self.max_prompt_tokens:
+            return prompt
+
+        # Trim reference data before instructions, recent dialogue, or the
+        # current target. Each section remains labelled even after trimming.
+        prefixes = (
+            "Web pages:",
+            "Web results:",
+            "Grounding notes:",
+            "Full group conversation history",
+            "Recent contiguous group history",
+            "Relevant earlier group messages",
+            "Relevant memories:",
+            "Relevant summaries:",
+            "Member focus:",
+            "Recent messages:",
+        )
+        trimmed = list(prompt)
+        for prefix in prefixes:
+            for index, line in enumerate(trimmed):
+                if total <= self.max_prompt_tokens:
+                    return trimmed
+                if not line.startswith(prefix):
+                    continue
+                current_cost = _estimate_tokens(line)
+                allowed = max(0, current_cost - (total - self.max_prompt_tokens))
+                keep_latest = prefix in {
+                    "Recent messages:",
+                    "Full group conversation history",
+                    "Recent contiguous group history",
+                }
+                trimmed[index] = _trim_prompt_section(line, allowed, keep_latest=keep_latest)
+                total = self.estimate_prompt_tokens(trimmed)
+        if total <= self.max_prompt_tokens:
+            return trimmed
+
+        # Preserve system and safety instructions until every data/reference
+        # section and the target have already been reduced.
+        protected_prefixes = (
+            "System persona:",
+            "Safety rules:",
+            "Group policy:",
+            "Reply style:",
+            "Target message:",
+        )
+        fallback_order = [
+            index for index, line in enumerate(trimmed) if not line.startswith(protected_prefixes)
+        ] + [
+            index for index, line in enumerate(trimmed) if line.startswith(protected_prefixes)
+        ]
+        for index in fallback_order:
+            if total <= self.max_prompt_tokens:
+                break
+            line = trimmed[index]
+            current_cost = _estimate_tokens(line)
+            allowed = max(0, current_cost - (total - self.max_prompt_tokens))
+            trimmed[index] = _trim_text_to_budget(line, allowed, keep_latest=False)
+            total = self.estimate_prompt_tokens(trimmed)
+        return trimmed

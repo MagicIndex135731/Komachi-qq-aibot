@@ -14,6 +14,7 @@ from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationService
+from app.core.memory_compaction_service import MemoryCompactionService
 from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.message_archive import sync_group_message_archives_from_db
 from app.core.reply_policy import ReplyPolicy
@@ -199,11 +200,26 @@ def build_group_image_service(
     )
 
 
+def build_memory_compaction_service(*, settings: AppSettings, engine, llm_client) -> MemoryCompactionService | None:
+    if not settings.memory_compaction_enabled:
+        return None
+    return MemoryCompactionService(
+        engine=engine,
+        llm_client=llm_client,
+        batch_size=settings.memory_compaction_batch_size,
+        max_facts=settings.memory_compaction_max_facts,
+        retry_limit=settings.memory_compaction_retry_limit,
+        backfill_windows=settings.memory_compaction_backfill_windows,
+        excluded_user_ids={settings.bot_qq},
+    )
+
+
 async def run() -> None:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "app.heartbeat.json")
     group_image_service = None
+    memory_compaction_service = None
     dev_control_service = None
     try:
         await heartbeat.start()
@@ -222,11 +238,18 @@ async def run() -> None:
             sender=sender,
             web_search_client=web_search_client,
         )
+        memory_compaction_service = build_memory_compaction_service(
+            settings=settings,
+            engine=engine,
+            llm_client=llm_client,
+        )
         persistent_group_engine = engine if hasattr(engine, "connect") else None
         if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
             group_image_service.engine = persistent_group_engine
         if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.start()
+        if memory_compaction_service is not None:
+            await memory_compaction_service.start()
         dev_control_service = DevControlService(
             engine=engine,
             sender=sender,
@@ -265,6 +288,7 @@ async def run() -> None:
             web_search_client=web_search_client,
             dev_control_service=dev_control_service,
             group_image_service=group_image_service,
+            memory_compaction_service=memory_compaction_service,
         )
 
         async def handle_payload(payload: dict) -> None:
@@ -303,6 +327,8 @@ async def run() -> None:
     finally:
         if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
+        if memory_compaction_service is not None:
+            await memory_compaction_service.stop()
         if dev_control_service is not None:
             await dev_control_service.stop()
         await heartbeat.stop()

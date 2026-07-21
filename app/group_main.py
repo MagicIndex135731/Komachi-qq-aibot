@@ -15,6 +15,7 @@ from app.core.router import InboundRouter
 from app.main import (
     build_group_image_llm_client,
     build_group_image_service,
+    build_memory_compaction_service,
     build_llm_client,
     build_web_search_client,
     create_runtime_banner,
@@ -47,11 +48,18 @@ async def run() -> None:
         sender=sender,
         web_search_client=web_search_client,
     )
+    memory_compaction_service = build_memory_compaction_service(
+        settings=settings,
+        engine=engine,
+        llm_client=llm_client,
+    )
     persistent_group_engine = engine if hasattr(engine, "connect") else None
     if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
         group_image_service.engine = persistent_group_engine
     if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
         await group_image_service.start()
+    if memory_compaction_service is not None:
+        await memory_compaction_service.start()
     router = InboundRouter(
         engine=engine,
         runtime=runtime,
@@ -63,6 +71,7 @@ async def run() -> None:
         web_search_client=web_search_client,
         dev_control_service=None,
         group_image_service=group_image_service,
+        memory_compaction_service=memory_compaction_service,
     )
 
     async def handle_payload(payload: dict) -> None:
@@ -104,6 +113,8 @@ async def run() -> None:
     finally:
         if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
+        if memory_compaction_service is not None:
+            await memory_compaction_service.stop()
         await heartbeat.stop()
 
 
