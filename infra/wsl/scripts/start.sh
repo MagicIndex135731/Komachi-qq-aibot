@@ -71,6 +71,12 @@ open_login_page() {
     echo "Waiting for ${service_name} WebUI (${attempt}/10)..."
     sleep 2
   done
+  if [[ "${platform}" == "llbot" ]] \
+      && docker logs --tail 200 "xiaomachi-llbot" 2>&1 \
+      | grep -Fq -e "replay protection unavailable" -e "sign 未初始化"; then
+    echo "LLBot signing backend is unavailable; quick login and QR login cannot proceed yet."
+    return 0
+  fi
   if [[ "${webui_ready}" == true ]] && command -v powershell.exe >/dev/null 2>&1; then
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
       -File "$(wslpath -w "${SCRIPT_DIR}/${launcher}")" -OnlyWhenLoginRequired >/dev/null 2>&1 || true
@@ -81,10 +87,24 @@ open_login_page() {
 
 enable_keepalive
 docker compose -f "${other_compose_file}" down --remove-orphans || true
+# Persistent runtime state lives in Docker named volumes on the Linux ext4
+# filesystem.  The migration script is a no-op in an installed Linux release.
+docker volume inspect xiaomachi-bot-data >/dev/null 2>&1 || docker volume create xiaomachi-bot-data >/dev/null
+docker volume inspect xiaomachi-llbot-data >/dev/null 2>&1 || docker volume create xiaomachi-llbot-data >/dev/null
+bash "${SCRIPT_DIR}/migrate_runtime_to_linux_volumes.sh"
 # This is a cache check on normal starts. Dependency installation only runs when
 # the Dockerfile or requirements file changed, or when the local image is absent.
 docker compose -f "${compose_file}" build xiaomachi
 bash "${SCRIPT_DIR}/migrate_xiaomachi_data_volume.sh" "${compose_file}"
+if [[ "${platform}" == "llbot" ]]; then
+  docker run --rm \
+    -v "${WSL_DIR}:/runtime:ro" \
+    -v "$(readlink -f "${WSL_DIR}/.env"):/runtime.env:ro" \
+    -v xiaomachi-llbot-data:/data \
+    python:3.12-slim \
+    python /runtime/scripts/bootstrap_llbot_runtime.py \
+      --wsl-dir /runtime --data-dir /data --env-file /runtime.env
+fi
 # Do not let Compose's `depends_on: service_healthy` block the login page.
 # The bot reconnects to OneBot on its own while the QQ platform finishes login.
 docker compose -f "${compose_file}" up -d "${service_name}"

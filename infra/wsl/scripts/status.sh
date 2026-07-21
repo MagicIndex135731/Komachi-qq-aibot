@@ -33,10 +33,11 @@ fi
 docker compose -f "${compose_file}" ps
 status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_name}" 2>/dev/null || true)"
 if [[ "${status}" != "healthy" && "${status}" != "running" ]]; then
-  echo "Waiting for ${service_name} healthcheck..."
+  echo "Waiting for ${service_name} container..."
   for _ in $(seq 1 24); do
     if [[ "${platform}" == "llbot" ]] \
-        && docker logs --tail 80 "${container_name}" 2>&1 | grep -Fq "replay protection unavailable"; then
+        && docker logs --tail 80 "${container_name}" 2>&1 \
+          | grep -Fq -e "replay protection unavailable" -e "sign 未初始化"; then
       echo "LLBot signing backend is unavailable; quick login and QR login cannot proceed yet."
       exit 1
     fi
@@ -46,9 +47,43 @@ if [[ "${status}" != "healthy" && "${status}" != "running" ]]; then
   done
 fi
 
+if [[ "${platform}" == "llbot" ]] \
+    && docker logs --tail 200 "${container_name}" 2>&1 \
+      | grep -Fq -e "replay protection unavailable" -e "sign 未初始化"; then
+  echo "LLBot signing backend is unavailable; quick login and QR login cannot proceed yet."
+  exit 1
+fi
+
 if [[ "${status}" != "healthy" && "${status}" != "running" ]]; then
   docker compose -f "${compose_file}" logs --tail=80 "${service_name}"
   exit 1
+fi
+
+bot_container_name="xiaomachi-bot"
+bot_status="$(docker inspect --format '{{.State.Status}}' "${bot_container_name}" 2>/dev/null || true)"
+if [[ "${bot_status}" != "running" ]]; then
+  echo "${bot_container_name} is not running (status=${bot_status:-missing})."
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi
+  exit 1
+fi
+
+if [[ "${platform}" == "llbot" ]]; then
+  echo "LLBot WebUI probe:"
+  webui_ok=false
+  for attempt in $(seq 1 12); do
+    if curl -fsS --max-time 8 http://127.0.0.1:3080/ >/dev/null; then
+      echo "webui=http://127.0.0.1:3080/ ok"
+      webui_ok=true
+      break
+    fi
+    echo "  waiting for LLBot WebUI (${attempt}/12)"
+    sleep 5
+  done
+  if [[ "${webui_ok}" != true ]]; then
+    echo "LLBot WebUI did not become ready. Check the ${service_name} logs."
+    docker compose -f "${compose_file}" logs --tail=80 "${service_name}"
+    exit 1
+  fi
 fi
 
 echo "OneBot probe (${platform}):"
@@ -56,7 +91,8 @@ probe_output="$(mktemp)"
 trap 'rm -f "${probe_output}"' EXIT
 probe_ok=false
 for attempt in $(seq 1 12); do
-  if "${REPO_ROOT}/.venv-wsl/bin/python" "${SCRIPT_DIR}/onebot_probe.py" --ws-url "${onebot_ws_url}" --request-timeout 8 >"${probe_output}" 2>&1; then
+  watchdog_python="${XIAOMACHI_WATCHDOG_PYTHON:-/opt/xiaomachi/current/.venv-wsl/bin/python}"
+  if "${watchdog_python}" "${SCRIPT_DIR}/onebot_probe.py" --ws-url "${onebot_ws_url}" --request-timeout 8 >"${probe_output}" 2>&1; then
     cat "${probe_output}"
     probe_ok=true
     break
@@ -71,15 +107,13 @@ if [[ "${probe_ok}" != true ]]; then
 fi
 
 echo "Waiting for xiaomachi bot heartbeat..."
-heartbeat_file="${WSL_DIR}/runtime/logs/group.heartbeat.json"
 for _ in $(seq 1 60); do
-  if python3 - "${heartbeat_file}" <<'PY'
+  heartbeat_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/group.heartbeat.json 2>/dev/null || true)"
+  if python3 - "${heartbeat_payload}" <<'PY'
 import json, sys
 from datetime import datetime, timezone
-from pathlib import Path
-p = Path(sys.argv[1])
-if not p.exists(): raise SystemExit(1)
-d = json.loads(p.read_text(encoding="utf-8"))
+if not sys.argv[1]: raise SystemExit(1)
+d = json.loads(sys.argv[1])
 t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
 if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
 age = (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()

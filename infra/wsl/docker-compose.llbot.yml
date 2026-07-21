@@ -1,10 +1,10 @@
-name: xiaomachi-llbot-stack
+name: xiaomachi-linux-stack
 
 services:
   llbot:
-    image: linyuchen/llbot:8.0.8
+    image: linyuchen/llbot:8.0.14
     container_name: xiaomachi-llbot
-    restart: unless-stopped
+    restart: "unless-stopped"
     network_mode: host
     environment:
       - TZ=${TZ:-Asia/Shanghai}
@@ -14,20 +14,13 @@ services:
       - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
     volumes:
-      - ./runtime/llbot/data:/app/llbot/data
+      - llbot_data:/app/llbot/data
       - xiaomachi_data:/workspace/data:ro
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"const net=require('net'); Promise.all([fetch('http://127.0.0.1:3080').then(r=>{if(!r.ok)throw Error('webui')}),new Promise((resolve,reject)=>{const s=net.connect(${LLBOT_WS_PORT:-3002},'127.0.0.1');s.once('connect',()=>{s.destroy();resolve()});s.once('error',reject)})]).catch(()=>process.exit(1))\""]
-      interval: 20s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-
   xiaomachi:
     image: xiaomachi-bot:local
     build:
-      context: .
-      dockerfile: Dockerfile.xiaomachi
+      context: ../..
+      dockerfile: infra/wsl/Dockerfile.xiaomachi
       network: host
       args:
         PIP_DEFAULT_TIMEOUT: ${PIP_DEFAULT_TIMEOUT:-120}
@@ -37,7 +30,7 @@ services:
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
         NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
     container_name: xiaomachi-bot
-    restart: unless-stopped
+    restart: "no"
     network_mode: host
     working_dir: /workspace
     env_file:
@@ -50,16 +43,16 @@ services:
       - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}
     volumes:
-      - ../../:/workspace
       - xiaomachi_data:/workspace/data
-      - ./runtime/logs:/workspace/data/logs
-      - ./runtime/cache:/workspace/data/cache
     depends_on:
       llbot:
-        condition: service_healthy
+        condition: service_started
     command: ["python", "-m", "app.group_main"]
 
 volumes:
+  llbot_data:
+    external: true
+    name: xiaomachi-llbot-data
   xiaomachi_data:
     external: true
     name: xiaomachi-bot-data

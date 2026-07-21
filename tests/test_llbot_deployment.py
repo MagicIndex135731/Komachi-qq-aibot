@@ -22,13 +22,15 @@ def test_llbot_compose_uses_pinned_image_host_network_and_persistent_data() -> N
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
     llbot = compose["services"]["llbot"]
 
-    assert llbot["image"] == "linyuchen/llbot:8.0.8"
+    assert llbot["image"] == "linyuchen/llbot:8.0.14"
+    assert llbot["restart"] == "unless-stopped"
     assert llbot["network_mode"] == "host"
     assert "ports" not in llbot
-    assert "./runtime/llbot/data:/app/llbot/data" in llbot["volumes"]
+    assert "llbot_data:/app/llbot/data" in llbot["volumes"]
     assert "xiaomachi_data:/workspace/data:ro" in llbot["volumes"]
     assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in llbot["environment"]
     assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in llbot["environment"]
+    assert "healthcheck" not in llbot
 
 
 def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None:
@@ -39,23 +41,24 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     xiaomachi = services["xiaomachi"]
 
     assert xiaomachi["image"] == "xiaomachi-bot:local"
-    assert xiaomachi["build"]["context"] == "."
-    assert xiaomachi["build"]["dockerfile"] == "Dockerfile.xiaomachi"
+    assert xiaomachi["build"]["context"] == "../.."
+    assert xiaomachi["build"]["dockerfile"] == "infra/wsl/Dockerfile.xiaomachi"
     assert xiaomachi["build"]["network"] == "host"
     assert xiaomachi["build"]["args"]["HTTP_PROXY"] == "${DOCKER_HTTP_PROXY:-}"
     assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
-    assert "../../:/workspace" in xiaomachi["volumes"]
+    assert "../../:/workspace" not in xiaomachi["volumes"]
     assert "xiaomachi_data:/workspace/data" in xiaomachi["volumes"]
-    assert "./runtime/logs:/workspace/data/logs" in xiaomachi["volumes"]
-    assert "./runtime/cache:/workspace/data/cache" in xiaomachi["volumes"]
+    assert all("/mnt/" not in volume for volume in xiaomachi["volumes"])
     assert "./runtime/pip-cache:/root/.cache/pip" not in xiaomachi["volumes"]
     assert xiaomachi["command"] == ["python", "-m", "app.group_main"]
     assert "NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3002}" in xiaomachi[
         "environment"
     ]
-    assert xiaomachi["depends_on"]["llbot"]["condition"] == "service_healthy"
+    assert xiaomachi["depends_on"]["llbot"]["condition"] == "service_started"
     assert compose["volumes"]["xiaomachi_data"]["external"] is True
     assert compose["volumes"]["xiaomachi_data"]["name"] == "xiaomachi-bot-data"
+    assert compose["volumes"]["llbot_data"]["external"] is True
+    assert compose["volumes"]["llbot_data"]["name"] == "xiaomachi-llbot-data"
 
 
 def test_llbot_data_volume_migration_stops_writer_copies_and_checks_database() -> None:
@@ -80,6 +83,8 @@ def test_llbot_runtime_bootstrap_configures_onebot_and_webui() -> None:
     assert '"webui"' in script
     assert '"port": 3080' in script
     assert "webui_token.txt" in script
+    assert 'parser.add_argument("--data-dir", type=Path)' in script
+    assert 'parser.add_argument("--env-file", type=Path)' in script
 
 
 def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
@@ -184,6 +189,8 @@ def test_stop_status_keepalive_and_watchdog_are_platform_aware() -> None:
     assert 'compose_file="${wsl_dir}/docker-compose.yml"' in keepalive_script
     assert 'service_name="napcat"' in keepalive_script
     assert 'onebot-watchdog-${platform}.json' in keepalive_script
+    assert "--daemon" in keepalive_script
+    assert "--once" not in keepalive_script
 
     assert 'choices=("napcat", "llbot")' in watchdog
     assert 'service_name: str = "napcat"' in watchdog
