@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import time
 from contextlib import contextmanager
@@ -156,7 +158,10 @@ def load_state(path: Path) -> WatchdogState:
             isOffline=payload.get("isOffline") if isinstance(payload.get("isOffline"), bool) else None,
             webui_login_error=bool(payload.get("webui_login_error", False)),
             webui_login_error_kind=(
-                "reported" if payload.get("webui_login_error_kind") == "reported" else ""
+                payload.get("webui_login_error_kind")
+                if payload.get("webui_login_error_kind")
+                in {"reported", "llbot_signing_backend_unavailable"}
+                else ""
             ),
         )
     except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -215,6 +220,11 @@ async def probe_onebot(ws_url: str) -> tuple[bool | None, bool | None, str]:
             if group_list.get("status") != "ok":
                 return online, False, "get_group_list_not_ok"
             return online, True, "get_group_list"
+    except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as exc:
+        # A transport that cannot be reached is a real service outage.  Count
+        # it toward the debounced restart threshold instead of treating it as
+        # an unknowable probe result forever.
+        return False, False, type(exc).__name__
     except Exception as exc:
         return None, None, type(exc).__name__
 
@@ -297,6 +307,35 @@ def restart_napcat(compose_file: Path) -> tuple[bool, str]:
     return restart_service(compose_file, "napcat")
 
 
+def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -> bool:
+    """Detect the known LLBot signing outage without persisting raw logs."""
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--tail", "200", container_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return (
+        "replay protection unavailable" in output
+        or "sign 未初始化" in output
+    )
+
+
+def _windows_powershell_path() -> str | None:
+    discovered = shutil.which("powershell.exe")
+    if discovered:
+        return discovered
+    # systemd's default PATH excludes Windows interop directories even though
+    # WSL interop itself is available.
+    fallback = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    return fallback if Path(fallback).is_file() else None
+
+
 def notify_windows(script_path: Path, reason: str) -> tuple[bool, str]:
     converted = subprocess.run(
         ["wslpath", "-w", str(script_path)],
@@ -307,10 +346,13 @@ def notify_windows(script_path: Path, reason: str) -> tuple[bool, str]:
     )
     if converted.returncode != 0 or not converted.stdout.strip():
         return False, "wslpath_failed"
+    powershell = _windows_powershell_path()
+    if powershell is None:
+        return False, "powershell_not_found"
     try:
         subprocess.Popen(
             [
-                "powershell.exe",
+                powershell,
                 "-NoProfile",
                 "-STA",
                 "-ExecutionPolicy",
@@ -330,7 +372,7 @@ def notify_windows(script_path: Path, reason: str) -> tuple[bool, str]:
     return True, "started"
 
 
-def run_once(
+async def run_check(
     *,
     ws_url: str,
     state_file: Path,
@@ -343,7 +385,7 @@ def run_once(
     webui_url: str = "http://127.0.0.1:6099",
 ) -> int:
     state = load_state(state_file)
-    online, active_session_ok, probe_detail = asyncio.run(probe_onebot(ws_url))
+    online, active_session_ok, probe_detail = await probe_onebot(ws_url)
     webui_status = (
         probe_webui(
             webui_config or compose_file.parent / "runtime/napcat/config/webui.json", webui_url
@@ -351,11 +393,21 @@ def run_once(
         if platform == "napcat"
         else {"isLogin": None, "isOffline": None, "loginError": ""}
     )
-    webui_login_error = is_explicit_webui_login_error(webui_status)
+    llbot_signing_error = (
+        platform == "llbot"
+        and online is not True
+        and llbot_signing_backend_unavailable()
+    )
+    webui_login_error = is_explicit_webui_login_error(webui_status) or llbot_signing_error
+    # Restarting LLBot cannot repair an unavailable external signing service.
+    # Treat it as an explicit login error so the user is notified immediately,
+    # while leaving the one controlled restart available for a real session fault.
+    evaluated_online = None if llbot_signing_error else online
+    evaluated_active_session = None if llbot_signing_error else active_session_ok
     next_state, action = evaluate_state(
         state,
-        online=online,
-        active_session_ok=active_session_ok,
+        online=evaluated_online,
+        active_session_ok=evaluated_active_session,
         webui_login_error=webui_login_error,
         now=time.time(),
     )
@@ -364,7 +416,11 @@ def run_once(
         isLogin=webui_status["isLogin"],
         isOffline=webui_status["isOffline"],
         webui_login_error=webui_login_error,
-        webui_login_error_kind="reported" if webui_login_error else "",
+        webui_login_error_kind=(
+            "llbot_signing_backend_unavailable"
+            if llbot_signing_error
+            else "reported" if webui_login_error else ""
+        ),
     )
     save_state(state_file, next_state)
 
@@ -386,11 +442,12 @@ def run_once(
             if not notified:
                 save_state(state_file, replace(failed_state, alerted=False))
     elif action == ACTION_NOTIFY:
-        reason = (
-            "webui_login_error"
-            if webui_login_error and not state.webui_alerted and next_state.webui_alerted
-            else "onebot_session_unhealthy"
-        )
+        if llbot_signing_error:
+            reason = "llbot_signing_backend_unavailable"
+        elif webui_login_error and not state.webui_alerted and next_state.webui_alerted:
+            reason = "webui_login_error"
+        else:
+            reason = "onebot_session_unhealthy"
         notified, detail = notify_windows(notifier, reason)
         append_log(log_file, "windows_alert_started" if notified else "windows_alert_failed", detail)
         if not notified:
@@ -405,11 +462,77 @@ def run_once(
     return 0
 
 
+def run_once(**kwargs: Any) -> int:
+    """Run one check for manual diagnostics and tests.
+
+    The normal service path uses ``run_daemon`` so all periodic checks share a
+    single asyncio event loop.  Keeping this small wrapper makes ``--once`` a
+    useful, deterministic operational command.
+    """
+    return asyncio.run(run_check(**kwargs))
+
+
+async def _wait_for_stop(stop_event: asyncio.Event, interval: float) -> bool:
+    """Wait for either a shutdown signal or the next scheduled check."""
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def run_daemon(*, interval: float, **kwargs: Any) -> int:
+    """Run checks in one long-lived process and one asyncio event loop.
+
+    The first probe deliberately waits one full interval: platform containers
+    need time to finish their own startup/login work, and an immediate probe
+    would create false incidents during normal boot.
+    """
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_stop() -> None:
+        stop_event.set()
+
+    installed_signals: list[signal.Signals] = []
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signum, request_stop)
+            installed_signals.append(signum)
+        except (NotImplementedError, RuntimeError):
+            # ``--daemon`` normally runs in WSL/Linux.  This fallback keeps
+            # the function testable on platforms without asyncio signal hooks.
+            signal.signal(signum, lambda *_: request_stop())
+
+    append_log(kwargs["log_file"], "watchdog_daemon_started", f"interval={interval:g}")
+    try:
+        while not await _wait_for_stop(stop_event, interval):
+            try:
+                await run_check(**kwargs)
+            except Exception as exc:
+                # A transient probe implementation failure must not make the
+                # supervisor restart the daemon or reset its persistent state.
+                append_log(kwargs["log_file"], "watchdog_check_failed", type(exc).__name__)
+    finally:
+        for signum in installed_signals:
+            loop.remove_signal_handler(signum)
+        append_log(kwargs["log_file"], "watchdog_daemon_stopped")
+    return 0
+
+
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
     wsl_dir = script_dir.parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Run one watchdog check.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--once", action="store_true", help="Run one watchdog check.")
+    mode.add_argument("--daemon", action="store_true", help="Run checks in one long-lived process.")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="Seconds between daemon checks, including the initial startup delay (default: 60).",
+    )
     parser.add_argument("--ws-url", default="ws://127.0.0.1:3001")
     parser.add_argument("--state-file", type=Path, default=wsl_dir / "runtime/onebot-watchdog.json")
     parser.add_argument("--log-file", type=Path, default=wsl_dir / "runtime/logs/onebot-watchdog.log")
@@ -420,24 +543,27 @@ def main() -> int:
     parser.add_argument("--webui-config", type=Path, default=wsl_dir / "runtime/napcat/config/webui.json")
     parser.add_argument("--webui-url", default="http://127.0.0.1:6099")
     args = parser.parse_args()
-    if not args.once:
-        parser.error("--once is required; keepalive.sh owns the scheduling loop")
+    if args.interval <= 0:
+        parser.error("--interval must be greater than zero")
     lock_file = args.state_file.with_suffix(args.state_file.suffix + ".lock")
     with exclusive_lock(lock_file) as acquired:
         if not acquired:
             append_log(args.log_file, "watchdog_run_skipped", "lock_busy")
             return 0
-        return run_once(
-            ws_url=args.ws_url,
-            state_file=args.state_file,
-            log_file=args.log_file,
-            compose_file=args.compose_file,
-            notifier=args.notifier,
-            service_name=args.service_name,
-            platform=args.platform,
-            webui_config=args.webui_config,
-            webui_url=args.webui_url,
-        )
+        run_kwargs = {
+            "ws_url": args.ws_url,
+            "state_file": args.state_file,
+            "log_file": args.log_file,
+            "compose_file": args.compose_file,
+            "notifier": args.notifier,
+            "service_name": args.service_name,
+            "platform": args.platform,
+            "webui_config": args.webui_config,
+            "webui_url": args.webui_url,
+        }
+        if args.daemon:
+            return asyncio.run(run_daemon(interval=args.interval, **run_kwargs))
+        return run_once(**run_kwargs)
 
 
 if __name__ == "__main__":

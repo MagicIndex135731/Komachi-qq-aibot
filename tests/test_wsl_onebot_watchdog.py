@@ -4,6 +4,7 @@ import importlib.util
 import asyncio
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -157,6 +158,20 @@ def test_group_list_failure_after_get_status_counts_as_active_session_failure(
     online, active_session_ok, _ = asyncio.run(watchdog.probe_onebot("ws://fake"))
 
     assert (online, active_session_ok) == (True, False)
+
+
+def test_connection_refused_counts_as_transport_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    watchdog = load_watchdog()
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise ConnectionRefusedError("local fake refused")
+
+    monkeypatch.setattr(watchdog.websockets, "connect", refuse)
+
+    online, active_session_ok, detail = asyncio.run(watchdog.probe_onebot("ws://fake"))
+
+    assert (online, active_session_ok) == (False, False)
+    assert detail == "ConnectionRefusedError"
 
 
 def test_explicit_webui_login_error_notifies_once_without_sensitive_state() -> None:
@@ -496,6 +511,91 @@ def test_webui_notification_failure_rolls_back_alerts_for_one_retry(
     assert notifications == ["attempt", "attempt"]
 
 
+def test_llbot_signing_failure_is_detected_without_exposing_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='sign request failed: {"message":"replay protection unavailable"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(watchdog.subprocess, "run", run)
+
+    assert watchdog.llbot_signing_backend_unavailable() is True
+    assert calls == [["docker", "logs", "--tail", "200", "xiaomachi-llbot"]]
+
+
+def test_notify_windows_uses_absolute_powershell_when_systemd_path_has_no_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    notifier = tmp_path / "notify.ps1"
+    notifier.write_text("", encoding="utf-8")
+    popen_calls: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert command == ["wslpath", "-w", str(notifier)]
+        return subprocess.CompletedProcess(command, 0, stdout="C:\\notify.ps1\n", stderr="")
+
+    class FakePopen:
+        def __init__(self, command: list[str], **kwargs: Any) -> None:
+            popen_calls.append(command)
+
+    monkeypatch.setattr(watchdog.shutil, "which", lambda _: None)
+    monkeypatch.setattr(watchdog.Path, "is_file", lambda path: str(path).endswith("powershell.exe"))
+    monkeypatch.setattr(watchdog.subprocess, "run", run)
+    monkeypatch.setattr(watchdog.subprocess, "Popen", FakePopen)
+
+    assert watchdog.notify_windows(notifier, "llbot_signing_backend_unavailable") == (True, "started")
+    assert popen_calls[0][0] == "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def test_llbot_signing_outage_notifies_without_restarting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    reasons: list[str] = []
+    restarts: list[bool] = []
+
+    async def probe_onebot(_: str) -> tuple[bool | None, bool | None, str]:
+        return False, False, "ConnectionRefusedError"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", probe_onebot)
+    monkeypatch.setattr(watchdog, "llbot_signing_backend_unavailable", lambda: True)
+    monkeypatch.setattr(
+        watchdog,
+        "restart_service",
+        lambda *args: (restarts.append(True) is not None, "unexpected"),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "notify_windows",
+        lambda _path, reason: (reasons.append(reason) is not None, "started"),
+    )
+
+    watchdog.run_once(
+        ws_url="ws://fake",
+        state_file=tmp_path / "state.json",
+        log_file=tmp_path / "watchdog.log",
+        compose_file=tmp_path / "docker-compose.llbot.yml",
+        notifier=tmp_path / "notify.ps1",
+        service_name="llbot",
+        platform="llbot",
+    )
+
+    state = watchdog.load_state(tmp_path / "state.json")
+    assert restarts == []
+    assert reasons == ["llbot_signing_backend_unavailable"]
+    assert state.webui_login_error_kind == "llbot_signing_backend_unavailable"
+
+
 def test_restart_failure_notification_failure_is_retried_after_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,16 +661,34 @@ def test_watchdog_lock_rejects_a_parallel_run(tmp_path: Path) -> None:
             assert second_acquired is False
 
 
-def test_keepalive_runs_watchdog_and_windows_notifier_is_present() -> None:
+def test_keepalive_supervises_daemon_and_windows_notifier_is_present() -> None:
     keepalive = (REPO_ROOT / "infra/wsl/scripts/keepalive.sh").read_text(encoding="utf-8")
     notifier = REPO_ROOT / "infra/wsl/scripts/notify_windows.ps1"
 
     assert "onebot_watchdog.py" in keepalive
-    assert "--once" in keepalive
+    assert "--daemon" in keepalive
+    assert "--once" not in keepalive
+    assert "backoff_seconds=5" in keepalive
+    assert "sleep 60" not in keepalive
+    assert 'watchdog_pid_file="${pid_file}.watchdog"' in keepalive
     assert notifier.exists()
     notifier_text = notifier.read_text(encoding="utf-8")
     assert "System.Windows.Forms.MessageBox" in notifier_text
     assert "ServiceNotification" in notifier_text
+    assert "llbot_signing_backend_unavailable" in notifier_text
+
+
+def test_llbot_runtime_uses_current_patch_and_survives_process_exit() -> None:
+    compose = (REPO_ROOT / "infra/wsl/docker-compose.llbot.yml").read_text(encoding="utf-8")
+    start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
+    status_script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+
+    assert "linyuchen/llbot:8.0.14" in compose
+    assert 'restart: "unless-stopped"' in compose
+    assert "replay protection unavailable" in start_script
+    assert status_script.count("replay protection unavailable") >= 2
+    assert "sign 未初始化" in start_script
+    assert status_script.count("sign 未初始化") >= 2
 
 
 def test_stop_cleans_watchdog_state_even_when_compose_down_fails() -> None:
@@ -582,4 +700,42 @@ def test_stop_cleans_watchdog_state_even_when_compose_down_fails() -> None:
     assert stop_script.index('rm -f "${flag_file}"') > stop_script.index(
         "docker compose -f docker-compose.llbot.yml down"
     )
+    assert "for _ in $(seq 1 50)" in stop_script
+    assert "kill -KILL" in stop_script
+    assert 'watchdog_pid_file="${pid_file}.watchdog"' in stop_script
     assert 'exit "${compose_exit}"' in stop_script
+
+
+def test_daemon_uses_one_event_loop_with_delayed_first_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watchdog = load_watchdog()
+    waits: list[float] = []
+    checks: list[bool] = []
+    stop_event = asyncio.Event()
+
+    async def wait_for_stop(event: asyncio.Event, interval: float) -> bool:
+        waits.append(interval)
+        if len(waits) == 1:
+            return False
+        event.set()
+        return True
+
+    async def checked(**_: Any) -> int:
+        checks.append(True)
+        return 0
+
+    monkeypatch.setattr(watchdog, "_wait_for_stop", wait_for_stop)
+    monkeypatch.setattr(watchdog, "run_check", checked)
+    monkeypatch.setattr(watchdog, "append_log", lambda *args: None)
+
+    assert asyncio.run(
+        watchdog.run_daemon(
+            interval=60,
+            ws_url="ws://fake",
+            state_file=tmp_path / "state.json",
+            log_file=tmp_path / "watchdog.log",
+            compose_file=tmp_path / "docker-compose.yml",
+            notifier=tmp_path / "notify.ps1",
+        )
+    ) == 0
+    assert waits == [60, 60]
+    assert checks == [True]
