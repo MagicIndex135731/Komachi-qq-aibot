@@ -4053,7 +4053,7 @@ class DevControlService:
                 "wsl.exe",
                 "bash",
                 "-lc",
-                "bash /mnt/d/xiaomachi-wsl-entry.sh stop && bash /mnt/d/xiaomachi-wsl-entry.sh start",
+                "bash /usr/local/bin/xiaomachi-wsl-entry install",
             ],
             self.repo_root,
         )
@@ -4062,18 +4062,12 @@ class DevControlService:
         return True, restart_result.stdout or "restart handoff launched"
 
     def _restart_runtime(self) -> tuple[bool, str]:
-        stop_result = self.command_runner(
-            ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "stop"],
+        install_result = self.command_runner(
+            ["wsl.exe", "bash", "/usr/local/bin/xiaomachi-wsl-entry", "install"],
             self.repo_root,
         )
-        start_result = self.command_runner(
-            ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "start"],
-            self.repo_root,
-        )
-        if stop_result.returncode != 0:
-            return False, stop_result.stderr or stop_result.stdout or "stop script failed"
-        if start_result.returncode != 0:
-            return False, start_result.stderr or start_result.stdout or "start script failed"
+        if install_result.returncode != 0:
+            return False, install_result.stderr or install_result.stdout or "install script failed"
         return True, "success"
 
     def _get_codex_thread_id(self, *, session_id: int) -> str | None:
@@ -4708,4 +4702,6 @@ class DevControlService:
         if any(part.endswith(script_name) for part in normalized_parts for script_name in launch_script_names):
             return True
         command_text = " ".join(normalized_parts)
-        return "xiaomachi-wsl-entry.sh" in command_text and "start" in command_text
+        return "xiaomachi-wsl-entry" in command_text and any(
+            action in command_text for action in ("start", "install")
+        )

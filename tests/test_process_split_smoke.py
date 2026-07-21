@@ -74,6 +74,13 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
         captured["llm_kwargs"] = kwargs
         return object()
 
+    class FakeMemoryCompactionService:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
     monkeypatch.setattr(group_main, "AppSettings", lambda: settings)
     monkeypatch.setattr(
         group_main,
@@ -95,6 +102,8 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
     monkeypatch.setattr(group_main, "ContextBuilder", lambda: object())
     monkeypatch.setattr(group_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(group_main, "build_web_search_client", lambda _settings: object())
+    monkeypatch.setattr(group_main, "build_group_image_llm_client", lambda **_kwargs: object())
+    monkeypatch.setattr(group_main, "build_memory_compaction_service", lambda **_kwargs: FakeMemoryCompactionService())
     monkeypatch.setattr(group_main, "InboundRouter", lambda **kwargs: captured.update(kwargs) or object())
 
     await group_main.run()

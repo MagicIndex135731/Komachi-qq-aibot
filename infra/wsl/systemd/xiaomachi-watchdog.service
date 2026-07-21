@@ -1,0 +1,13 @@
+[Unit]
+Description=Xiaomachi persistent OneBot watchdog
+Requires=xiaomachi-stack.service
+After=xiaomachi-stack.service
+PartOf=xiaomachi-stack.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/xiaomachi/current/infra/wsl
+ExecStart=/bin/bash /opt/xiaomachi/current/infra/wsl/scripts/anchor.sh watchdog
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=90s

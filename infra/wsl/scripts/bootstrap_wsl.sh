@@ -42,19 +42,12 @@ if [[ ! -f .env ]]; then
 fi
 
 cd "${REPO_ROOT}"
-python3 -m venv .venv-wsl
-./.venv-wsl/bin/python -m pip install -U pip
-./.venv-wsl/bin/python -m pip install websockets
+watchdog_venv="${XIAOMACHI_WATCHDOG_VENV:-/opt/xiaomachi/shared/venv}"
+python3 -m venv "${watchdog_venv}"
+"${watchdog_venv}/bin/python" -m pip install -U pip
+"${watchdog_venv}/bin/python" -m pip install websockets
 
-if ./.venv-wsl/bin/python - <<'PY'
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
-PY
-then
-  ./.venv-wsl/bin/python -m pip install -e .
-else
-  echo "WSL python is older than 3.12; installed probe dependencies only."
-  echo "The Xiaomachi bot runs in the python:3.12-slim Docker container."
-fi
+echo "Installed the persistent watchdog runtime at ${watchdog_venv}."
+echo "The Xiaomachi application itself runs from the immutable Docker image."
 
 echo "WSL bootstrap complete."

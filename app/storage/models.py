@@ -59,6 +59,13 @@ class Summary(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     content: Mapped[str] = mapped_column(Text)
     source_count: Mapped[int] = mapped_column(Integer)
+    # A stable topic or range key lets recursive summarization update its output
+    # without retaining duplicate summaries for the same source material.
+    summary_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    source_start_msg_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_end_msg_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_summary_ids: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="active")
 
 
 class MemoryItem(Base):
@@ -70,11 +77,24 @@ class MemoryItem(Base):
     subject_type: Mapped[str] = mapped_column(String(32))
     subject_id: Mapped[str] = mapped_column(String(64))
     memory_kind: Mapped[str] = mapped_column(String(32))
+    canonical_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    predicate: Mapped[str] = mapped_column(String(96), default="")
+    object_text: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[str] = mapped_column(Text)
     importance: Mapped[int] = mapped_column(Integer, default=1)
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     source_msg_id: Mapped[str] = mapped_column(String(128))
+    source_msg_ids: Mapped[list] = mapped_column(JSON, default=list)
+    mention_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Keep extraction provenance and the validity lifecycle separate: an old
+    # fact remains auditable after a newer fact supersedes it.
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    supersedes_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    superseded_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Job(Base):
@@ -82,6 +102,7 @@ class Job(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[str] = mapped_column(String(64))
+    job_key: Mapped[str] = mapped_column(String(255), default="", index=True)
     payload_json: Mapped[dict] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -292,7 +292,7 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     settings.llm_fallback_model = "gpt-5.4"
     router_arguments: dict[str, object] = {}
     sync_calls: list[tuple[object, object]] = []
-    llm_kwargs: dict[str, object] = {}
+    llm_kwargs: list[dict[str, object]] = []
     built_group_image_service = object()
 
     class FakeGateway:
@@ -319,6 +319,13 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
         async def stop(self) -> None:
             return None
 
+    class FakeMemoryCompactionService:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
     monkeypatch.setattr(app_main, "AppSettings", lambda: settings)
     monkeypatch.setattr(
         app_main,
@@ -335,7 +342,7 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     monkeypatch.setattr(app_main, "sync_history_archives", lambda engine, runtime: sync_calls.append((engine, runtime)))
     monkeypatch.setattr(app_main, "NapCatGateway", FakeGateway)
     monkeypatch.setattr(app_main, "Sender", lambda _gateway: object())
-    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: llm_kwargs.update(kwargs) or object())
+    monkeypatch.setattr(app_main, "LlmClient", lambda **kwargs: llm_kwargs.append(kwargs) or object())
     monkeypatch.setattr(
         app_main,
         "build_group_image_service",
@@ -345,6 +352,7 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     monkeypatch.setattr(app_main, "ContextBuilder", lambda: object())
     monkeypatch.setattr(app_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(app_main, "DevControlService", FakeDevControlService)
+    monkeypatch.setattr(app_main, "build_memory_compaction_service", lambda **_kwargs: FakeMemoryCompactionService())
     monkeypatch.setattr(app_main, "InboundRouter", FakeRouter)
 
     await app_main.run()
@@ -352,7 +360,10 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     assert isinstance(router_arguments["web_search_client"], WebSearchClient)
     assert router_arguments["group_image_service"] is built_group_image_service
     assert len(sync_calls) == 1
-    assert llm_kwargs["model"] == "gpt-5.4"
-    assert llm_kwargs["fallback_model"] == ""
-    assert llm_kwargs["responses_model"] == ""
-    assert llm_kwargs["compat_model"] == "gpt-5.4"
+    assert llm_kwargs[0]["model"] == "gpt-5.4"
+    assert llm_kwargs[0]["fallback_model"] == ""
+    assert llm_kwargs[0]["responses_model"] == ""
+    assert llm_kwargs[0]["compat_model"] == "gpt-5.4"
+    assert llm_kwargs[1]["model"] == "gpt-image-2"
+    assert llm_kwargs[1]["responses_model"] == ""
+    assert llm_kwargs[1]["image_responses_model"] == ""

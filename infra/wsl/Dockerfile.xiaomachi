@@ -12,9 +12,12 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /workspace
 
-COPY requirements.xiaomachi.txt ./
+COPY infra/wsl/requirements.xiaomachi.txt ./
 
 RUN python -m pip install -U pip setuptools wheel \
     && python -m pip install -r requirements.xiaomachi.txt
+
+COPY app ./app
+COPY configs ./configs
 
 CMD ["python", "-m", "app.group_main"]

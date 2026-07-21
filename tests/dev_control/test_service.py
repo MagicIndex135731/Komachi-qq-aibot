@@ -673,9 +673,9 @@ async def test_process_next_task_restart_only_restarts_directly_without_codex(sq
 
     assert processed is True
     assert bridge.prompts == []
-    assert len(command_calls) == 2
-    assert command_calls[0] == ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "stop"]
-    assert command_calls[1] == ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "start"]
+    assert command_calls == [
+        ["wsl.exe", "bash", "/usr/local/bin/xiaomachi-wsl-entry", "install"]
+    ]
     assert [outbound.text for outbound in sender.private_sent] == [
         "我开始处理这条了。",
         "我现在重启小町，让改动生效。",
@@ -3142,8 +3142,7 @@ async def test_owner_private_inline_runtime_change_hands_off_restart_until_servi
     assert (repo_root / "app" / "main.py").read_text(encoding="utf-8") == "after\n"
     assert len(command_calls) == 1
     assert command_calls[0][:3] == ["wsl.exe", "bash", "-lc"]
-    assert "xiaomachi-wsl-entry.sh stop" in command_calls[0][-1]
-    assert "xiaomachi-wsl-entry.sh start" in command_calls[0][-1]
+    assert "xiaomachi-wsl-entry install" in command_calls[0][-1]
     assert [outbound.text for outbound in sender.private_sent[-2:]] == [
         "我开始处理这条了。",
         "我现在重启小町，让改动生效。",
@@ -3832,9 +3831,9 @@ async def test_runtime_file_change_triggers_restart_even_when_bridge_does_not_re
     )
     await service.process_next_task_once()
 
-    assert len(command_calls) == 2
-    assert command_calls[0] == ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "stop"]
-    assert command_calls[1] == ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "start"]
+    assert command_calls == [
+        ["wsl.exe", "bash", "/usr/local/bin/xiaomachi-wsl-entry", "install"]
+    ]
     assert [outbound.text for outbound in sender.private_sent[-3:]] == [
         "我开始处理这条了。",
         "我现在重启小町，让改动生效。",
@@ -3940,7 +3939,9 @@ async def test_process_next_task_rewrites_final_reply_after_successful_restart(
     processed = await service.process_next_task_once()
 
     assert processed is True
-    assert len(command_calls) == 2
+    assert command_calls == [
+        ["wsl.exe", "bash", "/usr/local/bin/xiaomachi-wsl-entry", "install"]
+    ]
     assert sender.private_sent[-3].text == "我开始处理这条了。"
     assert sender.private_sent[-1].text != "代码里已经加进去了，但我不能直接替你执行重启。"
     assert "不能直接替你执行重启" not in sender.private_sent[-1].text
@@ -3993,7 +3994,12 @@ def test_default_command_runner_detaches_stdio_for_runtime_restart_scripts(tmp_p
     monkeypatch.setattr(dev_service_module.subprocess, "run", fake_run)
 
     service._default_command_runner(
-        ["wsl.exe", "bash", "/mnt/d/xiaomachi-wsl-entry.sh", "start"],
+        [
+            "wsl.exe",
+            "bash",
+            "/usr/local/bin/xiaomachi-wsl-entry",
+            "start",
+        ],
         tmp_path,
     )
 
@@ -4045,8 +4051,8 @@ async def test_process_next_task_rolls_back_when_restart_fails(sqlite_engine, tm
 
     def fake_command_runner(command: list[str], cwd: Path):
         call_index["value"] += 1
-        if call_index["value"] == 2:
-            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "start failed"})()
+        if call_index["value"] == 1:
+            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "install failed"})()
         return type("Result", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
 
     service = DevControlService(

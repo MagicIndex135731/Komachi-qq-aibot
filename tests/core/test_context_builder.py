@@ -301,3 +301,91 @@ def test_context_builder_trims_recent_messages_to_budget() -> None:
         "Recent messages:\nBob: five six seven eight\nCara: nine ten",
         "Target message: Alice: ping",
     ]
+
+
+def test_context_builder_expands_recalled_memory_budgets_for_history_detail() -> None:
+    builder = ContextBuilder(
+        summaries_budget_tokens=4,
+        relevant_history_budget_tokens=4,
+        memories_budget_tokens=4,
+    )
+
+    prompt = builder.build(
+        persona_text="You are Mira.",
+        safety_rules=[],
+        group_policy_lines=[],
+        recent_messages=[],
+        summaries=["one two three four", "five six seven eight"],
+        relevant_history_messages=["nine ten eleven twelve", "thirteen fourteen fifteen sixteen"],
+        memories=["seventeen eighteen nineteen twenty", "twentyone twentytwo twentythree twentyfour"],
+        history_detail=True,
+        target_message="Alice: what was decided?",
+    )
+
+    assert "one two three four\nfive six seven eight" in prompt[1]
+    assert "nine ten eleven twelve\nthirteen fourteen fifteen sixteen" in prompt[2]
+    assert "seventeen eighteen nineteen twenty\ntwentyone twentytwo twentythree twentyfour" in prompt[3]
+
+
+def test_context_builder_enforces_total_cap_for_oversized_sections_and_target() -> None:
+    builder = ContextBuilder(
+        recent_messages_budget_tokens=10,
+        summaries_budget_tokens=10,
+        relevant_history_budget_tokens=10,
+        memories_budget_tokens=10,
+        runtime_facts_budget_tokens=10,
+        grounding_notes_budget_tokens=10,
+        web_results_budget_tokens=10,
+        web_pages_budget_tokens=10,
+        max_prompt_tokens=40,
+    )
+
+    prompt = builder.build(
+        persona_text="persona " * 100,
+        safety_rules=[],
+        group_policy_lines=[],
+        recent_messages=["recent " * 100],
+        summaries=["summary " * 100],
+        relevant_history_messages=["history " * 100],
+        memories=["memory " * 100],
+        target_message="target " * 100,
+    )
+
+    assert builder.estimate_prompt_tokens(prompt) <= 40
+    assert prompt[-1].startswith("Target message:")
+
+
+def test_context_builder_keeps_newest_full_history_suffix_under_total_cap() -> None:
+    builder = ContextBuilder(max_prompt_tokens=30)
+
+    prompt = builder.build(
+        persona_text="Mira",
+        safety_rules=[],
+        group_policy_lines=[],
+        recent_messages=[],
+        full_history_messages=["old " * 40, "LATEST MARKER"],
+        summaries=[],
+        memories=[],
+        target_message="ping",
+    )
+
+    assert builder.estimate_prompt_tokens(prompt) <= 30
+    assert prompt[1].startswith("Full group conversation history")
+    assert "LATEST MARKER" in prompt[1]
+
+
+def test_default_total_cap_does_not_truncate_model_sized_full_history() -> None:
+    builder = ContextBuilder()
+    prompt = builder.build(
+        persona_text="Mira",
+        safety_rules=[],
+        group_policy_lines=[],
+        recent_messages=[],
+        full_history_messages=["history " * 30000 + "LATEST MARKER"],
+        summaries=[],
+        memories=[],
+        target_message="ping",
+    )
+
+    assert builder.estimate_prompt_tokens(prompt) > 18000
+    assert "LATEST MARKER" in prompt[1]

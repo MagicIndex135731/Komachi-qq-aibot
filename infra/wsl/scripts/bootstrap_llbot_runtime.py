@@ -25,9 +25,11 @@ def write_private(path: Path, content: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wsl-dir", type=Path, required=True)
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--env-file", type=Path)
     args = parser.parse_args()
 
-    env = read_env(args.wsl_dir / ".env")
+    env = read_env(args.env_file or args.wsl_dir / ".env")
     qq = env.get("BOT_QQ", "").strip()
     if not qq.isdigit():
         raise SystemExit("BOT_QQ must be configured in infra/wsl/.env")
@@ -38,7 +40,7 @@ def main() -> int:
     if not 1 <= onebot_port <= 65535:
         raise SystemExit("LLBOT_WS_PORT must be between 1 and 65535")
 
-    data_dir = args.wsl_dir / "runtime" / "llbot" / "data"
+    data_dir = args.data_dir or args.wsl_dir / "runtime" / "llbot" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     webui_token = data_dir / "webui_token.txt"
