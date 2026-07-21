@@ -33,6 +33,7 @@ from app.core.memory_engine import (
     extract_memory_candidates,
     extract_structured_memory_candidates,
     history_search_terms,
+    history_recall_limits,
     is_history_detail_query,
     retrieve_relevant_history,
     retrieve_relevant_memories,
@@ -1329,6 +1330,10 @@ class InboundRouter:
             ]
             relevant_history_lines: list[str] = []
             if not use_full_history:
+                candidate_limit, selected_history_limit = history_recall_limits(
+                    self.runtime.settings.context_history_limit,
+                    history_detail=history_detail,
+                )
                 candidate_messages = messages.list_group_messages_matching_terms(
                     group_id=event.group_id,
                     terms=history_search_terms(event.plain_text),
@@ -1336,7 +1341,7 @@ class InboundRouter:
                         event.platform_msg_id,
                         *(message.platform_msg_id for message in recent_messages),
                     },
-                    limit=max(24, self.runtime.settings.context_history_limit * 4),
+                    limit=candidate_limit,
                 )
                 relevant_history_messages = retrieve_relevant_history(
                     event.plain_text,
@@ -1344,7 +1349,7 @@ class InboundRouter:
                         {"id": message.id, "plain_text": message.plain_text}
                         for message in candidate_messages
                     ],
-                    limit=self.runtime.settings.context_history_limit,
+                    limit=selected_history_limit,
                 )
                 selected_ids = {int(message["id"]) for message in relevant_history_messages}
                 selected_messages = [message for message in candidate_messages if message.id in selected_ids]

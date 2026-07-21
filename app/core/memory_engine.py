@@ -42,7 +42,7 @@ CANCELLATION_PATTERNS = (
 )
 
 HISTORY_DETAIL_PATTERN = re.compile(
-    r"(?:\u4e4b\u524d|\u4ee5\u524d|\u4e0a\u6b21|\u5f53\u65f6|\u540e\u6765|\u5386\u53f2|\u8bb0\u5f97|\u8bf4\u8fc7|\u51b3\u5b9a|\u8ba1\u5212|\u73b0\u5728|\u8fd8\u662f|\u66fe\u7ecf|previously|before|earlier|remember|decided|plan)",
+    r"(?:\u4e4b\u524d|\u4ee5\u524d|\u4e0a\u6b21|\u5f53\u65f6|\u540e\u6765|\u6700\u540e|\u7ed3\u679c|\u5386\u53f2|\u8bb0\u5f97|\u8bf4\u8fc7|\u63d0\u8fc7|\u804a\u8fc7|\u95ee\u8fc7|\u51b3\u5b9a|\u8ba1\u5212|\u73b0\u5728|\u8fd8\u662f|\u66fe\u7ecf|\u539f\u6765|\u6700\u65e9|\u90a3\u6b21|\u8fd9\u6b21|\u524d\u9762|\u521a\u624d|\u521a\u521a|\u524d\u51e0\u5929|previously|before|earlier|remember|mentioned|discussed|decided|plan)|(?:(?:\u90a3\u4e2a\u4eba|\u8fd9\u4e2a\u4eba|\u90a3\u4ef6\u4e8b|\u8fd9\u4ef6\u4e8b|\u4ed6\u4eec|\u5979\u4eec|\u4ed6|\u5979).{0,12}(?:\u600e\u4e48|\u600e\u6837|\u4e3a\u4ec0\u4e48|\u4ec0\u4e48|\u662f\u8c01|\u54ea\u4e2a|\u540e\u6765|\u6700\u540e|\u7ed3\u679c|\u8bf4|\u63d0|\u804a|\u95ee|\u5904\u7406|\u53d1\u751f))",
     re.IGNORECASE,
 )
 
@@ -170,6 +170,12 @@ def extract_structured_memory_candidates(
 def is_history_detail_query(query: str) -> bool:
     """Whether a question needs a wider, evidence-heavy memory budget."""
     return bool(HISTORY_DETAIL_PATTERN.search(str(query or "")))
+
+
+def history_recall_limits(base_limit: int, *, history_detail: bool) -> tuple[int, int]:
+    """Return bounded SQL candidate and final raw-message limits."""
+    selected_limit = max(0, int(base_limit)) * (2 if history_detail else 1)
+    return max(24, selected_limit * 4), selected_limit
 
 
 def retrieve_relevant_memories(query: str, memories: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:

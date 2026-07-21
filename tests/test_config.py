@@ -58,7 +58,7 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.search_region == "wt-wt"
     assert settings.search_backend == "auto"
     assert settings.search_timeout_seconds == 8.0
-    assert settings.context_recent_limit == 60
+    assert settings.context_recent_limit == 100
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
     assert settings.llm_model == "gpt-5.4-mini"
