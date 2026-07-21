@@ -88,6 +88,15 @@ class MessageRepository:
         raw_json = message.raw_json
         return isinstance(raw_json, dict) and raw_json.get("delivery_state") == "reserved"
 
+    @staticmethod
+    def is_qq_blocked_outbound(message: Message) -> bool:
+        raw_json = message.raw_json
+        return (
+            isinstance(raw_json, dict)
+            and raw_json.get("delivery_state") == "blocked"
+            and raw_json.get("failure_kind") == "qq_sensitive_content"
+        )
+
     def add_group_message(
         self,
         *,
@@ -162,6 +171,21 @@ class MessageRepository:
                 break
         return list(reversed(recent_messages))
 
+    def list_recent_group_messages_for_summarization(self, *, group_id: int, limit: int) -> list[Message]:
+        stmt = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .order_by(Message.timestamp.desc(), Message.id.desc())
+        )
+        recent_messages = []
+        for message in self.session.scalars(stmt):
+            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
+                continue
+            recent_messages.append(message)
+            if len(recent_messages) >= limit:
+                break
+        return list(reversed(recent_messages))
+
     def list_group_messages_chronological(
         self,
         *,
@@ -218,6 +242,7 @@ class MessageRepository:
             if message.timestamp.date() == day
             and message.user_id not in excluded
             and not self._is_reserved_outbound(message)
+            and not self.is_qq_blocked_outbound(message)
         ]
 
     def list_group_ids(self) -> list[int]:
@@ -241,7 +266,9 @@ class MessageRepository:
         rows = [
             message
             for message in self.session.scalars(stmt)
-            if not self._is_reserved_outbound(message) and message.user_id not in excluded
+            if not self._is_reserved_outbound(message)
+            and not self.is_qq_blocked_outbound(message)
+            and message.user_id not in excluded
         ]
         windows = [
             rows[index : index + batch_size]
@@ -264,7 +291,7 @@ class MessageRepository:
         )
         rows: list[Message] = []
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
+            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
                 continue
             rows.append(message)
             if len(rows) >= max(1, limit):
@@ -289,7 +316,11 @@ class MessageRepository:
             .order_by(Message.id.asc())
             .limit(max(1, limit))
         )
-        return [message for message in self.session.scalars(stmt) if not self._is_reserved_outbound(message)]
+        return [
+            message
+            for message in self.session.scalars(stmt)
+            if not self._is_reserved_outbound(message) and not self.is_qq_blocked_outbound(message)
+        ]
 
     def list_recent_group_messages_for_user(self, *, group_id: int, user_id: int, limit: int) -> list[Message]:
         stmt = (
@@ -299,7 +330,7 @@ class MessageRepository:
         )
         recent_messages = []
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
+            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
                 continue
             recent_messages.append(message)
             if len(recent_messages) >= limit:
@@ -437,7 +468,7 @@ class MessageRepository:
         )
         timestamp = None
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
+            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
                 continue
             timestamp = message.timestamp
             break

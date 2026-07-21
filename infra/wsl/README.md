@@ -46,6 +46,8 @@ bash infra/wsl/scripts/stop.sh
 
 文本模型使用 Responses 端点时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true` 启用主模型内置联网检索。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存到 `runtime/logs/responses-tool-events.jsonl`，不进入 Git。
 
+LLBot 若连续返回 `retcode=1200 / waitForSelfEcho timeout`，原回复会以“QQ 拦截、未送达”状态保存在本地上下文，并改发一条固定失败提示；后续模型不得复述被拦截回复中的敏感细节。该记录保留在原始消息历史中，但不参与自动摘要和长期记忆压缩。
+
 ## 运行态保护
 
 不要删除：

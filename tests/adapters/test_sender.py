@@ -1,6 +1,8 @@
 import asyncio
 
-from app.adapters.sender import OutboundMessage, OutboundPrivateMessage, Sender
+import pytest
+
+from app.adapters.sender import OutboundMessage, OutboundPrivateMessage, QQMessageBlockedError, Sender
 
 
 class FakeGateway:
@@ -193,3 +195,31 @@ def test_sender_falls_back_to_chunking_after_retryable_long_message_failure() ->
     assert len(gateway.calls) >= 4
     assert all(call[0] == "send_group_msg" for call in gateway.calls)
     assert all(len(str(call[1]["message"])) <= 180 for call in gateway.calls[3:])
+
+
+class QQBlockedGateway:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def call_api(self, action: str, params: dict) -> dict:
+        self.calls.append((action, params))
+        return {
+            "status": "failed",
+            "retcode": 1200,
+            "message": "waitForSelfEcho timeout",
+        }
+
+
+def test_sender_reports_qq_content_block_without_chunking_original_text() -> None:
+    gateway = QQBlockedGateway()
+    sender = Sender(gateway)
+    long_text = "sensitive answer " * 30
+
+    with pytest.raises(QQMessageBlockedError, match="waitForSelfEcho timeout"):
+        asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text=long_text)))
+
+    assert gateway.calls == [
+        ("send_group_msg", {"group_id": 10001, "message": long_text.strip()}),
+        ("send_group_msg", {"group_id": 10001, "message": long_text.strip()}),
+        ("send_group_msg", {"group_id": 10001, "message": long_text.strip()}),
+    ]

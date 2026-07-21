@@ -72,6 +72,8 @@
 
 `LLM_TEXT_ENDPOINT=responses` 且 `LLM_BUILTIN_WEB_SEARCH=true` 时，文本请求可使用主模型的内置 `web_search` 工具。明确写出“联网”“搜索”“查资料”等请求会强制调用检索；普通聊天则由模型自行决定是否检索。实际工具调用会记录在未纳入 Git 的 `infra/wsl/runtime/logs/responses-tool-events.jsonl`，用于核验是否真的联网。
 
+当 LLBot 连续返回 `retcode=1200 / waitForSelfEcho timeout` 时，小町会把原回复标记为“QQ 拦截、未送达”并保留在本地上下文，同时在群内改发固定的失败提示。后续模型可以理解原回复，但会收到不得复述其中敏感细节的明确约束；这类记录不会进入自动摘要或长期记忆压缩。
+
 修改 `infra/wsl/.env` 后，需要重建小町容器才能加载新环境变量：
 
 ```bash
