@@ -3,6 +3,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -193,6 +195,54 @@ def test_wsl_env_example_has_no_real_secrets() -> None:
     assert "GROUP_STREAM_WATCH_GROUP_ID=" in env_example
 
 
+def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> None:
+    env_example = (REPO_ROOT / "infra/wsl/.env.example").read_text(encoding="utf-8")
+    root_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    wsl_readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
+    required_settings = [
+        "MEMORY_ORCHESTRATION_V2_ENABLED=true",
+        "MEMORY_ORCHESTRATION_SHADOW_MODE=true",
+        "MEMORY_EMBEDDING_PROVIDER=local",
+        "MEMORY_EMBEDDING_DEVICE=auto",
+        "MEMORY_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5",
+        "MEMORY_EMBEDDING_DIMENSIONS=512",
+        "MEMORY_EMBEDDING_CACHE_DIR=/workspace/data/models",
+        "MEMORY_EMBEDDING_BASE_URL=",
+        "MEMORY_EMBEDDING_API_KEY=",
+        "MEMORY_EMBEDDING_VERSION=",
+        "MEMORY_EPISODE_IDLE_MINUTES=30",
+        "MEMORY_EPISODE_MAX_MESSAGES=50",
+        "MEMORY_EPISODE_MAX_TOKENS=8000",
+        "MEMORY_CHUNK_MAX_TOKENS=1800",
+        "MEMORY_CHUNK_OVERLAP_MESSAGES=5",
+        "MEMORY_QUERY_REWRITE_ENABLED=false",
+        "MEMORY_QUERY_REWRITE_TIMEOUT_SECONDS=3",
+        "MEMORY_QUERY_REWRITE_MAX_OUTPUT_TOKENS=256",
+        "MEMORY_LLM_RERANK_ENABLED=false",
+        "MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS=32000",
+        "MEMORY_DETAIL_CONTEXT_BUDGET_TOKENS=64000",
+        "MEMORY_RECENT_CONTEXT_BUDGET_TOKENS=10000",
+        "MEMORY_FTS_CANDIDATE_LIMIT=30",
+        "MEMORY_VECTOR_CANDIDATE_LIMIT=30",
+        "MEMORY_FINAL_EPISODE_LIMIT=6",
+    ]
+    for setting in required_settings:
+        assert setting in env_example
+
+    for documentation in (root_readme, wsl_readme):
+        assert "shadow -> backfill -> evaluate -> active" in documentation
+        assert "/workspace/data/models" in documentation
+        assert "MEMORY_ORCHESTRATION_V2_ENABLED=false" in documentation
+        assert "MEMORY_ORCHESTRATION_V2_ENABLED=true" in documentation
+        assert "MEMORY_EMBEDDING_PROVIDER=disabled" in documentation
+        assert "MEMORY_EMBEDDING_DEVICE=auto" in documentation
+        assert "nvidia.com/gpu=all" in documentation
+        assert "docker compose build xiaomachi" in documentation
+        assert "docker compose up -d --no-deps --force-recreate xiaomachi" in documentation
+        assert "xiaomachi-llbot" in documentation
+        assert "must not restart xiaomachi-llbot" in documentation
+
+
 def test_gitignore_excludes_wsl_runtime_state() -> None:
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
     required_patterns = [
@@ -257,10 +307,18 @@ def test_xiaomachi_container_uses_prebuilt_local_image() -> None:
 
 def test_xiaomachi_dockerfile_installs_dependencies_at_build_time() -> None:
     dockerfile = (REPO_ROOT / "infra/wsl/Dockerfile.xiaomachi").read_text(encoding="utf-8")
-    assert "FROM python:3.12-slim" in dockerfile
+    assert "FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04" in dockerfile
     assert "COPY infra/wsl/requirements.xiaomachi.txt" in dockerfile
+    assert "COPY infra/wsl/requirements.xiaomachi-gpu.txt" in dockerfile
+    assert "python -m pip uninstall -y fastembed onnxruntime" in dockerfile
+    gpu_requirements = (
+        REPO_ROOT / "infra/wsl/requirements.xiaomachi-gpu.txt"
+    ).read_text(encoding="utf-8")
+    assert "fastembed-gpu>=0.6.0,<0.7.0" in gpu_requirements
+    assert "onnxruntime-gpu==1.22.0" in gpu_requirements
     assert "COPY app ./app" in dockerfile
     assert "COPY configs ./configs" in dockerfile
+    assert "COPY scripts ./scripts" in dockerfile
     assert "python -m pip install" in dockerfile
     assert "ARG HTTP_PROXY" in dockerfile
     assert "ARG HTTPS_PROXY" in dockerfile
@@ -280,6 +338,15 @@ def test_xiaomachi_image_requirements_match_pyproject() -> None:
         if line.strip() and not line.lstrip().startswith("#")
     }
     assert actual == expected
+    assert "fastembed>=0.6.0,<0.7.0" in actual
+
+
+def test_xiaomachi_compose_requests_only_the_nvidia_cdi_device_for_the_bot() -> None:
+    for name in ("docker-compose.yml", "docker-compose.llbot.yml"):
+        compose = yaml.safe_load((REPO_ROOT / "infra/wsl" / name).read_text(encoding="utf-8"))
+        assert compose["services"]["xiaomachi"]["devices"] == ["nvidia.com/gpu=all"]
+        platform_service = "llbot" if "llbot" in compose["services"] else "napcat"
+        assert "devices" not in compose["services"][platform_service]
 
 
 def test_status_script_uses_on_demand_probes_before_logs() -> None:

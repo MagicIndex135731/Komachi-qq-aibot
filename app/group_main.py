@@ -15,8 +15,8 @@ from app.core.router import InboundRouter
 from app.main import (
     build_group_image_llm_client,
     build_group_image_service,
-    build_memory_compaction_service,
     build_llm_client,
+    build_memory_runtime,
     build_web_search_client,
     create_runtime_banner,
     should_ingest_group_message,
@@ -48,11 +48,13 @@ async def run() -> None:
         sender=sender,
         web_search_client=web_search_client,
     )
-    memory_compaction_service = build_memory_compaction_service(
+    memory_runtime = build_memory_runtime(
         settings=settings,
         engine=engine,
         llm_client=llm_client,
+        bot_display_name=str(runtime.persona.get("name", settings.bot_qq)),
     )
+    memory_compaction_service = memory_runtime.memory_compaction_service
     persistent_group_engine = engine if hasattr(engine, "connect") else None
     if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
         group_image_service.engine = persistent_group_engine
@@ -72,6 +74,7 @@ async def run() -> None:
         dev_control_service=None,
         group_image_service=group_image_service,
         memory_compaction_service=memory_compaction_service,
+        memory_orchestrator=memory_runtime.memory_orchestrator,
     )
 
     async def handle_payload(payload: dict) -> None:

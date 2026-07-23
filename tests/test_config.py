@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from app.config import AppSettings, load_runtime_config
@@ -147,6 +149,44 @@ def test_app_settings_exposes_group_image_defaults(tmp_path, monkeypatch) -> Non
 
     assert settings.group_image_queue_capacity == 3
     assert settings.group_image_timeout_seconds == 900.0
+
+
+def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+
+    settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
+
+    assert settings.memory_orchestration_v2_enabled is False
+    assert settings.memory_orchestration_shadow_mode is False
+    assert settings.memory_embedding_provider == "local"
+    assert settings.memory_embedding_device == "cpu"
+    assert settings.memory_embedding_local_files_only is False
+    assert settings.memory_retrieval_channel_timeout_seconds == 2.0
+    assert settings.memory_embedding_model == "BAAI/bge-small-zh-v1.5"
+    assert settings.memory_embedding_dimensions == 512
+    assert settings.memory_embedding_cache_dir == Path("/workspace/data/models")
+    assert settings.memory_embedding_base_url == ""
+    assert settings.memory_embedding_api_key == ""
+    assert settings.memory_embedding_version == ""
+    assert settings.memory_episode_idle_minutes == 30
+    assert settings.memory_episode_max_messages == 50
+    assert settings.memory_episode_max_tokens == 8000
+    assert settings.memory_chunk_max_tokens == 1800
+    assert settings.memory_chunk_overlap_messages == 5
+    assert settings.memory_query_rewrite_enabled is False
+    assert settings.memory_query_rewrite_timeout_seconds == 3.0
+    assert settings.memory_query_rewrite_max_output_tokens == 256
+    assert settings.memory_llm_rerank_enabled is False
+    assert settings.memory_normal_context_budget_tokens == 32000
+    assert settings.memory_detail_context_budget_tokens == 64000
+    assert settings.memory_recent_context_budget_tokens == 10000
+    assert settings.memory_fts_candidate_limit == 30
+    assert settings.memory_vector_candidate_limit == 30
+    assert settings.memory_final_episode_limit == 6
 
 
 def test_app_settings_reads_group_image_timeout(tmp_path, monkeypatch) -> None:

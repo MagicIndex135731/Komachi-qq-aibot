@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ARG PIP_DEFAULT_TIMEOUT=120
 ARG PIP_RETRIES=10
@@ -8,16 +8,26 @@ ARG HTTPS_PROXY
 ARG NO_PROXY
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONUNBUFFERED=1
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PATH=/opt/venv/bin:$PATH
 
 WORKDIR /workspace
 
 COPY infra/wsl/requirements.xiaomachi.txt ./
+COPY infra/wsl/requirements.xiaomachi-gpu.txt ./
 
-RUN python -m pip install -U pip setuptools wheel \
-    && python -m pip install -r requirements.xiaomachi.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv \
+    && python -m pip install -U pip setuptools wheel \
+    && python -m pip install -r requirements.xiaomachi.txt \
+    && python -m pip uninstall -y fastembed onnxruntime \
+    && python -m pip install -r requirements.xiaomachi-gpu.txt
 
 COPY app ./app
 COPY configs ./configs
+COPY scripts ./scripts
 
 CMD ["python", "-m", "app.group_main"]

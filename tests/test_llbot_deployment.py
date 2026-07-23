@@ -39,6 +39,7 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     )
     services = compose["services"]
     xiaomachi = services["xiaomachi"]
+    llbot = services["llbot"]
 
     assert xiaomachi["image"] == "xiaomachi-bot:local"
     assert xiaomachi["build"]["context"] == "../.."
@@ -48,6 +49,8 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
     assert "../../:/workspace" not in xiaomachi["volumes"]
     assert "xiaomachi_data:/workspace/data" in xiaomachi["volumes"]
+    assert xiaomachi["devices"] == ["nvidia.com/gpu=all"]
+    assert "devices" not in llbot
     assert all("/mnt/" not in volume for volume in xiaomachi["volumes"])
     assert "./runtime/pip-cache:/root/.cache/pip" not in xiaomachi["volumes"]
     assert xiaomachi["command"] == ["python", "-m", "app.group_main"]

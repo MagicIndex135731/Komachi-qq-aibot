@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 import logging
+from threading import Lock
+from typing import Protocol
 
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
@@ -18,6 +22,33 @@ from app.storage.repositories import JobRepository, MemoryRepository, MessageRep
 logger = logging.getLogger(__name__)
 
 
+class MemoryBackgroundLifecycle(Protocol):
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def wake(self) -> None: ...
+
+    def enqueue_message(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime | None = None,
+        backfill_run_id: int | None = None,
+        watermark_message_id: int | None = None,
+    ): ...
+
+    def enqueue_late_arrival(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        message_timestamp: datetime,
+        now: datetime | None = None,
+    ): ...
+
+
 class MemoryCompactionService:
     job_type = "memory_compaction"
 
@@ -31,6 +62,9 @@ class MemoryCompactionService:
         retry_limit: int = 3,
         backfill_windows: int = 24,
         excluded_user_ids: set[int] | None = None,
+        background_service: MemoryBackgroundLifecycle | None = None,
+        legacy_enabled: bool = True,
+        shadow_enabled: bool = False,
     ) -> None:
         self.engine = engine
         self.llm_client = llm_client
@@ -39,25 +73,145 @@ class MemoryCompactionService:
         self.retry_limit = max(1, int(retry_limit))
         self.backfill_windows = max(0, int(backfill_windows))
         self.excluded_user_ids = {int(user_id) for user_id in (excluded_user_ids or set())}
+        self.background_service = background_service
+        self.legacy_enabled = bool(legacy_enabled)
+        self.shadow_enabled = bool(shadow_enabled)
         self._lock = asyncio.Lock()
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        self._shadow_loop: asyncio.AbstractEventLoop | None = None
+        self._shadow_futures: set[Future] = set()
+        self._shadow_futures_lock = Lock()
+        self._accept_shadow_enqueues = False
 
     async def start(self) -> None:
         self._stop_event.clear()
-        await asyncio.to_thread(self._prepare_jobs)
+        with self._shadow_futures_lock:
+            self._shadow_loop = asyncio.get_running_loop()
+            self._accept_shadow_enqueues = True
+        if self.legacy_enabled:
+            await asyncio.to_thread(self._prepare_jobs)
+        if self.background_service is not None:
+            try:
+                await self.background_service.start()
+            except Exception as exc:
+                logger.exception(
+                    "memory_background_start_failed error=%s",
+                    type(exc).__name__,
+                )
         await self.wake()
 
     async def stop(self) -> None:
         self._stop_event.set()
+        with self._shadow_futures_lock:
+            self._accept_shadow_enqueues = False
+            shadow_futures = tuple(self._shadow_futures)
         task = self._worker_task
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+        if shadow_futures:
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in shadow_futures),
+                return_exceptions=True,
+            )
+        if self.background_service is not None:
+            try:
+                await self.background_service.stop()
+            except Exception as exc:
+                logger.exception(
+                    "memory_background_stop_failed error=%s",
+                    type(exc).__name__,
+                )
 
     async def wake(self) -> None:
-        async with self._lock:
-            if self._worker_task is None or self._worker_task.done():
-                self._worker_task = asyncio.create_task(self._worker_loop())
+        if self.legacy_enabled:
+            async with self._lock:
+                if self._worker_task is None or self._worker_task.done():
+                    self._worker_task = asyncio.create_task(self._worker_loop())
+        if self.background_service is not None:
+            try:
+                await self.background_service.wake()
+            except Exception as exc:
+                logger.exception(
+                    "memory_background_wake_failed error=%s",
+                    type(exc).__name__,
+                )
+
+    def enqueue_episode_allocation(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime | None = None,
+        backfill_run_id: int | None = None,
+        watermark_message_id: int | None = None,
+        late_arrival: bool = False,
+    ):
+        """Best-effort V2 enqueue; V1/reply behavior never depends on it."""
+        if self.background_service is None:
+            return None
+        try:
+            if late_arrival:
+                enqueue_late = getattr(
+                    self.background_service,
+                    "enqueue_late_arrival",
+                    None,
+                )
+                if callable(enqueue_late):
+                    queued = enqueue_late(
+                        group_id=group_id,
+                        message_id=message_id,
+                        message_timestamp=now or datetime.now(UTC),
+                        now=datetime.now(UTC),
+                    )
+                    if queued is not None:
+                        return queued
+            return self.background_service.enqueue_message(
+                group_id=group_id,
+                message_id=message_id,
+                now=now,
+                backfill_run_id=backfill_run_id,
+                watermark_message_id=watermark_message_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "memory_episode_enqueue_failed group_id=%s message_id=%s error=%s",
+                group_id,
+                message_id,
+                type(exc).__name__,
+            )
+            return None
+
+    def submit_shadow_enqueue(self, callback: Callable[[], object]) -> bool:
+        """Schedule shadow persistence off the reply path and track shutdown."""
+        if not self.shadow_enabled or self.background_service is None:
+            return False
+        with self._shadow_futures_lock:
+            loop = self._shadow_loop
+            if (
+                not self._accept_shadow_enqueues
+                or loop is None
+                or loop.is_closed()
+            ):
+                return False
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.to_thread(callback),
+                loop,
+            )
+            self._shadow_futures.add(future)
+        future.add_done_callback(self._shadow_enqueue_done)
+        return True
+
+    def _shadow_enqueue_done(self, future: Future) -> None:
+        with self._shadow_futures_lock:
+            self._shadow_futures.discard(future)
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning(
+                "memory_shadow_enqueue_failed error=%s",
+                type(exc).__name__,
+            )
 
     def _prepare_jobs(self) -> None:
         with session_scope(self.engine) as session:

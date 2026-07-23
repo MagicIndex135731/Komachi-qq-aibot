@@ -63,6 +63,46 @@ class AppSettings(BaseSettings):
     memory_compaction_max_facts: int = Field(default=24, alias="MEMORY_COMPACTION_MAX_FACTS")
     memory_compaction_retry_limit: int = Field(default=3, alias="MEMORY_COMPACTION_RETRY_LIMIT")
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
+    memory_orchestration_v2_enabled: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_V2_ENABLED")
+    memory_orchestration_shadow_mode: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_SHADOW_MODE")
+    memory_embedding_provider: Literal["local", "openai_compatible", "disabled"] = Field(
+        default="local", alias="MEMORY_EMBEDDING_PROVIDER"
+    )
+    memory_embedding_device: Literal["auto", "cuda", "cpu"] = Field(
+        default="cpu", alias="MEMORY_EMBEDDING_DEVICE"
+    )
+    memory_embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5", alias="MEMORY_EMBEDDING_MODEL")
+    memory_embedding_dimensions: int = Field(default=512, alias="MEMORY_EMBEDDING_DIMENSIONS")
+    memory_embedding_cache_dir: Path = Field(
+        default=Path("/workspace/data/models"), alias="MEMORY_EMBEDDING_CACHE_DIR"
+    )
+    memory_embedding_local_files_only: bool = Field(
+        default=False, alias="MEMORY_EMBEDDING_LOCAL_FILES_ONLY"
+    )
+    memory_embedding_base_url: str = Field(default="", alias="MEMORY_EMBEDDING_BASE_URL")
+    memory_embedding_api_key: str = Field(default="", alias="MEMORY_EMBEDDING_API_KEY")
+    memory_embedding_version: str = Field(default="", alias="MEMORY_EMBEDDING_VERSION")
+    memory_embedding_timeout_seconds: float = Field(default=10.0, alias="MEMORY_EMBEDDING_TIMEOUT_SECONDS")
+    memory_retrieval_channel_timeout_seconds: float = Field(
+        default=2.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
+    )
+    memory_episode_idle_minutes: int = Field(default=30, alias="MEMORY_EPISODE_IDLE_MINUTES")
+    memory_episode_max_messages: int = Field(default=50, alias="MEMORY_EPISODE_MAX_MESSAGES")
+    memory_episode_max_tokens: int = Field(default=8000, alias="MEMORY_EPISODE_MAX_TOKENS")
+    memory_chunk_max_tokens: int = Field(default=1800, alias="MEMORY_CHUNK_MAX_TOKENS")
+    memory_chunk_overlap_messages: int = Field(default=5, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
+    memory_query_rewrite_enabled: bool = Field(default=False, alias="MEMORY_QUERY_REWRITE_ENABLED")
+    memory_query_rewrite_timeout_seconds: float = Field(default=3.0, alias="MEMORY_QUERY_REWRITE_TIMEOUT_SECONDS")
+    memory_query_rewrite_max_output_tokens: int = Field(
+        default=256, alias="MEMORY_QUERY_REWRITE_MAX_OUTPUT_TOKENS"
+    )
+    memory_llm_rerank_enabled: bool = Field(default=False, alias="MEMORY_LLM_RERANK_ENABLED")
+    memory_normal_context_budget_tokens: int = Field(default=32000, alias="MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS")
+    memory_detail_context_budget_tokens: int = Field(default=64000, alias="MEMORY_DETAIL_CONTEXT_BUDGET_TOKENS")
+    memory_recent_context_budget_tokens: int = Field(default=10000, alias="MEMORY_RECENT_CONTEXT_BUDGET_TOKENS")
+    memory_fts_candidate_limit: int = Field(default=30, alias="MEMORY_FTS_CANDIDATE_LIMIT")
+    memory_vector_candidate_limit: int = Field(default=30, alias="MEMORY_VECTOR_CANDIDATE_LIMIT")
+    memory_final_episode_limit: int = Field(default=6, alias="MEMORY_FINAL_EPISODE_LIMIT")
     llm_context_window_tokens: int = Field(default=258000, alias="LLM_CONTEXT_WINDOW_TOKENS")
     llm_max_output_tokens: int = Field(default=8192, alias="LLM_MAX_OUTPUT_TOKENS")
     llm_context_safety_margin_tokens: int = Field(default=32768, alias="LLM_CONTEXT_SAFETY_MARGIN_TOKENS")

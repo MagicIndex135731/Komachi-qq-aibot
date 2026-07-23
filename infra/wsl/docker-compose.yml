@@ -52,6 +52,8 @@ services:
       - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
     volumes:
       - xiaomachi_data:/workspace/data
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       napcat:
         condition: service_started
