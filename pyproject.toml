@@ -9,6 +9,7 @@ description = "NapCat-based QQ AI bot with image generation and private admin re
 requires-python = ">=3.12"
 dependencies = [
   "ddgs>=9.14.2",
+  "fastembed>=0.6.0,<0.7.0",
   "httpx>=0.28.0",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.3.0",

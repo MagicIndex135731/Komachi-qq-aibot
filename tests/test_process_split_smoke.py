@@ -68,6 +68,8 @@ class FakeGateway:
 async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_path) -> None:
     settings = _settings(tmp_path)
     captured: dict[str, object] = {}
+    built_memory_orchestrator = object()
+    memory_lifecycle_events: list[str] = []
     FakeGateway.instances.clear()
 
     def fake_llm_client(**kwargs):
@@ -76,10 +78,10 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
 
     class FakeMemoryCompactionService:
         async def start(self) -> None:
-            return None
+            memory_lifecycle_events.append("start")
 
         async def stop(self) -> None:
-            return None
+            memory_lifecycle_events.append("stop")
 
     monkeypatch.setattr(group_main, "AppSettings", lambda: settings)
     monkeypatch.setattr(
@@ -103,14 +105,23 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
     monkeypatch.setattr(group_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(group_main, "build_web_search_client", lambda _settings: object())
     monkeypatch.setattr(group_main, "build_group_image_llm_client", lambda **_kwargs: object())
-    monkeypatch.setattr(group_main, "build_memory_compaction_service", lambda **_kwargs: FakeMemoryCompactionService())
+    monkeypatch.setattr(
+        group_main,
+        "build_memory_runtime",
+        lambda **_kwargs: SimpleNamespace(
+            memory_compaction_service=FakeMemoryCompactionService(),
+            memory_orchestrator=built_memory_orchestrator,
+        ),
+    )
     monkeypatch.setattr(group_main, "InboundRouter", lambda **kwargs: captured.update(kwargs) or object())
 
     await group_main.run()
 
     assert captured["dev_control_service"] is None
+    assert captured["memory_orchestrator"] is built_memory_orchestrator
     assert captured["llm_kwargs"]["responses_model"] == ""
     assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
+    assert memory_lifecycle_events == ["start", "stop"]
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
 

@@ -1,34 +1,106 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import re
 from typing import Any
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import Integer, bindparam, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.storage.models import (
     BbotListenerCacheEntry,
+    ConversationEpisode,
     DevSession,
     DevTask,
     DevTaskArtifact,
+    EpisodeMessage,
     Group,
     Job,
+    MemoryBackfillRun,
     MemoryItem,
     Message,
+    RetrievalDocument,
+    RetrievalDocumentMessage,
+    RetrievalIndexState,
     Summary,
     UsageRecord,
     User,
 )
 from app.providers.embeddings import hashed_text_embedding
+from app.storage.db import validate_retrieval_vector_table_name
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalDocumentHit:
+    document_id: int
+    group_id: int
+    document_kind: str
+    episode_id: int | None
+    source_msg_ids: tuple[str, ...]
+    start_at: datetime
+    end_at: datetime
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalEmbeddingCoverage:
+    total_documents: int
+    ready_documents: int
+    failed_documents: int
+
+    @property
+    def coverage(self) -> float:
+        if self.total_documents == 0:
+            return 1.0
+        return self.ready_documents / self.total_documents
 
 
 def _normalize_utc_sqlite_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _delete_active_retrieval_vectors(
+    session: Session,
+    *,
+    document_ids: list[int],
+) -> None:
+    if not document_ids:
+        return
+    active_states = list(
+        session.scalars(
+            select(RetrievalIndexState).where(
+                RetrievalIndexState.channel == "vector",
+                RetrievalIndexState.is_active.is_(True),
+            )
+        )
+    )
+    for state in active_states:
+        physical_table = validate_retrieval_vector_table_name(
+            state.physical_table,
+            generation=state.generation,
+        )
+        try:
+            session.execute(
+                text(
+                    f"DELETE FROM {physical_table} "
+                    "WHERE document_id IN :document_ids"
+                ).bindparams(bindparam("document_ids", expanding=True)),
+                {
+                    "document_ids": tuple(
+                        int(document_id) for document_id in document_ids
+                    )
+                },
+            )
+        except SQLAlchemyError:
+            # The active metadata can outlive optional extension availability
+            # in a process. Canonical status still prevents use by fallback
+            # channels; vector cleanup can be retried when sqlite-vec returns.
+            continue
 
 
 class GroupRepository:
@@ -87,6 +159,10 @@ class MessageRepository:
     def _is_reserved_outbound(message: Message) -> bool:
         raw_json = message.raw_json
         return isinstance(raw_json, dict) and raw_json.get("delivery_state") == "reserved"
+
+    @staticmethod
+    def is_reserved_outbound(message: Message) -> bool:
+        return MessageRepository._is_reserved_outbound(message)
 
     @staticmethod
     def is_qq_blocked_outbound(message: Message) -> bool:
@@ -155,6 +231,25 @@ class MessageRepository:
     def get_by_platform_msg_id(self, platform_msg_id: str) -> Message | None:
         stmt = select(Message).where(Message.platform_msg_id == platform_msg_id).limit(1)
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def is_late_group_message(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        timestamp: datetime,
+    ) -> bool:
+        normalized_timestamp = _normalize_utc_sqlite_timestamp(timestamp)
+        stmt = (
+            select(Message.id)
+            .where(
+                Message.group_id == int(group_id),
+                Message.id < int(message_id),
+                Message.timestamp > normalized_timestamp,
+            )
+            .limit(1)
+        )
+        return self.session.execute(stmt).scalar_one_or_none() is not None
 
     def list_recent_group_messages(self, *, group_id: int, limit: int) -> list[Message]:
         stmt = (
@@ -1215,6 +1310,1532 @@ def _fts_search_terms(query: str) -> list[str]:
     terms.extend(re.findall(r"[a-z0-9_]{2,}", normalized))
     return list(dict.fromkeys(term for term in terms if term))[:16]
 
+
+class EpisodeRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_episode(
+        self,
+        *,
+        group_id: int,
+        start_message_id: int,
+        started_at: datetime,
+        segmentation_version: str,
+        status: str = "open",
+        boundary_reason: str = "",
+    ) -> ConversationEpisode:
+        episode = ConversationEpisode(
+            group_id=group_id,
+            segmentation_version=segmentation_version,
+            status=status,
+            is_current=True,
+            start_message_id=start_message_id,
+            end_message_id=None,
+            started_at=_normalize_utc_sqlite_timestamp(started_at),
+            ended_at=None,
+            boundary_reason=boundary_reason,
+            message_count=0,
+            token_count=0,
+        )
+        self.session.add(episode)
+        return episode
+
+    def get_open_episode(self, *, group_id: int) -> ConversationEpisode | None:
+        return self.session.scalars(
+            select(ConversationEpisode)
+            .where(
+                ConversationEpisode.group_id == group_id,
+                ConversationEpisode.status == "open",
+                ConversationEpisode.is_current.is_(True),
+            )
+            .order_by(ConversationEpisode.id.desc())
+            .limit(1)
+        ).first()
+
+    def get_episode(self, episode_id: int) -> ConversationEpisode | None:
+        return self.session.get(ConversationEpisode, episode_id)
+
+    def list_unassigned_messages(
+        self,
+        *,
+        group_id: int | None = None,
+        after_message_id: int | None = None,
+        watermark_message_id: int | None = None,
+        limit: int = 500,
+    ) -> list[Message]:
+        stmt = (
+            select(Message)
+            .outerjoin(
+                EpisodeMessage,
+                (EpisodeMessage.message_id == Message.id)
+                & (EpisodeMessage.group_id == Message.group_id),
+            )
+            .where(
+                Message.group_id.is_not(None),
+                EpisodeMessage.message_id.is_(None),
+                text(
+                    "(json_extract(messages.raw_json, '$.delivery_state') IS NULL "
+                    "OR json_extract(messages.raw_json, '$.delivery_state') <> 'reserved')"
+                ),
+            )
+        )
+        if group_id is not None:
+            stmt = stmt.where(Message.group_id == int(group_id))
+        if after_message_id is not None:
+            stmt = stmt.where(Message.id > int(after_message_id))
+        if watermark_message_id is not None:
+            stmt = stmt.where(Message.id <= int(watermark_message_id))
+        return list(
+            self.session.scalars(
+                stmt.order_by(
+                    Message.group_id.asc(),
+                    Message.timestamp.asc(),
+                    Message.id.asc(),
+                ).limit(max(1, int(limit)))
+            )
+        )
+
+    def list_idle_open_episodes(
+        self,
+        *,
+        idle_before: datetime,
+        group_id: int | None = None,
+        limit: int = 100,
+    ) -> list[ConversationEpisode]:
+        normalized_idle_before = _normalize_utc_sqlite_timestamp(idle_before)
+        last_message_at = (
+            select(func.max(Message.timestamp))
+            .join(
+                EpisodeMessage,
+                (EpisodeMessage.message_id == Message.id)
+                & (EpisodeMessage.group_id == Message.group_id),
+            )
+            .where(
+                EpisodeMessage.episode_id == ConversationEpisode.id,
+                EpisodeMessage.group_id == ConversationEpisode.group_id,
+            )
+            .correlate(ConversationEpisode)
+            .scalar_subquery()
+        )
+        stmt = select(ConversationEpisode).where(
+            ConversationEpisode.status == "open",
+            ConversationEpisode.is_current.is_(True),
+            func.coalesce(last_message_at, ConversationEpisode.started_at)
+            <= normalized_idle_before,
+        )
+        if group_id is not None:
+            stmt = stmt.where(ConversationEpisode.group_id == int(group_id))
+        return list(
+            self.session.scalars(
+                stmt.order_by(
+                    ConversationEpisode.group_id.asc(),
+                    ConversationEpisode.started_at.asc(),
+                    ConversationEpisode.id.asc(),
+                ).limit(max(1, int(limit)))
+            )
+        )
+
+    def list_processable_episodes(
+        self,
+        *,
+        group_id: int | None = None,
+        statuses: tuple[str, ...] = ("closed", "failed"),
+        compaction_version: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationEpisode]:
+        normalized_statuses = tuple(dict.fromkeys(str(value) for value in statuses))
+        if not normalized_statuses:
+            return []
+        stmt = select(ConversationEpisode).where(
+            ConversationEpisode.is_current.is_(True),
+            ConversationEpisode.status.in_(normalized_statuses),
+        )
+        if group_id is not None:
+            stmt = stmt.where(ConversationEpisode.group_id == int(group_id))
+        if compaction_version is not None:
+            stmt = stmt.where(
+                ConversationEpisode.compaction_version == str(compaction_version)
+            )
+        return list(
+            self.session.scalars(
+                stmt.order_by(
+                    ConversationEpisode.group_id.asc(),
+                    ConversationEpisode.ended_at.asc(),
+                    ConversationEpisode.id.asc(),
+                ).limit(max(1, int(limit)))
+            )
+        )
+
+    def compare_and_set_status(
+        self,
+        *,
+        episode_id: int,
+        group_id: int,
+        expected_statuses: tuple[str, ...],
+        new_status: str,
+        compaction_version: str | None = None,
+    ) -> bool:
+        normalized_statuses = tuple(
+            dict.fromkeys(str(value) for value in expected_statuses)
+        )
+        if not normalized_statuses:
+            return False
+        values: dict[str, Any] = {
+            "new_status": str(new_status),
+            "updated_at": _normalize_utc_sqlite_timestamp(datetime.now(UTC)),
+            "episode_id": int(episode_id),
+            "group_id": int(group_id),
+        }
+        assignments = "status = :new_status, updated_at = :updated_at"
+        if compaction_version is not None:
+            assignments += ", compaction_version = :compaction_version"
+            values["compaction_version"] = str(compaction_version)
+        status_params: list[str] = []
+        for index, status in enumerate(normalized_statuses):
+            key = f"expected_status_{index}"
+            values[key] = status
+            status_params.append(f":{key}")
+        result = self.session.execute(
+            text(
+                f"UPDATE conversation_episodes SET {assignments} "
+                "WHERE id = :episode_id AND group_id = :group_id "
+                f"AND status IN ({','.join(status_params)}) AND is_current = 1"
+            ),
+            values,
+        )
+        self.session.expire_all()
+        return int(result.rowcount or 0) == 1
+
+    def find_episode_for_late_arrival(
+        self,
+        *,
+        group_id: int,
+        timestamp: datetime,
+        segmentation_version: str | None = None,
+    ) -> ConversationEpisode | None:
+        resolved_timestamp = _normalize_utc_sqlite_timestamp(timestamp)
+        stmt = select(ConversationEpisode).where(
+            ConversationEpisode.group_id == int(group_id),
+            ConversationEpisode.is_current.is_(True),
+            ConversationEpisode.started_at <= resolved_timestamp,
+            or_(
+                ConversationEpisode.ended_at.is_(None),
+                ConversationEpisode.ended_at >= resolved_timestamp,
+            ),
+        )
+        if segmentation_version is not None:
+            normalized_generation = str(segmentation_version)
+            stmt = stmt.where(
+                or_(
+                    ConversationEpisode.segmentation_version
+                    == normalized_generation,
+                    ConversationEpisode.segmentation_version.like(
+                        f"{normalized_generation}:late:%"
+                    ),
+                )
+            )
+        containing = self.session.scalars(
+            stmt.order_by(
+                ConversationEpisode.started_at.desc(),
+                ConversationEpisode.id.desc(),
+            ).limit(1)
+        ).first()
+        if containing is not None:
+            return containing
+        future_stmt = select(ConversationEpisode).where(
+            ConversationEpisode.group_id == int(group_id),
+            ConversationEpisode.is_current.is_(True),
+            ConversationEpisode.started_at > resolved_timestamp,
+        )
+        if segmentation_version is not None:
+            normalized_generation = str(segmentation_version)
+            future_stmt = future_stmt.where(
+                or_(
+                    ConversationEpisode.segmentation_version
+                    == normalized_generation,
+                    ConversationEpisode.segmentation_version.like(
+                        f"{normalized_generation}:late:%"
+                    ),
+                )
+            )
+        return self.session.scalars(
+            future_stmt.order_by(
+                ConversationEpisode.started_at.asc(),
+                ConversationEpisode.id.asc(),
+            ).limit(1)
+        ).first()
+
+    def supersede_episode(
+        self,
+        *,
+        episode_id: int,
+        group_id: int,
+        expected_current: bool = True,
+    ) -> bool:
+        result = self.session.execute(
+            text(
+                "UPDATE conversation_episodes SET status = 'superseded', "
+                "is_current = 0, updated_at = :updated_at "
+                "WHERE id = :episode_id AND group_id = :group_id "
+                "AND is_current = :expected_current"
+            ),
+            {
+                "episode_id": int(episode_id),
+                "group_id": int(group_id),
+                "expected_current": bool(expected_current),
+                "updated_at": _normalize_utc_sqlite_timestamp(datetime.now(UTC)),
+            },
+        )
+        self.session.expire_all()
+        return int(result.rowcount or 0) == 1
+
+    def prepare_late_arrival_resegment(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        timestamp: datetime,
+        segmentation_version: str | None = None,
+        compaction_version: str | None = None,
+    ) -> list[int]:
+        """Atomically supersede the affected suffix and release its memberships."""
+
+        resolved_segmentation = str(segmentation_version or "")
+        if not resolved_segmentation:
+            raise ValueError("late-arrival preparation requires a segmentation generation")
+        preparation_id = self.session.execute(
+            text(
+                "INSERT INTO memory_late_arrival_preparations ("
+                "group_id, message_id, segmentation_generation, "
+                "compaction_generation, created_at"
+                ") VALUES ("
+                ":group_id, :message_id, :segmentation_generation, "
+                ":compaction_generation, :created_at"
+                ") ON CONFLICT(group_id, message_id, segmentation_generation) "
+                "DO NOTHING RETURNING id"
+            ),
+            {
+                "group_id": int(group_id),
+                "message_id": int(message_id),
+                "segmentation_generation": resolved_segmentation,
+                "compaction_generation": str(compaction_version or ""),
+                "created_at": _normalize_utc_sqlite_timestamp(datetime.now(UTC)),
+            },
+        ).scalar_one_or_none()
+        if preparation_id is None:
+            return []
+        affected = self.find_episode_for_late_arrival(
+            group_id=group_id,
+            timestamp=timestamp,
+            segmentation_version=segmentation_version,
+        )
+        if affected is None:
+            return [int(message_id)]
+        suffix_ids = list(
+            self.session.scalars(
+                select(ConversationEpisode.id)
+                .where(
+                    ConversationEpisode.group_id == int(group_id),
+                    ConversationEpisode.is_current.is_(True),
+                    ConversationEpisode.started_at >= affected.started_at,
+                )
+                .order_by(
+                    ConversationEpisode.started_at.asc(),
+                    ConversationEpisode.id.asc(),
+                )
+            )
+        )
+        if not suffix_ids:
+            return [int(message_id)]
+        replay_message_ids = list(
+            self.session.scalars(
+                select(Message.id)
+                .join(
+                    EpisodeMessage,
+                    (EpisodeMessage.message_id == Message.id)
+                    & (EpisodeMessage.group_id == Message.group_id),
+                )
+                .where(
+                    EpisodeMessage.group_id == int(group_id),
+                    EpisodeMessage.episode_id.in_(suffix_ids),
+                    Message.group_id == int(group_id),
+                )
+                .order_by(Message.timestamp.asc(), Message.id.asc())
+            )
+        )
+        values: dict[str, Any] = {
+            "updated_at": _normalize_utc_sqlite_timestamp(datetime.now(UTC)),
+            "group_id": int(group_id),
+            "episode_ids": tuple(int(value) for value in suffix_ids),
+        }
+        compaction_assignment = ""
+        if compaction_version is not None:
+            compaction_assignment = ", compaction_version = :compaction_version"
+            values["compaction_version"] = str(compaction_version)
+        superseded = self.session.execute(
+            text(
+                "UPDATE conversation_episodes SET status = 'superseded', "
+                f"is_current = 0, updated_at = :updated_at{compaction_assignment} "
+                "WHERE group_id = :group_id AND is_current = 1 "
+                "AND id IN :episode_ids"
+            ).bindparams(bindparam("episode_ids", expanding=True)),
+            values,
+        )
+        if int(superseded.rowcount or 0) != len(suffix_ids):
+            raise RuntimeError("late-arrival episode generation CAS failed")
+        document_ids = list(
+            self.session.scalars(
+                select(RetrievalDocument.id).where(
+                    RetrievalDocument.group_id == int(group_id),
+                    RetrievalDocument.episode_id.in_(suffix_ids),
+                    RetrievalDocument.status == "active",
+                )
+            )
+        )
+        if document_ids:
+            self.session.execute(
+                text(
+                    "UPDATE retrieval_documents SET status = 'inactive', "
+                    "embedding_status = 'stale', updated_at = :updated_at "
+                    "WHERE group_id = :group_id AND id IN :document_ids"
+                ).bindparams(bindparam("document_ids", expanding=True)),
+                {
+                    "group_id": int(group_id),
+                    "document_ids": tuple(int(value) for value in document_ids),
+                    "updated_at": values["updated_at"],
+                },
+            )
+            try:
+                self.session.execute(
+                    text(
+                        "DELETE FROM retrieval_documents_fts "
+                        "WHERE document_id IN :document_ids"
+                    ).bindparams(bindparam("document_ids", expanding=True)),
+                    {
+                        "document_ids": tuple(
+                            str(value) for value in document_ids
+                        )
+                    },
+                )
+            except SQLAlchemyError:
+                pass
+            _delete_active_retrieval_vectors(
+                self.session,
+                document_ids=[int(value) for value in document_ids],
+            )
+        self.session.execute(
+            text(
+                "DELETE FROM episode_messages WHERE group_id = :group_id "
+                "AND episode_id IN :episode_ids"
+            ).bindparams(bindparam("episode_ids", expanding=True)),
+            {
+                "group_id": int(group_id),
+                "episode_ids": tuple(int(value) for value in suffix_ids),
+            },
+        )
+        self.session.expire_all()
+        return [int(value) for value in replay_message_ids]
+
+    def add_message(
+        self,
+        *,
+        episode_id: int,
+        group_id: int,
+        message_id: int,
+        ordinal: int,
+        estimated_tokens: int,
+    ) -> EpisodeMessage:
+        membership = EpisodeMessage(
+            episode_id=episode_id,
+            group_id=group_id,
+            message_id=message_id,
+            ordinal=ordinal,
+        )
+        self.session.add(membership)
+        episode = self.session.get(ConversationEpisode, episode_id)
+        if episode is not None:
+            episode.message_count = max(int(episode.message_count or 0), ordinal + 1)
+            episode.token_count = int(episode.token_count or 0) + max(0, int(estimated_tokens))
+            episode.updated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+            self.session.add(episode)
+        return membership
+
+    def add_message_if_current(
+        self,
+        *,
+        episode_id: int,
+        group_id: int,
+        message_id: int,
+        estimated_tokens: int,
+    ) -> bool:
+        """Atomically append only while the target remains the current open episode."""
+        added_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        inserted = self.session.execute(
+            text(
+                "INSERT INTO episode_messages ("
+                "episode_id, message_id, group_id, ordinal, added_at"
+                ") SELECT id, :message_id, group_id, message_count, :added_at "
+                "FROM conversation_episodes "
+                "WHERE id = :episode_id AND group_id = :group_id "
+                "AND status = 'open' AND is_current = 1 "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {
+                "episode_id": int(episode_id),
+                "group_id": int(group_id),
+                "message_id": int(message_id),
+                "added_at": added_at,
+            },
+        )
+        if int(inserted.rowcount or 0) != 1:
+            return False
+        updated = self.session.execute(
+            text(
+                "UPDATE conversation_episodes SET "
+                "message_count = message_count + 1, "
+                "token_count = token_count + :estimated_tokens, "
+                "updated_at = :updated_at "
+                "WHERE id = :episode_id AND group_id = :group_id "
+                "AND status = 'open' AND is_current = 1"
+            ),
+            {
+                "episode_id": int(episode_id),
+                "group_id": int(group_id),
+                "estimated_tokens": max(0, int(estimated_tokens)),
+                "updated_at": added_at,
+            },
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise RuntimeError("current episode disappeared after guarded append")
+        self.session.expire_all()
+        return True
+
+    def close_episode(
+        self,
+        *,
+        episode_id: int,
+        ended_at: datetime,
+        end_message_id: int,
+        boundary_reason: str,
+        content_hash: str,
+    ) -> ConversationEpisode | None:
+        episode = self.session.get(ConversationEpisode, episode_id)
+        if episode is None:
+            return None
+        closed_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        episode.status = "closed"
+        episode.ended_at = _normalize_utc_sqlite_timestamp(ended_at)
+        episode.end_message_id = end_message_id
+        episode.boundary_reason = boundary_reason
+        episode.content_hash = content_hash
+        episode.closed_at = closed_at
+        episode.updated_at = closed_at
+        self.session.add(episode)
+        return episode
+
+    def list_episode_messages(self, *, episode_id: int, group_id: int) -> list[Message]:
+        return list(
+            self.session.scalars(
+                select(Message)
+                .join(
+                    EpisodeMessage,
+                    (EpisodeMessage.message_id == Message.id)
+                    & (EpisodeMessage.group_id == Message.group_id),
+                )
+                .where(
+                    EpisodeMessage.episode_id == episode_id,
+                    EpisodeMessage.group_id == group_id,
+                    Message.group_id == group_id,
+                )
+                .order_by(EpisodeMessage.ordinal.asc(), Message.id.asc())
+            )
+        )
+
+
+class RetrievalDocumentRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_document(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        group_id: int,
+        episode_id: int | None,
+        document_kind: str,
+        source_table: str,
+        source_id: str,
+        start_at: datetime,
+        end_at: datetime,
+        content: str,
+        metadata_json: dict[str, Any],
+        content_hash: str,
+        source_message_ids: list[int],
+        status: str = "active",
+        embedding_provider: str = "",
+        embedding_model: str = "",
+        embedding_version: str = "",
+        embedding_dimensions: int | None = None,
+        embedding_generation: int | None = None,
+        embedding_eligible: bool = False,
+        embedding_status: str = "disabled",
+    ) -> RetrievalDocument:
+        document = self.session.scalars(
+            select(RetrievalDocument).where(
+                RetrievalDocument.scope_type == scope_type,
+                RetrievalDocument.scope_id == scope_id,
+                RetrievalDocument.group_id == group_id,
+                RetrievalDocument.document_kind == document_kind,
+                RetrievalDocument.source_table == source_table,
+                RetrievalDocument.source_id == source_id,
+                RetrievalDocument.content_hash == content_hash,
+            )
+        ).first()
+        if document is None:
+            conflicting = self.session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.scope_type == scope_type,
+                    RetrievalDocument.scope_id == scope_id,
+                    RetrievalDocument.document_kind == document_kind,
+                    RetrievalDocument.source_table == source_table,
+                    RetrievalDocument.source_id == source_id,
+                    RetrievalDocument.content_hash == content_hash,
+                )
+            ).first()
+            if conflicting is not None:
+                raise ValueError("retrieval document identity is bound to another group")
+            document = RetrievalDocument(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                group_id=group_id,
+                episode_id=episode_id,
+                document_kind=document_kind,
+                source_table=source_table,
+                source_id=source_id,
+                start_at=_normalize_utc_sqlite_timestamp(start_at),
+                end_at=_normalize_utc_sqlite_timestamp(end_at),
+                content=content,
+                metadata_json=metadata_json,
+                content_hash=content_hash,
+                status=status,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model,
+                embedding_version=embedding_version,
+                embedding_dimensions=embedding_dimensions,
+                embedding_generation=embedding_generation,
+                embedding_eligible=bool(embedding_eligible),
+                embedding_status=embedding_status,
+            )
+            self.session.add(document)
+            self.session.flush()
+        else:
+            if document.group_id != group_id or document.episode_id != episode_id:
+                raise ValueError("retrieval document identity cannot move across group or episode")
+            document.status = status
+            document.metadata_json = metadata_json
+            document.embedding_provider = embedding_provider
+            document.embedding_model = embedding_model
+            document.embedding_version = embedding_version
+            document.embedding_dimensions = embedding_dimensions
+            document.embedding_generation = embedding_generation
+            document.embedding_eligible = bool(embedding_eligible)
+            document.embedding_status = embedding_status
+            document.updated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+            self.session.add(document)
+
+        existing_message_ids = set(
+            self.session.scalars(
+                select(RetrievalDocumentMessage.message_id).where(
+                    RetrievalDocumentMessage.document_id == document.id
+                )
+            )
+        )
+        for ordinal, message_id in enumerate(dict.fromkeys(source_message_ids)):
+            if message_id in existing_message_ids:
+                continue
+            self.session.add(
+                RetrievalDocumentMessage(
+                    document_id=document.id,
+                    group_id=group_id,
+                    message_id=message_id,
+                    ordinal=ordinal,
+                    role="source",
+                )
+            )
+        self._sync_fts(document)
+        return document
+
+    def list_source_message_ids(self, *, document_id: int, group_id: int) -> list[int]:
+        return list(
+            self.session.scalars(
+                select(RetrievalDocumentMessage.message_id)
+                .join(
+                    RetrievalDocument,
+                    (RetrievalDocument.id == RetrievalDocumentMessage.document_id)
+                    & (RetrievalDocument.group_id == RetrievalDocumentMessage.group_id),
+                )
+                .where(
+                    RetrievalDocumentMessage.document_id == document_id,
+                    RetrievalDocumentMessage.group_id == group_id,
+                    RetrievalDocument.group_id == group_id,
+                )
+                .order_by(RetrievalDocumentMessage.ordinal.asc())
+            )
+        )
+
+    def deactivate_episode_documents(
+        self,
+        *,
+        group_id: int,
+        episode_id: int,
+        embedding_generation: int | None = None,
+    ) -> int:
+        stmt = select(RetrievalDocument).where(
+            RetrievalDocument.group_id == int(group_id),
+            RetrievalDocument.episode_id == int(episode_id),
+            RetrievalDocument.status == "active",
+        )
+        if embedding_generation is not None:
+            stmt = stmt.where(
+                RetrievalDocument.embedding_generation == int(embedding_generation)
+            )
+        documents = list(self.session.scalars(stmt))
+        for document in documents:
+            document.status = "inactive"
+            document.embedding_status = "stale"
+            document.updated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+            self.session.add(document)
+            self._sync_fts(document)
+        _delete_active_retrieval_vectors(
+            self.session,
+            document_ids=[document.id for document in documents],
+        )
+        return len(documents)
+
+    def embedding_coverage(
+        self,
+        *,
+        group_id: int | None = None,
+        generation: int | None = None,
+    ) -> RetrievalEmbeddingCoverage:
+        filters = [
+            RetrievalDocument.status == "active",
+            RetrievalDocument.embedding_eligible.is_(True),
+        ]
+        if group_id is not None:
+            filters.append(RetrievalDocument.group_id == int(group_id))
+        if generation is not None:
+            filters.append(
+                RetrievalDocument.embedding_generation == int(generation)
+            )
+        total = int(
+            self.session.scalar(
+                select(func.count(RetrievalDocument.id)).where(*filters)
+            )
+            or 0
+        )
+        ready = int(
+            self.session.scalar(
+                select(func.count(RetrievalDocument.id)).where(
+                    *filters,
+                    RetrievalDocument.embedding_status == "ready",
+                )
+            )
+            or 0
+        )
+        failed = int(
+            self.session.scalar(
+                select(func.count(RetrievalDocument.id)).where(
+                    *filters,
+                    RetrievalDocument.embedding_status == "failed",
+                )
+            )
+            or 0
+        )
+        return RetrievalEmbeddingCoverage(
+            total_documents=total,
+            ready_documents=ready,
+            failed_documents=failed,
+        )
+
+    def search_group_documents_fts_hits(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        resolved_limit = max(1, int(limit))
+        terms = [term for term in _fts_search_terms(query) if len(term) >= 3]
+        ranked: list[tuple[int, float]] = []
+        if terms:
+            try:
+                ranked = [
+                    (int(document_id), -float(distance))
+                    for document_id, distance in self.session.execute(
+                        text(
+                            "SELECT d.id, bm25(retrieval_documents_fts) AS distance "
+                            "FROM retrieval_documents_fts "
+                            "JOIN retrieval_documents AS d "
+                            "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
+                            "AND d.group_id = :group_id "
+                            "WHERE retrieval_documents_fts MATCH :match_query "
+                            "AND retrieval_documents_fts.group_id = :group_id_text "
+                            "AND d.status = 'active' "
+                            "ORDER BY distance ASC, d.id ASC LIMIT :limit"
+                        ),
+                        {
+                            "match_query": " OR ".join(
+                                f'"{term}"' for term in terms
+                            ),
+                            "group_id": int(group_id),
+                            "group_id_text": str(int(group_id)),
+                            "limit": resolved_limit,
+                        },
+                    )
+                ]
+            except SQLAlchemyError:
+                ranked = []
+        if not ranked:
+            documents = self.search_group_documents_fts(
+                group_id=group_id,
+                query=query,
+                limit=resolved_limit,
+            )
+            ranked = [
+                (document.id, float(resolved_limit - rank))
+                for rank, document in enumerate(documents)
+            ]
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=ranked,
+        )
+
+    def search_group_documents_temporal_hits(
+        self,
+        *,
+        group_id: int,
+        start_at: datetime | None,
+        end_at: datetime | None,
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        if start_at is None and end_at is None:
+            return []
+        stmt = select(RetrievalDocument.id).where(
+            RetrievalDocument.group_id == int(group_id),
+            RetrievalDocument.status == "active",
+        )
+        if start_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.end_at
+                >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.start_at
+                < _normalize_utc_sqlite_timestamp(end_at)
+            )
+        document_ids = list(
+            self.session.scalars(
+                stmt.order_by(
+                    RetrievalDocument.end_at.desc(),
+                    RetrievalDocument.id.desc(),
+                ).limit(max(1, int(limit)))
+            )
+        )
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=[
+                (int(document_id), float(len(document_ids) - rank))
+                for rank, document_id in enumerate(document_ids)
+            ],
+        )
+
+    def search_group_documents_entity_hits(
+        self,
+        *,
+        group_id: int,
+        entities: tuple[str, ...],
+        speaker_ids: tuple[str, ...],
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        normalized_entities = tuple(
+            dict.fromkeys(value.strip() for value in entities if value.strip())
+        )[:12]
+        normalized_speaker_ids = tuple(
+            int(value)
+            for value in dict.fromkeys(speaker_ids)
+            if str(value).strip().lstrip("-").isdigit()
+        )
+        if not normalized_entities and not normalized_speaker_ids:
+            return []
+        conditions = []
+        for entity in normalized_entities:
+            conditions.extend(
+                (
+                    RetrievalDocument.content.contains(entity),
+                    RetrievalDocument.metadata_json.contains(entity),
+                )
+            )
+        identity_conditions = []
+        if normalized_speaker_ids:
+            identity_conditions.append(Message.user_id.in_(normalized_speaker_ids))
+        if normalized_entities:
+            identity_user_ids = select(User.user_id).where(
+                or_(
+                    User.nickname.in_(normalized_entities),
+                    User.group_card.in_(normalized_entities),
+                )
+            )
+            identity_conditions.append(Message.user_id.in_(identity_user_ids))
+        if identity_conditions:
+            identity_document_ids = (
+                select(RetrievalDocumentMessage.document_id)
+                .join(
+                    Message,
+                    (Message.id == RetrievalDocumentMessage.message_id)
+                    & (Message.group_id == RetrievalDocumentMessage.group_id),
+                )
+                .where(
+                    RetrievalDocumentMessage.group_id == int(group_id),
+                    Message.group_id == int(group_id),
+                    or_(*identity_conditions),
+                )
+            )
+            conditions.append(RetrievalDocument.id.in_(identity_document_ids))
+        stmt = (
+            select(RetrievalDocument.id)
+            .where(
+                RetrievalDocument.group_id == int(group_id),
+                RetrievalDocument.status == "active",
+                or_(*conditions),
+            )
+            .order_by(
+                RetrievalDocument.end_at.desc(),
+                RetrievalDocument.id.desc(),
+            )
+            .limit(max(1, int(limit)))
+        )
+        document_ids = list(self.session.scalars(stmt))
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=[
+                (int(document_id), float(len(document_ids) - rank))
+                for rank, document_id in enumerate(document_ids)
+            ],
+        )
+
+    def search_group_fact_hits(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        entities: tuple[str, ...],
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        terms = tuple(
+            dict.fromkeys(
+                [
+                    *(value.strip() for value in entities if value.strip()),
+                    *(
+                        value
+                        for value in _fts_search_terms(query)
+                        if len(value) >= 2
+                    ),
+                ]
+            )
+        )
+        stmt = (
+            select(RetrievalDocument.id)
+            .join(
+                MemoryItem,
+                MemoryItem.id
+                == func.cast(RetrievalDocument.source_id, Integer),
+            )
+            .where(
+                RetrievalDocument.group_id == int(group_id),
+                RetrievalDocument.status == "active",
+                RetrievalDocument.document_kind == "memory",
+                RetrievalDocument.source_table == "memory_items",
+                RetrievalDocument.scope_type == "group",
+                RetrievalDocument.scope_id == str(int(group_id)),
+                MemoryItem.scope_type == "group",
+                MemoryItem.scope_id == str(int(group_id)),
+                MemoryItem.status.in_(("active", "superseded")),
+            )
+        )
+        if terms:
+            stmt = stmt.where(
+                or_(
+                    *(
+                        RetrievalDocument.content.contains(term)
+                        for term in terms
+                    )
+                )
+            )
+        document_ids = list(
+            self.session.scalars(
+                stmt.order_by(
+                    (MemoryItem.status == "active").desc(),
+                    RetrievalDocument.end_at.desc(),
+                    RetrievalDocument.id.desc(),
+                ).limit(max(1, int(limit)))
+            )
+        )
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=[
+                (int(document_id), float(len(document_ids) - rank))
+                for rank, document_id in enumerate(document_ids)
+            ],
+        )
+
+    def search_group_reference_hits(
+        self,
+        *,
+        group_id: int,
+        reference_msg_ids: tuple[str, ...],
+        include_replies: bool,
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        references = tuple(
+            dict.fromkeys(value.strip() for value in reference_msg_ids if value.strip())
+        )
+        if not references:
+            return []
+        reference_condition = (
+            Message.reply_to_msg_id.in_(references)
+            if include_replies
+            else Message.platform_msg_id.in_(references)
+        )
+        document_ids = list(
+            self.session.scalars(
+                select(RetrievalDocument.id)
+                .join(
+                    RetrievalDocumentMessage,
+                    (RetrievalDocumentMessage.document_id == RetrievalDocument.id)
+                    & (RetrievalDocumentMessage.group_id == RetrievalDocument.group_id),
+                )
+                .join(
+                    Message,
+                    (Message.id == RetrievalDocumentMessage.message_id)
+                    & (Message.group_id == RetrievalDocumentMessage.group_id),
+                )
+                .where(
+                    RetrievalDocument.group_id == int(group_id),
+                    RetrievalDocument.status == "active",
+                    RetrievalDocumentMessage.group_id == int(group_id),
+                    Message.group_id == int(group_id),
+                    reference_condition,
+                )
+                .distinct()
+                .order_by(
+                    RetrievalDocument.end_at.desc(),
+                    RetrievalDocument.id.desc(),
+                )
+                .limit(max(1, int(limit)))
+            )
+        )
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=[
+                (int(document_id), float(len(document_ids) - rank))
+                for rank, document_id in enumerate(document_ids)
+            ],
+        )
+
+    def search_group_documents_vector_hits(
+        self,
+        *,
+        group_id: int,
+        embedding: list[float],
+        provider: str,
+        model: str,
+        dimensions: int,
+        version: str,
+        limit: int,
+    ) -> list[RetrievalDocumentHit]:
+        if len(embedding) != int(dimensions):
+            raise ValueError("query embedding dimensions are incompatible")
+        state = self.session.scalars(
+            select(RetrievalIndexState)
+            .where(
+                RetrievalIndexState.channel == "vector",
+                RetrievalIndexState.is_active.is_(True),
+                RetrievalIndexState.status == "ready",
+                RetrievalIndexState.provider == str(provider),
+                RetrievalIndexState.model == str(model),
+                RetrievalIndexState.dimensions == int(dimensions),
+                RetrievalIndexState.version == str(version),
+            )
+            .limit(1)
+        ).first()
+        if state is None:
+            return []
+        physical_table = validate_retrieval_vector_table_name(
+            state.physical_table,
+            generation=state.generation,
+        )
+        ranked = [
+            (int(document_id), -float(distance))
+            for document_id, distance in self.session.execute(
+                text(
+                    "SELECT document_id, distance "
+                    f"FROM {physical_table} "
+                    "WHERE embedding MATCH :embedding "
+                    "AND group_id = :group_id AND k = :limit"
+                ),
+                {
+                    "embedding": json.dumps(
+                        [float(value) for value in embedding],
+                        separators=(",", ":"),
+                    ),
+                    "group_id": int(group_id),
+                    "limit": max(1, int(limit)),
+                },
+            )
+        ]
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=ranked,
+        )
+
+    def _validated_hits(
+        self,
+        *,
+        group_id: int,
+        ranked_document_ids: list[tuple[int, float]],
+    ) -> list[RetrievalDocumentHit]:
+        if not ranked_document_ids:
+            return []
+        ordered_ids = list(
+            dict.fromkeys(int(document_id) for document_id, _ in ranked_document_ids)
+        )
+        documents = {
+            document.id: document
+            for document in self.session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.id.in_(ordered_ids),
+                    RetrievalDocument.group_id == int(group_id),
+                    RetrievalDocument.status == "active",
+                )
+            )
+        }
+        all_counts = {
+            int(document_id): int(count)
+            for document_id, count in self.session.execute(
+                select(
+                    RetrievalDocumentMessage.document_id,
+                    func.count(),
+                )
+                .where(RetrievalDocumentMessage.document_id.in_(ordered_ids))
+                .group_by(RetrievalDocumentMessage.document_id)
+            )
+        }
+        source_rows = list(
+            self.session.execute(
+                select(
+                    RetrievalDocumentMessage.document_id,
+                    RetrievalDocumentMessage.group_id,
+                    Message.group_id,
+                    Message.platform_msg_id,
+                    RetrievalDocumentMessage.ordinal,
+                )
+                .join(
+                    RetrievalDocument,
+                    (RetrievalDocument.id == RetrievalDocumentMessage.document_id)
+                    & (
+                        RetrievalDocument.group_id
+                        == RetrievalDocumentMessage.group_id
+                    ),
+                )
+                .join(
+                    Message,
+                    (Message.id == RetrievalDocumentMessage.message_id)
+                    & (Message.group_id == RetrievalDocumentMessage.group_id),
+                )
+                .where(
+                    RetrievalDocumentMessage.document_id.in_(ordered_ids),
+                    RetrievalDocumentMessage.group_id == int(group_id),
+                    RetrievalDocument.group_id == int(group_id),
+                    Message.group_id == int(group_id),
+                )
+                .order_by(
+                    RetrievalDocumentMessage.document_id.asc(),
+                    RetrievalDocumentMessage.ordinal.asc(),
+                    RetrievalDocumentMessage.message_id.asc(),
+                )
+            )
+        )
+        sources: dict[int, list[str]] = {}
+        for (
+            document_id,
+            provenance_group_id,
+            message_group_id,
+            platform_msg_id,
+            _ordinal,
+        ) in source_rows:
+            if (
+                int(provenance_group_id) != int(group_id)
+                or int(message_group_id) != int(group_id)
+            ):
+                raise ValueError("retrieval provenance failed group validation")
+            sources.setdefault(int(document_id), []).append(str(platform_msg_id))
+        score_by_id = {
+            int(document_id): float(score)
+            for document_id, score in ranked_document_ids
+        }
+        hits: list[RetrievalDocumentHit] = []
+        for document_id in ordered_ids:
+            document = documents.get(document_id)
+            if document is None:
+                continue
+            source_msg_ids = tuple(dict.fromkeys(sources.get(document_id, ())))
+            if not source_msg_ids or len(sources.get(document_id, ())) != all_counts.get(
+                document_id,
+                0,
+            ):
+                raise ValueError("retrieval provenance is incomplete or unscoped")
+            hits.append(
+                RetrievalDocumentHit(
+                    document_id=document.id,
+                    group_id=document.group_id,
+                    document_kind=document.document_kind,
+                    episode_id=document.episode_id,
+                    source_msg_ids=source_msg_ids,
+                    start_at=document.start_at,
+                    end_at=document.end_at,
+                    score=score_by_id[document_id],
+                )
+            )
+        return hits
+
+    def search_group_documents_fts(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        limit: int,
+    ) -> list[RetrievalDocument]:
+        resolved_limit = max(1, int(limit))
+        terms = [term for term in _fts_search_terms(query) if len(term) >= 3]
+        if terms:
+            try:
+                rows = self.session.execute(
+                    text(
+                        "SELECT d.id FROM retrieval_documents_fts "
+                        "JOIN retrieval_documents AS d "
+                        "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
+                        "WHERE retrieval_documents_fts MATCH :match_query "
+                        "AND retrieval_documents_fts.group_id = :group_id "
+                        "AND d.group_id = :group_id_int AND d.status = 'active' "
+                        "ORDER BY bm25(retrieval_documents_fts), d.id ASC LIMIT :limit"
+                    ),
+                    {
+                        "match_query": " OR ".join(f'"{term}"' for term in terms),
+                        "group_id": str(group_id),
+                        "group_id_int": group_id,
+                        "limit": resolved_limit,
+                    },
+                ).scalars()
+                document_ids = [int(document_id) for document_id in rows]
+                if document_ids:
+                    documents = {
+                        document.id: document
+                        for document in self.session.scalars(
+                            select(RetrievalDocument).where(
+                                RetrievalDocument.id.in_(document_ids),
+                                RetrievalDocument.group_id == group_id,
+                                RetrievalDocument.status == "active",
+                            )
+                        )
+                    }
+                    return [
+                        documents[document_id]
+                        for document_id in document_ids
+                        if document_id in documents
+                    ]
+            except SQLAlchemyError:
+                # FTS is optional. The canonical group-scoped LIKE fallback
+                # preserves availability without weakening isolation.
+                pass
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return []
+        return list(
+            self.session.scalars(
+                select(RetrievalDocument)
+                .where(
+                    RetrievalDocument.group_id == group_id,
+                    RetrievalDocument.status == "active",
+                    RetrievalDocument.content.contains(normalized_query),
+                )
+                .order_by(RetrievalDocument.start_at.desc(), RetrievalDocument.id.desc())
+                .limit(resolved_limit)
+            )
+        )
+
+    def _sync_fts(self, document: RetrievalDocument) -> None:
+        try:
+            self.session.execute(
+                text(
+                    "DELETE FROM retrieval_documents_fts "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": str(document.id)},
+            )
+            if document.status != "active":
+                return
+            self.session.execute(
+                text(
+                    "INSERT INTO retrieval_documents_fts "
+                    "(content, group_id, document_id, content_hash) "
+                    "VALUES (:content, :group_id, :document_id, :content_hash)"
+                ),
+                {
+                    "content": document.content,
+                    "group_id": str(document.group_id),
+                    "document_id": str(document.id),
+                    "content_hash": document.content_hash,
+                },
+            )
+        except SQLAlchemyError:
+            return
+
+
+class RetrievalIndexStateRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_generation(
+        self,
+        *,
+        channel: str,
+        generation: int,
+        physical_table: str,
+        provider: str,
+        model: str,
+        dimensions: int | None,
+        version: str,
+        status: str,
+        total_documents: int,
+        indexed_documents: int,
+    ) -> RetrievalIndexState:
+        if channel == "vector":
+            validate_retrieval_vector_table_name(
+                physical_table,
+                generation=generation,
+            )
+            if dimensions is None or int(dimensions) <= 0:
+                raise ValueError("vector generation dimensions are required")
+        state = self.session.scalars(
+            select(RetrievalIndexState).where(
+                RetrievalIndexState.channel == channel,
+                RetrievalIndexState.generation == generation,
+            )
+        ).first()
+        if state is None:
+            state = RetrievalIndexState(
+                channel=channel,
+                generation=generation,
+                physical_table=physical_table,
+            )
+        elif channel == "vector":
+            persisted_identity = (
+                state.physical_table,
+                state.provider,
+                state.model,
+                state.dimensions,
+                state.version,
+            )
+            requested_identity = (
+                physical_table,
+                provider,
+                model,
+                dimensions,
+                version,
+            )
+            if persisted_identity != requested_identity:
+                raise ValueError("vector generation identity is immutable")
+        state.provider = provider
+        state.model = model
+        state.dimensions = dimensions
+        state.version = version
+        state.status = status
+        state.total_documents = max(0, int(total_documents))
+        state.indexed_documents = max(0, int(indexed_documents))
+        state.updated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        self.session.add(state)
+        self.session.flush()
+        return state
+
+    def get_active_generation(self, *, channel: str) -> RetrievalIndexState | None:
+        return self.session.scalars(
+            select(RetrievalIndexState)
+            .where(
+                RetrievalIndexState.channel == channel,
+                RetrievalIndexState.is_active.is_(True),
+            )
+            .limit(1)
+        ).first()
+
+    def activate_generation(
+        self,
+        *,
+        channel: str,
+        generation: int,
+        expected_active_generation: int | None,
+    ) -> bool:
+        target = self.session.scalars(
+            select(RetrievalIndexState).where(
+                RetrievalIndexState.channel == channel,
+                RetrievalIndexState.generation == generation,
+                RetrievalIndexState.status == "ready",
+            )
+        ).first()
+        if target is None:
+            return False
+        if channel == "vector":
+            validate_retrieval_vector_table_name(
+                target.physical_table,
+                generation=target.generation,
+            )
+            if int(target.total_documents or 0) != int(
+                target.indexed_documents or 0
+            ):
+                return False
+        activated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        if expected_active_generation is None:
+            result = self.session.execute(
+                text(
+                    "UPDATE retrieval_index_state "
+                    "SET is_active = 1, activated_at = :activated_at, updated_at = :activated_at "
+                    "WHERE channel = :channel AND generation = :generation AND status = 'ready' "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM retrieval_index_state AS active "
+                    "WHERE active.channel = :channel AND active.is_active = 1"
+                    ")"
+                ),
+                {
+                    "channel": channel,
+                    "generation": generation,
+                    "activated_at": activated_at,
+                },
+            )
+            self.session.expire_all()
+            return int(result.rowcount or 0) == 1
+
+        if expected_active_generation == generation:
+            active = self.get_active_generation(channel=channel)
+            return active is not None and active.generation == generation
+
+        deactivated = self.session.execute(
+            text(
+                "UPDATE retrieval_index_state SET is_active = 0 "
+                "WHERE channel = :channel AND generation = :expected_generation "
+                "AND is_active = 1"
+            ),
+            {
+                "channel": channel,
+                "expected_generation": expected_active_generation,
+            },
+        )
+        if int(deactivated.rowcount or 0) != 1:
+            return False
+        activated = self.session.execute(
+            text(
+                "UPDATE retrieval_index_state "
+                "SET is_active = 1, activated_at = :activated_at, updated_at = :activated_at "
+                "WHERE channel = :channel AND generation = :generation AND status = 'ready'"
+            ),
+            {
+                "channel": channel,
+                "generation": generation,
+                "activated_at": activated_at,
+            },
+        )
+        if int(activated.rowcount or 0) != 1:
+            raise RuntimeError("ready retrieval generation disappeared during activation")
+        self.session.expire_all()
+        return True
+
+
+class MemoryBackfillRunRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_run(
+        self,
+        *,
+        run_key: str,
+        snapshot_watermarks: dict[str, int],
+        manifest: dict[str, Any],
+        segmentation_generation: str,
+        compaction_generation: str,
+        index_generation: str,
+        created_at: datetime,
+    ) -> MemoryBackfillRun:
+        frozen_watermarks = {
+            str(group_id): int(watermark)
+            for group_id, watermark in snapshot_watermarks.items()
+        }
+        self.session.execute(
+            text(
+                "INSERT OR IGNORE INTO memory_backfill_runs ("
+                "run_key, status, snapshot_watermarks_json, manifest_json, "
+                "segmentation_generation, compaction_generation, index_generation, "
+                "created_at, last_error_code"
+                ") VALUES ("
+                ":run_key, 'pending', :snapshot_watermarks_json, :manifest_json, "
+                ":segmentation_generation, :compaction_generation, :index_generation, "
+                ":created_at, ''"
+                ")"
+            ),
+            {
+                "run_key": run_key,
+                "snapshot_watermarks_json": json.dumps(frozen_watermarks),
+                "manifest_json": json.dumps(manifest),
+                "segmentation_generation": segmentation_generation,
+                "compaction_generation": compaction_generation,
+                "index_generation": index_generation,
+                "created_at": _normalize_utc_sqlite_timestamp(created_at),
+            },
+        )
+        self.session.expire_all()
+        run = self.session.scalars(
+            select(MemoryBackfillRun).where(MemoryBackfillRun.run_key == run_key)
+        ).first()
+        if run is None:
+            raise RuntimeError("backfill run upsert did not return a persisted row")
+        return run
+
+    def get_run(self, *, run_id: int) -> MemoryBackfillRun | None:
+        return self.session.get(MemoryBackfillRun, run_id)
+
+    def update_status(
+        self,
+        *,
+        run_id: int,
+        status: str,
+        completed_at: datetime | None,
+        last_error_code: str,
+    ) -> MemoryBackfillRun | None:
+        run = self.session.get(MemoryBackfillRun, run_id)
+        if run is None:
+            return None
+        run.status = status
+        run.completed_at = (
+            _normalize_utc_sqlite_timestamp(completed_at)
+            if completed_at is not None
+            else None
+        )
+        run.last_error_code = str(last_error_code or "")[:96]
+        self.session.add(run)
+        return run
+
+
 class JobRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -1252,6 +2873,266 @@ class JobRepository:
         self.session.flush()
         return job
 
+    def enqueue_coalescing_job(
+        self,
+        *,
+        job_type: str,
+        job_key: str,
+        payload_json: dict[str, Any],
+        run_at: datetime,
+        backfill_run_id: int | None = None,
+        target_generation: str = "",
+        max_attempts: int = 3,
+    ) -> Job:
+        if not job_key:
+            raise ValueError("coalescing jobs require a stable job_key")
+        job_id = self.session.execute(
+            text(
+                "INSERT INTO jobs ("
+                "job_type, job_key, payload_json, status, run_at, "
+                "requested_generation, processed_generation, claimed_generation, "
+                "backfill_run_id, target_generation, max_attempts"
+                ") VALUES ("
+                ":job_type, :job_key, :payload_json, 'queued', :run_at, 1, 0, 0, "
+                ":backfill_run_id, :target_generation, :max_attempts"
+                ") ON CONFLICT(job_type, job_key) WHERE job_key <> '' DO UPDATE SET "
+                "requested_generation = jobs.requested_generation + 1, "
+                "payload_json = excluded.payload_json, "
+                "backfill_run_id = coalesce("
+                "excluded.backfill_run_id, jobs.backfill_run_id), "
+                "target_generation = CASE WHEN excluded.target_generation <> '' "
+                "THEN excluded.target_generation ELSE jobs.target_generation END, "
+                "max_attempts = excluded.max_attempts, "
+                "status = CASE WHEN jobs.status = 'running' THEN 'running' ELSE 'queued' END, "
+                "run_at = CASE WHEN jobs.status = 'running' THEN jobs.run_at ELSE excluded.run_at END, "
+                "completed_at = NULL, last_error_code = '' "
+                "RETURNING id"
+            ),
+            {
+                "job_type": job_type,
+                "job_key": job_key,
+                "payload_json": json.dumps(payload_json),
+                "run_at": _normalize_utc_sqlite_timestamp(run_at),
+                "backfill_run_id": backfill_run_id,
+                "target_generation": str(target_generation or ""),
+                "max_attempts": max(1, int(max_attempts)),
+            },
+        ).scalar_one()
+        self.session.expire_all()
+        job = self.session.get(Job, int(job_id))
+        if job is None:
+            raise RuntimeError("coalescing job upsert did not return a persisted row")
+        return job
+
+    def claim_coalescing_job(
+        self,
+        *,
+        job_type: str,
+        worker_id: str,
+        now: datetime,
+        lease_seconds: int,
+        target_generation: str | None = None,
+        include_derived_generations: bool = False,
+    ) -> Job | None:
+        claimed_at = _normalize_utc_sqlite_timestamp(now)
+        lease_until = _normalize_utc_sqlite_timestamp(
+            now + timedelta(seconds=max(1, int(lease_seconds)))
+        )
+        generation_predicate = ""
+        parameters: dict[str, Any] = {
+            "job_type": job_type,
+            "worker_id": worker_id,
+            "claimed_at": claimed_at,
+            "lease_until": lease_until,
+        }
+        if target_generation is not None:
+            parameters["target_generation"] = str(target_generation)
+            if include_derived_generations:
+                parameters["derived_generation_pattern"] = (
+                    f"{str(target_generation)}:late:%"
+                )
+                generation_predicate = (
+                    "AND (target_generation = :target_generation "
+                    "OR target_generation LIKE :derived_generation_pattern) "
+                )
+            else:
+                generation_predicate = (
+                    "AND target_generation = :target_generation "
+                )
+        job_id = self.session.execute(
+            text(
+                "UPDATE jobs SET "
+                "status = 'running', locked_by = :worker_id, locked_at = :claimed_at, "
+                "lease_until = :lease_until, claimed_generation = requested_generation "
+                "WHERE id = ("
+                "SELECT id FROM jobs "
+                "WHERE job_type = :job_type AND status = 'queued' AND run_at <= :claimed_at "
+                f"{generation_predicate}"
+                "ORDER BY run_at ASC, id ASC LIMIT 1"
+                ") AND status = 'queued' RETURNING id"
+            ),
+            parameters,
+        ).scalar_one_or_none()
+        if job_id is None:
+            return None
+        self.session.expire_all()
+        return self.session.get(Job, int(job_id))
+
+    def complete_coalescing_job(
+        self,
+        *,
+        job_id: int,
+        worker_id: str,
+        claimed_generation: int,
+        now: datetime,
+    ) -> Job | None:
+        completed_at = _normalize_utc_sqlite_timestamp(now)
+        completed_id = self.session.execute(
+            text(
+                "UPDATE jobs SET "
+                "processed_generation = CASE "
+                "WHEN processed_generation < :claimed_generation THEN :claimed_generation "
+                "ELSE processed_generation END, "
+                "status = CASE "
+                "WHEN requested_generation = :claimed_generation THEN 'completed' "
+                "ELSE 'queued' END, "
+                "run_at = CASE "
+                "WHEN requested_generation = :claimed_generation THEN run_at "
+                "ELSE :completed_at END, "
+                "completed_at = CASE "
+                "WHEN requested_generation = :claimed_generation THEN :completed_at "
+                "ELSE NULL END, "
+                "locked_by = NULL, locked_at = NULL, lease_until = NULL "
+                "WHERE id = :job_id AND status = 'running' "
+                "AND locked_by = :worker_id AND claimed_generation = :claimed_generation "
+                "RETURNING id"
+            ),
+            {
+                "job_id": job_id,
+                "worker_id": worker_id,
+                "claimed_generation": claimed_generation,
+                "completed_at": completed_at,
+            },
+        ).scalar_one_or_none()
+        if completed_id is None:
+            return None
+        self.session.expire_all()
+        return self.session.get(Job, int(completed_id))
+
+    def fail_coalescing_job(
+        self,
+        *,
+        job_id: int,
+        worker_id: str,
+        claimed_generation: int,
+        error_code: str,
+        now: datetime,
+        retry_at: datetime,
+    ) -> Job | None:
+        failed_id = self.session.execute(
+            text(
+                "UPDATE jobs SET "
+                "attempt_count = attempt_count + 1, "
+                "status = CASE WHEN attempt_count + 1 >= max_attempts "
+                "THEN 'failed' ELSE 'queued' END, "
+                "run_at = CASE WHEN attempt_count + 1 >= max_attempts "
+                "THEN run_at ELSE :retry_at END, "
+                "last_error_code = :error_code, "
+                "completed_at = CASE WHEN attempt_count + 1 >= max_attempts "
+                "THEN :failed_at ELSE NULL END, "
+                "locked_by = NULL, locked_at = NULL, lease_until = NULL "
+                "WHERE id = :job_id AND status = 'running' "
+                "AND locked_by = :worker_id "
+                "AND claimed_generation = :claimed_generation "
+                "RETURNING id"
+            ),
+            {
+                "job_id": int(job_id),
+                "worker_id": str(worker_id),
+                "claimed_generation": int(claimed_generation),
+                "error_code": str(error_code or "")[:96],
+                "retry_at": _normalize_utc_sqlite_timestamp(retry_at),
+                "failed_at": _normalize_utc_sqlite_timestamp(now),
+            },
+        ).scalar_one_or_none()
+        if failed_id is None:
+            return None
+        self.session.expire_all()
+        return self.session.get(Job, int(failed_id))
+
+    def update_coalescing_job_payload(
+        self,
+        *,
+        job_id: int,
+        worker_id: str,
+        claimed_generation: int,
+        payload_json: dict[str, Any],
+    ) -> Job | None:
+        updated_id = self.session.execute(
+            text(
+                "UPDATE jobs SET payload_json = :payload_json "
+                "WHERE id = :job_id AND status = 'running' "
+                "AND locked_by = :worker_id "
+                "AND claimed_generation = :claimed_generation "
+                "RETURNING id"
+            ),
+            {
+                "job_id": int(job_id),
+                "worker_id": str(worker_id),
+                "claimed_generation": int(claimed_generation),
+                "payload_json": json.dumps(payload_json),
+            },
+        ).scalar_one_or_none()
+        if updated_id is None:
+            return None
+        self.session.expire_all()
+        return self.session.get(Job, int(updated_id))
+
+    def retry_failed_coalescing_job(
+        self,
+        *,
+        job_id: int,
+        run_at: datetime,
+        reset_attempts: bool = True,
+    ) -> Job | None:
+        result = self.session.execute(
+            text(
+                "UPDATE jobs SET status = 'queued', run_at = :run_at, "
+                "attempt_count = CASE WHEN :reset_attempts THEN 0 ELSE attempt_count END, "
+                "last_error_code = '', completed_at = NULL, "
+                "locked_by = NULL, locked_at = NULL, lease_until = NULL "
+                "WHERE id = :job_id AND status = 'failed' RETURNING id"
+            ),
+            {
+                "job_id": int(job_id),
+                "run_at": _normalize_utc_sqlite_timestamp(run_at),
+                "reset_attempts": bool(reset_attempts),
+            },
+        ).scalar_one_or_none()
+        if result is None:
+            return None
+        self.session.expire_all()
+        return self.session.get(Job, int(result))
+
+    def requeue_stale_coalescing_jobs(
+        self,
+        *,
+        job_type: str,
+        now: datetime,
+    ) -> int:
+        stale_before = _normalize_utc_sqlite_timestamp(now)
+        result = self.session.execute(
+            text(
+                "UPDATE jobs SET status = 'queued', run_at = :stale_before, "
+                "locked_by = NULL, locked_at = NULL, lease_until = NULL "
+                "WHERE job_type = :job_type AND status = 'running' "
+                "AND lease_until IS NOT NULL AND lease_until <= :stale_before"
+            ),
+            {"job_type": job_type, "stale_before": stale_before},
+        )
+        self.session.expire_all()
+        return int(result.rowcount or 0)
+
     def count_active_jobs(self, *, job_type: str, statuses: list[str] | None = None) -> int:
         active_statuses = statuses or ["queued", "running"]
         stmt = select(func.count(Job.id)).where(Job.job_type == job_type, Job.status.in_(active_statuses))
@@ -1274,7 +3155,9 @@ class JobRepository:
         )
         job_id = self.session.execute(
             text(
-                "UPDATE jobs SET status = 'running', run_at = :lease_until WHERE id = ("
+                "UPDATE jobs SET status = 'running', run_at = :lease_until, "
+                "locked_by = 'legacy-worker', locked_at = :run_before, lease_until = :lease_until "
+                "WHERE id = ("
                 "SELECT id FROM jobs WHERE job_type = :job_type AND status = 'queued' AND run_at <= :run_before "
                 "ORDER BY id ASC LIMIT 1"
                 ") AND status = 'queued' RETURNING id"
@@ -1325,12 +3208,15 @@ class JobRepository:
                 select(Job).where(
                     Job.job_type == job_type,
                     Job.status == "running",
-                    Job.run_at <= stale_before,
+                    func.coalesce(Job.lease_until, Job.run_at) <= stale_before,
                 )
             )
         )
         for job in jobs:
             job.status = "queued"
+            job.locked_by = None
+            job.locked_at = None
+            job.lease_until = None
             self.session.add(job)
         return len(jobs)
 

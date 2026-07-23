@@ -18,6 +18,9 @@ data/generated_images/
 data/generated_private_images/
 data/image_cache/
 data/logs/
+data/memory_eval/
+data/models/
+data/backups/
 data/napcat/
 .codex_tmp*/
 .tmp*/

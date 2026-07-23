@@ -4,7 +4,8 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import json
-from threading import Barrier
+from threading import Barrier, Event
+from time import perf_counter
 
 import pytest
 
@@ -23,6 +24,35 @@ class FakeCompactionLlm:
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+class FakeBackgroundService:
+    def __init__(self, *, enqueue_error: Exception | None = None) -> None:
+        self.enqueue_error = enqueue_error
+        self.started = 0
+        self.stopped = 0
+        self.woken = 0
+        self.enqueued: list[dict] = []
+        self.late_enqueued: list[dict] = []
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def wake(self) -> None:
+        self.woken += 1
+
+    def enqueue_message(self, **kwargs):
+        self.enqueued.append(kwargs)
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
+        return object()
+
+    def enqueue_late_arrival(self, **kwargs):
+        self.late_enqueued.append(kwargs)
+        return object()
 
 
 def _seed_messages(engine, *, count: int = 10) -> None:
@@ -305,3 +335,124 @@ def test_fresh_running_job_is_not_requeued_before_lease_expires(sqlite_engine) -
     with session_scope(sqlite_engine) as session:
         running = JobRepository(session).list_jobs(job_type="memory_compaction", statuses=["running"])
     assert [job.job_key for job in running] == ["leased-job"]
+
+
+@pytest.mark.asyncio
+async def test_v1_service_lifecycle_also_drives_optional_background_worker(
+    sqlite_engine,
+) -> None:
+    background = FakeBackgroundService()
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        backfill_windows=0,
+        background_service=background,
+    )
+
+    await service.start()
+    await service.wake()
+    await service.stop()
+
+    assert background.started == 1
+    assert background.woken >= 1
+    assert background.stopped == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_only_lifecycle_does_not_start_legacy_compaction_worker(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    background = FakeBackgroundService()
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        backfill_windows=24,
+        background_service=background,
+        legacy_enabled=False,
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepare_jobs",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy prepare ran")),
+    )
+
+    await service.start()
+    await service.wake()
+    await service.stop()
+
+    assert service._worker_task is None
+    assert background.started == 1
+    assert background.woken >= 1
+    assert background.stopped == 1
+
+
+def test_episode_enqueue_failure_is_best_effort_and_does_not_escape_reply_path(
+    sqlite_engine,
+) -> None:
+    background = FakeBackgroundService(enqueue_error=RuntimeError("storage down"))
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        backfill_windows=0,
+        background_service=background,
+    )
+
+    result = service.enqueue_episode_allocation(
+        group_id=10001,
+        message_id=99,
+        now=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+    )
+
+    assert result is None
+    assert background.enqueued[0]["group_id"] == 10001
+    assert background.enqueued[0]["message_id"] == 99
+
+
+@pytest.mark.asyncio
+async def test_shadow_enqueue_is_off_reply_path_and_drained_on_stop(sqlite_engine) -> None:
+    background = FakeBackgroundService()
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        backfill_windows=0,
+        background_service=background,
+        shadow_enabled=True,
+    )
+    entered = Event()
+    release = Event()
+    await service.start()
+
+    def blocking_enqueue() -> None:
+        entered.set()
+        release.wait(timeout=2)
+
+    started = perf_counter()
+    assert await asyncio.to_thread(service.submit_shadow_enqueue, blocking_enqueue)
+    assert perf_counter() - started < 0.1
+    assert await asyncio.to_thread(entered.wait, 1)
+    release.set()
+    await service.stop()
+    assert not service._shadow_futures
+
+
+def test_late_episode_enqueue_uses_resegmentation_path(sqlite_engine) -> None:
+    background = FakeBackgroundService()
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        backfill_windows=0,
+        background_service=background,
+    )
+    message_timestamp = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+
+    result = service.enqueue_episode_allocation(
+        group_id=10001,
+        message_id=99,
+        now=message_timestamp,
+        late_arrival=True,
+    )
+
+    assert result is not None
+    assert background.enqueued == []
+    assert background.late_enqueued[0]["message_timestamp"] == message_timestamp

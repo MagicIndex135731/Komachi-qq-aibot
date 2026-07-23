@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "full backend quality checklist"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "test migration deployment verification"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "database integrity and migration review"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "sensitive information review"}
+{"file": ".trellis/tasks/07-23-memory-orchestration-v2/research/query-retrieval-context.md", "reason": "compatibility and fallback review evidence"}

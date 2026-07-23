@@ -8,7 +8,10 @@ from sqlalchemy import select
 
 from app.adapters.onebot_models import GroupMessageEvent
 from app.adapters.sender import QQMessageBlockedError
+from app.core.legacy_memory_context import LegacyMemoryPromptContext
 from app.core.message_content import ImageAttachment
+from app.core.memory_context_packer import PackedMemoryContext
+from app.core.memory_orchestrator import MemoryContextResult, MemoryOrchestrator
 import app.core.router as router_module
 from app.core.router import InboundRouter
 from app.core.reply_policy import ReplyDecision
@@ -2568,6 +2571,114 @@ async def test_router_uses_bounded_relevant_older_history_when_full_history_is_d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("v2_enabled", "shadow_mode", "expected_marker", "expected_calls"),
+    [
+        (False, False, "legacy-marker", ["legacy"]),
+        (True, True, "legacy-marker", ["legacy", "shadow:orchestrated-memory-target"]),
+        (True, False, "v2-marker", ["v2"]),
+    ],
+)
+async def test_router_uses_memory_orchestrator_for_disabled_shadow_and_active_modes(
+    sqlite_engine,
+    v2_enabled,
+    shadow_mode,
+    expected_marker,
+    expected_calls,
+) -> None:
+    calls: list[str] = []
+    provider_requests: list[object] = []
+
+    def result(request, marker: str, mode: str) -> MemoryContextResult:
+        if mode == "v2":
+            packed_context = PackedMemoryContext(
+                mode="normal",
+                budget=100,
+                estimated_tokens=2,
+                text=marker,
+            )
+        else:
+            packed_context = LegacyMemoryPromptContext(
+                recent_messages=[],
+                full_history_messages=[],
+                full_history_preamble=[],
+                full_history_enabled=False,
+                member_focus_lines=[],
+                summaries=[],
+                relevant_history_messages=[marker],
+                memories=[],
+                history_detail=False,
+            )
+        return MemoryContextResult(
+            group_id=request.group_id,
+            packed_context=packed_context,
+            selected_source_msg_ids=(f"{mode}-source",),
+            estimated_tokens=2,
+            mode=mode,
+        )
+
+    def v2_provider(request):
+        calls.append("v2")
+        provider_requests.append(request)
+        return result(request, "v2-marker", "v2")
+
+    def legacy_provider(request):
+        calls.append("legacy")
+        provider_requests.append(request)
+        return result(request, "legacy-marker", "v1")
+
+    orchestrator = MemoryOrchestrator(
+        v2_enabled=v2_enabled,
+        shadow_mode=shadow_mode,
+        v2_provider=v2_provider,
+        legacy_provider=legacy_provider,
+        recent_provider=lambda request: calls.append("recent") or result(request, "recent-marker", "recent"),
+        shadow_enqueue=lambda request: calls.append(f"shadow:{request.current_msg_id}"),
+    )
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        memory_orchestrator=orchestrator,
+    )
+    captured_context_builds: list[dict] = []
+    original_build = router.context_builder.build
+
+    def capture_context_build(**kwargs):
+        captured_context_builds.append(kwargs)
+        return original_build(**kwargs)
+
+    router.context_builder.build = capture_context_build
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="orchestrated-memory-target",
+            plain_text="@Mira remember this",
+        )
+    )
+
+    prompt = "\n".join(llm.calls[-1])
+    assert expected_marker in prompt
+    assert ({"legacy-marker", "v2-marker", "recent-marker"} - {expected_marker}).isdisjoint(prompt.split())
+    assert ("Packed memory context" in prompt) is (expected_marker == "v2-marker")
+    assert isinstance(
+        captured_context_builds[-1]["packed_memory_context"],
+        PackedMemoryContext,
+    ) is (expected_marker == "v2-marker")
+    assert provider_requests[0].query == "@Mira remember this"
+    assert provider_requests[0].target_message_id == "orchestrated-memory-target"
+    assert all(
+        message.group_id == 10001 for message in provider_requests[0].recent_messages
+    )
+    assert provider_requests[0].available_input > 0
+    assert calls == expected_calls
+
+
+@pytest.mark.asyncio
 async def test_router_fallback_marks_delivered_reply_visible_for_cooldown(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = FakeLlm()
@@ -3873,3 +3984,91 @@ async def test_router_sends_local_fallback_when_image_context_exists_but_vision_
 
     assert [outbound.text for outbound in sender.sent] == ["我这边这路模型现在还看不了图，得换支持识图的模型才行。"]
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_enqueues_persisted_inbound_message_for_episode_allocation(sqlite_engine) -> None:
+    class BackgroundAwareCompaction:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+            self.wake_count = 0
+
+        def enqueue_episode_allocation(self, **kwargs):
+            self.enqueued.append(kwargs)
+
+        async def wake(self) -> None:
+            self.wake_count += 1
+
+    service = BackgroundAwareCompaction()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_compaction_service=service,
+    )
+    event = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="episode-enqueue-inbound-1",
+        plain_text="普通群消息",
+        timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+    )
+
+    await router.handle_group_message(event)
+
+    with session_scope(sqlite_engine) as session:
+        row = MessageRepository(session).get_by_platform_msg_id(event.platform_msg_id)
+        assert row is not None
+        expected_id = row.id
+    assert service.enqueued == [
+        {
+                "group_id": 10001,
+                "message_id": expected_id,
+                "now": event.timestamp,
+                "late_arrival": False,
+            }
+        ]
+    assert service.wake_count == 1
+
+
+@pytest.mark.asyncio
+async def test_router_marks_out_of_order_timestamp_as_late_arrival(
+    sqlite_engine,
+) -> None:
+    class BackgroundAwareCompaction:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def enqueue_episode_allocation(self, **kwargs):
+            self.enqueued.append(kwargs)
+
+        async def wake(self) -> None:
+            return None
+
+    service = BackgroundAwareCompaction()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_compaction_service=service,
+    )
+    newer = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="episode-newer",
+        plain_text="newer",
+        timestamp=datetime(2026, 5, 9, 12, 30, tzinfo=UTC),
+    )
+    late = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="episode-late",
+        plain_text="late",
+        timestamp=datetime(2026, 5, 9, 12, 10, tzinfo=UTC),
+    )
+
+    await router.handle_group_message(newer)
+    await router.handle_group_message(late)
+
+    assert service.enqueued[0]["late_arrival"] is False
+    assert service.enqueued[1]["late_arrival"] is True

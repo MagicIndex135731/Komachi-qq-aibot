@@ -1,0 +1,2 @@
+fastembed-gpu>=0.6.0,<0.7.0
+onnxruntime-gpu==1.22.0
