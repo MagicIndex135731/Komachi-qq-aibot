@@ -37,8 +37,13 @@ from app.core.legacy_memory_context import (
 from app.core.message_content import ImageAttachment, extract_images_from_raw_payload
 from app.core.memory_context_packer import EvidenceMessage, PackedMemoryContext
 from app.core.memory_engine import (
-    extract_memory_candidates,
     extract_structured_memory_candidates,
+    parse_personal_claim,
+)
+from app.core.memory_compaction import canonical_key
+from app.core.member_identity import (
+    group_member_identities_from_messages,
+    resolve_group_member_reference,
 )
 from app.core.memory_orchestrator import MemoryContextResult, MemoryOrchestrator
 from app.core.persona_engine import render_persona, render_safety_lines
@@ -917,13 +922,78 @@ class InboundRouter:
                     )
                 ]
             )
-            for candidate in extract_memory_candidates(
-                scope_id=str(event.group_id),
-                source_msg_id=event.platform_msg_id,
-                lines=current_lines,
-            ):
-                candidate["subject_id"] = str(event.user_id)
-                memories.add_memory(**candidate)
+            claim = parse_personal_claim(event.plain_text)
+            if claim is not None and event.user_id != self.runtime.settings.bot_qq:
+                member_messages = messages.list_recent_group_member_messages(
+                    group_id=event.group_id,
+                    limit=200,
+                )
+                members = group_member_identities_from_messages(member_messages)
+                subject_id: int | None = event.user_id if claim.subject_mode == "sender" else None
+                subject_display = str(event.group_card or event.nickname or event.user_id).strip()
+                if claim.subject_alias is not None:
+                    resolved_subject = resolve_group_member_reference(
+                        claim.subject_alias,
+                        members,
+                        match_mode="exact",
+                        exclude_user_ids={self.runtime.settings.bot_qq},
+                    )
+                    subject_id = resolved_subject.user_id if resolved_subject is not None else None
+                    if resolved_subject is not None:
+                        subject_display = resolved_subject.matched_alias
+                if subject_id is not None:
+                    observed_at = self._normalize_timestamp(event.timestamp)
+                    stable_subject_id = str(subject_id)
+                    memory = memories.upsert_canonical_memory(
+                        scope_type="group",
+                        scope_id=str(event.group_id),
+                        subject_type="user",
+                        subject_id=stable_subject_id,
+                        memory_kind=claim.memory_kind,
+                        canonical_key=canonical_key(
+                            claim.memory_kind,
+                            stable_subject_id,
+                            claim.predicate,
+                            claim.object_text,
+                        ),
+                        predicate=claim.predicate,
+                        object_text=claim.object_text,
+                        content=f"{subject_display} {claim.predicate} {claim.object_text}.",
+                        importance=4,
+                        confidence=0.9 if claim.is_correction else 0.8,
+                        source_msg_ids=[event.platform_msg_id],
+                        valid_from=observed_at,
+                    )
+                    if claim.is_correction:
+                        old_subject_id: str | None = None
+                        old_subject_resolved = claim.old_subject_alias is None
+                        if claim.old_subject_alias is not None:
+                            old_subject = resolve_group_member_reference(
+                                claim.old_subject_alias,
+                                members,
+                                match_mode="exact",
+                                exclude_user_ids={self.runtime.settings.bot_qq},
+                            )
+                            if old_subject is not None:
+                                old_subject_id = str(old_subject.user_id)
+                                old_subject_resolved = True
+                        if old_subject_resolved:
+                            previous = memories.find_unique_correction_candidate(
+                                scope_id=str(event.group_id),
+                                predicate=claim.predicate,
+                                object_text=claim.object_text,
+                                replacement_memory_id=memory.id,
+                                as_of=observed_at,
+                                subject_id=old_subject_id,
+                            )
+                            if previous is not None:
+                                memories.mark_superseded(
+                                    memory_id=previous.id,
+                                    superseded_by_id=memory.id,
+                                    valid_until=observed_at,
+                                )
+                                memory.supersedes_id = previous.id
+                                session.add(memory)
 
             for candidate in extract_structured_memory_candidates(
                 scope_id=str(event.group_id),

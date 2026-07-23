@@ -16,6 +16,7 @@ from app.core.memory_context_packer import (
 from app.core.hybrid_memory_retriever import MemoryScopeViolation
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQuery
+from app.core.member_identity import GroupMemberIdentity
 
 
 class QueryResolver(Protocol):
@@ -26,6 +27,8 @@ class QueryResolver(Protocol):
         recent_messages: Sequence[RecentMemoryMessage],
         quoted_message: RecentMemoryMessage | None,
         now: datetime | None,
+        group_members: Sequence[GroupMemberIdentity] = (),
+        excluded_member_ids: set[int] | frozenset[int] = frozenset(),
     ) -> ResolvedMemoryQuery: ...
 
 
@@ -40,6 +43,7 @@ class Expander(Protocol):
 FactLoader = Callable[..., Sequence[MemoryFact]]
 SummaryLoader = Callable[..., Sequence[MemorySummary]]
 SourceScopeValidator = Callable[[int, tuple[str, ...]], bool]
+MemberLoader = Callable[[int], Sequence[GroupMemberIdentity]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +82,8 @@ class MemoryV2ContextProvider:
         source_scope_validator: SourceScopeValidator,
         fact_loader: FactLoader | None = None,
         summary_loader: SummaryLoader | None = None,
+        member_loader: MemberLoader | None = None,
+        excluded_member_ids: set[int] | frozenset[int] = frozenset(),
     ) -> None:
         self._resolver = resolver
         self._retriever = retriever
@@ -86,6 +92,8 @@ class MemoryV2ContextProvider:
         self._source_scope_validator = source_scope_validator
         self._fact_loader = fact_loader or (lambda **_: ())
         self._summary_loader = summary_loader or (lambda **_: ())
+        self._member_loader = member_loader
+        self._excluded_member_ids = frozenset(int(item) for item in excluded_member_ids)
 
     def __call__(self, request: MemoryV2Request) -> MemoryContextResult:
         return self.evaluate(request).result
@@ -93,12 +101,15 @@ class MemoryV2ContextProvider:
     def evaluate(self, request: MemoryV2Request) -> MemoryV2EvaluationTrace:
         """Run V2 and expose an in-memory, content-free evaluation trace."""
         self._validate_recent_scope(request)
-        resolved = self._resolver.resolve(
-            request.query,
-            recent_messages=request.recent_messages,
-            quoted_message=request.quoted_message,
-            now=request.now,
-        )
+        resolve_kwargs = {
+            "recent_messages": request.recent_messages,
+            "quoted_message": request.quoted_message,
+            "now": request.now,
+        }
+        if self._member_loader is not None:
+            resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
+            resolve_kwargs["excluded_member_ids"] = self._excluded_member_ids
+        resolved = self._resolver.resolve(request.query, **resolve_kwargs)
         retrieval_result = self._retriever.retrieve(
             group_id=request.group_id,
             resolved_query=resolved,

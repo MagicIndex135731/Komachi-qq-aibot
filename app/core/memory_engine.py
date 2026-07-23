@@ -1,11 +1,123 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 import re
-from typing import Any
+from typing import Any, Literal
 
 from app.providers.embeddings import tokenize_text
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalClaim:
+    memory_kind: Literal["preference", "taboo"]
+    predicate: Literal["likes", "dislikes"]
+    object_text: str
+    subject_mode: Literal["sender", "alias"]
+    subject_alias: str | None
+    old_subject_alias: str | None
+    is_correction: bool
+    display_content: str
+
+
+_CHINESE_RELATION = r"(?P<relation>最喜欢|不喜欢|讨厌|喜欢)"
+_FIRST_PERSON_CLAIM = re.compile(rf"^我{_CHINESE_RELATION}(?P<object>.+)$")
+_NAMED_CLAIM = re.compile(
+    rf"^(?P<alias>[\w\u4e00-\u9fff][\w\u4e00-\u9fff .·\-]{{0,31}}?){_CHINESE_RELATION}(?P<object>.+)$"
+)
+_ENGLISH_FIRST_PERSON_CLAIM = re.compile(
+    r"^I\s+(?P<relation>do\s+not\s+like|don't\s+like|dislike|hate|really\s+like|like)\s+(?P<object>.+)$",
+    re.IGNORECASE,
+)
+_ENGLISH_NAMED_CLAIM = re.compile(
+    r"^(?P<alias>[A-Za-z0-9][A-Za-z0-9 ._\-]{0,31}?)\s+(?P<relation>does\s+not\s+like|doesn't\s+like|dislikes|hates|really\s+likes|likes)\s+(?P<object>.+)$",
+    re.IGNORECASE,
+)
+_CORRECTION_PREFIX = re.compile(r"^(?:你记错了|记错了|其实)[，,：:\s]*(?:是[，,：:\s]*)?")
+_REASSIGNMENT_PREFIX = re.compile(
+    r"^不是\s*(?P<old_alias>[\w\u4e00-\u9fff .·\-]{1,32}?)\s*[，,]\s*是\s*"
+)
+_UNSUPPORTED_SUBJECTS = frozenset({"他", "她", "它", "他们", "她们", "有人", "某人", "大家", "我们", "你"})
+_SPECULATIVE_ALIAS_SUFFIXES = ("可能", "也许", "大概", "应该", "好像", "似乎")
+_UNSUPPORTED_OBJECT_PREFIX = re.compile(r"^(?:的)?(?:不是|并不|不一定|可能|也许|大概|应该|好像|似乎)")
+_UNSUPPORTED_OBJECT_QUESTION = re.compile(
+    r"(?:什么|谁|是否|是不是|哪(?:个|些|种)?|\bwhat\b|\bwho\b|\bwhich\b|\bwhether\b)|(?:吗|么|呢|吧|嘛)$",
+    re.IGNORECASE,
+)
+_ADDITIONAL_CLAIM = re.compile(
+    r"(?:[，,；;]|但是|但|而且|然后|\bbut\b).*(?:最喜欢|不喜欢|讨厌|喜欢|likes?|dislikes?|hates?)",
+    re.IGNORECASE,
+)
+
+
+def parse_personal_claim(text: str) -> PersonalClaim | None:
+    """Parse only explicit first-person or named personal preferences."""
+
+    raw_text = str(text or "").strip()
+    if not raw_text or raw_text.endswith(("?", "？")):
+        return None
+    normalized = raw_text.rstrip("。！.!").strip()
+    old_alias: str | None = None
+    is_correction = False
+    reassignment = _REASSIGNMENT_PREFIX.match(normalized)
+    if reassignment is not None:
+        old_alias = reassignment.group("old_alias").strip()
+        normalized = normalized[reassignment.end() :].strip()
+        is_correction = True
+    else:
+        correction = _CORRECTION_PREFIX.match(normalized)
+        if correction is not None:
+            normalized = normalized[correction.end() :].strip()
+            is_correction = True
+
+    match = _FIRST_PERSON_CLAIM.fullmatch(normalized) or _ENGLISH_FIRST_PERSON_CLAIM.fullmatch(normalized)
+    subject_mode: Literal["sender", "alias"] = "sender"
+    subject_alias: str | None = None
+    if match is None:
+        match = _NAMED_CLAIM.fullmatch(normalized) or _ENGLISH_NAMED_CLAIM.fullmatch(normalized)
+        if match is None:
+            return None
+        subject_alias = match.group("alias").strip()
+        if subject_alias in _UNSUPPORTED_SUBJECTS or subject_alias.endswith(_SPECULATIVE_ALIAS_SUFFIXES):
+            return None
+        subject_mode = "alias"
+
+    object_text = " ".join(match.group("object").strip().split()).rstrip("。！？.!?").strip()
+    if (
+        not object_text
+        or len(object_text) > 600
+        or _UNSUPPORTED_OBJECT_PREFIX.search(object_text)
+        or _UNSUPPORTED_OBJECT_QUESTION.search(object_text)
+        or _ADDITIONAL_CLAIM.search(object_text)
+    ):
+        return None
+    relation = " ".join(match.group("relation").casefold().split())
+    negative = relation in {
+        "不喜欢",
+        "讨厌",
+        "do not like",
+        "don't like",
+        "dislike",
+        "hate",
+        "does not like",
+        "doesn't like",
+        "dislikes",
+        "hates",
+    }
+    predicate: Literal["likes", "dislikes"] = "dislikes" if negative else "likes"
+    memory_kind: Literal["preference", "taboo"] = "taboo" if negative else "preference"
+    display_subject = subject_alias or "the sender"
+    return PersonalClaim(
+        memory_kind=memory_kind,
+        predicate=predicate,
+        object_text=object_text,
+        subject_mode=subject_mode,
+        subject_alias=subject_alias,
+        old_subject_alias=old_alias,
+        is_correction=is_correction,
+        display_content=f"{display_subject} {predicate} {object_text}.",
+    )
 
 
 LIKE_PATTERNS = (

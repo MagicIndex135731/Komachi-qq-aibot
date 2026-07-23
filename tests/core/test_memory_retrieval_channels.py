@@ -21,6 +21,7 @@ from app.storage.db import (
     write_retrieval_vector_embeddings,
 )
 from app.storage.repositories import (
+    EpisodeRepository,
     GroupRepository,
     MemoryRepository,
     MessageRepository,
@@ -98,6 +99,245 @@ def _seed_document(
         )
         session.flush()
         return document.id
+
+
+def test_entity_channel_uses_bound_speaker_id_without_global_alias_expansion(sqlite_engine) -> None:
+    target_id = _seed_document(
+        sqlite_engine,
+        group_id=10001,
+        user_id=20001,
+        platform_msg_id="bound-speaker-target",
+        content="target-only evidence",
+    )
+    _seed_document(
+        sqlite_engine,
+        group_id=10001,
+        user_id=20002,
+        platform_msg_id="global-alias-other",
+        content="other-member evidence",
+    )
+    with session_scope(sqlite_engine) as session:
+        UserRepository(session).upsert_user(
+            user_id=20002,
+            nickname="阿渣",
+            group_card="",
+        )
+        hits = RetrievalDocumentRepository(session).search_group_documents_entity_hits(
+            group_id=10001,
+            entities=("阿渣",),
+            speaker_ids=("20001",),
+            limit=10,
+        )
+
+    assert [hit.document_id for hit in hits] == [target_id]
+
+
+def test_subject_filter_applies_to_all_memory_document_channels_without_removing_episode(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "subject-filter-channels.db")
+    create_all(engine)
+    observed_at = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="target",
+            enabled=True,
+            speak_enabled=True,
+        )
+        users = UserRepository(session)
+        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=20002, nickname="Garfield", group_card="加菲猫")
+        messages = MessageRepository(session)
+        target_message = messages.add_group_message(
+            platform_msg_id="subject-target-source",
+            group_id=10001,
+            user_id=20001,
+            timestamp=observed_at,
+            plain_text="共同检索词：阿渣喜欢动画。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        other_message = messages.add_group_message(
+            platform_msg_id="subject-other-source",
+            group_id=10001,
+            user_id=20002,
+            timestamp=observed_at,
+            plain_text="共同检索词：加菲猫喜欢动画。",
+            raw_json={"sender": {"nickname": "Garfield", "card": "加菲猫"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        episodes = EpisodeRepository(session)
+        episode = episodes.create_episode(
+            group_id=10001,
+            start_message_id=target_message.id,
+            started_at=observed_at,
+            segmentation_version="test-v1",
+        )
+        session.flush()
+        for ordinal, message in enumerate((target_message, other_message)):
+            episodes.add_message(
+                episode_id=episode.id,
+                group_id=10001,
+                message_id=message.id,
+                ordinal=ordinal,
+                estimated_tokens=10,
+            )
+        episodes.close_episode(
+            episode_id=episode.id,
+            ended_at=observed_at,
+            end_message_id=other_message.id,
+            boundary_reason="test",
+            content_hash="episode-content",
+        )
+        memories = MemoryRepository(session)
+        target_memory = memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            content="共同检索词：阿渣最喜欢动画。",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="subject-target-source",
+            valid_from=observed_at,
+        )
+        other_memory = memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20002",
+            memory_kind="preference",
+            content="共同检索词：加菲猫最喜欢动画。",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="subject-other-source",
+            valid_from=observed_at,
+        )
+        documents = RetrievalDocumentRepository(session)
+        target_document = documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=episode.id,
+            document_kind="memory",
+            source_table="memory_items",
+            source_id=str(target_memory.id),
+            start_at=observed_at,
+            end_at=observed_at,
+            content=target_memory.content,
+            metadata_json={"subject_id": "20001"},
+            content_hash="target-memory-document",
+            source_message_ids=[target_message.id],
+            embedding_eligible=True,
+        )
+        other_document = documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=episode.id,
+            document_kind="memory",
+            source_table="memory_items",
+            source_id=str(other_memory.id),
+            start_at=observed_at,
+            end_at=observed_at,
+            content=other_memory.content,
+            metadata_json={"subject_id": "20002"},
+            content_hash="other-memory-document",
+            source_message_ids=[other_message.id],
+            embedding_eligible=True,
+        )
+        episode_document = documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=episode.id,
+            document_kind="episode",
+            source_table="conversation_episodes",
+            source_id=str(episode.id),
+            start_at=observed_at,
+            end_at=observed_at,
+            content="共同检索词：两位成员讨论动画。",
+            metadata_json={"episode_id": episode.id},
+            content_hash="episode-document",
+            source_message_ids=[target_message.id, other_message.id],
+            embedding_eligible=True,
+        )
+        session.flush()
+        target_document_id = int(target_document.id)
+        other_document_id = int(other_document.id)
+        episode_document_id = int(episode_document.id)
+
+    provider = _FakeEmbeddingProvider()
+    generation = ensure_retrieval_vector_generation(
+        engine,
+        provider=provider.identity.provider,
+        model=provider.identity.model,
+        dimensions=provider.identity.dimensions,
+        version=provider.identity.version,
+    )
+    assert generation is not None
+    assert write_retrieval_vector_embeddings(
+        engine,
+        generation=generation,
+        rows=[
+            (target_document_id, 10001, [1.0, 0.0, 0.0]),
+            (other_document_id, 10001, [1.0, 0.0, 0.0]),
+            (episode_document_id, 10001, [1.0, 0.0, 0.0]),
+        ],
+    ) == 3
+    assert refresh_retrieval_vector_generation(
+        engine,
+        generation=generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        engine,
+        generation=generation,
+        expected_active_generation=None,
+    )
+    channels = build_memory_retrieval_channels(engine, embedding_provider=provider)
+
+    def channel_ids(channel: str, subject_ids: tuple[str, ...] | None) -> set[int]:
+        resolved = ResolvedMemoryQuery(
+            original_query="共同检索词 动画",
+            retrieval_query="共同检索词 动画",
+            entities=("动画",),
+            subject_ids=subject_ids,
+            time_range=TimeRange(
+                datetime(2026, 7, 23, 0, 0, tzinfo=UTC),
+                datetime(2026, 7, 24, 0, 0, tzinfo=UTC),
+            ),
+        )
+        return {
+            candidate.document_id
+            for candidate in channels[channel](
+                group_id=10001,
+                resolved_query=resolved,
+                limit=20,
+            )
+        }
+
+    for channel in ("bm25", "vector", "temporal", "entity"):
+        assert channel_ids(channel, None) == {
+            target_document_id,
+            other_document_id,
+            episode_document_id,
+        }
+        assert channel_ids(channel, ()) == {episode_document_id}
+        assert channel_ids(channel, ("20001",)) == {
+            target_document_id,
+            episode_document_id,
+        }
+    assert channel_ids("fact", None) == {target_document_id, other_document_id}
+    assert channel_ids("fact", ()) == set()
+    assert channel_ids("fact", ("20001",)) == {target_document_id}
 
 
 def test_real_sqlite_parallel_channels_use_independent_short_sessions_and_scope_top_k(

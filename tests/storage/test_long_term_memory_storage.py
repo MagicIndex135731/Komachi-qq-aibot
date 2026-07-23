@@ -485,6 +485,67 @@ def test_supersession_requires_matching_object_and_specific_content(sqlite_engin
         assert skiing.status == "superseded"
 
 
+def test_legacy_correction_candidate_requires_one_object_related_wrong_fact(sqlite_engine) -> None:
+    now = datetime.now(UTC)
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        legacy = memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="preference",
+            content="Alice likes 坐床上看动画片.",
+            importance=4,
+            confidence=0.8,
+            source_msg_id="legacy-wrong",
+            valid_from=now - timedelta(days=1),
+        )
+        replacement = memories.upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="43",
+            memory_kind="preference",
+            canonical_key="preference|43|likes|坐床上看动画",
+            predicate="likes",
+            object_text="坐床上看动画",
+            content="Bob likes 坐床上看动画.",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=["correction"],
+            valid_from=now,
+        )
+
+        assert memories.find_unique_correction_candidate(
+            scope_id="10001",
+            predicate="likes",
+            object_text="坐床上看动画",
+            replacement_memory_id=replacement.id,
+            as_of=now,
+        ).id == legacy.id
+
+        memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="44",
+            memory_kind="preference",
+            content="Cara likes 坐床上看动画.",
+            importance=4,
+            confidence=0.8,
+            source_msg_id="legacy-ambiguous",
+            valid_from=now - timedelta(days=1),
+        )
+        assert memories.find_unique_correction_candidate(
+            scope_id="10001",
+            predicate="likes",
+            object_text="坐床上看动画",
+            replacement_memory_id=replacement.id,
+            as_of=now,
+        ) is None
+
+
 def test_backfill_windows_are_stable_and_inbound_count_excludes_bot(sqlite_engine) -> None:
     with session_scope(sqlite_engine) as session:
         GroupRepository(session).upsert_group(group_id=10001, group_name="test", enabled=True, speak_enabled=True)

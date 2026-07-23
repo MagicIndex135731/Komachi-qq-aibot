@@ -14,6 +14,11 @@ import json
 import re
 from typing import Callable, Literal, Protocol, Sequence
 
+from app.core.member_identity import (
+    GroupMemberIdentity,
+    classify_group_member_reference,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TimeRange:
@@ -42,6 +47,7 @@ class ResolvedMemoryQuery:
     retrieval_query: str
     entities: tuple[str, ...] = ()
     speaker_ids: tuple[str, ...] = ()
+    subject_ids: tuple[str, ...] | None = None
     time_range: TimeRange | None = None
     reference_msg_ids: tuple[str, ...] = ()
     rewrite_used: bool = False
@@ -79,6 +85,40 @@ _JOINED_NAME_PATTERN = re.compile(r"([\u4e00-\u9fff]{2})(?=和|、)|(?:和|、)(
 _FOLLOW_UP_PATTERN = re.compile(r"详细讲讲|后来呢|之前那个|那个人|他说了什么|她说了什么|最后怎么样")
 _DETAIL_PATTERN = re.compile(r"详细|经过|后来|最后|怎么处理")
 _COMMON_WORDS = frozenset({"发布", "已经", "那个", "什么", "怎么", "后来", "之前", "最后", "结果", "消息", "延期", "完成", "服务", "迁移", "今天", "昨天", "前天"})
+_PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
+    r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么)"
+)
+_REMEMBER_PERSON_PATTERN = re.compile(
+    r"^\s*(?:还)?记得\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:吗|么|的|曾经|以前|喜欢|讨厌|[？?]|$)"
+)
+_NON_PERSON_MEMORY_SUBJECTS = frozenset(
+    {
+        "我",
+        "你",
+        "您",
+        "他",
+        "她",
+        "它",
+        "大家",
+        "群里",
+        "群友",
+        "各位",
+        "所有人",
+        "我们",
+        "你们",
+        "他们",
+        "她们",
+        "它们",
+        "有人",
+        "谁",
+    }
+)
+_SUBJECTLESS_MEMORY_QUERY_PREFIXES = (
+    "最喜欢什么",
+    "喜欢什么",
+    "讨厌什么",
+    "不喜欢什么",
+)
 
 
 class MemoryQueryResolver:
@@ -119,6 +159,8 @@ class MemoryQueryResolver:
         recent_messages: Sequence[RecentMemoryMessage],
         quoted_message: RecentMemoryMessage | None = None,
         now: datetime | None = None,
+        group_members: Sequence[GroupMemberIdentity] = (),
+        excluded_member_ids: set[int] | frozenset[int] = frozenset(),
     ) -> ResolvedMemoryQuery:
         """Return a typed retrieval query without reading persistence.
 
@@ -134,6 +176,39 @@ class MemoryQueryResolver:
         needs_detail = bool(_DETAIL_PATTERN.search(original))
         needs_history = bool(time_range or _FOLLOW_UP_PATTERN.search(original) or "历史" in original)
 
+        direct_reference = classify_group_member_reference(
+            original,
+            group_members,
+            match_mode="contained",
+            exclude_user_ids=excluded_member_ids,
+        )
+        if direct_reference.status == "resolved":
+            direct_member = direct_reference.member
+            if direct_member is None:
+                raise RuntimeError("resolved group member reference is missing its member")
+            direct_subject_ids = (str(direct_member.user_id),)
+            return ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query=original,
+                entities=(direct_member.matched_alias,),
+                speaker_ids=direct_subject_ids,
+                subject_ids=direct_subject_ids,
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=needs_history,
+                needs_detail=needs_detail,
+            )
+        if direct_reference.status == "ambiguous" or self._is_person_memory_query(original):
+            return ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query=original,
+                subject_ids=(),
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=needs_history,
+                needs_detail=needs_detail,
+            )
+
         deterministic = self._resolve_reference(original, recent, quoted_message)
         if deterministic is not None:
             retrieval_query, entities, speaker_ids, source_ids = deterministic
@@ -142,6 +217,7 @@ class MemoryQueryResolver:
                 retrieval_query=retrieval_query,
                 entities=entities,
                 speaker_ids=speaker_ids,
+                subject_ids=speaker_ids or None,
                 time_range=time_range,
                 reference_msg_ids=source_ids,
                 retrieval_mode="exact_quote" if quoted_message is not None else "hybrid",
@@ -162,6 +238,16 @@ class MemoryQueryResolver:
             needs_history=needs_history,
             needs_detail=needs_detail,
         )
+
+    @staticmethod
+    def _is_person_memory_query(query: str) -> bool:
+        if query.lstrip().startswith(_SUBJECTLESS_MEMORY_QUERY_PREFIXES):
+            return False
+        for pattern in (_PERSON_MEMORY_SUBJECT_PATTERN, _REMEMBER_PERSON_PATTERN):
+            match = pattern.search(query)
+            if match is not None and match.group("subject") not in _NON_PERSON_MEMORY_SUBJECTS:
+                return True
+        return False
 
     def _resolve_reference(
         self,
@@ -359,6 +445,7 @@ class MemoryQueryResolver:
             retrieval_query=retrieval_query.strip(),
             entities=normalized_entities,
             speaker_ids=normalized_speakers,
+            subject_ids=normalized_speakers or None,
             time_range=time_range,
             rewrite_used=True,
             confidence=float(confidence),

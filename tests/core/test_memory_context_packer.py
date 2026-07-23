@@ -23,6 +23,8 @@ def test_recent_is_a_contiguous_suffix_and_target_is_not_repeated() -> None:
 
     assert packed.recent_source_msg_ids == ("1", "2")
     assert "ask" not in packed.text
+    assert packed.grounding_policy
+    assert packed.estimated_tokens <= packed.budget
 
 
 def test_evidence_is_deduplicated_against_recent_and_quote_pair_is_atomic() -> None:
@@ -159,3 +161,35 @@ def test_blocked_neighbor_adds_safe_policy_note_without_raw_text() -> None:
     assert packed.blocked_output_present is True
     assert "QQ blocked" in packed.text
     assert "raw-secret-marker" not in packed.text
+
+
+def test_empty_v2_context_explicitly_marks_memory_evidence_as_insufficient() -> None:
+    packer = MemoryContextPacker(normal_budget=200, detail_budget=200)
+
+    packed = packer.pack(
+        "normal",
+        available_input=200,
+        target_message_id=None,
+    )
+
+    assert "No relevant memory fact or retrieved evidence was found" in packed.text
+    assert "Do not infer a person's preference from topical discussion" in packed.text
+
+
+def test_v2_context_with_evidence_prioritizes_corrections_over_historical_chat() -> None:
+    packer = MemoryContextPacker(normal_budget=300, detail_budget=300)
+    segment = EvidenceSegment(
+        "ep-correction",
+        2.0,
+        (message("correction", "explicit corrected fact"),),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=300,
+        target_message_id=None,
+        evidence_segments=(segment,),
+    )
+
+    assert "later corrections or newer evidence" in packed.text
+    assert "Topical discussion alone does not prove a personal preference" in packed.text

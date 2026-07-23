@@ -71,6 +71,7 @@ class ScopedMemoryRetrievalChannels:
                 group_id=group_id,
                 query=self._query_text(resolved_query),
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -101,6 +102,7 @@ class ScopedMemoryRetrievalChannels:
                 dimensions=identity.dimensions,
                 version=identity.version,
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -120,6 +122,7 @@ class ScopedMemoryRetrievalChannels:
                 start_at=getattr(time_range, "start", None),
                 end_at=getattr(time_range, "end", None),
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -142,6 +145,7 @@ class ScopedMemoryRetrievalChannels:
                     getattr(resolved_query, "speaker_ids", ())
                 ),
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -160,6 +164,7 @@ class ScopedMemoryRetrievalChannels:
                     getattr(resolved_query, "entities", ())
                 ),
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -180,6 +185,7 @@ class ScopedMemoryRetrievalChannels:
                 ),
                 include_replies=True,
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -200,6 +206,7 @@ class ScopedMemoryRetrievalChannels:
                 ),
                 include_replies=False,
                 limit=limit,
+                subject_ids=self._subject_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -253,6 +260,11 @@ class ScopedMemoryRetrievalChannels:
                 if str(value).strip()
             )
         )
+
+    @classmethod
+    def _subject_ids(cls, resolved_query: Any) -> tuple[str, ...] | None:
+        values = getattr(resolved_query, "subject_ids", None)
+        return None if values is None else cls._string_tuple(values)
 
 
 def build_memory_retrieval_channels(

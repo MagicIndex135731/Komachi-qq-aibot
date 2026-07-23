@@ -23,12 +23,62 @@ from app.storage.repositories import (
     EpisodeRepository,
     GroupRepository,
     JobRepository,
+    MemoryRepository,
     MemoryBackfillRunRepository,
     RetrievalDocumentRepository,
     RetrievalIndexStateRepository,
     UserRepository,
     MessageRepository,
 )
+
+
+def test_memory_document_rejects_cross_group_source_memory(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        source_message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="memory-source-group-one",
+        )
+        other_message = _seed_group_message(
+            session,
+            group_id=10002,
+            user_id=20002,
+            platform_msg_id="memory-source-group-two",
+        )
+        memory = MemoryRepository(session).upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            canonical_key="preference|20001|likes|animation",
+            predicate="likes",
+            object_text="animation",
+            content="Alice likes animation.",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=[source_message.platform_msg_id],
+            valid_from=source_message.timestamp,
+        )
+        session.flush()
+
+        with pytest.raises(ValueError, match="source scope mismatch"):
+            RetrievalDocumentRepository(session).upsert_document(
+                scope_type="group",
+                scope_id="10002",
+                group_id=10002,
+                episode_id=None,
+                document_kind="memory",
+                source_table="memory_items",
+                source_id=str(memory.id),
+                start_at=other_message.timestamp,
+                end_at=other_message.timestamp,
+                content=memory.content,
+                metadata_json={},
+                content_hash="cross-group-memory-document",
+                source_message_ids=[other_message.id],
+            )
 
 
 def _seed_group_message(

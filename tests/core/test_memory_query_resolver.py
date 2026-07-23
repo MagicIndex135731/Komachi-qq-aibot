@@ -5,6 +5,7 @@ from datetime import datetime
 import time
 
 from app.core.memory_query_resolver import MemoryQueryResolver, TimeRange
+from app.core.member_identity import GroupMemberIdentity
 
 
 @dataclass(frozen=True)
@@ -63,8 +64,125 @@ def test_nickname_in_question_binds_the_matching_recent_speaker() -> None:
 
     assert result.entities == ("小王",)
     assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
     assert result.reference_msg_ids == ("7",)
     assert result.rewrite_used is False
+
+
+def test_direct_nickname_question_binds_unique_group_member_without_rewriting_query() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="Garfield", group_card="加菲猫"),
+        GroupMemberIdentity(user_id=10002, nickname="Bob", group_card=""),
+    )
+
+    result = resolver.resolve(
+        "加菲猫最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.retrieval_query == "加菲猫最喜欢什么动画？"
+    assert result.entities == ("加菲猫",)
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+
+
+def test_direct_nickname_question_fails_closed_for_duplicate_aliases() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "阿渣最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.retrieval_query == "阿渣最喜欢什么动画？"
+    assert result.entities == ()
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_direct_multi_member_question_fails_closed_for_fact_subjects() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, group_card="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        "阿渣和加菲猫最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.entities == ()
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_unknown_person_memory_query_fails_closed_but_topic_query_remains_unbound() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
+
+    ordinary = resolver.resolve(
+        "动画有什么推荐？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    unknown = resolver.resolve(
+        "陌生猫最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    first_person = resolver.resolve(
+        "我最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    second_person = resolver.resolve(
+        "你最喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    first_person_likes = resolver.resolve(
+        "我喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    subjectless = tuple(
+        resolver.resolve(
+            query,
+            recent_messages=(),
+            now=NOW,
+            group_members=members,
+        )
+        for query in (
+            "最喜欢什么动画？",
+            "喜欢什么动画？",
+            "讨厌什么动画？",
+            "不喜欢什么动画？",
+        )
+    )
+
+    assert ordinary.subject_ids is None
+    assert unknown.subject_ids == ()
+    assert first_person.subject_ids is None
+    assert second_person.subject_ids is None
+    assert first_person_likes.subject_ids is None
+    assert all(result.subject_ids is None for result in subjectless)
 
 
 def test_ambiguous_history_question_can_use_one_safe_rewrite() -> None:

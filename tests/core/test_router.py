@@ -1,7 +1,7 @@
 ﻿import asyncio
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import pytest
 from sqlalchemy import select
@@ -18,7 +18,7 @@ from app.core.reply_policy import ReplyDecision
 from app.core.search_policy import AddressDecision
 from app.storage.db import session_scope
 from app.storage.models import MemoryItem, Message, Summary
-from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
+from app.storage.repositories import GroupRepository, MemoryRepository, MessageRepository, UserRepository
 
 
 class FakeSender:
@@ -3704,6 +3704,164 @@ async def test_router_persists_inline_summary_and_memories_without_breaking_repl
     assert summaries[1].content.startswith("Rolling group memory:")
     assert [memory.subject_id for memory in memories] == ["20001"]
     assert [memory.content for memory in memories] == ["Alice likes hotpot."]
+
+
+@pytest.mark.asyncio
+async def test_router_correction_reassigns_named_fact_and_keeps_raw_messages(sqlite_engine) -> None:
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+    )
+    observed_at = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="10001",
+            enabled=True,
+            speak_enabled=True,
+        )
+        users = UserRepository(session)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        users.upsert_user(user_id=20002, nickname="A-Zha", group_card="阿渣")
+        MessageRepository(session).add_group_message(
+            platform_msg_id="target-member-seed",
+            group_id=10001,
+            user_id=20002,
+            timestamp=observed_at - timedelta(minutes=5),
+            plain_text="在看动画。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        MessageRepository(session).add_group_message(
+            platform_msg_id="wrong-attribution",
+            group_id=10001,
+            user_id=20001,
+            timestamp=observed_at - timedelta(days=1),
+            plain_text="阿渣喜欢坐床上看动画。",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        old = MemoryRepository(session).add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            content="Alice likes 坐床上看动画.",
+            importance=4,
+            confidence=0.8,
+            source_msg_id="wrong-attribution",
+            valid_from=observed_at - timedelta(days=1),
+        )
+        old_id = old.id
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="explicit-correction",
+            plain_text="你记错了，是阿渣喜欢坐床上看动画。",
+            timestamp=observed_at,
+            user_id=20001,
+            nickname="Alice",
+        )
+    )
+
+    with session_scope(sqlite_engine) as session:
+        facts = list(
+            session.scalars(
+                select(MemoryItem)
+                .where(MemoryItem.memory_kind == "preference")
+                .order_by(MemoryItem.id)
+            )
+        )
+        source_messages = list(
+            session.scalars(
+                select(Message).where(
+                    Message.platform_msg_id.in_(
+                        ("target-member-seed", "wrong-attribution", "explicit-correction")
+                    )
+                )
+            )
+        )
+
+    assert [(fact.subject_id, fact.status) for fact in facts] == [
+        ("20001", "superseded"),
+        ("20002", "active"),
+    ]
+    assert facts[0].id == old_id
+    assert facts[0].superseded_by_id == facts[1].id
+    assert facts[1].supersedes_id == facts[0].id
+    assert facts[1].content == "阿渣 likes 坐床上看动画."
+    assert facts[1].source_msg_ids == ["explicit-correction"]
+    assert {message.platform_msg_id for message in source_messages} == {
+        "target-member-seed",
+        "wrong-attribution",
+        "explicit-correction",
+    }
+
+
+@pytest.mark.asyncio
+async def test_router_named_claim_uses_alias_snapshot_from_requested_group(sqlite_engine) -> None:
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+    )
+    observed_at = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        groups.upsert_group(group_id=10001, group_name="one", enabled=True, speak_enabled=True)
+        groups.upsert_group(group_id=10002, group_name="two", enabled=True, speak_enabled=True)
+        users = UserRepository(session)
+        users.upsert_user(user_id=20002, nickname="Target", group_card="本群名片")
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="same-user-group-one",
+            group_id=10001,
+            user_id=20002,
+            timestamp=observed_at - timedelta(minutes=2),
+            plain_text="群一发言",
+            raw_json={"sender": {"nickname": "Target", "card": "本群名片"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        users.upsert_user(user_id=20002, nickname="Target", group_card="其他群名片")
+        messages.add_group_message(
+            platform_msg_id="same-user-group-two",
+            group_id=10002,
+            user_id=20002,
+            timestamp=observed_at - timedelta(minutes=1),
+            plain_text="群二发言",
+            raw_json={"sender": {"nickname": "Target", "card": "其他群名片"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="group-scoped-alias-claim",
+            plain_text="本群名片喜欢科幻动画。",
+            timestamp=observed_at,
+        )
+    )
+
+    with session_scope(sqlite_engine) as session:
+        fact = session.scalar(
+            select(MemoryItem).where(MemoryItem.source_msg_id == "group-scoped-alias-claim")
+        )
+
+    assert fact is not None
+    assert fact.subject_id == "20002"
 
 
 @pytest.mark.asyncio

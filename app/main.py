@@ -42,6 +42,7 @@ from app.core.memory_context_packer import (
 from app.core.memory_evidence_expander import MemoryEvidenceExpander
 from app.core.memory_orchestrator import MemoryOrchestrator, ShadowJobRequest
 from app.core.memory_query_resolver import MemoryQueryResolver
+from app.core.member_identity import GroupMemberIdentity, group_member_identities_from_messages
 from app.core.memory_retrieval_channels import build_memory_retrieval_channels
 from app.core.memory_v2_context import MemoryV2ContextProvider
 from app.core.group_history_backfill import backfill_recent_group_history
@@ -528,6 +529,7 @@ def build_memory_runtime(
                 query=str(resolved_query.retrieval_query),
                 limit=settings.memory_final_episode_limit,
                 as_of=datetime.now().astimezone(),
+                subject_ids=resolved_query.subject_ids,
             )
             return tuple(
                 MemoryFact(
@@ -583,6 +585,13 @@ def build_memory_runtime(
                     )
             return tuple(summaries)
 
+    def load_members(group_id: int) -> tuple[GroupMemberIdentity, ...]:
+        with session_scope(engine) as session:
+            messages = MessageRepository(session)
+            return group_member_identities_from_messages(
+                messages.list_recent_group_member_messages(group_id=group_id, limit=200)
+            )
+
     def validate_source_scope(group_id: int, source_msg_ids: tuple[str, ...]) -> bool:
         with session_scope(engine) as session:
             messages = MessageRepository(session)
@@ -610,6 +619,8 @@ def build_memory_runtime(
         source_scope_validator=validate_source_scope,
         fact_loader=load_facts,
         summary_loader=load_summaries,
+        member_loader=load_members,
+        excluded_member_ids={settings.bot_qq},
     )
 
     shadow_evaluator = _DatabaseShadowEvaluator(

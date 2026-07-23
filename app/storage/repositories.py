@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import Integer, bindparam, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -101,6 +101,43 @@ def _delete_active_retrieval_vectors(
             # in a process. Canonical status still prevents use by fallback
             # channels; vector cleanup can be retried when sqlite-vec returns.
             continue
+
+
+def _deactivate_memory_retrieval_documents(
+    session: Session,
+    *,
+    memory_id: int,
+    keep_document_id: int | None = None,
+) -> int:
+    filters = [
+        RetrievalDocument.document_kind == "memory",
+        RetrievalDocument.source_table == "memory_items",
+        RetrievalDocument.source_id == str(int(memory_id)),
+        RetrievalDocument.status == "active",
+    ]
+    if keep_document_id is not None:
+        filters.append(RetrievalDocument.id != int(keep_document_id))
+    documents = list(session.scalars(select(RetrievalDocument).where(*filters)))
+    if not documents:
+        return 0
+    now = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+    for document in documents:
+        document.status = "inactive"
+        document.embedding_status = "stale"
+        document.updated_at = now
+        session.add(document)
+        try:
+            session.execute(
+                text("DELETE FROM retrieval_documents_fts WHERE document_id = :document_id"),
+                {"document_id": str(document.id)},
+            )
+        except SQLAlchemyError:
+            pass
+    _delete_active_retrieval_vectors(
+        session,
+        document_ids=[document.id for document in documents],
+    )
+    return len(documents)
 
 
 class GroupRepository:
@@ -231,6 +268,23 @@ class MessageRepository:
     def get_by_platform_msg_id(self, platform_msg_id: str) -> Message | None:
         stmt = select(Message).where(Message.platform_msg_id == platform_msg_id).limit(1)
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def get_group_messages_by_platform_msg_ids(
+        self,
+        *,
+        group_id: int,
+        platform_msg_ids: list[str],
+    ) -> dict[str, Message]:
+        identifiers = list(dict.fromkeys(str(item).strip() for item in platform_msg_ids if str(item).strip()))
+        if not identifiers:
+            return {}
+        rows = self.session.scalars(
+            select(Message).where(
+                Message.group_id == int(group_id),
+                Message.platform_msg_id.in_(identifiers),
+            )
+        )
+        return {str(message.platform_msg_id): message for message in rows}
 
     def is_late_group_message(
         self,
@@ -555,6 +609,33 @@ class MessageRepository:
         )
         return [int(user_id) for user_id, _latest in self.session.execute(stmt)]
 
+    def list_recent_group_member_messages(self, *, group_id: int, limit: int) -> list[Message]:
+        """Return the latest target-group sender snapshot for each recent member."""
+
+        if limit <= 0:
+            return []
+        ranked = (
+            select(
+                Message.id.label("message_id"),
+                func.row_number()
+                .over(
+                    partition_by=Message.user_id,
+                    order_by=(Message.timestamp.desc(), Message.id.desc()),
+                )
+                .label("member_rank"),
+            )
+            .where(Message.group_id == int(group_id))
+            .subquery()
+        )
+        stmt = (
+            select(Message)
+            .join(ranked, ranked.c.message_id == Message.id)
+            .where(ranked.c.member_rank == 1)
+            .order_by(Message.timestamp.desc(), Message.id.desc())
+            .limit(int(limit))
+        )
+        return list(self.session.scalars(stmt))
+
     def last_bot_reply_at(self, *, group_id: int, bot_user_id: int) -> datetime | None:
         stmt = (
             select(Message)
@@ -876,6 +957,7 @@ class MemoryRepository:
                 MemoryItem.status == "active",
             )
         ).first()
+        previous_content: str | None = str(memory.content) if memory is not None else None
         if memory is None:
             legacy_memory = None
             if normalized_sources:
@@ -893,6 +975,7 @@ class MemoryRepository:
             primary_source = normalized_sources[0] if normalized_sources else f"canonical:{canonical_key}"
             if legacy_memory is not None:
                 memory = legacy_memory
+                previous_content = str(memory.content)
                 memory.canonical_key = canonical_key
                 memory.predicate = predicate
                 memory.object_text = object_text
@@ -931,6 +1014,11 @@ class MemoryRepository:
         memory.expires_at = valid_until
         memory.last_seen_at = valid_from or datetime.now(UTC)
         self.session.flush()
+        if previous_content is not None and previous_content != content:
+            _deactivate_memory_retrieval_documents(
+                self.session,
+                memory_id=memory.id,
+            )
 
         legacy_candidates = list(
             self.session.scalars(
@@ -997,7 +1085,62 @@ class MemoryRepository:
             memory.valid_until = valid_until
             memory.expires_at = valid_until
         self._sync_memory_indexes(memory)
+        _deactivate_memory_retrieval_documents(
+            self.session,
+            memory_id=memory.id,
+        )
         return memory
+
+    def find_unique_correction_candidate(
+        self,
+        *,
+        scope_id: str,
+        predicate: str,
+        object_text: str,
+        replacement_memory_id: int,
+        as_of: datetime,
+        subject_id: str | None = None,
+    ) -> MemoryItem | None:
+        instant = _normalize_utc_sqlite_timestamp(as_of)
+        memory_kind = "preference" if predicate == "likes" else "taboo" if predicate == "dislikes" else ""
+        if not memory_kind:
+            return None
+        filters = [
+            MemoryItem.scope_type == "group",
+            MemoryItem.scope_id == scope_id,
+            MemoryItem.subject_type == "user",
+            MemoryItem.memory_kind == memory_kind,
+            or_(MemoryItem.predicate == predicate, MemoryItem.predicate == ""),
+            MemoryItem.status == "active",
+            MemoryItem.id != int(replacement_memory_id),
+            or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= instant),
+            or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > instant),
+        ]
+        if subject_id is not None:
+            filters.append(MemoryItem.subject_id == subject_id)
+        rows = list(self.session.scalars(select(MemoryItem).where(*filters)))
+        target = " ".join(str(object_text or "").casefold().split())
+        if target:
+            rows = [
+                row
+                for row in rows
+                if self.correction_objects_are_related(
+                    target,
+                    row.object_text if str(row.object_text or "").strip() else row.content,
+                )
+            ]
+        return rows[0] if len(rows) == 1 else None
+
+    @staticmethod
+    def correction_objects_are_related(target: str, candidate: str) -> bool:
+        normalized = " ".join(str(candidate or "").casefold().split())
+        if not target or not normalized:
+            return False
+        if target == normalized:
+            return True
+        return min(len(target), len(normalized)) >= 4 and (
+            target in normalized or normalized in target
+        )
 
     def supersede_current_memories(
         self,
@@ -1039,6 +1182,36 @@ class MemoryRepository:
         )
         return list(self.session.scalars(stmt))
 
+    def list_group_memories_by_source_msg_ids(
+        self,
+        *,
+        scope_id: str,
+        source_msg_ids: list[str],
+    ) -> list[MemoryItem]:
+        identifiers = {
+            str(item).strip()
+            for item in source_msg_ids
+            if str(item).strip()
+        }
+        if not identifiers:
+            return []
+        rows = self.session.scalars(
+            select(MemoryItem)
+            .where(
+                MemoryItem.scope_type == "group",
+                MemoryItem.scope_id == scope_id,
+            )
+            .order_by(MemoryItem.id)
+        )
+        return [
+            memory
+            for memory in rows
+            if str(memory.source_msg_id) in identifiers
+            or identifiers.intersection(
+                str(item) for item in (memory.source_msg_ids or [])
+            )
+        ]
+
     def list_current_group_memories(
         self,
         *,
@@ -1074,6 +1247,7 @@ class MemoryRepository:
         query: str,
         limit: int,
         as_of: datetime | None = None,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[MemoryItem]:
         """Return group-scoped lexical candidates with FTS5 as an accelerator.
 
@@ -1082,6 +1256,15 @@ class MemoryRepository:
         than spending a bounded query on the source-of-truth table.
         """
         if limit <= 0:
+            return []
+        normalized_subject_ids = tuple(
+            dict.fromkeys(
+                str(subject_id).strip()
+                for subject_id in (subject_ids or ())
+                if str(subject_id).strip()
+            )
+        )
+        if subject_ids is not None and not normalized_subject_ids:
             return []
         terms = _fts_search_terms(query)
         if not terms:
@@ -1112,6 +1295,8 @@ class MemoryRepository:
             or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= instant),
             or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > instant),
         ]
+        if subject_ids is not None:
+            active_filters.append(MemoryItem.subject_id.in_(normalized_subject_ids))
         memories = self.session.scalars(
             select(MemoryItem).where(
                 MemoryItem.id.in_(ids),
@@ -1882,6 +2067,21 @@ class RetrievalDocumentRepository:
         embedding_eligible: bool = False,
         embedding_status: str = "disabled",
     ) -> RetrievalDocument:
+        memory_source_id: int | None = None
+        if document_kind == "memory" and source_table == "memory_items":
+            try:
+                memory_source_id = int(source_id)
+            except ValueError:
+                raise ValueError("memory retrieval document source_id must be numeric") from None
+            source_memory = self.session.get(MemoryItem, memory_source_id)
+            if (
+                source_memory is None
+                or scope_type != "group"
+                or source_memory.scope_type != "group"
+                or source_memory.scope_id != str(scope_id)
+                or str(scope_id) != str(int(group_id))
+            ):
+                raise ValueError("memory retrieval document source scope mismatch")
         document = self.session.scalars(
             select(RetrievalDocument).where(
                 RetrievalDocument.scope_type == scope_type,
@@ -1944,6 +2144,13 @@ class RetrievalDocumentRepository:
             document.embedding_status = embedding_status
             document.updated_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
             self.session.add(document)
+
+        if document.document_kind == "memory" and document.source_table == "memory_items":
+            _deactivate_memory_retrieval_documents(
+                self.session,
+                memory_id=int(memory_source_id),
+                keep_document_id=document.id,
+            )
 
         existing_message_ids = set(
             self.session.scalars(
@@ -2066,6 +2273,7 @@ class RetrievalDocumentRepository:
         group_id: int,
         query: str,
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         resolved_limit = max(1, int(limit))
         terms = [term for term in _fts_search_terms(query) if len(term) >= 3]
@@ -2111,6 +2319,7 @@ class RetrievalDocumentRepository:
         return self._validated_hits(
             group_id=group_id,
             ranked_document_ids=ranked,
+            subject_ids=subject_ids,
         )
 
     def search_group_documents_temporal_hits(
@@ -2120,6 +2329,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None,
         end_at: datetime | None,
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if start_at is None and end_at is None:
             return []
@@ -2151,6 +2361,7 @@ class RetrievalDocumentRepository:
                 (int(document_id), float(len(document_ids) - rank))
                 for rank, document_id in enumerate(document_ids)
             ],
+            subject_ids=subject_ids,
         )
 
     def search_group_documents_entity_hits(
@@ -2160,6 +2371,7 @@ class RetrievalDocumentRepository:
         entities: tuple[str, ...],
         speaker_ids: tuple[str, ...],
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         normalized_entities = tuple(
             dict.fromkeys(value.strip() for value in entities if value.strip())
@@ -2182,7 +2394,7 @@ class RetrievalDocumentRepository:
         identity_conditions = []
         if normalized_speaker_ids:
             identity_conditions.append(Message.user_id.in_(normalized_speaker_ids))
-        if normalized_entities:
+        if normalized_entities and not normalized_speaker_ids:
             identity_user_ids = select(User.user_id).where(
                 or_(
                     User.nickname.in_(normalized_entities),
@@ -2225,6 +2437,7 @@ class RetrievalDocumentRepository:
                 (int(document_id), float(len(document_ids) - rank))
                 for rank, document_id in enumerate(document_ids)
             ],
+            subject_ids=subject_ids,
         )
 
     def search_group_fact_hits(
@@ -2234,6 +2447,7 @@ class RetrievalDocumentRepository:
         query: str,
         entities: tuple[str, ...],
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         terms = tuple(
             dict.fromkeys(
@@ -2247,6 +2461,7 @@ class RetrievalDocumentRepository:
                 ]
             )
         )
+        instant = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
         stmt = (
             select(RetrievalDocument.id)
             .join(
@@ -2263,7 +2478,9 @@ class RetrievalDocumentRepository:
                 RetrievalDocument.scope_id == str(int(group_id)),
                 MemoryItem.scope_type == "group",
                 MemoryItem.scope_id == str(int(group_id)),
-                MemoryItem.status.in_(("active", "superseded")),
+                MemoryItem.status == "active",
+                or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= instant),
+                or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > instant),
             )
         )
         if terms:
@@ -2278,7 +2495,6 @@ class RetrievalDocumentRepository:
         document_ids = list(
             self.session.scalars(
                 stmt.order_by(
-                    (MemoryItem.status == "active").desc(),
                     RetrievalDocument.end_at.desc(),
                     RetrievalDocument.id.desc(),
                 ).limit(max(1, int(limit)))
@@ -2290,6 +2506,7 @@ class RetrievalDocumentRepository:
                 (int(document_id), float(len(document_ids) - rank))
                 for rank, document_id in enumerate(document_ids)
             ],
+            subject_ids=subject_ids,
         )
 
     def search_group_reference_hits(
@@ -2299,6 +2516,7 @@ class RetrievalDocumentRepository:
         reference_msg_ids: tuple[str, ...],
         include_replies: bool,
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         references = tuple(
             dict.fromkeys(value.strip() for value in reference_msg_ids if value.strip())
@@ -2344,6 +2562,7 @@ class RetrievalDocumentRepository:
                 (int(document_id), float(len(document_ids) - rank))
                 for rank, document_id in enumerate(document_ids)
             ],
+            subject_ids=subject_ids,
         )
 
     def search_group_documents_vector_hits(
@@ -2356,6 +2575,7 @@ class RetrievalDocumentRepository:
         dimensions: int,
         version: str,
         limit: int,
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if len(embedding) != int(dimensions):
             raise ValueError("query embedding dimensions are incompatible")
@@ -2400,6 +2620,7 @@ class RetrievalDocumentRepository:
         return self._validated_hits(
             group_id=group_id,
             ranked_document_ids=ranked,
+            subject_ids=subject_ids,
         )
 
     def _validated_hits(
@@ -2407,6 +2628,7 @@ class RetrievalDocumentRepository:
         *,
         group_id: int,
         ranked_document_ids: list[tuple[int, float]],
+        subject_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if not ranked_document_ids:
             return []
@@ -2423,6 +2645,57 @@ class RetrievalDocumentRepository:
                 )
             )
         }
+        memory_documents = {
+            document_id: document
+            for document_id, document in documents.items()
+            if document.document_kind == "memory"
+        }
+        if memory_documents:
+            normalized_subject_ids = (
+                None
+                if subject_ids is None
+                else tuple(
+                    dict.fromkeys(
+                        str(subject_id).strip()
+                        for subject_id in subject_ids
+                        if str(subject_id).strip()
+                    )
+                )
+            )
+            if normalized_subject_ids == ():
+                for document_id in memory_documents:
+                    documents.pop(document_id, None)
+                memory_documents = {}
+            memory_ids = {
+                int(document.source_id)
+                for document in memory_documents.values()
+                if document.source_table == "memory_items"
+                and str(document.source_id).lstrip("-").isdigit()
+            }
+            instant = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+            current_filters = [
+                MemoryItem.id.in_(memory_ids),
+                MemoryItem.scope_type == "group",
+                MemoryItem.scope_id == str(int(group_id)),
+                MemoryItem.status == "active",
+                or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= instant),
+                or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > instant),
+            ]
+            if normalized_subject_ids is not None:
+                current_filters.append(MemoryItem.subject_id.in_(normalized_subject_ids))
+            current_memory_ids = set(
+                self.session.scalars(
+                    select(MemoryItem.id).where(*current_filters)
+                )
+            )
+            for document_id, document in memory_documents.items():
+                source_id = str(document.source_id)
+                if (
+                    document.source_table != "memory_items"
+                    or not source_id.lstrip("-").isdigit()
+                    or int(source_id) not in current_memory_ids
+                ):
+                    documents.pop(document_id, None)
         all_counts = {
             int(document_id): int(count)
             for document_id, count in self.session.execute(
