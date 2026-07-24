@@ -77,8 +77,8 @@ LLBot 若连续返回 `retcode=1200 / waitForSelfEcho timeout`，原回复会以
 部署只构建和重建 `xiaomachi` service（容器名 `xiaomachi-bot`）：
 
 ```bash
-docker compose build xiaomachi
-docker compose up -d --no-deps --force-recreate xiaomachi
+docker compose -f docker-compose.llbot.yml build xiaomachi
+docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
 Before and after this operation, record the `xiaomachi-llbot` container ID and

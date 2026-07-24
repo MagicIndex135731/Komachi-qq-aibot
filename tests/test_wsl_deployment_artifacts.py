@@ -200,6 +200,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
     root_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     wsl_readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
     required_settings = [
+        "CONTEXT_RECENT_LIMIT=60",
         "MEMORY_ORCHESTRATION_V2_ENABLED=true",
         "MEMORY_ORCHESTRATION_SHADOW_MODE=true",
         "MEMORY_EMBEDDING_PROVIDER=local",
@@ -210,7 +211,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         "MEMORY_EMBEDDING_BASE_URL=",
         "MEMORY_EMBEDDING_API_KEY=",
         "MEMORY_EMBEDDING_VERSION=",
-        "MEMORY_EPISODE_IDLE_MINUTES=30",
+        "MEMORY_EPISODE_IDLE_MINUTES=10",
         "MEMORY_EPISODE_MAX_MESSAGES=50",
         "MEMORY_EPISODE_MAX_TOKENS=8000",
         "MEMORY_CHUNK_MAX_TOKENS=1800",
@@ -237,8 +238,11 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         assert "MEMORY_EMBEDDING_PROVIDER=disabled" in documentation
         assert "MEMORY_EMBEDDING_DEVICE=auto" in documentation
         assert "nvidia.com/gpu=all" in documentation
-        assert "docker compose build xiaomachi" in documentation
-        assert "docker compose up -d --no-deps --force-recreate xiaomachi" in documentation
+        assert "docker compose -f docker-compose.llbot.yml build xiaomachi" in documentation
+        assert (
+            "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi"
+            in documentation
+        )
         assert "xiaomachi-llbot" in documentation
         assert "must not restart xiaomachi-llbot" in documentation
 

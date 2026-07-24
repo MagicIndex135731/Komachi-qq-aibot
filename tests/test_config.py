@@ -60,7 +60,7 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.search_region == "wt-wt"
     assert settings.search_backend == "auto"
     assert settings.search_timeout_seconds == 8.0
-    assert settings.context_recent_limit == 100
+    assert settings.context_recent_limit == 60
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
     assert settings.llm_model == "gpt-5.4-mini"
@@ -172,7 +172,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_embedding_base_url == ""
     assert settings.memory_embedding_api_key == ""
     assert settings.memory_embedding_version == ""
-    assert settings.memory_episode_idle_minutes == 30
+    assert settings.memory_episode_idle_minutes == 10
     assert settings.memory_episode_max_messages == 50
     assert settings.memory_episode_max_tokens == 8000
     assert settings.memory_chunk_max_tokens == 1800

@@ -81,6 +81,7 @@ def test_build_memory_runtime_shares_one_lazy_embedding_provider_and_background(
     )
 
     assert runtime.background_service is not None
+    assert runtime.background_service.idle_minutes == 10
     assert runtime.embedding_provider is runtime.background_service.embedder
     assert runtime.memory_compaction_service is not None
     assert runtime.memory_compaction_service.background_service is runtime.background_service

@@ -55,7 +55,7 @@ class AppSettings(BaseSettings):
     search_timeout_seconds: float = Field(default=8.0, alias="SEARCH_TIMEOUT_SECONDS")
     search_region: str = Field(default="wt-wt", alias="SEARCH_REGION")
     search_backend: str = Field(default="auto", alias="SEARCH_BACKEND")
-    context_recent_limit: int = Field(default=100, alias="CONTEXT_RECENT_LIMIT")
+    context_recent_limit: int = Field(default=60, alias="CONTEXT_RECENT_LIMIT")
     context_summary_limit: int = Field(default=3, alias="CONTEXT_SUMMARY_LIMIT")
     context_history_limit: int = Field(default=8, alias="CONTEXT_HISTORY_LIMIT")
     memory_compaction_enabled: bool = Field(default=True, alias="MEMORY_COMPACTION_ENABLED")
@@ -86,7 +86,7 @@ class AppSettings(BaseSettings):
     memory_retrieval_channel_timeout_seconds: float = Field(
         default=2.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
     )
-    memory_episode_idle_minutes: int = Field(default=30, alias="MEMORY_EPISODE_IDLE_MINUTES")
+    memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
     memory_episode_max_messages: int = Field(default=50, alias="MEMORY_EPISODE_MAX_MESSAGES")
     memory_episode_max_tokens: int = Field(default=8000, alias="MEMORY_EPISODE_MAX_TOKENS")
     memory_chunk_max_tokens: int = Field(default=1800, alias="MEMORY_CHUNK_MAX_TOKENS")

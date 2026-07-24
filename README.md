@@ -66,8 +66,9 @@
 - `LLM_TEXT_ENDPOINT`、`LLM_REASONING_EFFORT`
 - `LLM_BUILTIN_WEB_SEARCH`、`LLM_BUILTIN_WEB_SEARCH_CONTEXT_SIZE`
 - `SEARCH_PROVIDER`、`SEARCH_API_KEY`、`SEARCH_BASE_URL`
-- `CONTEXT_RECENT_LIMIT`（默认 100 条近期实际消息）、`CONTEXT_SUMMARY_LIMIT`、`CONTEXT_HISTORY_LIMIT`；带有旧话题承接、人物指代或时间回顾语义的问题会自动扩大详细历史回溯。
+- `CONTEXT_RECENT_LIMIT`（默认 60 条近期实际消息）、`CONTEXT_SUMMARY_LIMIT`、`CONTEXT_HISTORY_LIMIT`；带有旧话题承接、人物指代或时间回顾语义的问题会自动扩大详细历史回溯。
 - `MEMORY_COMPACTION_ENABLED`、`MEMORY_COMPACTION_BATCH_SIZE`、`MEMORY_COMPACTION_BACKFILL_WINDOWS`
+- `MEMORY_EPISODE_IDLE_MINUTES`（默认 10 分钟）控制普通语义聊天停止多久后封闭 episode 并进入长期记忆提炼；它与 `CONTEXT_RECENT_LIMIT` 相互独立。
 - 生图直接复用主模型的 Responses `image_generation` 工具；横图使用 `1536x1024`，竖图使用 `1024x1536`，质量固定为 `high`；仅单独配置 `GROUP_IMAGE_QUEUE_CAPACITY` 和 `GROUP_IMAGE_TIMEOUT_SECONDS`
 
 `LLM_TEXT_ENDPOINT=responses` 且 `LLM_BUILTIN_WEB_SEARCH=true` 时，文本请求可使用主模型的内置 `web_search` 工具。明确写出“联网”“搜索”“查资料”等请求会强制调用检索；普通聊天则由模型自行决定是否检索。实际工具调用会记录在未纳入 Git 的 `infra/wsl/runtime/logs/responses-tool-events.jsonl`，用于核验是否真的联网。
@@ -78,7 +79,7 @@
 
 ```bash
 cd "/mnt/d/qq群ai小人/infra/wsl"
-docker compose up -d --force-recreate xiaomachi
+docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
 ### 群聊记忆编排 V2 灰度与回滚
@@ -104,8 +105,8 @@ JSONL 对比 V1/V2；只有冻结 run 内 mandatory jobs 全部清空、embeddin
 
 ```bash
 cd "/mnt/d/qq群ai小人/infra/wsl"
-docker compose build xiaomachi
-docker compose up -d --no-deps --force-recreate xiaomachi
+docker compose -f docker-compose.llbot.yml build xiaomachi
+docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
 **must not restart xiaomachi-llbot**：不得重建或重启 LLBot，也不得删除其登录态。若 V2
