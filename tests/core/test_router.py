@@ -3,7 +3,6 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
@@ -20,12 +19,9 @@ from app.core.search_policy import AddressDecision
 from app.storage.db import session_scope
 from app.storage.models import MemoryItem, Message, Summary
 from app.storage.repositories import (
-    EpisodeRepository,
     GroupRepository,
     MemoryRepository,
     MessageRepository,
-    RetrievalDocumentRepository,
-    SummaryRepository,
     UserRepository,
 )
 
@@ -296,35 +292,6 @@ class ImageCapturingLlm:
     def generate_text(self, prompt_lines: list[str], *, images=None, conversation_key=None) -> str:
         self.calls.append({"prompt_lines": prompt_lines, "images": images})
         return "I can see it."
-
-
-class WeeklyReportLlm:
-    def __init__(self) -> None:
-        self.calls = []
-        self.conversation_keys: list[str | None] = []
-
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
-        self.calls.append(prompt_lines)
-        self.conversation_keys.append(conversation_key)
-        if ":uncovered:" in str(conversation_key):
-            return "weekly-seed-1\nweekly-seed-2"
-        return "1|weekly-seed-1|Mallory 编造的原话\n2|weekly-seed-2|节目效果很强"
-
-
-class V2WeeklyReportLlm:
-    def __init__(self) -> None:
-        self.calls: list[list[str]] = []
-        self.conversation_keys: list[str | None] = []
-
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
-        self.calls.append(prompt_lines)
-        self.conversation_keys.append(conversation_key)
-        if "Episode summaries:" in "\n".join(prompt_lines):
-            return '{"overview":"周初高能讨论","document_ids":[1]}'
-        if ":uncovered:" in str(conversation_key):
-            return "weekly-v2-tail"
-        return "1|weekly-v2-early|Mallory 编造的姓名和原话"
-
 
 class FakeGateway:
     def __init__(self, *, responses=None, error: Exception | None = None) -> None:
@@ -3952,535 +3919,52 @@ async def test_router_supersedes_cancelled_plan_instead_of_prompting_both_versio
 
 
 @pytest.mark.asyncio
-async def test_router_handles_group_weekly_report_command(sqlite_engine) -> None:
-    sender = FakeSender()
-    llm = WeeklyReportLlm()
-    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=False,
-            message_id="weekly-seed-1",
-            plain_text="今天这波真离谱",
-            timestamp=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
-            user_id=20001,
-            nickname="Alice",
-            group_card="Alice",
-        )
-    )
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=False,
-            message_id="weekly-seed-2",
-            plain_text="这也太炸了吧",
-            timestamp=datetime(2026, 5, 14, 12, 5, tzinfo=UTC),
-            user_id=20002,
-            nickname="Bob",
-            group_card="",
-        )
-    )
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-command",
-            plain_text="@Mira 周报",
-            timestamp=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
-            user_id=20003,
-            nickname="Carol",
-            group_card="",
-        )
-    )
-
-    assert len(sender.sent) == 1
-    assert "本群近一周高能雷霆发言周报" in sender.sent[0].text
-    assert "第1名 Alice" in sender.sent[0].text
-    assert "原话：今天这波真离谱" in sender.sent[0].text
-    assert "第1名 Mallory" not in sender.sent[0].text
-    assert "原话：Mallory 编造的原话" not in sender.sent[0].text
-    assert llm.conversation_keys == [
-        "group-weekly-report:10001:uncovered:1-of-1",
-        "group-weekly-report:10001",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_router_weekly_report_reads_v2_summary_but_renders_database_quote_and_card(
-    sqlite_engine,
-) -> None:
-    sender = FakeSender()
-    llm = V2WeeklyReportLlm()
-    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
-    now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-
-    with session_scope(sqlite_engine) as session:
-        groups = GroupRepository(session)
-        users = UserRepository(session)
-        messages = MessageRepository(session)
-        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
-        users.upsert_user(user_id=20001, nickname="Database Alice", group_card="Database Card")
-        early = messages.add_group_message(
-            platform_msg_id="weekly-v2-early",
-            group_id=10001,
-            user_id=20001,
-            timestamp=now - timedelta(days=6),
-            plain_text="数据库保存的早期原话",
-            raw_json={
-                "sender": {
-                    "nickname": "Group A Nickname",
-                    "card": "Group A Card",
-                }
-            },
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
-        messages.add_group_message(
-            platform_msg_id="weekly-v2-tail",
-            group_id=10001,
-            user_id=20001,
-            timestamp=now - timedelta(minutes=5),
-            plain_text="未压缩尾部消息",
-            raw_json={},
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
-        session.flush()
-        episode = EpisodeRepository(session).create_episode(
-            group_id=10001,
-            start_message_id=early.id,
-            started_at=early.timestamp,
-            segmentation_version="test-v2",
-            status="processed",
-        )
-        episode.compaction_version = "compact-v2"
-        summary = SummaryRepository(session).upsert_summary(
-            scope_type="group",
-            scope_id="10001",
-            summary_level="episode",
-            summary_key="weekly-v2-summary",
-            start_at=early.timestamp,
-            end_at=early.timestamp,
-            content="周初高能讨论的 V2 摘要",
-            source_count=1,
-            source_start_msg_id=early.platform_msg_id,
-            source_end_msg_id=early.platform_msg_id,
-        )
-        session.flush()
-        RetrievalDocumentRepository(session).upsert_document(
-            scope_type="group",
-            scope_id="10001",
-            group_id=10001,
-            episode_id=episode.id,
-            document_kind="episode_summary",
-            source_table="summaries",
-            source_id=str(summary.id),
-            start_at=early.timestamp,
-            end_at=early.timestamp,
-            content="周初高能讨论的 V2 摘要",
-            metadata_json={"compaction_generation": "compact-v2"},
-            content_hash="weekly-v2-summary",
-            source_message_ids=[early.id],
-        )
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-v2-command",
-            plain_text="@Mira 周报",
-            timestamp=now,
-            user_id=20003,
-            nickname="Requester",
-        )
-    )
-
-    assert [outbound.text for outbound in sender.sent]
-    reply = sender.sent[0].text
-    assert "第1名 Group A Card" in reply
-    assert "第1名 Database Card" not in reply
-    assert "原话：数据库保存的早期原话" in reply
-    assert "第1名 Mallory" not in reply
-    assert "原话：Mallory 编造的姓名和原话" not in reply
-    assert llm.conversation_keys == [
-        "group-weekly-report:10001:outline:1-of-1",
-        "group-weekly-report:10001:uncovered:1-of-1",
-        "group-weekly-report:10001",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_router_weekly_report_passes_full_window_and_group_scoped_v2_summaries(
-    sqlite_engine,
-    monkeypatch,
-) -> None:
-    sender = FakeSender()
-    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=FakeLlm())
-    window_end = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-    window_start = window_end - timedelta(days=7)
-
-    with session_scope(sqlite_engine) as session:
-        groups = GroupRepository(session)
-        users = UserRepository(session)
-        messages = MessageRepository(session)
-        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
-        groups.upsert_group(group_id=20002, group_name="20002", enabled=True, speak_enabled=True)
-        users.upsert_user(user_id=20001, nickname="Database Alice", group_card="Original Card")
-        for index in range(401):
-            messages.add_group_message(
-                platform_msg_id=f"weekly-window-{index}",
-                group_id=10001,
-                user_id=20001,
-                timestamp=window_start + timedelta(minutes=index),
-                plain_text=f"weekly source {index}",
-                raw_json={},
-                msg_type="text",
-                reply_to_msg_id=None,
-                mentioned_bot=False,
-            )
-        messages.add_group_message(
-            platform_msg_id="weekly-other-group",
-            group_id=20002,
-            user_id=20001,
-            timestamp=window_end - timedelta(minutes=1),
-            plain_text="must not enter group 10001 weekly report",
-            raw_json={},
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
-        messages.add_group_message(
-            platform_msg_id="weekly-blocked-outbound",
-            group_id=10001,
-            user_id=20001,
-            timestamp=window_end - timedelta(minutes=1),
-            plain_text="blocked content must not enter weekly report",
-            raw_json={
-                "direction": "outbound",
-                "delivery_state": "blocked",
-                "failure_kind": "qq_sensitive_content",
-            },
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
-        messages.add_group_message(
-            platform_msg_id="weekly-future-message",
-            group_id=10001,
-            user_id=20001,
-            timestamp=window_end + timedelta(minutes=1),
-            plain_text="future content must not enter weekly report",
-            raw_json={},
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
-
-    captured: dict[str, object] = {}
-    threaded_functions: list[object] = []
-    original_to_thread = asyncio.to_thread
-
-    async def recording_to_thread(function, /, *args, **kwargs):
-        threaded_functions.append(function)
-        return await original_to_thread(function, *args, **kwargs)
-
-    def fake_build_group_weekly_outline(**kwargs):
-        assert kwargs["group_id"] == 10001
-        assert kwargs["now"] == window_end
-        assert kwargs["episode_summaries"] == []
-        return SimpleNamespace(
-            ok=False,
-            overview="",
-            selected_document_ids=(),
-            error_code="no_summaries",
-        )
-
-    def fake_build_group_weekly_report_from_evidence(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(ok=True, reply_text="weekly report", error_code=None)
-
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_outline",
-        fake_build_group_weekly_outline,
-    )
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_report_from_evidence",
-        fake_build_group_weekly_report_from_evidence,
-    )
-    monkeypatch.setattr(router_module.asyncio, "to_thread", recording_to_thread)
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-full-window-command",
-            plain_text="@Mira 周报",
-            timestamp=window_end,
-            user_id=20003,
-            nickname="Requester",
-        )
-    )
-
-    forwarded_ids = {
-        message.platform_msg_id
-        for message in captured["uncovered_messages"]
-    }
-    assert len(captured["uncovered_messages"]) == 200
-    assert "weekly-window-0" not in forwarded_ids
-    assert "weekly-window-201" not in forwarded_ids
-    assert "weekly-window-202" in forwarded_ids
-    assert "weekly-window-249" in forwarded_ids
-    assert "weekly-window-400" in forwarded_ids
-    assert "weekly-other-group" not in forwarded_ids
-    assert "weekly-blocked-outbound" not in forwarded_ids
-    assert "weekly-future-message" not in forwarded_ids
-    assert captured["document_message_groups"] == []
-    assert "users_by_id" not in captured
-    assert router_module._load_weekly_episode_summaries in threaded_functions
-    assert router_module._load_weekly_raw_fallback in threaded_functions
-    assert [outbound.text for outbound in sender.sent] == ["weekly report"]
-
-
-@pytest.mark.asyncio
-async def test_router_weekly_raw_fallback_prompt_uses_latest_messages(
-    sqlite_engine,
-) -> None:
-    class LatestFallbackLlm:
+async def test_router_treats_retired_report_keyword_as_normal_mention(sqlite_engine) -> None:
+    class BackgroundAwareCompaction:
         def __init__(self) -> None:
-            self.uncovered_prompts: list[str] = []
+            self.enqueued: list[dict] = []
+            self.wake_count = 0
 
-        def generate_text(self, prompt_lines, *, conversation_key=None):
-            prompt = "\n".join(prompt_lines)
-            if ":uncovered:" in str(conversation_key):
-                self.uncovered_prompts.append(prompt)
-                return "weekly-latest-249" if "weekly-latest-249" in prompt else ""
-            return "1|weekly-latest-249|周末高能发言"
+        def enqueue_episode_allocation(self, **kwargs) -> None:
+            self.enqueued.append(kwargs)
+
+        async def wake(self) -> None:
+            self.wake_count += 1
 
     sender = FakeSender()
-    llm = LatestFallbackLlm()
+    llm = FakeLlm()
+    service = BackgroundAwareCompaction()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=llm,
+        memory_compaction_service=service,
     )
-    now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-    start_at = now - timedelta(days=7)
+    retired_keyword = "\u5468\u62a5"
+    event = make_event(
+        group_id=10001,
+        mentioned_bot=True,
+        message_id="retired-report-keyword",
+        plain_text=retired_keyword,
+        timestamp=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+    )
 
+    await router.handle_group_message(event)
+
+    assert [outbound.text for outbound in sender.sent] == ["I am here."]
     with session_scope(sqlite_engine) as session:
-        GroupRepository(session).upsert_group(
-            group_id=10001,
-            group_name="10001",
-            enabled=True,
-            speak_enabled=True,
-        )
-        UserRepository(session).upsert_user(
-            user_id=20001,
-            nickname="Alice",
-            group_card="",
-        )
-        messages = MessageRepository(session)
-        for index in range(250):
-            messages.add_group_message(
-                platform_msg_id=f"weekly-latest-{index}",
-                group_id=10001,
-                user_id=20001,
-                timestamp=start_at + timedelta(minutes=index),
-                plain_text=f"weekly fallback source {index}",
-                raw_json={"sender": {"nickname": "Alice", "card": ""}},
-                msg_type="text",
-                reply_to_msg_id=None,
-                mentioned_bot=False,
-            )
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-latest-command",
-            plain_text="@Mira 周报",
-            timestamp=now,
-            user_id=20003,
-            nickname="Requester",
-        )
-    )
-
-    combined_prompt = "\n".join(llm.uncovered_prompts)
-    assert "source_msg_id=weekly-latest-0 " not in combined_prompt
-    assert "source_msg_id=weekly-latest-249 " in combined_prompt
-    assert "原话：weekly fallback source 249" in sender.sent[0].text
-
-
-@pytest.mark.asyncio
-async def test_router_weekly_report_falls_back_to_raw_messages_when_v2_lookup_fails(
-    sqlite_engine,
-    monkeypatch,
-) -> None:
-    sender = FakeSender()
-    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=FakeLlm())
-    now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-
-    with session_scope(sqlite_engine) as session:
-        groups = GroupRepository(session)
-        users = UserRepository(session)
-        messages = MessageRepository(session)
-        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
-        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
-        for index in range(2):
-            messages.add_group_message(
-                platform_msg_id=f"weekly-fallback-{index}",
-                group_id=10001,
-                user_id=20001,
-                timestamp=now - timedelta(minutes=2 - index),
-                plain_text=f"raw fallback source {index}",
-                raw_json={},
-                msg_type="text",
-                reply_to_msg_id=None,
-                mentioned_bot=False,
-            )
-
-    captured: dict[str, object] = {}
-
-    class FailingRetrievalDocumentRepository:
-        def __init__(self, session) -> None:
-            del session
-
-        def list_active_episode_summaries_for_window(
-            self,
-            *,
-            group_id,
-            start_at,
-            end_at,
-            bot_user_id,
-            limit,
-        ):
-            assert limit == router_module.MAX_SUMMARY_DOCUMENTS + 1
-            del group_id, start_at, end_at, bot_user_id
-            raise RuntimeError("retrieval database unavailable")
-
-    def fake_build_group_weekly_outline(**kwargs):
-        assert kwargs["episode_summaries"] == []
-        return SimpleNamespace(
-            ok=False,
-            overview="",
-            selected_document_ids=(),
-            error_code="no_summaries",
-        )
-
-    def fake_build_group_weekly_report_from_evidence(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(ok=True, reply_text="raw fallback report", error_code=None)
-
-    monkeypatch.setattr(router_module, "RetrievalDocumentRepository", FailingRetrievalDocumentRepository)
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_outline",
-        fake_build_group_weekly_outline,
-    )
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_report_from_evidence",
-        fake_build_group_weekly_report_from_evidence,
-    )
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-fallback-command",
-            plain_text="@Mira 周报",
-            timestamp=now,
-            user_id=20003,
-            nickname="Requester",
-        )
-    )
-
-    assert {
-        message.platform_msg_id
-        for message in captured["uncovered_messages"]
-    } >= {
-        "weekly-fallback-0",
-        "weekly-fallback-1",
+        row = MessageRepository(session).get_by_platform_msg_id(event.platform_msg_id)
+        assert row is not None
+        assert row.plain_text == retired_keyword
+        expected_id = row.id
+    assert service.enqueued[0] == {
+        "group_id": 10001,
+        "message_id": expected_id,
+        "now": event.timestamp,
+        "late_arrival": False,
     }
-    assert captured["document_message_groups"] == []
-    assert "users_by_id" not in captured
-    assert [outbound.text for outbound in sender.sent] == ["raw fallback report"]
-
-
-@pytest.mark.asyncio
-async def test_router_weekly_report_summary_capacity_failure_does_not_use_raw_fallback(
-    sqlite_engine,
-    monkeypatch,
-) -> None:
-    sender = FakeSender()
-    router = InboundRouter.build_for_test(
-        sqlite_engine=sqlite_engine,
-        sender=sender,
-        llm_client=FakeLlm(),
-    )
-    now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-    captured: dict[str, object] = {}
-
-    def fake_load_weekly_episode_summaries(**kwargs):
-        del kwargs
-        return [SimpleNamespace(document_id=index) for index in range(321)]
-
-    def fake_build_group_weekly_outline(**kwargs):
-        captured["summary_count"] = len(kwargs["episode_summaries"])
-        return SimpleNamespace(
-            ok=False,
-            overview="",
-            selected_document_ids=(),
-            error_code="summary_limit_exceeded",
-        )
-
-    def forbidden_raw_fallback(**kwargs):
-        raise AssertionError("summary capacity overflow must not use raw fallback")
-
-    def forbidden_report_builder(**kwargs):
-        raise AssertionError("summary capacity overflow must not build a partial report")
-
-    monkeypatch.setattr(
-        router_module,
-        "_load_weekly_episode_summaries",
-        fake_load_weekly_episode_summaries,
-    )
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_outline",
-        fake_build_group_weekly_outline,
-    )
-    monkeypatch.setattr(
-        router_module,
-        "_load_weekly_raw_fallback",
-        forbidden_raw_fallback,
-    )
-    monkeypatch.setattr(
-        router_module,
-        "build_group_weekly_report_from_evidence",
-        forbidden_report_builder,
-    )
-
-    await router.handle_group_message(
-        make_event(
-            group_id=10001,
-            mentioned_bot=True,
-            message_id="weekly-summary-capacity-command",
-            plain_text="@Mira 周报",
-            timestamp=now,
-            user_id=20003,
-            nickname="Requester",
-        )
-    )
-
-    assert captured["summary_count"] == 321
-    assert [outbound.text for outbound in sender.sent] == [
-        "这周话题太多，超出周报容量，暂时无法生成"
-    ]
+    assert len(service.enqueued) == 2
+    assert service.wake_count == 1
 
 
 @pytest.mark.asyncio

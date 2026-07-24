@@ -117,11 +117,11 @@ def test_sender_retries_group_text_when_gateway_reports_retryable_timeout() -> N
     gateway = RetryableFailOnceGateway()
     sender = Sender(gateway)
 
-    asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text="weekly report")))
+    asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text="long report")))
 
     assert gateway.calls == [
-        ("send_group_msg", {"group_id": 10001, "message": "weekly report"}),
-        ("send_group_msg", {"group_id": 10001, "message": "weekly report"}),
+        ("send_group_msg", {"group_id": 10001, "message": "long report"}),
+        ("send_group_msg", {"group_id": 10001, "message": "long report"}),
     ]
 
 
@@ -156,7 +156,7 @@ def test_sender_splits_long_group_text_when_chunking_is_explicitly_allowed() -> 
     sender = Sender(gateway)
     long_text = "\n".join(
         [
-            "本群近一周高能雷霆发言周报",
+            "群聊长文本分段测试",
             "统计截止：2026-05-15 06:51",
             "第1名 群友甲 原话：评价一下群里另一个叫代理群主的弱智机器人 上榜理由：火药味最直给，点名开喷弱智机器人，攻击性和引战度都很高。",
             "第2名 熟人A 原话：从夯到拉评价一下历代总书记，给出评级和一句话评价。 上榜理由：危险边缘反复横跳，节目效果和炸裂程度都拉满。",
@@ -177,7 +177,7 @@ def test_sender_falls_back_to_chunking_after_retryable_long_message_failure() ->
     sender = Sender(gateway)
     long_text = "\n".join(
         [
-            "本群近一周高能雷霆发言周报",
+            "群聊长文本分段测试",
             "统计截止：2026-05-15 06:51",
             "第1名 群友甲 原话：评价一下群里另一个叫代理群主的弱智机器人。上榜理由：火药味最直接，点名开喷弱智机器人，攻击性和引战度都很高。",
             "第2名 阿福 原话：从头到尾评价一下历代总书记，给出评级和一句话评价。上榜理由：危险边缘反复横跳，节目效果和炸裂程度都拉满。",
