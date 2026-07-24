@@ -24,7 +24,13 @@ from app.core.chat_style import (
 )
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
-from app.core.group_weekly_report import build_group_weekly_report
+from app.core.group_weekly_report import (
+    MAX_CANDIDATE_MESSAGES,
+    MAX_SUMMARY_DOCUMENTS,
+    MAX_UNCOVERED_MESSAGES,
+    build_group_weekly_outline,
+    build_group_weekly_report_from_evidence,
+)
 from app.core.image_cache import cache_images_in_raw_payload
 from app.core.message_archive import append_group_message_archive
 from app.core.image_turn_resolver import ResolvedImageTurn, resolve_images_for_turn
@@ -76,10 +82,82 @@ from app.storage.repositories import (
     BbotListenerCacheRepository,
     SummaryRepository,
     JobRepository,
+    RetrievalDocumentRepository,
     UserRepository,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_weekly_episode_summaries(
+    *,
+    engine,
+    group_id: int,
+    start_at: datetime,
+    end_at: datetime,
+    bot_user_id: int,
+):
+    with session_scope(engine) as session:
+        return RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=group_id,
+            start_at=start_at,
+            end_at=end_at,
+            bot_user_id=bot_user_id,
+            limit=MAX_SUMMARY_DOCUMENTS + 1,
+        )
+
+
+def _load_weekly_v2_evidence(
+    *,
+    engine,
+    group_id: int,
+    start_at: datetime,
+    end_at: datetime,
+    bot_user_id: int,
+    selected_document_ids,
+    covered_document_ids,
+):
+    with session_scope(engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        document_message_groups = documents.list_weekly_document_message_groups(
+            group_id=group_id,
+            document_ids=selected_document_ids,
+            start_at=start_at,
+            end_at=end_at,
+            bot_user_id=bot_user_id,
+        )
+        uncovered_messages = (
+            documents.list_uncovered_group_messages_for_weekly_report(
+                group_id=group_id,
+                start_at=start_at,
+                end_at=end_at,
+                bot_user_id=bot_user_id,
+                covered_document_ids=covered_document_ids,
+                limit=MAX_UNCOVERED_MESSAGES + 1,
+            )
+        )
+        return document_message_groups, uncovered_messages
+
+
+def _load_weekly_raw_fallback(
+    *,
+    engine,
+    group_id: int,
+    start_at: datetime,
+    end_at: datetime,
+    bot_user_id: int,
+):
+    with session_scope(engine) as session:
+        return MessageRepository(session).list_group_messages_since(
+            group_id=group_id,
+            since=start_at,
+            until=end_at,
+            bot_user_id=bot_user_id,
+            limit=MAX_CANDIDATE_MESSAGES,
+            exclude_qq_blocked_outbound=True,
+        )
 QQ_BLOCKED_REPLY_NOTICE = "刚刚的回复可能包含敏感信息，被 QQ 拦截了，无法发送。"
 QQ_BLOCKED_CONTEXT_NOTE = (
     "[系统投递状态：以上回复未在 QQ 群中送达；连续发送后仍被 QQ 拦截，可能包含敏感信息。"
@@ -435,24 +513,94 @@ class InboundRouter:
         return normalized == "周报"
 
     async def _handle_group_weekly_report_request(self, event) -> bool:
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            users = UserRepository(session)
-            since = self._normalize_timestamp(event.timestamp) - timedelta(days=7)
-            weekly_messages = messages.list_group_messages_since(
+        now = self._normalize_timestamp(event.timestamp)
+        since = now - timedelta(days=7)
+        try:
+            episode_summaries = await asyncio.to_thread(
+                _load_weekly_episode_summaries,
+                engine=self.engine,
                 group_id=event.group_id,
-                since=since,
+                start_at=since,
+                end_at=now,
                 bot_user_id=self.runtime.settings.bot_qq,
-                limit=400,
             )
-            users_by_id = users.get_users_by_ids([message.user_id for message in weekly_messages])
-        result = await asyncio.to_thread(
-            build_group_weekly_report,
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_v2_summaries_unavailable group_id=%s error_type=%s",
+                event.group_id,
+                type(exc).__name__,
+            )
+            episode_summaries = []
+
+        outline = await asyncio.to_thread(
+            build_group_weekly_outline,
             group_id=event.group_id,
-            now=event.timestamp,
-            messages=weekly_messages,
-            users_by_id=users_by_id,
+            now=now,
+            episode_summaries=episode_summaries,
             llm_client=self.llm_client,
+        )
+        if outline.error_code == "summary_limit_exceeded":
+            await self._send_prebuilt_reply(
+                event,
+                "这周话题太多，超出周报容量，暂时无法生成",
+            )
+            return True
+        document_message_groups = []
+        uncovered_messages = []
+        overview = ""
+        if outline.ok:
+            try:
+                document_message_groups, uncovered_messages = (
+                    await asyncio.to_thread(
+                        _load_weekly_v2_evidence,
+                        engine=self.engine,
+                        group_id=event.group_id,
+                        start_at=since,
+                        end_at=now,
+                        bot_user_id=self.runtime.settings.bot_qq,
+                        selected_document_ids=outline.selected_document_ids,
+                        covered_document_ids=[
+                            str(summary.document_id)
+                            for summary in episode_summaries
+                        ],
+                    )
+                )
+                overview = outline.overview
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_v2_evidence_unavailable group_id=%s error_type=%s",
+                    event.group_id,
+                    type(exc).__name__,
+                )
+
+        if not outline.ok or not document_message_groups:
+            try:
+                uncovered_messages = await asyncio.to_thread(
+                    _load_weekly_raw_fallback,
+                    engine=self.engine,
+                    group_id=event.group_id,
+                    start_at=since,
+                    end_at=now,
+                    bot_user_id=self.runtime.settings.bot_qq,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_raw_fallback_unavailable group_id=%s error_type=%s",
+                    event.group_id,
+                    type(exc).__name__,
+                )
+                uncovered_messages = []
+            document_message_groups = []
+            overview = ""
+
+        result = await asyncio.to_thread(
+            build_group_weekly_report_from_evidence,
+            group_id=event.group_id,
+            now=now,
+            document_message_groups=document_message_groups,
+            uncovered_messages=uncovered_messages,
+            llm_client=self.llm_client,
+            overview=overview,
         )
         if not result.ok:
             if result.error_code == "insufficient_data":

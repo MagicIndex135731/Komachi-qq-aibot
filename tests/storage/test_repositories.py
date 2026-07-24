@@ -1,14 +1,19 @@
 from datetime import UTC, datetime, timedelta, timezone
 
+import pytest
+
 from sqlalchemy import text
 
 from app.storage.db import build_engine, create_all, session_scope
+from app.storage.models import RetrievalDocumentMessage
 from app.storage.repositories import (
     GroupRepository,
     DevSessionRepository,
     DevTaskRepository,
     MemoryRepository,
     MessageRepository,
+    EpisodeRepository,
+    RetrievalDocumentRepository,
     SummaryRepository,
     UsageRepository,
     UserRepository,
@@ -435,12 +440,982 @@ def test_message_repository_lists_group_messages_since_for_weekly_report(tmp_pat
             reply_to_msg_id=None,
             mentioned_bot=False,
         )
+        messages.add_group_message(
+            platform_msg_id="m-blocked",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 14, 5, tzinfo=UTC),
+            plain_text="blocked outbound",
+            raw_json={
+                "direction": "outbound",
+                "delivery_state": "blocked",
+                "failure_kind": "qq_sensitive_content",
+            },
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="m-future",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 16, tzinfo=UTC),
+            plain_text="outside requested weekly window",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
 
         kept = messages.list_group_messages_since(
             group_id=10001,
             since=datetime(2026, 5, 8, tzinfo=UTC),
             bot_user_id=123456789,
-            limit=50,
+            limit=None,
+            until=datetime(2026, 5, 15, tzinfo=UTC),
+            exclude_qq_blocked_outbound=True,
         )
 
     assert [message.platform_msg_id for message in kept] == ["m-keep"]
+
+
+def test_message_repository_limited_weekly_messages_keep_latest_rows_in_order(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-latest-limit.db")
+    create_all(engine)
+    start_at = datetime(2026, 5, 8, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        for index in range(250):
+            messages.add_group_message(
+                platform_msg_id=f"m-{index}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=start_at + timedelta(minutes=index),
+                plain_text=f"weekly source {index}",
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+        kept = messages.list_group_messages_since(
+            group_id=10001,
+            since=start_at,
+            until=start_at + timedelta(days=1),
+            bot_user_id=123456789,
+            limit=200,
+            exclude_qq_blocked_outbound=True,
+        )
+
+    assert [message.platform_msg_id for message in kept] == [
+        f"m-{index}" for index in range(50, 250)
+    ]
+
+
+def _add_weekly_source_message(
+    messages: MessageRepository,
+    *,
+    group_id: int,
+    user_id: int,
+    platform_msg_id: str,
+    timestamp: datetime,
+    raw_json: dict | None = None,
+):
+    message = messages.add_group_message(
+        platform_msg_id=platform_msg_id,
+        group_id=group_id,
+        user_id=user_id,
+        timestamp=timestamp,
+        plain_text=f"source {platform_msg_id}",
+        raw_json=raw_json or {},
+        msg_type="text",
+        reply_to_msg_id=None,
+        mentioned_bot=False,
+    )
+    messages.session.flush()
+    return message
+
+
+def _add_weekly_episode_summary(
+    session,
+    *,
+    group_id: int,
+    source_messages,
+    start_at: datetime,
+    end_at: datetime,
+    content_hash: str,
+    status: str = "active",
+    document_kind: str = "episode_summary",
+    episode_status: str = "processed",
+    compaction_version: str = "compact-v2",
+    metadata_generation: str | None = None,
+):
+    episode = EpisodeRepository(session).create_episode(
+        group_id=group_id,
+        start_message_id=source_messages[0].id,
+        started_at=start_at,
+        segmentation_version="segment-v2",
+        status=episode_status,
+    )
+    episode.compaction_version = compaction_version
+    summary = SummaryRepository(session).upsert_summary(
+        scope_type="group",
+        scope_id=str(group_id),
+        summary_level="episode",
+        summary_key=content_hash,
+        start_at=start_at,
+        end_at=end_at,
+        content=f"summary {content_hash}",
+        source_count=len(source_messages),
+        source_start_msg_id=source_messages[0].platform_msg_id,
+        source_end_msg_id=source_messages[-1].platform_msg_id,
+    )
+    session.flush()
+    return RetrievalDocumentRepository(session).upsert_document(
+        scope_type="group",
+        scope_id=str(group_id),
+        group_id=group_id,
+        episode_id=episode.id,
+        document_kind=document_kind,
+        source_table="summaries",
+        source_id=str(summary.id),
+        start_at=start_at,
+        end_at=end_at,
+        content=f"summary {content_hash}",
+        metadata_json={
+            "compaction_generation": (
+                compaction_version
+                if metadata_generation is None
+                else metadata_generation
+            )
+        },
+        content_hash=content_hash,
+        source_message_ids=[message.id for message in source_messages],
+        status=status,
+    )
+
+
+def test_retrieval_documents_list_weekly_episode_summaries_scoped_by_window_status_and_kind(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-summaries.db")
+    create_all(engine)
+    window_start = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    window_end = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        groups.upsert_group(group_id=10002, group_name="group-2", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        users.upsert_user(user_id=20002, nickname="Bob", group_card="")
+
+        left_edge = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-left-edge",
+            timestamp=window_start - timedelta(days=1),
+        )
+        inside = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-inside",
+            timestamp=window_start + timedelta(days=1),
+        )
+        other = _add_weekly_source_message(
+            messages,
+            group_id=10002,
+            user_id=20002,
+            platform_msg_id="weekly-other-group",
+            timestamp=window_start + timedelta(days=1),
+        )
+        left_edge_document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[left_edge],
+            start_at=window_start - timedelta(days=1),
+            end_at=window_start,
+            content_hash="weekly-left-edge",
+        )
+        expected = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[inside],
+            start_at=window_start + timedelta(days=1),
+            end_at=window_end - timedelta(days=1),
+            content_hash="weekly-inside",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[inside],
+            start_at=window_start + timedelta(days=2),
+            end_at=window_start + timedelta(days=3),
+            content_hash="weekly-inactive",
+            status="inactive",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[inside],
+            start_at=window_start + timedelta(days=3),
+            end_at=window_start + timedelta(days=4),
+            content_hash="weekly-other-kind",
+            document_kind="episode",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10002,
+            source_messages=[other],
+            start_at=window_start + timedelta(days=1),
+            end_at=window_end - timedelta(days=1),
+            content_hash="weekly-other-group",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[left_edge],
+            start_at=window_start - timedelta(days=3),
+            end_at=window_start - timedelta(microseconds=1),
+            content_hash="weekly-before-window",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[inside],
+            start_at=window_end + timedelta(microseconds=1),
+            end_at=window_end + timedelta(days=1),
+            content_hash="weekly-after-window",
+        )
+
+        documents = RetrievalDocumentRepository(session).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=window_start,
+            end_at=window_end,
+        )
+
+    assert [document.document_id for document in documents] == [
+        left_edge_document.id,
+        expected.id,
+    ]
+    assert [document.content for document in documents] == [
+        "summary weekly-left-edge",
+        "summary weekly-inside",
+    ]
+    assert documents[1].episode_id == expected.episode_id
+    assert documents[1].source_msg_ids == ()
+
+
+def test_retrieval_documents_weekly_summary_requires_a_current_episode(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-current-episode.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        source = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-not-current-source",
+            timestamp=now,
+        )
+        document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[source],
+            start_at=now,
+            end_at=now,
+            content_hash="weekly-not-current",
+        )
+        episode = EpisodeRepository(session).get_episode(document.episode_id)
+        assert episode is not None
+        episode.is_current = False
+        session.add(episode)
+
+        documents = RetrievalDocumentRepository(session).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+
+def test_retrieval_documents_weekly_summary_query_is_bounded(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-summary-limit.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        for index in range(4):
+            source = _add_weekly_source_message(
+                messages,
+                group_id=10001,
+                user_id=20001,
+                platform_msg_id=f"weekly-limited-summary-{index}",
+                timestamp=now - timedelta(minutes=4 - index),
+            )
+            _add_weekly_episode_summary(
+                session,
+                group_id=10001,
+                source_messages=[source],
+                start_at=source.timestamp,
+                end_at=source.timestamp,
+                content_hash=f"weekly-limited-summary-{index}",
+            )
+
+        repository = RetrievalDocumentRepository(session)
+        documents = repository.list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+            limit=3,
+        )
+        with pytest.raises(ValueError, match="limit"):
+            repository.list_active_episode_summaries_for_window(
+                group_id=10001,
+                start_at=now - timedelta(days=7),
+                end_at=now,
+                limit=0,
+            )
+
+    assert len(documents) == 3
+    assert [document.content for document in documents] == [
+        "summary weekly-limited-summary-0",
+        "summary weekly-limited-summary-1",
+        "summary weekly-limited-summary-2",
+    ]
+
+
+def test_retrieval_documents_weekly_summary_rejects_missing_provenance(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-missing-provenance.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        source = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-missing-provenance-source",
+            timestamp=now,
+        )
+        episode = EpisodeRepository(session).create_episode(
+            group_id=10001,
+            start_message_id=source.id,
+            started_at=now,
+            segmentation_version="segment-v2",
+            status="processed",
+        )
+        session.flush()
+        RetrievalDocumentRepository(session).upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=episode.id,
+            document_kind="episode_summary",
+            source_table="summaries",
+            source_id="weekly-missing-provenance",
+            start_at=now,
+            end_at=now,
+            content="summary missing provenance",
+            metadata_json={},
+            content_hash="weekly-missing-provenance",
+            source_message_ids=[],
+        )
+
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+
+def test_retrieval_documents_weekly_summary_rejects_cross_group_or_dangling_provenance(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-invalid-provenance.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        groups.upsert_group(group_id=10002, group_name="group-2", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        users.upsert_user(user_id=20002, nickname="Bob", group_card="")
+        source = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-valid-source",
+            timestamp=now,
+        )
+        other = _add_weekly_source_message(
+            messages,
+            group_id=10002,
+            user_id=20002,
+            platform_msg_id="weekly-cross-group-source",
+            timestamp=now,
+        )
+        document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[source],
+            start_at=now,
+            end_at=now,
+            content_hash="weekly-cross-group-provenance",
+        )
+        document_id = document.id
+        other_message_id = other.id
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            text(
+                "UPDATE retrieval_document_messages "
+                "SET group_id = :group_id, message_id = :message_id "
+                "WHERE document_id = :document_id"
+            ),
+            {
+                "group_id": 10002,
+                "message_id": other_message_id,
+                "document_id": document_id,
+            },
+        )
+        connection.commit()
+
+    with session_scope(engine) as session:
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            text(
+                "UPDATE retrieval_document_messages "
+                "SET group_id = :group_id, message_id = :message_id "
+                "WHERE document_id = :document_id"
+            ),
+            {
+                "group_id": 10001,
+                "message_id": 999999,
+                "document_id": document_id,
+            },
+        )
+        connection.commit()
+
+    with session_scope(engine) as session:
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+
+def test_retrieval_documents_weekly_summary_preserves_source_provenance_order(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-source-order.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group-1", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        first = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-source-first",
+            timestamp=now - timedelta(minutes=2),
+        )
+        second = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-source-second",
+            timestamp=now - timedelta(minutes=1),
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[second, first],
+            start_at=now - timedelta(minutes=2),
+            end_at=now,
+            content_hash="weekly-source-order",
+        )
+
+        repository = RetrievalDocumentRepository(session)
+        documents = repository.list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+        message_groups = repository.list_weekly_document_message_groups(
+            group_id=10001,
+            document_ids=[documents[0].document_id],
+            start_at=now - timedelta(days=7),
+            end_at=now,
+            bot_user_id=123456789,
+        )
+
+    assert [message.platform_msg_id for message in message_groups[0]] == [
+        "weekly-source-second",
+        "weekly-source-first",
+    ]
+
+
+def test_retrieval_documents_weekly_summary_requires_processed_matching_generation(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-terminal-generation.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        sources = [
+            _add_weekly_source_message(
+                messages,
+                group_id=10001,
+                user_id=20001,
+                platform_msg_id=f"weekly-state-{index}",
+                timestamp=now - timedelta(minutes=4 - index),
+            )
+            for index in range(4)
+        ]
+        expected = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[sources[0]],
+            start_at=sources[0].timestamp,
+            end_at=sources[0].timestamp,
+            content_hash="weekly-processed-current",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[sources[1]],
+            start_at=sources[1].timestamp,
+            end_at=sources[1].timestamp,
+            content_hash="weekly-processing",
+            episode_status="processing",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[sources[2]],
+            start_at=sources[2].timestamp,
+            end_at=sources[2].timestamp,
+            content_hash="weekly-failed",
+            episode_status="failed",
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[sources[3]],
+            start_at=sources[3].timestamp,
+            end_at=sources[3].timestamp,
+            content_hash="weekly-stale-generation",
+            compaction_version="compact-current",
+            metadata_generation="compact-stale",
+        )
+
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert [document.document_id for document in documents] == [expected.id]
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        {"delivery_state": "reserved"},
+        {
+            "delivery_state": "blocked",
+            "failure_kind": "qq_sensitive_content",
+        },
+    ],
+)
+def test_retrieval_documents_weekly_summary_excludes_unsafe_source_provenance(
+    tmp_path,
+    raw_json,
+) -> None:
+    engine = build_engine(tmp_path / f"weekly-unsafe-{raw_json['delivery_state']}.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        source = _add_weekly_source_message(
+            MessageRepository(session),
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-unsafe-source",
+            timestamp=now,
+            raw_json=raw_json,
+        )
+        _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[source],
+            start_at=now,
+            end_at=now,
+            content_hash="weekly-unsafe-document",
+        )
+
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+            bot_user_id=123456789,
+        )
+
+    assert documents == []
+
+
+def test_retrieval_documents_weekly_summary_only_accepts_source_role(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-source-role.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        source = _add_weekly_source_message(
+            MessageRepository(session),
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-context-only",
+            timestamp=now,
+        )
+        document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[source],
+            start_at=now,
+            end_at=now,
+            content_hash="weekly-context-document",
+        )
+        session.flush()
+        provenance = session.get(
+            RetrievalDocumentMessage,
+            (document.id, source.id, "source"),
+        )
+        assert provenance is not None
+        session.delete(provenance)
+        session.flush()
+        session.add(
+            RetrievalDocumentMessage(
+                document_id=document.id,
+                message_id=source.id,
+                role="context",
+                group_id=10001,
+                ordinal=0,
+            )
+        )
+        session.flush()
+
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+
+def test_retrieval_documents_weekly_summary_excludes_partially_deleted_provenance(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-partial-provenance.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        first = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-partial-first",
+            timestamp=now - timedelta(minutes=1),
+        )
+        second = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-partial-second",
+            timestamp=now,
+        )
+        document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[first, second],
+            start_at=first.timestamp,
+            end_at=second.timestamp,
+            content_hash="weekly-partial-document",
+        )
+        session.flush()
+        provenance = session.get(
+            RetrievalDocumentMessage,
+            (document.id, second.id, "source"),
+        )
+        assert provenance is not None
+        session.delete(provenance)
+        session.flush()
+
+        documents = RetrievalDocumentRepository(
+            session
+        ).list_active_episode_summaries_for_window(
+            group_id=10001,
+            start_at=now - timedelta(days=7),
+            end_at=now,
+        )
+
+    assert documents == []
+
+
+def test_weekly_document_evidence_rechecks_window_and_document_status(tmp_path) -> None:
+    engine = build_engine(tmp_path / "weekly-evidence-recheck.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+    window_start = now - timedelta(days=7)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        before = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-before-window-source",
+            timestamp=window_start - timedelta(seconds=1),
+        )
+        inside = _add_weekly_source_message(
+            messages,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="weekly-inside-window-source",
+            timestamp=window_start,
+        )
+        document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[before, inside],
+            start_at=window_start - timedelta(minutes=1),
+            end_at=window_start,
+            content_hash="weekly-boundary-evidence",
+        )
+        repository = RetrievalDocumentRepository(session)
+        groups = repository.list_weekly_document_message_groups(
+            group_id=10001,
+            document_ids=[document.id],
+            start_at=window_start,
+            end_at=now,
+            bot_user_id=123456789,
+        )
+        assert [message.platform_msg_id for message in groups[0]] == [
+            "weekly-inside-window-source"
+        ]
+
+        document.status = "inactive"
+        session.add(document)
+        session.flush()
+        with pytest.raises(ValueError, match="no longer valid"):
+            repository.list_weekly_document_message_groups(
+                group_id=10001,
+                document_ids=[document.id],
+                start_at=window_start,
+                end_at=now,
+                bot_user_id=123456789,
+            )
+
+
+def test_weekly_uncovered_messages_are_safe_bounded_and_ignore_nonterminal_coverage(
+    tmp_path,
+) -> None:
+    engine = build_engine(tmp_path / "weekly-uncovered-limit.db")
+    create_all(engine)
+    now = datetime(2026, 7, 24, 12, tzinfo=UTC)
+    window_start = now - timedelta(days=7)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group-1",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        rows = [
+            _add_weekly_source_message(
+                messages,
+                group_id=10001,
+                user_id=20001,
+                platform_msg_id=f"weekly-uncovered-{index}",
+                timestamp=window_start + timedelta(minutes=index),
+            )
+            for index in range(802)
+        ]
+        covered_document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[rows[0]],
+            start_at=rows[0].timestamp,
+            end_at=rows[0].timestamp,
+            content_hash="weekly-covered",
+        )
+        nonterminal_document = _add_weekly_episode_summary(
+            session,
+            group_id=10001,
+            source_messages=[rows[1]],
+            start_at=rows[1].timestamp,
+            end_at=rows[1].timestamp,
+            content_hash="weekly-processing-coverage",
+            episode_status="processing",
+        )
+
+        uncovered = RetrievalDocumentRepository(
+            session
+        ).list_uncovered_group_messages_for_weekly_report(
+            group_id=10001,
+            start_at=window_start,
+            end_at=now,
+            bot_user_id=123456789,
+            covered_document_ids=[
+                covered_document.id,
+                nonterminal_document.id,
+            ],
+            limit=801,
+        )
+
+    uncovered_ids = [message.platform_msg_id for message in uncovered]
+    assert len(uncovered_ids) == 801
+    assert "weekly-uncovered-0" not in uncovered_ids
+    assert "weekly-uncovered-1" in uncovered_ids
+    assert uncovered_ids[-1] == "weekly-uncovered-801"

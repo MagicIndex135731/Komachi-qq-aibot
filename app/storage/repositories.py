@@ -6,9 +6,9 @@ import json
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import Integer, bindparam, func, or_, select, text
+from sqlalchemy import Integer, and_, bindparam, cast, exists, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.storage.models import (
     BbotListenerCacheEntry,
@@ -46,6 +46,16 @@ class RetrievalDocumentHit:
 
 
 @dataclass(frozen=True, slots=True)
+class WeeklyRetrievalDocument:
+    document_id: int
+    episode_id: int
+    content: str
+    start_at: datetime
+    end_at: datetime
+    source_msg_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalEmbeddingCoverage:
     total_documents: int
     ready_documents: int
@@ -62,6 +72,134 @@ def _normalize_utc_sqlite_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _weekly_safe_message_conditions(
+    message,
+    *,
+    group_id: int,
+    bot_user_id: int,
+) -> tuple[object, ...]:
+    delivery_state = func.coalesce(
+        func.json_extract(message.raw_json, "$.delivery_state"),
+        "",
+    )
+    failure_kind = func.coalesce(
+        func.json_extract(message.raw_json, "$.failure_kind"),
+        "",
+    )
+    return (
+        message.group_id == int(group_id),
+        message.user_id != int(bot_user_id),
+        func.trim(func.coalesce(message.plain_text, "")) != "",
+        delivery_state != "reserved",
+        or_(
+            delivery_state != "blocked",
+            failure_kind != "qq_sensitive_content",
+        ),
+    )
+
+
+def _weekly_summary_conditions(
+    document,
+    episode,
+    *,
+    group_id: int,
+    start_at: datetime,
+    end_at: datetime,
+) -> tuple[object, ...]:
+    return (
+        document.scope_type == "group",
+        document.scope_id == str(int(group_id)),
+        document.group_id == int(group_id),
+        document.status == "active",
+        document.document_kind == "episode_summary",
+        document.source_table == "summaries",
+        document.episode_id.is_not(None),
+        episode.group_id == int(group_id),
+        episode.is_current.is_(True),
+        episode.status == "processed",
+        func.coalesce(episode.compaction_version, "") != "",
+        func.json_extract(
+            document.metadata_json,
+            "$.compaction_generation",
+        )
+        == episode.compaction_version,
+        document.end_at >= start_at,
+        document.start_at <= end_at,
+    )
+
+
+def _weekly_source_integrity_conditions(
+    document,
+    *,
+    group_id: int,
+    bot_user_id: int,
+) -> tuple[object, ...]:
+    source_link = aliased(RetrievalDocumentMessage)
+    source_message = aliased(Message)
+    safe_conditions = _weekly_safe_message_conditions(
+        source_message,
+        group_id=group_id,
+        bot_user_id=bot_user_id,
+    )
+    source_exists = exists(
+        select(1)
+        .select_from(source_link)
+        .join(source_message, source_message.id == source_link.message_id)
+        .where(
+            source_link.document_id == document.id,
+            source_link.role == "source",
+            source_link.group_id == int(group_id),
+            *safe_conditions,
+        )
+    )
+
+    unsafe_link = aliased(RetrievalDocumentMessage)
+    unsafe_message = aliased(Message)
+    unsafe_conditions = _weekly_safe_message_conditions(
+        unsafe_message,
+        group_id=group_id,
+        bot_user_id=bot_user_id,
+    )
+    unsafe_source_exists = exists(
+        select(1)
+        .select_from(unsafe_link)
+        .outerjoin(unsafe_message, unsafe_message.id == unsafe_link.message_id)
+        .where(
+            unsafe_link.document_id == document.id,
+            unsafe_link.role == "source",
+            or_(
+                unsafe_link.group_id != int(group_id),
+                unsafe_message.id.is_(None),
+                ~and_(*unsafe_conditions),
+            ),
+        )
+    )
+    counted_source_link = aliased(RetrievalDocumentMessage)
+    source_count = (
+        select(func.count())
+        .select_from(counted_source_link)
+        .where(
+            counted_source_link.document_id == document.id,
+            counted_source_link.role == "source",
+        )
+        .correlate(document)
+        .scalar_subquery()
+    )
+    complete_summary_source = exists(
+        select(1)
+        .select_from(Summary)
+        .where(
+            Summary.id == cast(document.source_id, Integer),
+            Summary.scope_type == "group",
+            Summary.scope_id == str(int(group_id)),
+            Summary.summary_level == "episode",
+            Summary.status == "active",
+            Summary.source_count == source_count,
+        )
+    )
+    return source_exists, ~unsafe_source_exists, complete_summary_source
 
 
 def _delete_active_retrieval_vectors(
@@ -543,30 +681,51 @@ class MessageRepository:
         group_id: int,
         since: datetime,
         bot_user_id: int,
-        limit: int,
+        limit: int | None = None,
+        until: datetime | None = None,
+        exclude_qq_blocked_outbound: bool = False,
     ) -> list[Message]:
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             return []
-        stmt = (
-            select(Message)
-            .where(
-                Message.group_id == group_id,
-                Message.timestamp >= since,
+        conditions = [
+            Message.group_id == group_id,
+            Message.timestamp >= _normalize_utc_sqlite_timestamp(since),
+            Message.user_id != int(bot_user_id),
+            func.trim(func.coalesce(Message.plain_text, "")) != "",
+            func.coalesce(
+                func.json_extract(Message.raw_json, "$.delivery_state"),
+                "",
             )
-            .order_by(Message.timestamp.asc(), Message.id.asc())
-        )
-        kept_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
-                continue
-            if message.user_id == bot_user_id:
-                continue
-            if str(message.plain_text or "").strip() == "":
-                continue
-            kept_messages.append(message)
-            if len(kept_messages) >= limit:
-                break
-        return kept_messages
+            != "reserved",
+        ]
+        if until is not None:
+            conditions.append(
+                Message.timestamp <= _normalize_utc_sqlite_timestamp(until)
+            )
+        stmt = select(Message).where(*conditions)
+        if exclude_qq_blocked_outbound:
+            stmt = stmt.where(
+                or_(
+                    func.coalesce(
+                        func.json_extract(Message.raw_json, "$.delivery_state"),
+                        "",
+                    )
+                    != "blocked",
+                    func.coalesce(
+                        func.json_extract(Message.raw_json, "$.failure_kind"),
+                        "",
+                    )
+                    != "qq_sensitive_content",
+                )
+            )
+        if limit is not None:
+            stmt = stmt.order_by(
+                Message.timestamp.desc(),
+                Message.id.desc(),
+            ).limit(int(limit))
+            return list(reversed(list(self.session.scalars(stmt))))
+        stmt = stmt.order_by(Message.timestamp.asc(), Message.id.asc())
+        return list(self.session.scalars(stmt))
 
     def list_group_messages_matching_terms(
         self,
@@ -2321,6 +2480,272 @@ class RetrievalDocumentRepository:
             ranked_document_ids=ranked,
             subject_ids=subject_ids,
         )
+
+    def list_active_episode_summaries_for_window(
+        self,
+        *,
+        group_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        bot_user_id: int = 0,
+        limit: int = 321,
+    ) -> list[WeeklyRetrievalDocument]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("weekly retrieval summary limit must be positive")
+        normalized_start_at = _normalize_utc_sqlite_timestamp(start_at)
+        normalized_end_at = _normalize_utc_sqlite_timestamp(end_at)
+        if normalized_start_at > normalized_end_at:
+            raise ValueError("weekly retrieval window start must not follow end")
+
+        rows = list(
+            self.session.execute(
+                select(
+                    RetrievalDocument,
+                    ConversationEpisode.compaction_version,
+                )
+                .join(
+                    ConversationEpisode,
+                    (ConversationEpisode.id == RetrievalDocument.episode_id)
+                    & (ConversationEpisode.group_id == RetrievalDocument.group_id),
+                )
+                .where(
+                    *_weekly_summary_conditions(
+                        RetrievalDocument,
+                        ConversationEpisode,
+                        group_id=group_id,
+                        start_at=normalized_start_at,
+                        end_at=normalized_end_at,
+                    ),
+                    *_weekly_source_integrity_conditions(
+                        RetrievalDocument,
+                        group_id=group_id,
+                        bot_user_id=bot_user_id,
+                    ),
+                )
+                .order_by(
+                    RetrievalDocument.start_at.asc(),
+                    RetrievalDocument.end_at.asc(),
+                    RetrievalDocument.id.asc(),
+                )
+                .limit(limit)
+            )
+        )
+        weekly_documents: list[WeeklyRetrievalDocument] = []
+        for document, compaction_version in rows:
+            if document.episode_id is None:
+                raise ValueError("weekly episode summary is missing its episode")
+            metadata = document.metadata_json
+            if (
+                not isinstance(metadata, dict)
+                or not str(compaction_version or "")
+                or str(metadata.get("compaction_generation", ""))
+                != str(compaction_version)
+            ):
+                continue
+            weekly_documents.append(
+                WeeklyRetrievalDocument(
+                    document_id=int(document.id),
+                    episode_id=int(document.episode_id),
+                    content=str(document.content),
+                    start_at=document.start_at,
+                    end_at=document.end_at,
+                )
+            )
+        return weekly_documents
+
+    def list_weekly_document_message_groups(
+        self,
+        *,
+        group_id: int,
+        document_ids: Sequence[int | str],
+        start_at: datetime,
+        end_at: datetime,
+        bot_user_id: int,
+    ) -> list[list[Message]]:
+        normalized_start_at = _normalize_utc_sqlite_timestamp(start_at)
+        normalized_end_at = _normalize_utc_sqlite_timestamp(end_at)
+        if normalized_start_at > normalized_end_at:
+            raise ValueError("weekly retrieval window start must not follow end")
+        normalized_document_ids: list[int] = []
+        for raw_document_id in document_ids:
+            if isinstance(raw_document_id, bool):
+                raise ValueError("weekly document id must be an integer")
+            try:
+                document_id = int(raw_document_id)
+            except (TypeError, ValueError):
+                raise ValueError("weekly document id must be an integer") from None
+            if document_id <= 0 or document_id in normalized_document_ids:
+                raise ValueError("weekly document ids must be unique positive integers")
+            normalized_document_ids.append(document_id)
+        if not normalized_document_ids:
+            return []
+
+        valid_document_ids = set(
+            self.session.scalars(
+                select(RetrievalDocument.id)
+                .join(
+                    ConversationEpisode,
+                    (ConversationEpisode.id == RetrievalDocument.episode_id)
+                    & (ConversationEpisode.group_id == RetrievalDocument.group_id),
+                )
+                .where(
+                    RetrievalDocument.id.in_(normalized_document_ids),
+                    *_weekly_summary_conditions(
+                        RetrievalDocument,
+                        ConversationEpisode,
+                        group_id=group_id,
+                        start_at=normalized_start_at,
+                        end_at=normalized_end_at,
+                    ),
+                    *_weekly_source_integrity_conditions(
+                        RetrievalDocument,
+                        group_id=group_id,
+                        bot_user_id=bot_user_id,
+                    ),
+                )
+            )
+        )
+        if valid_document_ids != set(normalized_document_ids):
+            raise ValueError("weekly selected document is no longer valid")
+
+        source_rows = list(
+            self.session.execute(
+                select(
+                    RetrievalDocumentMessage.document_id,
+                    RetrievalDocumentMessage.group_id,
+                    Message,
+                )
+                .outerjoin(
+                    Message,
+                    Message.id == RetrievalDocumentMessage.message_id,
+                )
+                .where(
+                    RetrievalDocumentMessage.document_id.in_(normalized_document_ids),
+                    RetrievalDocumentMessage.role == "source",
+                )
+                .order_by(
+                    RetrievalDocumentMessage.document_id.asc(),
+                    RetrievalDocumentMessage.ordinal.asc(),
+                    RetrievalDocumentMessage.message_id.asc(),
+                )
+            )
+        )
+        grouped_messages: dict[int, list[Message]] = {
+            document_id: [] for document_id in normalized_document_ids
+        }
+        for document_id, provenance_group_id, message in source_rows:
+            if (
+                provenance_group_id != int(group_id)
+                or message is None
+                or message.group_id != int(group_id)
+                or message.user_id == int(bot_user_id)
+                or not str(message.plain_text or "").strip()
+                or MessageRepository.is_reserved_outbound(message)
+                or MessageRepository.is_qq_blocked_outbound(message)
+            ):
+                raise ValueError("weekly selected document provenance is unsafe")
+            timestamp = _normalize_utc_sqlite_timestamp(message.timestamp)
+            if normalized_start_at <= timestamp <= normalized_end_at:
+                grouped_messages[int(document_id)].append(message)
+
+        result = [
+            grouped_messages[document_id]
+            for document_id in normalized_document_ids
+        ]
+        if any(not messages for messages in result):
+            raise ValueError("weekly selected document has no in-window evidence")
+        return result
+
+    def list_uncovered_group_messages_for_weekly_report(
+        self,
+        *,
+        group_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        bot_user_id: int,
+        covered_document_ids: Sequence[int | str],
+        limit: int = 801,
+    ) -> list[Message]:
+        if limit <= 0:
+            return []
+        normalized_start_at = _normalize_utc_sqlite_timestamp(start_at)
+        normalized_end_at = _normalize_utc_sqlite_timestamp(end_at)
+        if normalized_start_at > normalized_end_at:
+            raise ValueError("weekly retrieval window start must not follow end")
+
+        requested_document_ids: list[int] = []
+        for raw_document_id in covered_document_ids:
+            if isinstance(raw_document_id, bool):
+                continue
+            try:
+                document_id = int(raw_document_id)
+            except (TypeError, ValueError):
+                continue
+            if document_id > 0 and document_id not in requested_document_ids:
+                requested_document_ids.append(document_id)
+
+        valid_document_ids: list[int] = []
+        if requested_document_ids:
+            valid_document_ids = list(
+                self.session.scalars(
+                    select(RetrievalDocument.id)
+                    .join(
+                        ConversationEpisode,
+                        (ConversationEpisode.id == RetrievalDocument.episode_id)
+                        & (
+                            ConversationEpisode.group_id
+                            == RetrievalDocument.group_id
+                        ),
+                    )
+                    .where(
+                        RetrievalDocument.id.in_(requested_document_ids),
+                        *_weekly_summary_conditions(
+                            RetrievalDocument,
+                            ConversationEpisode,
+                            group_id=group_id,
+                            start_at=normalized_start_at,
+                            end_at=normalized_end_at,
+                        ),
+                        *_weekly_source_integrity_conditions(
+                            RetrievalDocument,
+                            group_id=group_id,
+                            bot_user_id=bot_user_id,
+                        ),
+                    )
+                )
+            )
+
+        conditions = [
+            *_weekly_safe_message_conditions(
+                Message,
+                group_id=group_id,
+                bot_user_id=bot_user_id,
+            ),
+            Message.timestamp >= normalized_start_at,
+            Message.timestamp <= normalized_end_at,
+        ]
+        if valid_document_ids:
+            conditions.append(
+                ~exists(
+                    select(1)
+                    .select_from(RetrievalDocumentMessage)
+                    .where(
+                        RetrievalDocumentMessage.document_id.in_(
+                            valid_document_ids
+                        ),
+                        RetrievalDocumentMessage.group_id == int(group_id),
+                        RetrievalDocumentMessage.message_id == Message.id,
+                        RetrievalDocumentMessage.role == "source",
+                    )
+                )
+            )
+        stmt = (
+            select(Message)
+            .where(*conditions)
+            .order_by(Message.timestamp.asc(), Message.id.asc())
+            .limit(int(limit))
+        )
+        return list(self.session.scalars(stmt))
 
     def search_group_documents_temporal_hits(
         self,
