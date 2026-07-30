@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import text
 
 from app.adapters.onebot_models import PrivateMessageEvent
+from app.adapters.sender import QQMessageDeliveryUncertainError
 from app.core.group_image_generation import PrivateImageGenerationRequest
 from app.core.message_content import ImageAttachment
 import app.dev_control.service as dev_service_module
@@ -72,6 +73,12 @@ class SelectiveFailSender(FakeSender):
         if outbound.user_id in self.failing_user_ids:
             raise RuntimeError(f"send_private_msg failed: target={outbound.user_id}")
         await super().send_private_text(outbound)
+
+
+class UncertainPrivateSender(FakeSender):
+    async def send_private_text(self, outbound) -> None:
+        self.private_sent.append(outbound)
+        raise QQMessageDeliveryUncertainError("waitForSelfEcho timeout")
 
 
 class FakeLlmClient:
@@ -4902,3 +4909,40 @@ async def test_send_private_text_deduplicates_same_context(sqlite_engine, tmp_pa
         stored = messages.get_by_platform_msg_id("private-outbound-project_chat:123:completed")
     assert stored is not None
     assert stored.raw_json["delivery_state"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_send_private_text_preserves_reservation_when_delivery_is_uncertain(sqlite_engine, tmp_path) -> None:
+    sender = UncertainPrivateSender()
+    service = DevControlService(
+        engine=sqlite_engine,
+        sender=sender,
+        llm_client=FakeLlmClient(),
+        owner_qq=10001,
+        bot_qq=200000003,
+        repo_root=tmp_path / "repo",
+        data_dir=tmp_path / "data",
+    )
+    (tmp_path / "repo").mkdir()
+
+    first = await service._send_private_text(
+        user_id=10001,
+        text="uncertain reply",
+        context="project_chat:uncertain:completed",
+    )
+    second = await service._send_private_text(
+        user_id=10001,
+        text="uncertain reply",
+        context="project_chat:uncertain:completed",
+    )
+
+    assert first is False
+    assert second is True
+    assert [outbound.text for outbound in sender.private_sent] == ["uncertain reply"]
+
+    with session_scope(sqlite_engine) as session:
+        messages = dev_service_module.MessageRepository(session)
+        stored = messages.get_by_platform_msg_id("private-outbound-project_chat:uncertain:completed")
+    assert stored is not None
+    assert stored.raw_json["delivery_state"] == "uncertain"
+    assert stored.raw_json["failure_kind"] == "delivery_result_unknown"

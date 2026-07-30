@@ -205,6 +205,10 @@ class HybridMemoryRetriever:
                 item.document_id,
             )
         )
+        if getattr(resolved_query, "coverage_mode", "relevance") == "chronological":
+            fused.sort(key=lambda item: (item.start_at, item.document_id))
+        elif getattr(resolved_query, "coverage_mode", "relevance") == "time_buckets":
+            fused = self._time_bucket_coverage(fused, self.final_limit)
         return HybridRetrievalResult(
             candidates=tuple(fused[: self.final_limit]),
             failed_channels=tuple(failed_channels),
@@ -214,3 +218,77 @@ class HybridMemoryRetriever:
                 for channel in channel_names
             ),
         )
+
+    @staticmethod
+    def _time_bucket_coverage(
+        candidates: Sequence[FusedRetrievalCandidate],
+        limit: int,
+    ) -> list[FusedRetrievalCandidate]:
+        """Allocate a fair quota across equal spans of the available timeline."""
+
+        resolved_limit = max(1, int(limit))
+        ordered = sorted(
+            candidates,
+            key=lambda item: (item.start_at, item.document_id),
+        )
+        if len(ordered) <= resolved_limit:
+            return ordered
+        if resolved_limit == 1:
+            return [ordered[-1]]
+
+        start_value = ordered[0].start_at.timestamp()
+        end_value = ordered[-1].start_at.timestamp()
+        if end_value <= start_value:
+            return sorted(
+                ordered,
+                key=lambda item: (
+                    -item.fused_score,
+                    -item.end_at.timestamp(),
+                    item.document_id,
+                ),
+            )[:resolved_limit]
+
+        bucket_count = min(12, resolved_limit, len(ordered))
+        buckets: list[list[FusedRetrievalCandidate]] = [
+            [] for _ in range(bucket_count)
+        ]
+        span = end_value - start_value
+        for candidate in ordered:
+            ratio = (candidate.start_at.timestamp() - start_value) / span
+            bucket_index = min(
+                bucket_count - 1,
+                max(0, int(ratio * bucket_count)),
+            )
+            buckets[bucket_index].append(candidate)
+
+        for index, bucket in enumerate(buckets):
+            bucket.sort(
+                key=lambda item: (
+                    -item.fused_score,
+                    item.start_at,
+                    item.document_id,
+                )
+            )
+            if index == 0:
+                bucket.sort(key=lambda item: (item.start_at, item.document_id))
+            elif index == bucket_count - 1:
+                bucket.sort(
+                    key=lambda item: (item.start_at, item.document_id),
+                    reverse=True,
+                )
+
+        selected: list[FusedRetrievalCandidate] = []
+        depth = 0
+        while len(selected) < resolved_limit:
+            added = False
+            for bucket in buckets:
+                if depth >= len(bucket):
+                    continue
+                selected.append(bucket[depth])
+                added = True
+                if len(selected) >= resolved_limit:
+                    break
+            if not added:
+                break
+            depth += 1
+        return selected

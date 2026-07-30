@@ -33,6 +33,9 @@ class ScopedMemoryRetrievalChannels:
         engine: Engine | None = None,
         session_factory: SessionFactory | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        vector_generation: int | None = None,
+        raw_message_v3_only: bool = False,
+        legacy_v2_only: bool = False,
     ) -> None:
         if session_factory is None:
             if engine is None:
@@ -45,17 +48,26 @@ class ScopedMemoryRetrievalChannels:
             session_factory = maker
         self._session_factory = session_factory
         self._embedding_provider = embedding_provider
+        self._vector_generation = (
+            int(vector_generation) if vector_generation is not None else None
+        )
+        self._raw_message_v3_only = bool(raw_message_v3_only)
+        self._legacy_v2_only = bool(legacy_v2_only)
+        if self._raw_message_v3_only and self._legacy_v2_only:
+            raise ValueError("retrieval document families are mutually exclusive")
 
     def as_mapping(self) -> Mapping[str, RetrievalChannel]:
-        return {
+        channels = {
             "bm25": self.bm25,
             "vector": self.vector,
             "temporal": self.temporal,
             "entity": self.entity,
-            "fact": self.fact,
             "reply_graph": self.reply_graph,
             "exact_quote": self.exact_quote,
         }
+        if not self._raw_message_v3_only:
+            channels["fact"] = self.fact
+        return channels
 
     def bm25(
         self,
@@ -72,6 +84,7 @@ class ScopedMemoryRetrievalChannels:
                 query=self._query_text(resolved_query),
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                **self._hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -83,14 +96,14 @@ class ScopedMemoryRetrievalChannels:
         limit: int,
     ) -> Sequence[RetrievalCandidate]:
         provider = self._embedding_provider
-        embedding = (
-            provider.embed_query(self._query_text(resolved_query))
-            if provider is not None and provider.available
-            else None
-        )
         with self._session_factory() as session:
-            if provider is None or embedding is None:
-                return ()
+            if provider is None or not provider.available:
+                raise RuntimeError("vector embedding provider unavailable")
+            embedding = provider.embed_query(self._query_text(resolved_query))
+            if embedding is None:
+                raise RuntimeError(
+                    "vector embedding provider returned no embedding"
+                )
             identity = provider.identity
             hits = RetrievalDocumentRepository(
                 session
@@ -101,8 +114,10 @@ class ScopedMemoryRetrievalChannels:
                 model=identity.model,
                 dimensions=identity.dimensions,
                 version=identity.version,
+                generation=self._vector_generation,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                **self._hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -123,6 +138,19 @@ class ScopedMemoryRetrievalChannels:
                 end_at=getattr(time_range, "end", None),
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                document_kinds=self._document_kinds(),
+                speaker_ids=self._speaker_filter_ids(resolved_query),
+                mentioned_user_ids=self._mentioned_user_ids(resolved_query),
+                allow_unbounded=(
+                    getattr(resolved_query, "coverage_mode", "relevance")
+                    == "time_buckets"
+                    or getattr(resolved_query, "answer_mode", "")
+                    == "mention"
+                ),
+                sample_time_coverage=(
+                    getattr(resolved_query, "coverage_mode", "relevance")
+                    == "time_buckets"
+                ),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -141,11 +169,13 @@ class ScopedMemoryRetrievalChannels:
                 entities=self._string_tuple(
                     getattr(resolved_query, "entities", ())
                 ),
-                speaker_ids=self._string_tuple(
-                    getattr(resolved_query, "speaker_ids", ())
-                ),
+                speaker_ids=self._speaker_filter_ids(resolved_query),
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                document_kinds=self._document_kinds(),
+                start_at=self._time_bound(resolved_query, "start"),
+                end_at=self._time_bound(resolved_query, "end"),
+                mentioned_user_ids=self._mentioned_user_ids(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -165,6 +195,7 @@ class ScopedMemoryRetrievalChannels:
                 ),
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                **self._hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -186,6 +217,7 @@ class ScopedMemoryRetrievalChannels:
                 include_replies=True,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                **self._hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -207,6 +239,7 @@ class ScopedMemoryRetrievalChannels:
                 include_replies=False,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
+                **self._hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -266,15 +299,57 @@ class ScopedMemoryRetrievalChannels:
         values = getattr(resolved_query, "subject_ids", None)
         return None if values is None else cls._string_tuple(values)
 
+    def _hard_filters(self, resolved_query: Any) -> dict[str, object]:
+        return {
+            "document_kinds": self._document_kinds(),
+            "start_at": self._time_bound(resolved_query, "start"),
+            "end_at": self._time_bound(resolved_query, "end"),
+            "speaker_ids": self._speaker_filter_ids(resolved_query),
+            "mentioned_user_ids": self._mentioned_user_ids(resolved_query),
+        }
+
+    def _document_kinds(self) -> tuple[str, ...] | None:
+        if self._raw_message_v3_only:
+            return ("raw_message_v3",)
+        if self._legacy_v2_only:
+            return ("episode", "episode_summary", "memory")
+        return None
+
+    @staticmethod
+    def _time_bound(resolved_query: Any, name: str):
+        time_range = getattr(resolved_query, "time_range", None)
+        return getattr(time_range, name, None)
+
+    def _speaker_filter_ids(self, resolved_query: Any) -> tuple[str, ...] | None:
+        if getattr(resolved_query, "answer_mode", "") == "mention":
+            return None
+        subject_ids = self._subject_ids(resolved_query)
+        if self._raw_message_v3_only and subject_ids is not None:
+            return subject_ids
+        speaker_ids = self._string_tuple(getattr(resolved_query, "speaker_ids", ()))
+        return speaker_ids or None
+
+    @classmethod
+    def _mentioned_user_ids(cls, resolved_query: Any) -> tuple[str, ...] | None:
+        if getattr(resolved_query, "answer_mode", "") != "mention":
+            return None
+        return cls._subject_ids(resolved_query)
+
 
 def build_memory_retrieval_channels(
     engine: Engine | None = None,
     *,
     session_factory: SessionFactory | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    vector_generation: int | None = None,
+    raw_message_v3_only: bool = False,
+    legacy_v2_only: bool = False,
 ) -> Mapping[str, RetrievalChannel]:
     return ScopedMemoryRetrievalChannels(
         engine=engine,
         session_factory=session_factory,
         embedding_provider=embedding_provider,
+        vector_generation=vector_generation,
+        raw_message_v3_only=raw_message_v3_only,
+        legacy_v2_only=legacy_v2_only,
     ).as_mapping()

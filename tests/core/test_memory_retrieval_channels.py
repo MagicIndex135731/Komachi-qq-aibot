@@ -132,6 +132,94 @@ def test_entity_channel_uses_bound_speaker_id_without_global_alias_expansion(sql
     assert [hit.document_id for hit in hits] == [target_id]
 
 
+def test_unbounded_temporal_channel_recalls_real_mention_without_text_overlap(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=100,
+            group_name="group-100",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=200,
+            nickname="speaker",
+            group_card="",
+        )
+        message = MessageRepository(session).add_group_message(
+            platform_msg_id="structured-mention",
+            group_id=100,
+            user_id=200,
+            timestamp=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            plain_text="今晚开黑三缺一",
+            raw_json={
+                "message": [
+                    {"type": "at", "data": {"qq": "300"}},
+                    {"type": "text", "data": {"text": "今晚开黑三缺一"}},
+                ]
+            },
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        document = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=100,
+            message_id=message.id,
+        )
+        assert document is not None
+        document_id = int(document.id)
+        newer_message = MessageRepository(session).add_group_message(
+            platform_msg_id="structured-mention-newer",
+            group_id=100,
+            user_id=200,
+            timestamp=datetime(2026, 7, 24, 8, 0, tzinfo=UTC),
+            plain_text="临时改到东门集合",
+            raw_json={
+                "message": [
+                    {"type": "at", "data": {"qq": "300"}},
+                    {"type": "text", "data": {"text": "临时改到东门集合"}},
+                ]
+            },
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        newer_document = RetrievalDocumentRepository(
+            session
+        ).project_raw_message_v3(
+            group_id=100,
+            message_id=newer_message.id,
+        )
+        assert newer_document is not None
+        newer_document_id = int(newer_document.id)
+
+    channels = build_memory_retrieval_channels(
+        sqlite_engine,
+        raw_message_v3_only=True,
+    )
+    hits = channels["temporal"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="他们最近有没有叫我",
+            retrieval_query="他们最近有没有叫我",
+            group_id=100,
+            requester_id="300",
+            subject_ids=("300",),
+            answer_mode="mention",
+            coverage_mode="relevance",
+        ),
+        limit=10,
+    )
+
+    assert [item.document_id for item in hits] == [
+        newer_document_id,
+        document_id,
+    ]
+
+
 def test_subject_filter_applies_to_all_memory_document_channels_without_removing_episode(
     tmp_path,
 ) -> None:
@@ -518,6 +606,31 @@ def test_missing_vector_extension_leaves_bm25_channel_available(tmp_path) -> Non
 
     assert [candidate.document_id for candidate in result.candidates] == [target_id]
     assert result.candidates[0].routes == ("bm25",)
+
+
+def test_unavailable_vector_provider_is_reported_as_failed_channel(tmp_path) -> None:
+    engine = build_engine(tmp_path / "vector-provider-unavailable.db")
+    create_all(engine)
+    channels = build_memory_retrieval_channels(
+        engine,
+        embedding_provider=None,
+    )
+
+    result = HybridMemoryRetriever(
+        channels={"vector": channels["vector"]},
+        channel_timeout_seconds=2.0,
+    ).retrieve(
+        group_id=10001,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="query",
+            retrieval_query="query",
+            needs_history=True,
+        ),
+    )
+
+    assert result.candidates == ()
+    assert result.failed_channels == ("vector",)
+    assert result.channel_candidate_counts == (("vector", 0),)
 
 
 def test_vector_sql_failure_is_reported_as_a_failed_channel(

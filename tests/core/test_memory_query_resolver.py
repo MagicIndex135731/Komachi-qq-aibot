@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import time
+
+import pytest
 
 from app.core.memory_query_resolver import MemoryQueryResolver, TimeRange
 from app.core.member_identity import GroupMemberIdentity
@@ -31,6 +33,7 @@ def test_deterministic_follow_up_uses_quoted_message_without_rewrite() -> None:
 
     assert result.retrieval_query == quoted.content
     assert result.reference_msg_ids == ("42",)
+    assert result.subject_ids is None
     assert result.rewrite_used is False
 
 
@@ -203,6 +206,89 @@ def test_ambiguous_history_question_can_use_one_safe_rewrite() -> None:
     assert calls[0][2] == 0.25
 
 
+def test_rewrite_cannot_drop_deterministic_time_boundary() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=lambda *_: '{"retrieval_query":"那个话题怎么样"}'
+    )
+
+    result = resolver.resolve(
+        "昨天之前那个怎么样",
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is True
+    assert result.time_range == TimeRange(
+        start=datetime(2026, 7, 21, 16, tzinfo=UTC),
+        end=datetime(2026, 7, 22, 16, tzinfo=UTC),
+    )
+    assert result.retrieval_mode == "temporal"
+
+
+@pytest.mark.parametrize("query", ("以前说过什么", "曾经聊过什么", "过去的发言"))
+def test_general_history_markers_never_degrade_to_recent(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.needs_history is True
+
+
+def test_first_person_history_binds_requester_and_unknown_speaker_fails_closed() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
+
+    requester = resolver.resolve(
+        "我以前说过什么劲爆话题",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+        requester_id=10001,
+    )
+    unknown = resolver.resolve(
+        "陌生猫昨天说了什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+        requester_id=10001,
+    )
+    unknown_assessment = resolver.resolve(
+        "如何评价陌生猫这个人",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert requester.subject_ids == ("10001",)
+    assert requester.subject_binding == "requester"
+    assert unknown.subject_ids == ()
+    assert unknown_assessment.subject_ids == ()
+
+
+def test_temporal_prefix_before_first_person_still_binds_requester() -> None:
+    result = MemoryQueryResolver().resolve(
+        "昨天我说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+        requester_id=20001,
+    )
+
+    assert result.subject_ids == ("20001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "dated_history"
+
+
 def test_bad_or_unsafe_rewrite_json_falls_back_to_original_question() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=lambda *_: '{"retrieval_query":"x","group_id":"forged"}'
@@ -235,8 +321,14 @@ def test_relative_and_absolute_dates_are_a_local_calendar_range() -> None:
     yesterday = resolver.resolve("昨天发生了什么", recent_messages=(), now=NOW)
     explicit = resolver.resolve("2026-07-21 的消息", recent_messages=(), now=NOW)
 
-    assert yesterday.time_range == TimeRange(datetime(2026, 7, 22), datetime(2026, 7, 23))
-    assert explicit.time_range == TimeRange(datetime(2026, 7, 21), datetime(2026, 7, 22))
+    assert yesterday.time_range == TimeRange(
+        datetime(2026, 7, 21, 16, tzinfo=UTC),
+        datetime(2026, 7, 22, 16, tzinfo=UTC),
+    )
+    assert explicit.time_range == TimeRange(
+        datetime(2026, 7, 20, 16, tzinfo=UTC),
+        datetime(2026, 7, 21, 16, tzinfo=UTC),
+    )
 
 
 def test_resolved_query_contract_exposes_speaker_ids_and_confidence() -> None:
@@ -311,7 +403,10 @@ def test_last_week_is_a_temporal_half_open_range() -> None:
 
     result = resolver.resolve("上周发生了什么", recent_messages=(), now=NOW)
 
-    assert result.time_range == TimeRange(datetime(2026, 7, 13), datetime(2026, 7, 20))
+    assert result.time_range == TimeRange(
+        datetime(2026, 7, 12, 16, tzinfo=UTC),
+        datetime(2026, 7, 19, 16, tzinfo=UTC),
+    )
     assert result.retrieval_mode == "temporal"
     assert result.needs_history is True
 
@@ -332,3 +427,148 @@ def test_rewrite_timeout_is_enforced_by_resolver_boundary() -> None:
     assert time.perf_counter() - started < 0.1
     assert result.resolved_query == "之前那个怎么样？"
     assert result.rewrite_used is False
+
+
+def test_query_plan_binds_requester_and_keeps_group_and_typed_modes() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "评价一下我过去的表现",
+        recent_messages=(),
+        now=datetime(2026, 7, 23, 8, 10, tzinfo=UTC),
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.group_id == 12345
+    assert result.requester_id == "10001"
+    assert result.requester_uin == "10001"
+    assert result.subject_binding == "requester"
+    assert result.subject_ids == ("10001",)
+    assert result.subject_uins == ("10001",)
+    assert result.answer_mode == "assessment"
+    assert result.coverage_mode == "time_buckets"
+    assert result.coverage_strategy == "time_buckets"
+    assert result.needs_history is True
+
+
+def test_named_assessment_binds_explicit_speaker_and_uses_time_buckets() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="加菲猫"),)
+
+    result = resolver.resolve(
+        "评价加菲猫的性格",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+        requester_id="10001",
+    )
+
+    assert result.speaker_ids == ("10002",)
+    assert result.subject_ids == ("10002",)
+    assert result.subject_binding == "explicit"
+    assert result.answer_mode == "assessment"
+    assert result.coverage_mode == "time_buckets"
+
+
+def test_shanghai_yesterday_is_converted_once_to_strict_utc_boundaries() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "昨天谁发了消息",
+        recent_messages=(),
+        now=datetime(2026, 7, 23, 18, 30, tzinfo=UTC),
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.start_at_utc == datetime(2026, 7, 22, 16, tzinfo=UTC)
+    assert result.end_at_utc == datetime(2026, 7, 23, 16, tzinfo=UTC)
+    assert result.answer_mode == "dated_history"
+    assert result.coverage_mode == "chronological"
+
+
+def test_summary_mode_with_date_uses_time_bucket_coverage() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "总结昨天发生了什么",
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.answer_mode == "summary"
+    assert result.coverage_mode == "time_buckets"
+
+
+def test_explicit_date_interval_is_inclusive_by_shanghai_day_and_half_open_in_utc() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "总结 2026-07-20 到 7月22日 的聊天",
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.start_at_utc == datetime(2026, 7, 19, 16, tzinfo=UTC)
+    assert result.end_at_utc == datetime(2026, 7, 22, 16, tzinfo=UTC)
+    assert result.answer_mode == "summary"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "他们最近有没有叫我",
+        "最近谁@我",
+        "谁提到我",
+    ),
+)
+def test_requester_mention_queries_bind_requester_and_require_history(query: str) -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.answer_mode == "mention"
+    assert result.subject_binding == "requester"
+    assert result.subject_ids == ("10001",)
+    assert result.speaker_ids == ("10001",)
+    assert result.needs_history is True
+
+
+def test_requester_mention_query_without_requester_fails_closed() -> None:
+    result = MemoryQueryResolver().resolve(
+        "他们最近有没有叫我",
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=None,
+    )
+
+    assert result.answer_mode == "mention"
+    assert result.subject_ids == ()
+    assert result.needs_history is True
+
+
+def test_invalid_or_conflicting_scope_identity_is_rejected() -> None:
+    resolver = MemoryQueryResolver()
+
+    with pytest.raises(ValueError, match="group_id"):
+        resolver.resolve("历史", recent_messages=(), group_id=0)
+    with pytest.raises(ValueError, match="same user"):
+        resolver.resolve(
+            "历史",
+            recent_messages=(),
+            requester_id=10001,
+            requester_uin=10002,
+        )

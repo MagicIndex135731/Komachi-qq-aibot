@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,15 +20,17 @@ def candidate(
     group_id: int = 100,
     source_msg_ids: tuple[str, ...] = (),
     score: float = 0.0,
+    at: datetime | None = None,
 ) -> RetrievalCandidate:
+    timestamp = at or datetime(2026, 7, document_id, tzinfo=UTC)
     return RetrievalCandidate(
         document_id=document_id,
         group_id=group_id,
         document_kind="episode",
         episode_id=document_id,
         source_msg_ids=source_msg_ids or (f"msg-{document_id}",),
-        start_at=datetime(2026, 7, document_id, tzinfo=UTC),
-        end_at=datetime(2026, 7, document_id, tzinfo=UTC),
+        start_at=timestamp,
+        end_at=timestamp,
         channel_score=score,
     )
 
@@ -168,3 +171,54 @@ def test_rrf_tie_break_is_stable_by_recency_then_document_id() -> None:
     result = retriever.retrieve(group_id=100, resolved_query=object())
 
     assert [item.document_id for item in result.candidates] == [1, 2]
+
+
+def test_time_bucket_coverage_spans_available_history_deterministically() -> None:
+    retriever = HybridMemoryRetriever(
+        channels={"entity": lambda **_: [candidate(index) for index in range(1, 11)]},
+        candidate_limit=10,
+        final_limit=3,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(coverage_mode="time_buckets"),
+    )
+
+    assert [item.document_id for item in result.candidates] == [1, 4, 10]
+
+
+def test_time_bucket_coverage_resists_busy_recent_interval() -> None:
+    old = [
+        candidate(
+            index + 1,
+            at=datetime(2025, 1, 1, tzinfo=UTC)
+            + timedelta(days=index * 36),
+        )
+        for index in range(10)
+    ]
+    recent = [
+        candidate(
+            100 + index,
+            at=datetime(2025, 12, 31, tzinfo=UTC)
+            + timedelta(minutes=index),
+        )
+        for index in range(90)
+    ]
+    retriever = HybridMemoryRetriever(
+        channels={"entity": lambda **_: [*recent, *old]},
+        candidate_limit=100,
+        final_limit=12,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(coverage_mode="time_buckets"),
+    )
+
+    represented_months = {
+        (item.start_at.year, item.start_at.month)
+        for item in result.candidates
+    }
+    assert len(result.candidates) == 12
+    assert len(represented_months) >= 9

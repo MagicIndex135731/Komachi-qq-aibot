@@ -29,6 +29,22 @@ class _NoopLlmClient:
         return "{}"
 
 
+def test_onebot_mentions_are_projected_into_evidence_identity() -> None:
+    assert app_main._mentioned_uins(
+        {
+            "message": [
+                {"type": "text", "data": {"text": "hello"}},
+                {"type": "at", "data": {"qq": "123"}},
+                {"type": "at", "data": {"qq": "all"}},
+                {"type": "at", "data": {"qq": 456}},
+                {"type": "at", "data": {"uin": "789"}},
+                {"type": "at", "data": {"target": "987"}},
+                {"type": "at", "data": {"qq": "123"}},
+            ]
+        }
+    ) == ("123", "456", "789", "987")
+
+
 class _AvailableEmbeddingProvider:
     identity = EmbeddingIdentity(
         provider="fake",
@@ -91,6 +107,39 @@ def test_build_memory_runtime_shares_one_lazy_embedding_provider_and_background(
     assert runtime.embedding_generation is None
 
 
+def test_raw_v3_activation_switch_controls_strict_provider_and_document_family(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    legacy_settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=False,
+        compaction_enabled=True,
+    )
+    legacy_runtime = build_memory_runtime(
+        settings=legacy_settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    assert legacy_runtime.memory_orchestrator.strict_scoped_fallback is False
+    assert "fact" in legacy_runtime.v2_provider._retriever.channels
+
+    raw_settings = legacy_settings.model_copy(
+        update={"memory_raw_v3_enabled": True}
+    )
+    raw_runtime = build_memory_runtime(
+        settings=raw_settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    assert raw_runtime.memory_orchestrator.strict_scoped_fallback is True
+    assert "fact" not in raw_runtime.v2_provider._retriever.channels
+    assert raw_runtime.v2_provider._historical_no_hit_omit_recent is True
+
+
 def test_build_memory_runtime_passes_resolved_vector_generation_to_background_store(
     sqlite_engine,
     tmp_path,
@@ -120,6 +169,77 @@ def test_build_memory_runtime_passes_resolved_vector_generation_to_background_st
     assert runtime.background_service is not None
     assert runtime.background_service.store.embedding_generation == 7
     assert runtime.background_service.embedder is provider
+
+
+def test_build_memory_runtime_can_bind_prepared_raw_generation_for_offline_eval(
+    sqlite_engine,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _AvailableEmbeddingProvider()
+    monkeypatch.setattr(
+        app_main,
+        "build_embedding_provider",
+        lambda **_kwargs: provider,
+    )
+    monkeypatch.setattr(
+        app_main,
+        "find_active_retrieval_vector_generation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "offline evaluation must not resolve the active generation"
+        ),
+    )
+
+    runtime = build_memory_runtime(
+        settings=_settings(
+            tmp_path,
+            v2_enabled=True,
+            shadow_mode=False,
+            compaction_enabled=True,
+        ).model_copy(update={"memory_raw_v3_enabled": True}),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+        raw_message_embedding_generation_override=17,
+    )
+
+    assert runtime.embedding_generation == 17
+    assert runtime.background_service is not None
+    assert runtime.background_service.store.raw_message_embedding_generation == 17
+
+
+def test_production_runtime_does_not_pin_vector_queries_to_startup_generation(
+    sqlite_engine,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _AvailableEmbeddingProvider()
+    monkeypatch.setattr(
+        app_main,
+        "build_embedding_provider",
+        lambda **_kwargs: provider,
+    )
+    monkeypatch.setattr(
+        app_main,
+        "find_active_retrieval_vector_generation",
+        lambda *_args, **_kwargs: 23,
+    )
+
+    runtime = build_memory_runtime(
+        settings=_settings(
+            tmp_path,
+            v2_enabled=True,
+            shadow_mode=False,
+            compaction_enabled=True,
+        ).model_copy(update={"memory_raw_v3_enabled": True}),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+
+    vector_channel = runtime.v2_provider._retriever.channels["vector"]
+    assert runtime.embedding_generation == 23
+    assert vector_channel.__self__._vector_generation is None
 
 
 def test_disabled_runtime_keeps_v1_and_does_not_construct_group_background_worker(
@@ -284,7 +404,7 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
         v2_enabled=True,
         shadow_mode=True,
         compaction_enabled=True,
-    )
+    ).model_copy(update={"memory_raw_v3_enabled": True})
     observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
     with session_scope(sqlite_engine) as session:
         GroupRepository(session).upsert_group(
@@ -387,6 +507,13 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             minutes=4,
         )
         session.flush()
+        documents = RetrievalDocumentRepository(session)
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=int(row.id),
+                embedding_generation=None,
+            )
         azha_query_id = int(azha_query.id)
         garfield_query_id = int(garfield_query.id)
 
@@ -405,9 +532,8 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
     )
 
     assert azha_trace.resolved_query.speaker_ids == ("42",)
-    assert [fact.text for fact in azha_trace.result.packed_context.facts] == [
-        "阿渣最喜欢葫芦兄弟动画。"
-    ]
+    assert azha_trace.result.packed_context.facts == ()
+    assert "azha-fact-source" in azha_trace.result.selected_source_msg_ids
     assert garfield_trace.resolved_query.speaker_ids == ("43",)
     assert garfield_trace.result.packed_context.facts == ()
 
@@ -421,7 +547,7 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
         v2_enabled=True,
         shadow_mode=True,
         compaction_enabled=True,
-    )
+    ).model_copy(update={"memory_raw_v3_enabled": True})
     observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
     with session_scope(sqlite_engine) as session:
         groups = GroupRepository(session)
@@ -471,6 +597,26 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             platform_msg_id="duplicate-azha-43",
             content="同名成员发言。",
         )
+        for user_id, card, source_id in (
+            (42, "新名甲", "renamed-42"),
+            (43, "新名乙", "renamed-43"),
+        ):
+            messages.add_group_message(
+                platform_msg_id=source_id,
+                group_id=10001,
+                user_id=user_id,
+                timestamp=observed_at + timedelta(minutes=1),
+                plain_text="改名后的消息",
+                raw_json={
+                    "sender": {
+                        "nickname": f"user-{user_id}",
+                        "card": card,
+                    }
+                },
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
         memories.add_memory(
             scope_type="group",
             scope_id="10001",
@@ -570,6 +716,16 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             source_message_ids=[message.id for message in multi_messages],
         )
         episode_document_id = int(episode_document.id)
+        raw_document_ids: dict[str, int] = {}
+        for group_id in (10001, 10002):
+            for row in messages.list_group_messages_chronological(group_id=group_id):
+                raw_document = documents.project_raw_message_v3(
+                    group_id=group_id,
+                    message_id=int(row.id),
+                    embedding_generation=None,
+                )
+                if raw_document is not None:
+                    raw_document_ids[str(row.platform_msg_id)] = int(raw_document.id)
 
     runtime = build_memory_runtime(
         settings=settings,
@@ -604,9 +760,9 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
     assert duplicate.resolved_query.subject_ids == ()
     assert duplicate.result.packed_context.facts == ()
     unique_candidate_ids = {document_id for document_id, _score in unique.candidate_scores}
-    assert memory_document_ids["53"] in unique_candidate_ids
-    assert memory_document_ids["52"] not in unique_candidate_ids
-    assert episode_document_id in unique_candidate_ids
+    assert raw_document_ids["multi-garfield"] in unique_candidate_ids
+    assert raw_document_ids["multi-azha"] not in unique_candidate_ids
+    assert episode_document_id not in unique_candidate_ids
     assert multiple.resolved_query.subject_ids == ()
     assert multiple.result.packed_context.facts == ()
     assert unknown.resolved_query.subject_ids == ()
@@ -615,34 +771,30 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
     assert second_person.resolved_query.subject_ids is None
     assert first_person_likes.resolved_query.subject_ids is None
     assert subjectless.resolved_query.subject_ids is None
-    assert first_person.result.packed_context.facts
-    assert second_person.result.packed_context.facts
-    assert first_person_likes.result.packed_context.facts
-    assert subjectless.result.packed_context.facts
+    assert first_person.result.packed_context.facts == ()
+    assert second_person.result.packed_context.facts == ()
+    assert first_person_likes.result.packed_context.facts == ()
+    assert subjectless.result.packed_context.facts == ()
     assert unbound.resolved_query.subject_ids is None
-    assert {fact.text for fact in unbound.result.packed_context.facts} == {
-        "阿渣最喜欢葫芦兄弟动画。",
-        "加菲猫最喜欢猫和老鼠动画。",
-    }
+    assert unbound.result.packed_context.facts == ()
     for trace in (multiple, unknown):
         candidate_ids = {document_id for document_id, _score in trace.candidate_scores}
-        assert candidate_ids.isdisjoint(memory_document_ids.values())
-        assert episode_document_id in candidate_ids
+        assert candidate_ids == set()
     unbound_candidate_ids = {document_id for document_id, _score in unbound.candidate_scores}
-    assert set(memory_document_ids.values()) <= unbound_candidate_ids
+    assert unbound_candidate_ids <= set(raw_document_ids.values())
     unique_segment_ids = {
         int(segment.document_id)
         for segment in unique.result.packed_context.evidence_segments
         if segment.document_id is not None
     }
-    assert memory_document_ids["52"] not in unique_segment_ids
+    assert raw_document_ids["multi-azha"] not in unique_segment_ids
     for trace in (multiple, unknown):
         segment_ids = {
             int(segment.document_id)
             for segment in trace.result.packed_context.evidence_segments
             if segment.document_id is not None
         }
-        assert segment_ids.isdisjoint(memory_document_ids.values())
+        assert segment_ids == set()
 
 
 def test_shadow_evaluator_records_rewrite_flag_from_real_v2_trace(

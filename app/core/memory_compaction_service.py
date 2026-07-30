@@ -39,6 +39,14 @@ class MemoryBackgroundLifecycle(Protocol):
         watermark_message_id: int | None = None,
     ): ...
 
+    def enqueue_raw_message_index(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime | None = None,
+    ): ...
+
     def enqueue_late_arrival(
         self,
         *,
@@ -176,6 +184,38 @@ class MemoryCompactionService:
         except Exception as exc:
             logger.exception(
                 "memory_episode_enqueue_failed group_id=%s message_id=%s error=%s",
+                group_id,
+                message_id,
+                type(exc).__name__,
+            )
+            return None
+
+    def enqueue_raw_message_index(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime | None = None,
+    ):
+        """Persist an ID-only projection job without coupling it to replies."""
+        if self.background_service is None:
+            return None
+        try:
+            enqueue = getattr(
+                self.background_service,
+                "enqueue_raw_message_index",
+                None,
+            )
+            if not callable(enqueue):
+                return None
+            return enqueue(
+                group_id=int(group_id),
+                message_id=int(message_id),
+                now=now,
+            )
+        except Exception as exc:
+            logger.exception(
+                "raw_message_index_enqueue_failed group_id=%s message_id=%s error=%s",
                 group_id,
                 message_id,
                 type(exc).__name__,

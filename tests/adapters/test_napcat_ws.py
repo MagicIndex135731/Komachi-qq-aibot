@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from app.adapters.napcat_ws import NapCatGateway
+from app.adapters.napcat_ws import NapCatDeliveryUncertainError, NapCatGateway
 
 
 class FakeWebSocket:
@@ -85,7 +85,7 @@ def test_call_api_clears_pending_call_when_send_fails() -> None:
     gateway = NapCatGateway(ws_url="ws://example")
     gateway.websocket = FakeWebSocket(fail_send=True)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NapCatDeliveryUncertainError):
         asyncio.run(gateway.call_api("send_group_msg", {"group_id": 1, "message": "hi"}))
 
     assert gateway._pending_calls == {}

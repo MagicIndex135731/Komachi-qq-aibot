@@ -398,7 +398,8 @@ def _collect_group_coverage(
                 "SELECT COUNT(*) FROM messages "
                 "WHERE group_id = :group_id AND id <= :watermark "
                 "AND (json_extract(raw_json, '$.delivery_state') IS NULL "
-                "OR json_extract(raw_json, '$.delivery_state') <> 'reserved')"
+                "OR json_extract(raw_json, '$.delivery_state') "
+                "NOT IN ('reserved', 'uncertain'))"
             ),
             parameters,
         ).scalar_one()
@@ -527,9 +528,13 @@ def _collect_group_coverage(
                 "AND e.compaction_version = :compaction_generation "
                 "AND json_extract(rd.metadata_json, '$.compaction_generation') "
                 "= :compaction_generation "
-                "AND json_extract(m.raw_json, '$.delivery_state') = 'blocked' "
+                "AND (("
+                "json_extract(m.raw_json, '$.delivery_state') = 'blocked' "
                 "AND json_extract(m.raw_json, '$.failure_kind') = "
-                "'qq_sensitive_content'"
+                "'qq_sensitive_content') OR ("
+                "json_extract(m.raw_json, '$.delivery_state') = 'uncertain' "
+                "AND json_extract(m.raw_json, '$.failure_kind') = "
+                "'delivery_result_unknown'))"
             ),
             parameters,
         ).scalar_one()

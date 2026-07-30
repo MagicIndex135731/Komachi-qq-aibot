@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from app.adapters.onebot_models import GroupMessageEvent
-from app.adapters.sender import QQMessageBlockedError
+from app.adapters.sender import QQMessageBlockedError, Sender
 from app.core.legacy_memory_context import LegacyMemoryPromptContext
 from app.core.message_content import ImageAttachment
 from app.core.memory_context_packer import PackedMemoryContext
@@ -49,6 +49,19 @@ class FailingSenderOnce:
         if self.attempts == 1:
             raise RuntimeError("send failed")
         self.sent.append(outbound)
+
+
+class AmbiguousSendGateway:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def call_api(self, action: str, params: dict) -> dict:
+        self.calls.append((action, params))
+        return {
+            "status": "failed",
+            "retcode": 1200,
+            "message": "waitForSelfEcho timeout",
+        }
 
 
 class BlockingSender:
@@ -2263,10 +2276,58 @@ async def test_router_retries_duplicate_inbound_when_first_send_fails(sqlite_eng
 
 
 @pytest.mark.asyncio
+async def test_router_keeps_reservation_when_delivery_is_uncertain(sqlite_engine) -> None:
+    gateway = AmbiguousSendGateway()
+    sender = Sender(gateway)
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    event = make_event(group_id=10001, mentioned_bot=True, message_id="dup-uncertain-1")
+
+    await router.handle_group_message(event)
+    await router.handle_group_message(event)
+
+    with session_scope(sqlite_engine) as session:
+        stored_messages = session.execute(
+            select(Message).where(Message.group_id == 10001).order_by(Message.id)
+        ).scalars().all()
+
+    assert gateway.calls == [
+        ("send_group_msg", {"group_id": 10001, "message": "I am here."}),
+    ]
+    assert len(llm.calls) == 1
+    assert [message.platform_msg_id for message in stored_messages] == [
+        "dup-uncertain-1",
+        "bot-reply-dup-uncertain-1",
+    ]
+    uncertain = stored_messages[1]
+    assert uncertain.raw_json["delivery_state"] == "uncertain"
+    assert uncertain.raw_json["failure_kind"] == "delivery_result_unknown"
+    assert uncertain.raw_json["delivery_reason"] == "gateway_ack_timeout"
+    assert uncertain.raw_json["delivery_attempts"] == 1
+    assert uncertain.plain_text.startswith("I am here.")
+    assert "不会自动重发" in uncertain.plain_text
+
+
+@pytest.mark.asyncio
 async def test_router_persists_qq_blocked_reply_and_sends_safe_notice(sqlite_engine) -> None:
+    class MemoryIndexRecorder:
+        def __init__(self) -> None:
+            self.raw_message_ids: list[int] = []
+
+        def enqueue_raw_message_index(self, **kwargs) -> None:
+            self.raw_message_ids.append(int(kwargs["message_id"]))
+
+        def enqueue_episode_allocation(self, **_kwargs) -> None:
+            return None
+
+        async def wake(self) -> None:
+            return None
+
     sender = QQBlockingSender()
     llm = LongReplyLlm("sensitive generated detail")
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    memory_index = MemoryIndexRecorder()
+    router.memory_compaction_service = memory_index
 
     await router.handle_group_message(
         make_event(group_id=10001, mentioned_bot=True, message_id="qq-blocked-1", plain_text="@Mira explain")
@@ -2295,6 +2356,10 @@ async def test_router_persists_qq_blocked_reply_and_sends_safe_notice(sqlite_eng
     assert "以上回复未在 QQ 群中送达" in blocked.plain_text
     assert "后续回答不得复述其中的敏感细节" in blocked.plain_text
     assert stored_messages[2].raw_json["delivery_state"] == "sent"
+    assert memory_index.raw_message_ids == [
+        int(stored_messages[0].id),
+        int(stored_messages[2].id),
+    ]
 
     router.runtime.settings.context_recent_limit = 1
     await router.handle_group_message(

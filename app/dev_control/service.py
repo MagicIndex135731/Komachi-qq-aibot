@@ -11,7 +11,7 @@ import subprocess
 from typing import Callable
 
 from app.adapters.onebot_models import PrivateMessageEvent
-from app.adapters.sender import OutboundPrivateMessage
+from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncertainError
 from app.core.chat_style import normalize_chat_reply
 from app.core.group_image_generation import ImageJobResult, PrivateImageGenerationRequest, PrivateImageGenerationService
 from app.core.image_turn_resolver import resolve_private_images_for_turn
@@ -1322,6 +1322,19 @@ class DevControlService:
             await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
             self._mark_private_outbound_reply_sent(user_id=user_id, reply_text=text, context=context)
             return True, None
+        except QQMessageDeliveryUncertainError as exc:
+            self._mark_private_outbound_reply_uncertain(
+                user_id=user_id,
+                reply_text=text,
+                context=context,
+            )
+            logger.warning(
+                "private_reply_delivery_uncertain context=%s user_id=%s error_type=%s",
+                context,
+                user_id,
+                type(exc).__name__,
+            )
+            return False, "delivery_result_unknown"
         except Exception as exc:
             self._clear_private_outbound_reply_reservation(context=context)
             logger.exception("private_reply_send_failed context=%s user_id=%s", context, user_id)
@@ -3644,6 +3657,25 @@ class DevControlService:
                 "direction": "outbound",
                 "recipient_user_id": user_id,
                 "delivery_state": "sent",
+                "context": context,
+            }
+            session.add(outbound_message)
+
+    def _mark_private_outbound_reply_uncertain(self, *, user_id: int, reply_text: str, context: str) -> None:
+        platform_msg_id = self._private_outbound_platform_msg_id(context=context)
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            outbound_message = messages.get_by_platform_msg_id(platform_msg_id)
+            if outbound_message is None:
+                raise RuntimeError("uncertain private outbound reply reservation is missing")
+            outbound_message.plain_text = reply_text
+            outbound_message.raw_json = {
+                "direction": "outbound",
+                "recipient_user_id": user_id,
+                "delivery_state": "uncertain",
+                "failure_kind": "delivery_result_unknown",
+                "delivery_reason": "gateway_ack_timeout",
+                "delivery_attempts": 1,
                 "context": context,
             }
             session.add(outbound_message)

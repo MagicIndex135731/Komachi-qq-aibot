@@ -7,7 +7,12 @@ import logging
 from pathlib import Path
 import re
 
-from app.adapters.sender import OutboundMessage, OutboundPrivateMessage, QQMessageBlockedError
+from app.adapters.sender import (
+    OutboundMessage,
+    OutboundPrivateMessage,
+    QQMessageBlockedError,
+    QQMessageDeliveryUncertainError,
+)
 from app.admin.commands import AdminCommandParser, CommandContext
 from app.config import AppSettings, RuntimeConfig
 from app.core.bbot_bridge import build_bbot_outbound_message, resolve_bbot_command
@@ -85,6 +90,9 @@ QQ_BLOCKED_REPLY_NOTICE = "刚刚的回复可能包含敏感信息，被 QQ 拦�
 QQ_BLOCKED_CONTEXT_NOTE = (
     "[系统投递状态：以上回复未在 QQ 群中送达；连续发送后仍被 QQ 拦截，可能包含敏感信息。"
     "后续回答不得复述其中的敏感细节，只能概括说明上一条回复可能包含敏感信息、无法详细发送。]"
+)
+DELIVERY_UNCERTAIN_CONTEXT_NOTE = (
+    "[系统投递状态：上一条回复的发送结果未得到确认；系统不会自动重发，以避免重复消息。]"
 )
 GROUP_IMAGE_REQUEST_FLAGS = re.IGNORECASE | re.DOTALL
 GROUP_IMAGE_REQUEST_PATTERNS = (
@@ -468,6 +476,16 @@ class InboundRouter:
             await self.sender.send_group_text(
                 OutboundMessage(group_id=event.group_id, text=reply_text, allow_chunking=allow_chunking)
             )
+        except QQMessageDeliveryUncertainError as exc:
+            logger.warning(
+                "reply_delivery_uncertain group_id=%s msg_id=%s error_type=%s",
+                event.group_id,
+                event.platform_msg_id,
+                type(exc).__name__,
+            )
+            uncertain_reply_text = self._mark_outbound_reply_uncertain(event, reply_text)
+            self._archive_outbound_reply(event, uncertain_reply_text)
+            return
         except QQMessageBlockedError as exc:
             logger.warning(
                 "reply_qq_blocked group_id=%s msg_id=%s reason=%s",
@@ -1740,12 +1758,26 @@ class InboundRouter:
                 "delivery_attempts": 3,
             }
             session.add(outbound_message)
-        self._enqueue_episode_message(
-            group_id=event.group_id,
-            platform_msg_id=self._outbound_platform_msg_id(event.platform_msg_id),
-            timestamp=event.timestamp,
-        )
         return blocked_reply_text
+
+    def _mark_outbound_reply_uncertain(self, event, reply_text: str) -> str:
+        uncertain_reply_text = f"{str(reply_text).strip()}\n\n{DELIVERY_UNCERTAIN_CONTEXT_NOTE}"
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            if outbound_message is None:
+                raise RuntimeError("uncertain outbound reply reservation is missing")
+            outbound_message.plain_text = uncertain_reply_text
+            outbound_message.raw_json = {
+                "direction": "outbound",
+                "reply_to_msg_id": event.platform_msg_id,
+                "delivery_state": "uncertain",
+                "failure_kind": "delivery_result_unknown",
+                "delivery_reason": "gateway_ack_timeout",
+                "delivery_attempts": 1,
+            }
+            session.add(outbound_message)
+        return uncertain_reply_text
 
     def _reserve_block_notice(self, event) -> bool:
         with session_scope(self.engine) as session:
@@ -1814,6 +1846,11 @@ class InboundRouter:
             QQ_BLOCKED_REPLY_NOTICE,
             platform_msg_id=platform_msg_id,
         )
+        self._enqueue_episode_message(
+            group_id=event.group_id,
+            platform_msg_id=platform_msg_id,
+            timestamp=event.timestamp,
+        )
         logger.info(
             "reply_qq_block_notice_success group_id=%s msg_id=%s",
             event.group_id,
@@ -1866,8 +1903,9 @@ class InboundRouter:
         timestamp: datetime,
     ) -> None:
         service = self.memory_compaction_service
-        enqueue = getattr(service, "enqueue_episode_allocation", None)
-        if not callable(enqueue):
+        enqueue_episode = getattr(service, "enqueue_episode_allocation", None)
+        enqueue_raw = getattr(service, "enqueue_raw_message_index", None)
+        if not callable(enqueue_episode) and not callable(enqueue_raw):
             return
         try:
             with session_scope(self.engine) as session:
@@ -1883,15 +1921,23 @@ class InboundRouter:
                     message_id=message_id,
                     timestamp=message.timestamp,
                 )
-            enqueue(
-                group_id=int(group_id),
-                message_id=message_id,
-                now=self._normalize_timestamp(timestamp),
-                late_arrival=late_arrival,
-            )
+            normalized_timestamp = self._normalize_timestamp(timestamp)
+            if callable(enqueue_raw):
+                enqueue_raw(
+                    group_id=int(group_id),
+                    message_id=message_id,
+                    now=normalized_timestamp,
+                )
+            if callable(enqueue_episode):
+                enqueue_episode(
+                    group_id=int(group_id),
+                    message_id=message_id,
+                    now=normalized_timestamp,
+                    late_arrival=late_arrival,
+                )
         except Exception as exc:
             logger.warning(
-                "memory_episode_enqueue_failed group_id=%s msg_id=%s error_type=%s",
+                "memory_index_enqueue_failed group_id=%s msg_id=%s error_type=%s",
                 group_id,
                 platform_msg_id,
                 type(exc).__name__,

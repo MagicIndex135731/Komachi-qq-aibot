@@ -21,9 +21,12 @@ EVALUATION_CATEGORIES = frozenset(
         "multi_hop",
         "update",
         "abstention",
+        "assessment",
+        "summary",
+        "mention",
     }
 )
-EVALUATION_VARIANTS = frozenset({"v1", "v2"})
+EVALUATION_VARIANTS = frozenset({"v1", "v2", "v3"})
 REAL_DATASET_MIN_CASES = 64
 REAL_DATASET_MAX_CASES = 100
 REAL_DATASET_CATEGORY_QUOTAS = {
@@ -47,12 +50,22 @@ class EvaluationCase:
     category: str
     time_range: tuple[str, str] | None = None
     quoted_context_message_id: str | None = None
+    schema_version: int = 1
+    requester_uin: str | None = None
+    allowed_subject_user_ids: tuple[str, ...] | None = None
+    allowed_evidence_user_ids: tuple[str, ...] | None = None
+    expected_answer_mode: str | None = None
+    expected_coverage_strategy: str | None = None
+    minimum_time_bucket_count: int = 0
+    forbidden_evidence_message_ids: tuple[str, ...] = ()
+    gate_tags: tuple[str, ...] = ()
+    contract_fields_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class EvaluationResult:
     case_index: int
-    variant: Literal["v1", "v2"]
+    variant: Literal["v1", "v2", "v3"]
     retrieved_evidence_message_ids: tuple[str, ...]
     packed_evidence_message_ids: tuple[str, ...]
     context_tokens: int
@@ -98,6 +111,16 @@ def _parse_message_ids(value: object, *, field: str) -> tuple[str, ...]:
     return values
 
 
+def _parse_optional_message_ids(
+    value: object,
+    *,
+    field: str,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return _parse_message_ids(value, field=field)
+
+
 def _parse_retrieval_units(value: object) -> tuple[tuple[str, ...], ...]:
     if not isinstance(value, list):
         raise ValueError("retrieved_evidence_units must be a list")
@@ -130,7 +153,19 @@ def parse_evaluation_case(record: Mapping[str, Any]) -> EvaluationCase:
             "expected_evidence_message_ids",
             "category",
         },
-        optional={"time_range", "quoted_context_message_id"},
+        optional={
+            "time_range",
+            "quoted_context_message_id",
+            "schema_version",
+            "requester_uin",
+            "allowed_subject_user_ids",
+            "allowed_evidence_user_ids",
+            "expected_answer_mode",
+            "expected_coverage_strategy",
+            "minimum_time_bucket_count",
+            "forbidden_evidence_message_ids",
+            "gate_tags",
+        },
     )
     group_id = record["group_id"]
     query = record["query"]
@@ -141,13 +176,71 @@ def parse_evaluation_case(record: Mapping[str, Any]) -> EvaluationCase:
         raise ValueError("query must be a non-empty string")
     if not isinstance(category, str) or category not in EVALUATION_CATEGORIES:
         raise ValueError(f"category must be one of: {', '.join(sorted(EVALUATION_CATEGORIES))}")
-    time_range = _parse_time_range(record["time_range"]) if "time_range" in record else None
+    time_range = (
+        _parse_time_range(record["time_range"])
+        if record.get("time_range") is not None
+        else None
+    )
     quoted_context_message_id = record.get("quoted_context_message_id")
     if quoted_context_message_id is not None and (
         not isinstance(quoted_context_message_id, str)
         or not quoted_context_message_id
     ):
         raise ValueError("quoted_context_message_id must be a non-empty string")
+    schema_version = record.get("schema_version", 1)
+    requester_uin = record.get("requester_uin")
+    allowed_subject_user_ids = (
+        _parse_optional_message_ids(
+            record.get("allowed_subject_user_ids"),
+            field="allowed_subject_user_ids",
+        )
+        if "allowed_subject_user_ids" in record
+        else None
+    )
+    allowed_evidence_user_ids = (
+        _parse_optional_message_ids(
+            record.get("allowed_evidence_user_ids"),
+            field="allowed_evidence_user_ids",
+        )
+        if "allowed_evidence_user_ids" in record
+        else None
+    )
+    expected_answer_mode = record.get("expected_answer_mode")
+    expected_coverage_strategy = record.get("expected_coverage_strategy")
+    minimum_time_bucket_count = record.get("minimum_time_bucket_count", 0)
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 1
+    ):
+        raise ValueError("schema_version must be a positive integer")
+    if requester_uin is not None and (
+        not isinstance(requester_uin, str) or not requester_uin.strip()
+    ):
+        raise ValueError("requester_uin must be a non-empty string")
+    for field, value in (
+        ("expected_answer_mode", expected_answer_mode),
+        ("expected_coverage_strategy", expected_coverage_strategy),
+    ):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{field} must be a non-empty string")
+    if (
+        isinstance(minimum_time_bucket_count, bool)
+        or not isinstance(minimum_time_bucket_count, int)
+        or minimum_time_bucket_count < 0
+    ):
+        raise ValueError("minimum_time_bucket_count must be a non-negative integer")
+    v3_contract_fields = {
+        "requester_uin",
+        "allowed_subject_user_ids",
+        "allowed_evidence_user_ids",
+        "time_range",
+        "expected_answer_mode",
+        "expected_coverage_strategy",
+        "minimum_time_bucket_count",
+        "forbidden_evidence_message_ids",
+        "gate_tags",
+    }
     return EvaluationCase(
         group_id=group_id,
         query=query,
@@ -158,6 +251,19 @@ def parse_evaluation_case(record: Mapping[str, Any]) -> EvaluationCase:
         category=category,
         time_range=time_range,
         quoted_context_message_id=quoted_context_message_id,
+        schema_version=schema_version,
+        requester_uin=requester_uin,
+        allowed_subject_user_ids=allowed_subject_user_ids,
+        allowed_evidence_user_ids=allowed_evidence_user_ids,
+        expected_answer_mode=expected_answer_mode,
+        expected_coverage_strategy=expected_coverage_strategy,
+        minimum_time_bucket_count=minimum_time_bucket_count,
+        forbidden_evidence_message_ids=_parse_message_ids(
+            record.get("forbidden_evidence_message_ids", []),
+            field="forbidden_evidence_message_ids",
+        ),
+        gate_tags=_parse_message_ids(record.get("gate_tags", []), field="gate_tags"),
+        contract_fields_complete=v3_contract_fields <= set(record),
     )
 
 
@@ -212,9 +318,16 @@ def validate_real_dataset_review(
 ) -> None:
     """Require a human-approved, dataset-bound review sidecar."""
     validate_real_dataset(cases)
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
     try:
-        review = json.loads(Path(review_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        review = json.loads(
+            Path(review_path).read_text(encoding="utf-8"),
+            parse_constant=reject_constant,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("invalid real-dataset review sidecar") from exc
     if not isinstance(review, dict) or review.get("review_version") != REAL_DATASET_REVIEW_VERSION:
         raise ValueError("review sidecar has unsupported version")
@@ -237,7 +350,13 @@ def validate_real_dataset_review(
     for index, (case, row) in enumerate(zip(cases, rows)):
         if not isinstance(row, dict):
             raise ValueError(f"review entry {index} is invalid")
-        if row.get("case_index") != index or row.get("approved") is not True:
+        case_index = row.get("case_index")
+        if (
+            isinstance(case_index, bool)
+            or not isinstance(case_index, int)
+            or case_index != index
+            or row.get("approved") is not True
+        ):
             raise ValueError(f"review entry {index} is not approved")
         if not isinstance(row.get("reviewer"), str) or not row["reviewer"].strip():
             raise ValueError(f"review entry {index} has no reviewer")
@@ -340,15 +459,15 @@ def parse_evaluation_result(record: Mapping[str, Any]) -> EvaluationResult:
     if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 0:
         raise ValueError("case_index must be a non-negative integer")
     if not isinstance(variant, str) or variant not in EVALUATION_VARIANTS:
-        raise ValueError("variant must be v1 or v2")
+        raise ValueError("variant must be v1, v2, or v3")
     if isinstance(context_tokens, bool) or not isinstance(context_tokens, int) or context_tokens < 0:
         raise ValueError("context_tokens must be a non-negative integer")
     if isinstance(latency_ms, bool) or not isinstance(latency_ms, (int, float)) or not math.isfinite(latency_ms) or latency_ms < 0:
         raise ValueError("latency_ms must be a finite non-negative number")
     if not isinstance(rewrite_used, bool):
         raise ValueError("rewrite_used must be a boolean")
-    if variant == "v2" and "retrieved_evidence_units" not in record:
-        raise ValueError("v2 results require retrieved_evidence_units")
+    if variant in {"v2", "v3"} and "retrieved_evidence_units" not in record:
+        raise ValueError("v2/v3 results require retrieved_evidence_units")
     return EvaluationResult(
         case_index=case_index,
         variant=variant,
@@ -392,10 +511,24 @@ def collect_fixture_results(
 
 def _per_case_metrics(case: EvaluationCase, result: EvaluationResult, *, recall_k: int) -> dict[str, float]:
     expected = set(case.expected_evidence_message_ids)
+    # raw_message_v3 documents are already one-source retrieval units. The
+    # compatibility trace may expose an empty episode-only unit tuple, so V3
+    # must use the ordered raw source IDs instead of treating that tuple as a
+    # real empty recall result.
     retrieval_units = (
-        result.retrieved_evidence_units[:recall_k]
-        if result.retrieved_evidence_units is not None
-        else tuple((source_id,) for source_id in result.retrieved_evidence_message_ids[:recall_k])
+        tuple(
+            (source_id,)
+            for source_id in result.retrieved_evidence_message_ids[:recall_k]
+        )
+        if result.variant == "v3"
+        else (
+            result.retrieved_evidence_units[:recall_k]
+            if result.retrieved_evidence_units is not None
+            else tuple(
+                (source_id,)
+                for source_id in result.retrieved_evidence_message_ids[:recall_k]
+            )
+        )
     )
     retrieved = {
         source_id
@@ -457,6 +590,7 @@ def evaluate(
     results: Sequence[EvaluationResult],
     dataset_sha256: str,
     recall_k: int = 10,
+    variants: Sequence[str] = ("v1", "v2"),
 ) -> dict[str, Any]:
     if not cases:
         raise ValueError("cannot evaluate an empty case set")
@@ -465,21 +599,35 @@ def evaluate(
     if len(dataset_sha256) != 64 or any(character not in "0123456789abcdef" for character in dataset_sha256.lower()):
         raise ValueError("dataset_sha256 must be a SHA-256 hex digest")
 
-    grouped: dict[str, list[EvaluationResult]] = {"v1": [], "v2": []}
+    requested_variants = tuple(dict.fromkeys(str(item) for item in variants))
+    if (
+        not requested_variants
+        or any(item not in EVALUATION_VARIANTS for item in requested_variants)
+    ):
+        raise ValueError("variants must contain known evaluation variants")
+    grouped: dict[str, list[EvaluationResult]] = {
+        variant: [] for variant in requested_variants
+    }
     seen: set[tuple[int, str]] = set()
     for result in results:
         if result.case_index >= len(cases):
             raise ValueError("result case_index is outside the dataset")
-        if result.variant == "v2" and result.retrieved_evidence_units is None:
-            raise ValueError("v2 results require retrieved_evidence_units")
+        if result.variant not in grouped:
+            raise ValueError("result variant is outside the requested evaluation variants")
+        if result.variant in {"v2", "v3"} and result.retrieved_evidence_units is None:
+            raise ValueError("v2/v3 results require retrieved_evidence_units")
         key = (result.case_index, result.variant)
         if key in seen:
             raise ValueError("duplicate result for case and variant")
         seen.add(key)
         grouped[result.variant].append(result)
-    expected = {(case_index, variant) for case_index in range(len(cases)) for variant in EVALUATION_VARIANTS}
+    expected = {
+        (case_index, variant)
+        for case_index in range(len(cases))
+        for variant in requested_variants
+    }
     if seen != expected:
-        raise ValueError("results must contain exactly one v1 and v2 result per case")
+        raise ValueError("results must contain exactly one result per case and requested variant")
 
     variants: dict[str, Any] = {}
     for variant, variant_results in grouped.items():
@@ -504,6 +652,7 @@ def evaluate(
         "dataset_sha256": dataset_sha256,
         "case_count": len(cases),
         "recall_k": recall_k,
+        "evaluation_variants": list(requested_variants),
         "variants": variants,
     }
 

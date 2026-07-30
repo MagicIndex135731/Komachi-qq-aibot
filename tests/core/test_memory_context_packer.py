@@ -76,11 +76,11 @@ def test_default_budgets_follow_v2_contract_and_recent_has_own_cap() -> None:
         recent_messages=(message("1", "x" * 12_000),),
     )
 
-    assert packed.budget == 32_000
+    assert packed.budget == 34_000
     assert packed.estimated_tokens <= 10_000
 
 
-def test_detail_allows_more_segments_and_summary_requires_evidence() -> None:
+def test_both_modes_allow_bounded_history_and_summary_requires_evidence() -> None:
     packer = MemoryContextPacker(normal_budget=100, detail_budget=100, token_counter=lambda value: 1)
     segments = tuple(EvidenceSegment(f"ep-{index}", 10 - index, (message(str(index), f"proof {index}"),)) for index in range(7))
     summary = MemorySummary("latest summary", ("x",), relevant=True)
@@ -89,8 +89,8 @@ def test_detail_allows_more_segments_and_summary_requires_evidence() -> None:
     detail = packer.pack("detail", available_input=100, target_message_id=None, evidence_segments=segments, summaries=(summary,))
     empty = packer.pack("normal", available_input=100, target_message_id=None, summaries=(summary,))
 
-    assert len(normal.evidence_segments) == 4
-    assert len(detail.evidence_segments) == 6
+    assert len(normal.evidence_segments) == 7
+    assert len(detail.evidence_segments) == 7
     assert "latest summary" in normal.text
     assert empty.summaries == ()
 
@@ -193,3 +193,173 @@ def test_v2_context_with_evidence_prioritizes_corrections_over_historical_chat()
 
     assert "later corrections or newer evidence" in packed.text
     assert "Topical discussion alone does not prove a personal preference" in packed.text
+
+
+def test_recent_60_and_history_150_use_independent_message_quotas() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100_000,
+        detail_budget=100_000,
+        recent_budget=100_000,
+        history_budget=100_000,
+        max_recent_messages=60,
+        max_history_messages=150,
+        token_counter=lambda _value: 1,
+    )
+    recent = tuple(message(f"r-{index}", "recent") for index in range(70))
+    history = tuple(
+        EvidenceSegment(
+            f"raw:{index}",
+            float(200 - index),
+            (message(f"h-{index}", "history"),),
+        )
+        for index in range(170)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100_000,
+        target_message_id=None,
+        recent_messages=recent,
+        evidence_segments=history,
+    )
+
+    assert len(packed.recent_messages) == 60
+    assert sum(len(segment.messages) for segment in packed.evidence_segments) == 150
+    assert len(packed.source_msg_ids) == 210
+
+
+def test_default_counter_enforces_24k_history_cap_for_long_chinese_text() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100_000,
+        detail_budget=100_000,
+        recent_budget=100_000,
+        history_budget=24_000,
+        max_history_messages=150,
+    )
+    history = tuple(
+        EvidenceSegment(
+            f"raw:{index}",
+            float(200 - index),
+            (message(f"zh-{index}", "中" * 1000),),
+        )
+        for index in range(40)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100_000,
+        target_message_id=None,
+        evidence_segments=history,
+    )
+
+    assert packed.estimated_tokens <= 24_000
+    assert len(packed.evidence_segments) < 40
+
+
+def test_rendered_evidence_time_is_explicit_shanghai_time() -> None:
+    source = EvidenceMessage(
+        "utc-source",
+        "Alice",
+        "hello",
+        datetime(2026, 7, 23, 16, 30),
+    )
+    packed = MemoryContextPacker(
+        normal_budget=1000,
+        detail_budget=1000,
+    ).pack(
+        "normal",
+        available_input=1000,
+        target_message_id=None,
+        recent_messages=(source,),
+    )
+
+    assert "2026-07-24 00:30 +08" in packed.text
+
+
+def test_rendered_history_includes_uin_source_and_reply_relationship() -> None:
+    source = EvidenceMessage(
+        "reply-source",
+        "SameCard",
+        "quoted reply",
+        datetime(2026, 7, 23, 16, 30),
+        group_id=100,
+        reply_to_msg_id="parent-source",
+        user_id=123456,
+    )
+    packed = MemoryContextPacker(
+        normal_budget=1000,
+        detail_budget=1000,
+    ).pack(
+        "normal",
+        available_input=1000,
+        target_message_id=None,
+        evidence_segments=(EvidenceSegment("raw:1", 1.0, (source,)),),
+    )
+
+    assert "SameCard (uin: 123456;" in packed.text
+    assert "source: reply-source;" in packed.text
+    assert "reply_to: parent-source" in packed.text
+
+
+def test_history_budget_preserves_retriever_time_bucket_order() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=1000,
+        detail_budget=1000,
+        history_budget=20,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    segments = (
+        EvidenceSegment("old-bucket", 0.1, (message("old", "TOKEN " * 10),)),
+        EvidenceSegment("middle-bucket", 0.2, (message("middle", "TOKEN " * 10),)),
+        EvidenceSegment("recent-high-score", 999.0, (message("recent", "TOKEN " * 10),)),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=1000,
+        target_message_id=None,
+        evidence_segments=segments,
+    )
+
+    assert tuple(segment.episode_id for segment in packed.evidence_segments) == (
+        "old-bucket",
+        "middle-bucket",
+    )
+
+
+def test_default_normal_budget_allows_independent_recent_and_history_caps() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=32,
+        detail_budget=64,
+        recent_budget=10,
+        history_budget=24,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    recent = (
+        message("recent-independent", "TOKEN " * 10),
+    )
+    history = (
+        EvidenceSegment(
+            "history-a",
+            1.0,
+            (message("history-a", "TOKEN " * 12),),
+        ),
+        EvidenceSegment(
+            "history-b",
+            0.9,
+            (message("history-b", "TOKEN " * 12),),
+        ),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=34,
+        target_message_id=None,
+        recent_messages=recent,
+        evidence_segments=history,
+    )
+
+    assert packed.recent_estimated_tokens == 10
+    assert packed.history_estimated_tokens == 24
+    assert len(packed.recent_messages) == 1
+    assert len(packed.evidence_segments) == 2

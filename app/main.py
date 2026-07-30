@@ -9,7 +9,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_group_message_event, parse_private_message_event
@@ -58,6 +58,7 @@ from app.storage.db import (
     build_engine,
     create_all,
     ensure_retrieval_vector_generation,
+    find_active_retrieval_vector_generation,
 )
 from app.storage.db import session_scope
 from app.storage.models import Message
@@ -284,9 +285,37 @@ def _evidence_messages_from_rows(
             reply_to_msg_id=row.reply_to_msg_id,
             is_bot=int(row.user_id) == int(settings.bot_qq),
             user_id=int(row.user_id),
+            mentioned_uins=_mentioned_uins(row.raw_json),
+            delivery_state=(
+                str(row.raw_json.get("delivery_state") or "")
+                .strip()
+                .casefold()
+                if isinstance(row.raw_json, dict)
+                else ""
+            ),
         )
         for row in rows
     )
+
+
+def _mentioned_uins(raw_json: object) -> tuple[str, ...]:
+    if not isinstance(raw_json, dict):
+        return ()
+    segments = raw_json.get("message")
+    if not isinstance(segments, list):
+        return ()
+    values: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict) or segment.get("type") != "at":
+            continue
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("qq", "uin", "target"):
+            value = str(data.get(key, "") or "").strip()
+            if value and value.casefold() != "all":
+                values.append(value)
+    return tuple(dict.fromkeys(values))
 
 
 def _build_query_rewrite_provider(*, settings: AppSettings, llm_client):
@@ -468,6 +497,7 @@ def build_memory_runtime(
     engine,
     llm_client,
     bot_display_name: str,
+    raw_message_embedding_generation_override: int | None = None,
 ) -> MemoryRuntimeComposition:
     legacy = LegacyMemoryContext(
         engine=engine,
@@ -487,20 +517,73 @@ def build_memory_runtime(
         api_key=settings.memory_embedding_api_key,
         timeout_seconds=settings.memory_embedding_timeout_seconds,
     )
+    legacy_embedding_generation = None
+    raw_message_embedding_generation = None
+    if settings.memory_orchestration_v2_enabled and embedding_provider.available:
+        identity = embedding_provider.identity
+        try:
+            if settings.memory_raw_v3_enabled:
+                raw_message_embedding_generation = (
+                    int(raw_message_embedding_generation_override)
+                    if raw_message_embedding_generation_override is not None
+                    else find_active_retrieval_vector_generation(
+                        engine,
+                        provider=identity.provider,
+                        model=identity.model,
+                        dimensions=identity.dimensions,
+                        version=identity.version,
+                        document_family="raw_message_v3",
+                    )
+                )
+                if raw_message_embedding_generation is None:
+                    logging.warning(
+                        "memory_raw_v3_vector_generation_unavailable "
+                        "fallback=fts_only"
+                    )
+            else:
+                legacy_embedding_generation = ensure_retrieval_vector_generation(
+                    engine,
+                    provider=identity.provider,
+                    model=identity.model,
+                    dimensions=identity.dimensions,
+                    version=identity.version,
+                )
+        except Exception as exc:
+            logging.warning(
+                "memory_vector_generation_unavailable error_type=%s",
+                type(exc).__name__,
+            )
     resolver = MemoryQueryResolver(
         _build_query_rewrite_provider(settings=settings, llm_client=llm_client),
         rewrite_timeout_seconds=settings.memory_query_rewrite_timeout_seconds,
     )
+    history_classifier = MemoryQueryResolver()
     retriever = HybridMemoryRetriever(
         channels=build_memory_retrieval_channels(
             engine,
             embedding_provider=embedding_provider,
+            vector_generation=(
+                int(raw_message_embedding_generation_override)
+                if raw_message_embedding_generation_override is not None
+                else None
+            ),
+            raw_message_v3_only=settings.memory_raw_v3_enabled,
+            legacy_v2_only=not settings.memory_raw_v3_enabled,
         ),
         candidate_limit=max(
             settings.memory_fts_candidate_limit,
             settings.memory_vector_candidate_limit,
+            (
+                settings.memory_max_evidence_messages * 4
+                if settings.memory_raw_v3_enabled
+                else 1
+            ),
         ),
-        final_limit=settings.memory_final_episode_limit,
+        final_limit=(
+            settings.memory_max_evidence_messages
+            if settings.memory_raw_v3_enabled
+            else settings.memory_final_episode_limit
+        ),
         channel_timeout_seconds=settings.memory_retrieval_channel_timeout_seconds,
     )
 
@@ -522,7 +605,36 @@ def build_memory_runtime(
                 bot_display_name=bot_display_name,
             )
 
+    def load_sources(*, group_id: int, source_msg_ids: tuple[str, ...]):
+        with session_scope(engine) as session:
+            messages = MessageRepository(session)
+            rows_by_id = messages.get_group_messages_by_platform_msg_ids(
+                group_id=group_id,
+                platform_msg_ids=list(source_msg_ids),
+            )
+            rows = tuple(
+                rows_by_id[source_id]
+                for source_id in source_msg_ids
+                if source_id in rows_by_id
+                and not messages.is_reserved_outbound(rows_by_id[source_id])
+                and not messages.is_delivery_uncertain_outbound(rows_by_id[source_id])
+            )
+            users_by_id = UserRepository(session).get_users_by_ids(
+                [int(row.user_id) for row in rows]
+            )
+            return tuple(
+                _evidence_messages_from_rows(
+                    rows=rows,
+                    users_by_id=users_by_id,
+                    messages=messages,
+                    settings=settings,
+                    bot_display_name=bot_display_name,
+                )
+            )
+
     def load_facts(*, group_id: int, resolved_query):
+        if settings.memory_raw_v3_enabled:
+            return ()
         with session_scope(engine) as session:
             rows = MemoryRepository(session).search_group_memories_fts(
                 scope_id=str(group_id),
@@ -538,11 +650,7 @@ def build_memory_runtime(
                         dict.fromkeys(
                             [
                                 *[str(item) for item in (row.source_msg_ids or []) if str(item)],
-                                *(
-                                    [str(row.source_msg_id)]
-                                    if row.source_msg_id
-                                    else []
-                                ),
+                                *([str(row.source_msg_id)] if row.source_msg_id else []),
                             ]
                         )
                     ),
@@ -555,41 +663,52 @@ def build_memory_runtime(
             )
 
     def load_summaries(*, group_id: int, resolved_query):
-        if not resolved_query.needs_history:
+        if settings.memory_raw_v3_enabled or not resolved_query.needs_history:
             return ()
         with session_scope(engine) as session:
             rows = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
                 limit=settings.context_summary_limit,
             )
-            summaries = []
-            for row in rows:
-                source_ids = tuple(
-                    dict.fromkeys(
-                        source_id
-                        for source_id in (
-                            row.source_start_msg_id,
-                            row.source_end_msg_id,
+            return tuple(
+                MemorySummary(
+                    text=str(row.content),
+                    source_msg_ids=tuple(
+                        dict.fromkeys(
+                            source_id
+                            for source_id in (
+                                row.source_start_msg_id,
+                                row.source_end_msg_id,
+                            )
+                            if source_id
                         )
-                        if source_id
-                    )
+                    ),
+                    relevant=True,
+                    group_id=group_id,
                 )
-                if source_ids:
-                    summaries.append(
-                        MemorySummary(
-                            text=str(row.content),
-                            source_msg_ids=source_ids,
-                            relevant=True,
-                            group_id=group_id,
-                        )
-                    )
-            return tuple(summaries)
+                for row in rows
+                if row.source_start_msg_id or row.source_end_msg_id
+            )
 
     def load_members(group_id: int) -> tuple[GroupMemberIdentity, ...]:
         with session_scope(engine) as session:
-            messages = MessageRepository(session)
-            return group_member_identities_from_messages(
-                messages.list_recent_group_member_messages(group_id=group_id, limit=200)
+            rows = session.execute(
+                select(
+                    Message.user_id,
+                    func.json_extract(Message.raw_json, "$.sender.nickname"),
+                    func.json_extract(Message.raw_json, "$.sender.card"),
+                )
+                .where(Message.group_id == int(group_id))
+                .distinct()
+            )
+            return tuple(
+                GroupMemberIdentity(
+                    user_id=int(user_id),
+                    nickname=str(nickname or "").strip(),
+                    group_card=str(group_card or "").strip(),
+                )
+                for user_id, nickname, group_card in rows
+                if str(nickname or "").strip() or str(group_card or "").strip()
             )
 
     def validate_source_scope(group_id: int, source_msg_ids: tuple[str, ...]) -> bool:
@@ -603,13 +722,25 @@ def build_memory_runtime(
 
     expander = MemoryEvidenceExpander(
         episode_loader=load_episode,
-        normal_segment_limit=min(4, settings.memory_final_episode_limit),
-        detail_segment_limit=settings.memory_final_episode_limit,
+        source_loader=load_sources,
+        normal_segment_limit=(
+            settings.memory_max_evidence_messages
+            if settings.memory_raw_v3_enabled
+            else min(4, settings.memory_final_episode_limit)
+        ),
+        detail_segment_limit=(
+            settings.memory_max_evidence_messages
+            if settings.memory_raw_v3_enabled
+            else min(6, settings.memory_final_episode_limit)
+        ),
     )
     packer = MemoryContextPacker(
         normal_budget=settings.memory_normal_context_budget_tokens,
         detail_budget=settings.memory_detail_context_budget_tokens,
         recent_budget=settings.memory_recent_context_budget_tokens,
+        history_budget=settings.memory_history_context_budget_tokens,
+        max_recent_messages=settings.context_recent_limit,
+        max_history_messages=settings.memory_max_evidence_messages,
     )
     v2_provider = MemoryV2ContextProvider(
         resolver=resolver,
@@ -621,6 +752,10 @@ def build_memory_runtime(
         summary_loader=load_summaries,
         member_loader=load_members,
         excluded_member_ids={settings.bot_qq},
+        historical_no_hit_omit_recent=settings.memory_raw_v3_enabled,
+        observability_route=(
+            "raw_v3" if settings.memory_raw_v3_enabled else "legacy_v2"
+        ),
     )
 
     shadow_evaluator = _DatabaseShadowEvaluator(
@@ -630,23 +765,8 @@ def build_memory_runtime(
         v2_provider=v2_provider,
     )
     background_service = None
-    embedding_generation = None
     if settings.memory_orchestration_v2_enabled:
         identity = embedding_provider.identity
-        if embedding_provider.available:
-            try:
-                embedding_generation = ensure_retrieval_vector_generation(
-                    engine,
-                    provider=identity.provider,
-                    model=identity.model,
-                    dimensions=identity.dimensions,
-                    version=identity.version,
-                )
-            except Exception as exc:
-                logging.warning(
-                    "memory_vector_generation_unavailable error_type=%s",
-                    type(exc).__name__,
-                )
         background_service = MemoryBackgroundService(
             store=SqlAlchemyMemoryBackgroundStore(
                 engine,
@@ -655,7 +775,9 @@ def build_memory_runtime(
                 embedding_model=identity.model,
                 embedding_version=identity.version,
                 embedding_dimensions=identity.dimensions,
-                embedding_generation=embedding_generation,
+                embedding_generation=legacy_embedding_generation,
+                raw_message_embedding_enabled=settings.memory_raw_v3_enabled,
+                raw_message_embedding_generation=raw_message_embedding_generation,
             ),
             deriver=CompactionEpisodeDeriver(
                 llm_client=llm_client,
@@ -718,13 +840,41 @@ def build_memory_runtime(
         legacy_provider=legacy.build_context,
         recent_provider=legacy.build_recent_context,
         shadow_enqueue=enqueue_shadow,
+        strict_scoped_fallback=settings.memory_raw_v3_enabled,
+        history_request_predicate=lambda request: history_classifier.resolve(
+            request.query,
+            recent_messages=request.recent_messages,
+            quoted_message=request.quoted_message,
+            now=request.now,
+            group_id=request.group_id,
+            requester_id=getattr(request, "current_user_id", None),
+        ).needs_history,
+    )
+    identity = embedding_provider.identity
+    logging.info(
+        "memory_runtime route=%s raw_enabled=%s embedding_provider=%s "
+        "embedding_model=%s embedding_device=%s embedding_generation=%s",
+        "raw_v3" if settings.memory_raw_v3_enabled else "legacy_v2",
+        settings.memory_raw_v3_enabled,
+        identity.provider,
+        identity.model,
+        settings.memory_embedding_device,
+        (
+            raw_message_embedding_generation
+            if settings.memory_raw_v3_enabled
+            else legacy_embedding_generation
+        ),
     )
     return MemoryRuntimeComposition(
         memory_orchestrator=orchestrator,
         memory_compaction_service=compaction_service,
         background_service=background_service,
         embedding_provider=embedding_provider,
-        embedding_generation=embedding_generation,
+        embedding_generation=(
+            raw_message_embedding_generation
+            if settings.memory_raw_v3_enabled
+            else legacy_embedding_generation
+        ),
         v2_provider=v2_provider,
         legacy_provider=legacy,
         build_request=shadow_evaluator.load_request,

@@ -391,6 +391,32 @@ def test_real_dataset_review_is_item_approved_and_bound_to_dataset_hash(tmp_path
         review_path=review_path,
         database=database,
     )
+    for invalid_case_index in (False, 0.0, 1):
+        review["cases"][0]["case_index"] = invalid_case_index
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        with pytest.raises(ValueError, match="not approved"):
+            validate_real_dataset_review(
+                cases,
+                dataset_sha256=digest,
+                review_path=review_path,
+                database=database,
+            )
+    review["cases"][0]["case_index"] = 0
+    for invalid_constant in ("NaN", "Infinity", "-Infinity"):
+        review_path.write_text(
+            json.dumps(review).replace(
+                '"review_version": 1',
+                f'"review_version": {invalid_constant}',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="invalid real-dataset review sidecar"):
+            validate_real_dataset_review(
+                cases,
+                dataset_sha256=digest,
+                review_path=review_path,
+                database=database,
+            )
     review["snapshot_manifest_sha256"] = "d" * 64
     review_path.write_text(json.dumps(review), encoding="utf-8")
     validate_real_dataset_review(

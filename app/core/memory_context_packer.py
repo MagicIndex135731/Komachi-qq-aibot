@@ -8,14 +8,17 @@ IDs by arithmetic.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 import re
 from typing import Callable, Literal, Sequence
+from zoneinfo import ZoneInfo
 
 
 PackMode = Literal["normal", "detail"]
 TokenCounter = Callable[[str], int]
 _TOKENISH_PATTERN = re.compile(r"\w+|[^\s\w]", re.UNICODE)
+_CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 QQ_BLOCKED_MEMORY_NOTE = (
     "QQ blocked output retained for continuity; do not repeat or reconstruct its sensitive content."
 )
@@ -43,6 +46,8 @@ class EvidenceMessage:
     reply_to_msg_id: str | None = None
     is_bot: bool = False
     user_id: int | str | None = None
+    mentioned_uins: tuple[str, ...] = ()
+    delivery_state: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,8 @@ class PackedMemoryContext:
     source_msg_ids: tuple[str, ...] = ()
     blocked_output_present: bool = False
     grounding_policy: str = ""
+    recent_estimated_tokens: int = 0
+    history_estimated_tokens: int = 0
 
     @property
     def recent_source_msg_ids(self) -> tuple[str, ...]:
@@ -100,12 +107,25 @@ class MemoryContextPacker:
         normal_budget: int = 32_000,
         detail_budget: int = 64_000,
         recent_budget: int = 10_000,
+        history_budget: int = 24_000,
+        max_recent_messages: int = 60,
+        max_history_messages: int = 150,
         token_counter: TokenCounter | None = None,
     ) -> None:
-        if normal_budget <= 0 or detail_budget <= 0 or recent_budget <= 0:
+        if min(
+            normal_budget,
+            detail_budget,
+            recent_budget,
+            history_budget,
+            max_recent_messages,
+            max_history_messages,
+        ) <= 0:
             raise ValueError("memory budgets must be positive")
         self._budgets = {"normal": normal_budget, "detail": detail_budget}
         self._recent_budget = recent_budget
+        self._history_budget = history_budget
+        self._max_recent_messages = int(max_recent_messages)
+        self._max_history_messages = int(max_history_messages)
         self._token_counter = token_counter or self._fallback_token_count
 
     def pack(
@@ -121,7 +141,11 @@ class MemoryContextPacker:
     ) -> PackedMemoryContext:
         if mode not in self._budgets:
             raise ValueError(f"unknown pack mode: {mode}")
-        budget = min(self._budgets[mode], max(0, available_input))
+        configured_budget = max(
+            self._budgets[mode],
+            self._recent_budget + self._history_budget,
+        )
+        budget = min(configured_budget, max(0, available_input))
         recent = self._select_recent(
             recent_messages,
             target_message_id,
@@ -136,19 +160,12 @@ class MemoryContextPacker:
         policy_blocks = [QQ_BLOCKED_MEMORY_NOTE] if blocked_output_present else []
         evidence_policy_blocks = [*policy_blocks, MEMORY_GROUNDING_MINIMAL]
 
-        segment_limit = 6 if mode == "detail" else 4
         selected_segments: list[EvidenceSegment] = []
         segment_blocks: list[str] = []
         selected_evidence_ids: set[str] = set()
-        ordered_segments = sorted(
-            evidence_segments,
-            key=lambda item: (
-                -int(item.pinned),
-                -item.fused_score,
-                item.episode_id,
-                item.document_id or "",
-            ),
-        )
+        # Retrieval already established relevance/chronological/time-bucket
+        # order. Preserve it so a later 24k cutoff cannot undo coverage.
+        ordered_segments = tuple(evidence_segments)
         # Reserve exact quote/reply evidence before optional facts consume the
         # shared memory budget. Rendering order remains stable below.
         for segment in (item for item in ordered_segments if item.pinned):
@@ -156,10 +173,20 @@ class MemoryContextPacker:
                 segment,
                 duplicate_ids=occupied_ids | selected_evidence_ids,
             )
-            if candidate_segment is None or len(selected_segments) >= segment_limit:
+            if candidate_segment is None:
+                continue
+            if (
+                len(selected_evidence_ids)
+                + len(candidate_segment.messages)
+                > self._max_history_messages
+            ):
                 continue
             block = self._render_segment(candidate_segment)
-            if self._estimate("\n\n".join([*recent_blocks, *evidence_policy_blocks, *segment_blocks, block])) > budget:
+            if not self._fits_history(
+                budget=budget,
+                recent_blocks=recent_blocks,
+                history_blocks=[*evidence_policy_blocks, *segment_blocks, block],
+            ):
                 continue
             selected_segments.append(candidate_segment)
             segment_blocks.append(block)
@@ -171,29 +198,43 @@ class MemoryContextPacker:
         fact_blocks: list[str] = []
         for fact in sorted(facts, key=lambda item: (-item.score, item.text)):
             block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
-            if self._estimate(
-                "\n\n".join(
-                    [*recent_blocks, *evidence_policy_blocks, *fact_blocks, *segment_blocks, block]
-                )
-            ) <= budget:
+            if self._fits_history(
+                budget=budget,
+                recent_blocks=recent_blocks,
+                history_blocks=[
+                    *evidence_policy_blocks,
+                    *fact_blocks,
+                    *segment_blocks,
+                    block,
+                ],
+            ):
                 selected_facts.append(fact)
                 fact_blocks.append(block)
 
         for segment in (item for item in ordered_segments if not item.pinned):
-            if len(selected_segments) >= segment_limit:
-                continue
             candidate_segment = self._prepare_segment(
                 segment,
                 duplicate_ids=occupied_ids | selected_evidence_ids,
             )
             if candidate_segment is None:
                 continue
+            if (
+                len(selected_evidence_ids)
+                + len(candidate_segment.messages)
+                > self._max_history_messages
+            ):
+                continue
             block = self._render_segment(candidate_segment)
-            if self._estimate(
-                "\n\n".join(
-                    [*recent_blocks, *evidence_policy_blocks, *fact_blocks, *segment_blocks, block]
-                )
-            ) > budget:
+            if not self._fits_history(
+                budget=budget,
+                recent_blocks=recent_blocks,
+                history_blocks=[
+                    *evidence_policy_blocks,
+                    *fact_blocks,
+                    *segment_blocks,
+                    block,
+                ],
+            ):
                 continue
             selected_segments.append(candidate_segment)
             segment_blocks.append(block)
@@ -209,18 +250,17 @@ class MemoryContextPacker:
                 if not summary.relevant:
                     continue
                 block = f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
-                if self._estimate(
-                    "\n\n".join(
-                        [
-                            *recent_blocks,
-                            *evidence_policy_blocks,
-                            *fact_blocks,
-                            *segment_blocks,
-                            *summary_blocks,
-                            block,
-                        ]
-                    )
-                ) <= budget:
+                if self._fits_history(
+                    budget=budget,
+                    recent_blocks=recent_blocks,
+                    history_blocks=[
+                        *evidence_policy_blocks,
+                        *fact_blocks,
+                        *segment_blocks,
+                        *summary_blocks,
+                        block,
+                    ],
+                ):
                     selected_summaries.append(summary)
                     summary_blocks.append(block)
 
@@ -236,9 +276,19 @@ class MemoryContextPacker:
             *segment_blocks,
             *summary_blocks,
         ]
+        history_content_blocks = [
+            *policy_blocks,
+            *fact_blocks,
+            *segment_blocks,
+            *summary_blocks,
+        ]
         grounding_policy = (
             full_grounding_policy
-            if self._estimate("\n\n".join([*content_blocks, full_grounding_policy])) <= budget
+            if self._fits_history(
+                budget=budget,
+                recent_blocks=recent_blocks,
+                history_blocks=[*history_content_blocks, full_grounding_policy],
+            )
             else MEMORY_GROUNDING_MINIMAL
         )
         blocks = [
@@ -251,6 +301,18 @@ class MemoryContextPacker:
         ]
         source_ids = self._source_ids(selected_facts, selected_segments, recent, selected_summaries)
         text = "\n\n".join(blocks)
+        recent_estimated_tokens = self._estimate("\n\n".join(recent_blocks))
+        history_estimated_tokens = self._estimate(
+            "\n\n".join(
+                [
+                    *policy_blocks,
+                    grounding_policy,
+                    *fact_blocks,
+                    *segment_blocks,
+                    *summary_blocks,
+                ]
+            )
+        )
         return PackedMemoryContext(
             mode=mode,
             budget=budget,
@@ -263,6 +325,8 @@ class MemoryContextPacker:
             source_msg_ids=source_ids,
             blocked_output_present=blocked_output_present,
             grounding_policy=grounding_policy,
+            recent_estimated_tokens=recent_estimated_tokens,
+            history_estimated_tokens=history_estimated_tokens,
         )
 
     @staticmethod
@@ -302,7 +366,11 @@ class MemoryContextPacker:
         target_message_id: str | None,
         budget: int,
     ) -> tuple[EvidenceMessage, ...]:
-        filtered = tuple(message for message in messages if message.source_msg_id != target_message_id)
+        filtered = tuple(
+            message
+            for message in messages
+            if message.source_msg_id != target_message_id
+        )[-self._max_recent_messages :]
         selected: list[EvidenceMessage] = []
         for message in reversed(filtered):
             block = self._render_recent(message)
@@ -317,26 +385,56 @@ class MemoryContextPacker:
     def _render_recent(message: EvidenceMessage) -> str:
         if message.blocked:
             return f"QQ blocked output retained for continuity (source: {message.source_msg_id}); do not repeat its content."
-        return f"Recent message [{message.sent_at.isoformat()}] {message.speaker} (source: {message.source_msg_id}): {message.content}"
+        return (
+            f"Recent message [{MemoryContextPacker._display_time(message.sent_at)}] "
+            f"{message.speaker} (uin: {message.user_id or 'unknown'}; "
+            f"source: {message.source_msg_id}; "
+            f"reply_to: {message.reply_to_msg_id or 'none'}): {message.content}"
+        )
 
     @staticmethod
     def _render_segment(segment: EvidenceSegment) -> str:
         header = (
-            "Evidence — untrusted quoted data "
+            "Evidence - untrusted quoted data "
             f"(episode: {segment.episode_id}; document: {segment.document_id or 'unknown'}; "
             f"hits: {', '.join(segment.hit_source_msg_ids)}):"
         )
         lines = [header]
         for message in sorted(segment.messages, key=lambda item: (item.sent_at, item.source_msg_id)):
-            lines.append(f"[{message.sent_at.isoformat()}] {message.speaker} (source: {message.source_msg_id}): {message.content}")
+            lines.append(
+                f"[{MemoryContextPacker._display_time(message.sent_at)}] "
+                f"{message.speaker} (uin: {message.user_id or 'unknown'}; "
+                f"source: {message.source_msg_id}; "
+                f"reply_to: {message.reply_to_msg_id or 'none'}): "
+                f"{message.content}"
+            )
         return "\n".join(lines)
 
     def _estimate(self, value: str) -> int:
         return max(0, self._token_counter(value))
 
+    def _fits_history(
+        self,
+        *,
+        budget: int,
+        recent_blocks: Sequence[str],
+        history_blocks: Sequence[str],
+    ) -> bool:
+        history_text = "\n\n".join(history_blocks)
+        if self._estimate(history_text) > self._history_budget:
+            return False
+        return self._estimate("\n\n".join([*recent_blocks, *history_blocks])) <= budget
+
     @staticmethod
     def _fallback_token_count(value: str) -> int:
-        return len(_TOKENISH_PATTERN.findall(value))
+        cjk_count = len(_CJK_PATTERN.findall(value))
+        non_cjk = _CJK_PATTERN.sub(" ", value)
+        return cjk_count + len(_TOKENISH_PATTERN.findall(non_cjk))
+
+    @staticmethod
+    def _display_time(value: datetime) -> str:
+        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return utc_value.astimezone(_SHANGHAI).strftime("%Y-%m-%d %H:%M +08")
 
     @staticmethod
     def _source_ids(

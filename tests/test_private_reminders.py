@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.adapters.sender import OutboundPrivateMessage
+from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncertainError
 from app.private_reminders import PrivateReminder, PrivateReminderScheduler, load_private_reminders
 
 
@@ -15,6 +15,12 @@ class FakeSender:
 
     async def send_private_text(self, outbound: OutboundPrivateMessage) -> None:
         self.private_sent.append(outbound)
+
+
+class UncertainSender(FakeSender):
+    async def send_private_text(self, outbound: OutboundPrivateMessage) -> None:
+        self.private_sent.append(outbound)
+        raise QQMessageDeliveryUncertainError("waitForSelfEcho timeout")
 
 
 def test_load_private_reminders_reads_yaml(tmp_path) -> None:
@@ -96,3 +102,31 @@ async def test_private_reminder_scheduler_catches_up_missed_one_time_reminder(tm
     await second_scheduler.stop()
 
     assert second_sender.private_sent == []
+
+
+@pytest.mark.asyncio
+async def test_private_reminder_does_not_retry_uncertain_delivery(tmp_path) -> None:
+    sender = UncertainSender()
+    reminder = PrivateReminder(
+        reminder_id="uncertain-reminder",
+        user_id=20002,
+        text="one-time reminder",
+        run_at=datetime.fromisoformat("2026-05-11T08:00:00+08:00"),
+        catch_up_if_missed=True,
+    )
+    scheduler = PrivateReminderScheduler(
+        sender=sender,
+        data_dir=tmp_path / "data",
+        reminders=[reminder],
+        allowed_user_ids={20002},
+        now_provider=lambda: datetime.fromisoformat("2026-05-11T08:05:00+08:00"),
+        poll_interval_seconds=0.01,
+    )
+
+    await scheduler._run_due_reminders_once()
+    await scheduler._run_due_reminders_once()
+
+    assert sender.private_sent == [
+        OutboundPrivateMessage(user_id=20002, text="one-time reminder")
+    ]
+    assert scheduler._load_state()["uncertain-reminder"] == "uncertain"

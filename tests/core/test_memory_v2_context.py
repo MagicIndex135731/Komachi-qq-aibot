@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import logging
 
 import pytest
 
@@ -10,9 +11,13 @@ from app.core.hybrid_memory_retriever import (
     HybridRetrievalResult,
     MemoryScopeViolation,
 )
-from app.core.memory_context_packer import EvidenceMessage, PackedMemoryContext
+from app.core.memory_context_packer import (
+    EvidenceMessage,
+    EvidenceSegment,
+    PackedMemoryContext,
+)
 from app.core.memory_orchestrator import MemoryContextResult
-from app.core.memory_query_resolver import ResolvedMemoryQuery
+from app.core.memory_query_resolver import ResolvedMemoryQuery, TimeRange
 from app.core.memory_v2_context import MemoryV2ContextProvider, MemoryV2Request
 
 
@@ -20,12 +25,13 @@ from app.core.memory_v2_context import MemoryV2ContextProvider, MemoryV2Request
 class Resolver:
     detail: bool = False
 
-    def resolve(self, query, **_):
+    def resolve(self, query, **kwargs):
         return ResolvedMemoryQuery(
             original_query=query,
             retrieval_query=query,
             needs_history=True,
             needs_detail=self.detail,
+            group_id=kwargs.get("group_id"),
         )
 
 
@@ -86,6 +92,26 @@ class Expander:
         return ()
 
 
+class OneSegmentExpander(Expander):
+    def expand(self, *, mode, **_):
+        self.modes.append(mode)
+        return (
+            EvidenceSegment(
+                episode_id="raw-1",
+                fused_score=1.0,
+                messages=(
+                    EvidenceMessage(
+                        "history",
+                        "member",
+                        "oversized history",
+                        datetime(2026, 7, 22, tzinfo=UTC),
+                        group_id=100,
+                    ),
+                ),
+            ),
+        )
+
+
 class Packer:
     def pack(self, mode, **_):
         return PackedMemoryContext(
@@ -94,6 +120,42 @@ class Packer:
             estimated_tokens=5,
             text="packed",
             source_msg_ids=("m-1",),
+        )
+
+
+class CapturingPacker(Packer):
+    def __init__(self) -> None:
+        self.recent_messages = None
+
+    def pack(self, mode, **kwargs):
+        self.recent_messages = kwargs["recent_messages"]
+        return super().pack(mode, **kwargs)
+
+
+class CapturingSegmentsPacker(Packer):
+    def __init__(self) -> None:
+        self.evidence_segments = None
+
+    def pack(self, mode, **kwargs):
+        self.evidence_segments = kwargs["evidence_segments"]
+        return super().pack(mode, **kwargs)
+
+
+class PostPackDropPacker(Packer):
+    def __init__(self) -> None:
+        self.recent_calls: list[tuple[EvidenceMessage, ...]] = []
+
+    def pack(self, mode, **kwargs):
+        recent = tuple(kwargs["recent_messages"])
+        self.recent_calls.append(recent)
+        return PackedMemoryContext(
+            mode=mode,
+            budget=100,
+            estimated_tokens=1,
+            text="recent only" if recent else "no evidence",
+            recent_messages=recent,
+            evidence_segments=(),
+            source_msg_ids=tuple(item.source_msg_id for item in recent),
         )
 
 
@@ -168,7 +230,7 @@ def test_v2_provider_rejects_cross_group_fact_or_unverified_final_source() -> No
         provider(request())
 
 
-def test_v2_provider_rejects_all_channel_failure_instead_of_claiming_abstention() -> None:
+def test_v2_provider_keeps_all_channel_failure_inside_safe_empty_v3_path() -> None:
     provider = MemoryV2ContextProvider(
         resolver=Resolver(),
         retriever=FailedRetriever(),
@@ -177,8 +239,61 @@ def test_v2_provider_rejects_all_channel_failure_instead_of_claiming_abstention(
         source_scope_validator=lambda _group_id, _source_ids: True,
     )
 
-    with pytest.raises(RuntimeError, match="all memory retrieval channels"):
-        provider(request())
+    result = provider(request())
+
+    assert result.mode == "v2"
+    assert result.selected_source_msg_ids == ("m-1",)
+
+
+def test_historical_v3_no_hit_does_not_inject_unrelated_recent_messages() -> None:
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        historical_no_hit_omit_recent=True,
+    )
+
+    provider(request())
+
+    assert packer.recent_messages == ()
+
+
+def test_historical_v3_post_validation_empty_does_not_inject_recent() -> None:
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=TracedRetriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        historical_no_hit_omit_recent=True,
+    )
+
+    provider(request())
+
+    assert packer.recent_messages == ()
+
+
+def test_historical_v3_post_pack_empty_retries_without_recent() -> None:
+    packer = PostPackDropPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=TracedRetriever(),
+        expander=OneSegmentExpander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        historical_no_hit_omit_recent=True,
+    )
+
+    result = provider(request())
+
+    assert len(packer.recent_calls) == 2
+    assert packer.recent_calls[0]
+    assert packer.recent_calls[1] == ()
+    assert result.packed_context.recent_messages == ()
 
 
 def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
@@ -204,3 +319,182 @@ def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
     assert trace.failed_channels == ()
     assert trace.channel_candidate_counts == (("bm25", 2), ("vector", 1))
     assert trace.resolved_query.retrieval_query
+
+
+def test_v3_observability_logs_metrics_without_query_or_message_content(
+    caplog,
+) -> None:
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=TracedRetriever(),
+        expander=Expander(),
+        packer=Packer(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        observability_route="raw_v3",
+    )
+    sensitive_query = "private-query-marker"
+    sensitive_message = "private-message-marker"
+    observed_request = replace(
+        request(),
+        query=sensitive_query,
+        recent_messages=(
+            replace(
+                request().recent_messages[0],
+                content=sensitive_message,
+            ),
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.core.memory_v2_context"):
+        provider.evaluate(observed_request)
+
+    metrics = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("memory_query_metrics ")
+    )
+    assert "route=raw_v3" in metrics
+    assert "attempted_channels=[\"bm25\",\"vector\"]" in metrics
+    assert "channel_counts=[[\"bm25\",2],[\"vector\",1]]" in metrics
+    assert "candidate_units=2" in metrics
+    assert "recent_messages=0" in metrics
+    assert "history_messages=0" in metrics
+    assert "recent_tokens=0" in metrics
+    assert "history_tokens=0" in metrics
+    assert sensitive_query not in metrics
+    assert sensitive_message not in metrics
+
+
+def test_expanded_sources_are_revalidated_against_subject_time_and_group() -> None:
+    class ScopedResolver:
+        def resolve(self, query, **_):
+            return ResolvedMemoryQuery(
+                original_query=query,
+                retrieval_query=query,
+                needs_history=True,
+                group_id=100,
+                subject_ids=("42",),
+                answer_mode="dated_history",
+                time_range=TimeRange(
+                    start=datetime(2026, 7, 22, tzinfo=UTC),
+                    end=datetime(2026, 7, 24, tzinfo=UTC),
+                ),
+            )
+
+    class MixedExpander:
+        def expand(self, **_):
+            return (
+                EvidenceSegment(
+                    "raw:eligible",
+                    1.0,
+                    (
+                        EvidenceMessage(
+                            "eligible",
+                            "Target",
+                            "inside",
+                            datetime(2026, 7, 23, tzinfo=UTC),
+                            group_id=100,
+                            user_id=42,
+                        ),
+                    ),
+                    hit_source_msg_ids=("eligible",),
+                ),
+                EvidenceSegment(
+                    "raw:wrong-subject",
+                    100.0,
+                    (
+                        EvidenceMessage(
+                            "wrong-subject",
+                            "Other",
+                            "must not pass",
+                            datetime(2026, 7, 23, tzinfo=UTC),
+                            group_id=100,
+                            user_id=99,
+                        ),
+                    ),
+                    hit_source_msg_ids=("wrong-subject",),
+                ),
+                EvidenceSegment(
+                    "raw:wrong-time",
+                    100.0,
+                    (
+                        EvidenceMessage(
+                            "wrong-time",
+                            "Target",
+                            "must not pass",
+                            datetime(2026, 7, 25, tzinfo=UTC),
+                            group_id=100,
+                            user_id=42,
+                        ),
+                    ),
+                    hit_source_msg_ids=("wrong-time",),
+                ),
+                EvidenceSegment(
+                    "raw:deleted",
+                    100.0,
+                    (
+                        EvidenceMessage(
+                            "deleted",
+                            "Target",
+                            "must not pass",
+                            datetime(2026, 7, 23, tzinfo=UTC),
+                            group_id=100,
+                            user_id=42,
+                            delivery_state="deleted",
+                        ),
+                    ),
+                    hit_source_msg_ids=("deleted",),
+                ),
+            )
+
+    packer = CapturingSegmentsPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=ScopedResolver(),
+        retriever=Retriever(),
+        expander=MixedExpander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+
+    provider(request())
+
+    assert tuple(
+        segment.episode_id for segment in packer.evidence_segments
+    ) == ("raw:eligible",)
+
+
+def test_required_reference_and_mention_segments_are_pinned() -> None:
+    segment = EvidenceSegment(
+        "raw:required",
+        1.0,
+        (
+            EvidenceMessage(
+                "required-source",
+                "Target",
+                "inside",
+                datetime(2026, 7, 23, tzinfo=UTC),
+                group_id=100,
+                user_id=42,
+            ),
+        ),
+    )
+
+    referenced = MemoryV2ContextProvider._pin_required_segments(
+        (segment,),
+        ResolvedMemoryQuery(
+            original_query="that",
+            retrieval_query="that",
+            reference_msg_ids=("required-source",),
+        ),
+    )
+    mentioned = MemoryV2ContextProvider._pin_required_segments(
+        (segment,),
+        ResolvedMemoryQuery(
+            original_query="@ me",
+            retrieval_query="@ me",
+            answer_mode="mention",
+        ),
+    )
+
+    assert referenced[0].pinned is True
+    assert mentioned[0].pinned is True

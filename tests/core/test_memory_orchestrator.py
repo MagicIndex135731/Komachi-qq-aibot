@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.memory_context_packer import PackedMemoryContext
 from app.core.memory_orchestrator import (
     MemoryContextResult,
     MemoryOrchestrator,
@@ -82,7 +83,7 @@ def test_active_mode_returns_v2_context() -> None:
     assert orchestrator.build_context(Request(group_id=100)).mode == "v2"
 
 
-def test_active_failure_falls_back_to_independent_v1() -> None:
+def test_legacy_v2_failure_keeps_independent_v1_rollback() -> None:
     def broken(_request):
         raise RuntimeError("sensitive provider body")
 
@@ -107,6 +108,45 @@ def test_cross_group_v2_result_is_discarded_and_falls_back() -> None:
     )
 
     assert orchestrator.build_context(Request(group_id=100)).mode == "v1"
+
+
+def test_historical_v3_failure_never_falls_back_to_unscoped_memory() -> None:
+    orchestrator = MemoryOrchestrator(
+        v2_enabled=True,
+        shadow_mode=False,
+        v2_provider=lambda _request: (_ for _ in ()).throw(RuntimeError("failed")),
+        legacy_provider=lambda _request: result(100, "v1"),
+        recent_provider=lambda _request: result(100, "recent"),
+        strict_scoped_fallback=True,
+    )
+
+    resolved = orchestrator.build_context(
+        Request(group_id=100, query="昨天阿渣说了什么劲爆发言")
+    )
+
+    assert resolved.mode == "v3_safe_empty"
+    assert resolved.selected_source_msg_ids == ()
+    assert "No relevant memory fact" in resolved.packed_context.text
+
+
+def test_ordinary_v3_failure_keeps_only_scoped_recent_context() -> None:
+    orchestrator = MemoryOrchestrator(
+        v2_enabled=True,
+        shadow_mode=False,
+        v2_provider=lambda _request: (_ for _ in ()).throw(
+            RuntimeError("failed")
+        ),
+        legacy_provider=lambda _request: result(100, "v1"),
+        recent_provider=lambda _request: result(100, "recent"),
+        strict_scoped_fallback=True,
+        history_request_predicate=lambda _request: False,
+    )
+
+    resolved = orchestrator.build_context(
+        Request(group_id=100, query="今天吃什么")
+    )
+
+    assert resolved.mode == "recent"
 
 
 def test_legacy_failure_uses_minimal_recent_context() -> None:
@@ -138,13 +178,12 @@ def test_recent_failure_returns_safe_empty_context_instead_of_blocking_reply() -
 
     resolved = orchestrator.build_context(Request(group_id=100))
 
-    assert resolved == MemoryContextResult(
-        group_id=100,
-        packed_context="",
-        selected_source_msg_ids=(),
-        estimated_tokens=0,
-        mode="empty",
-    )
+    assert resolved.group_id == 100
+    assert resolved.selected_source_msg_ids == ()
+    assert resolved.mode == "empty"
+    assert isinstance(resolved.packed_context, PackedMemoryContext)
+    assert resolved.packed_context.source_msg_ids == ()
+    assert "No relevant memory fact" in resolved.packed_context.text
 
 
 def test_shadow_job_uses_target_message_id_when_current_alias_is_absent() -> None:

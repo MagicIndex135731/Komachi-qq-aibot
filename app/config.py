@@ -65,6 +65,7 @@ class AppSettings(BaseSettings):
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
     memory_orchestration_v2_enabled: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_V2_ENABLED")
     memory_orchestration_shadow_mode: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_SHADOW_MODE")
+    memory_raw_v3_enabled: bool = Field(default=False, alias="MEMORY_RAW_V3_ENABLED")
     memory_embedding_provider: Literal["local", "openai_compatible", "disabled"] = Field(
         default="local", alias="MEMORY_EMBEDDING_PROVIDER"
     )
@@ -100,6 +101,14 @@ class AppSettings(BaseSettings):
     memory_normal_context_budget_tokens: int = Field(default=32000, alias="MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS")
     memory_detail_context_budget_tokens: int = Field(default=64000, alias="MEMORY_DETAIL_CONTEXT_BUDGET_TOKENS")
     memory_recent_context_budget_tokens: int = Field(default=10000, alias="MEMORY_RECENT_CONTEXT_BUDGET_TOKENS")
+    memory_history_context_budget_tokens: int = Field(
+        default=24000,
+        alias="MEMORY_HISTORY_CONTEXT_BUDGET_TOKENS",
+    )
+    memory_max_evidence_messages: int = Field(
+        default=150,
+        alias="MEMORY_MAX_EVIDENCE_MESSAGES",
+    )
     memory_fts_candidate_limit: int = Field(default=30, alias="MEMORY_FTS_CANDIDATE_LIMIT")
     memory_vector_candidate_limit: int = Field(default=30, alias="MEMORY_VECTOR_CANDIDATE_LIMIT")
     memory_final_episode_limit: int = Field(default=6, alias="MEMORY_FINAL_EPISODE_LIMIT")

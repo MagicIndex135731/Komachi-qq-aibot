@@ -10,6 +10,10 @@ from uuid import uuid4
 import websockets
 
 
+class NapCatDeliveryUncertainError(ConnectionError):
+    """A send frame may have reached NapCat before the websocket failed."""
+
+
 class NapCatGateway:
     REQUEST_TIMEOUT_SECONDS = 20.0
 
@@ -112,9 +116,9 @@ class NapCatGateway:
         envelope = {"action": action, "params": params, "echo": echo}
         try:
             await self.websocket.send(json.dumps(envelope, ensure_ascii=False))
-        except Exception:
+        except Exception as exc:
             self._discard_pending_call(echo, future)
-            raise
+            raise NapCatDeliveryUncertainError("NapCat websocket failed while sending request") from exc
         try:
             return await asyncio.wait_for(future, timeout=self.REQUEST_TIMEOUT_SECONDS)
         except (asyncio.CancelledError, asyncio.TimeoutError):

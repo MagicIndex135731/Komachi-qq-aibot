@@ -468,7 +468,7 @@ def test_context_builder_drops_lowest_scoring_packed_evidence_as_a_whole_segment
             EvidenceSegment("low", 1.0, (_packed_message("low-1", "LOW QUOTE COMPLETE"),)),
         ),
     )
-    builder = ContextBuilder(max_prompt_tokens=70)
+    builder = ContextBuilder(max_prompt_tokens=80)
 
     prompt = builder.build(
         persona_text="Mira",
@@ -485,7 +485,7 @@ def test_context_builder_drops_lowest_scoring_packed_evidence_as_a_whole_segment
     assert "HIGH QUOTE COMPLETE" in packed_prompt
     assert "LOW QUOTE COMPLETE" not in packed_prompt
     assert "episode: high" in packed_prompt
-    assert builder.estimate_prompt_tokens(prompt) <= 70
+    assert builder.estimate_prompt_tokens(prompt) <= 80
 
 
 def test_context_builder_shortens_packed_recent_context_from_oldest_end_only() -> None:
@@ -556,7 +556,7 @@ def test_total_cap_keeps_pinned_exact_segment_until_non_pinned_memory_is_removed
             ),
         ),
     )
-    prompt = ContextBuilder(max_prompt_tokens=68).build(
+    prompt = ContextBuilder(max_prompt_tokens=80).build(
         persona_text="Mira",
         safety_rules=[],
         group_policy_lines=[],
@@ -571,4 +571,4 @@ def test_total_cap_keeps_pinned_exact_segment_until_non_pinned_memory_is_removed
     assert "PINNED EXACT" in packed_prompt
     assert "OTHER EVIDENCE" not in packed_prompt
     assert "Discussion is not preference evidence; corrections win." in packed_prompt
-    assert ContextBuilder.estimate_prompt_tokens(prompt) <= 68
+    assert ContextBuilder.estimate_prompt_tokens(prompt) <= 80

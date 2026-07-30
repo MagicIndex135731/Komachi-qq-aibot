@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import Integer, bindparam, func, or_, select, text
+from sqlalchemy import Integer, String, bindparam, cast, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -31,6 +32,14 @@ from app.storage.models import (
 )
 from app.providers.embeddings import hashed_text_embedding
 from app.storage.db import validate_retrieval_vector_table_name
+
+
+_INELIGIBLE_DELIVERY_STATES = (
+    "reserved",
+    "blocked",
+    "uncertain",
+    "deleted",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +71,102 @@ def _normalize_utc_sqlite_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _mentioned_user_ids(raw_json: object) -> frozenset[str]:
+    if not isinstance(raw_json, dict):
+        return frozenset()
+    segments = raw_json.get("message", raw_json.get("raw_message"))
+    if not isinstance(segments, list):
+        return frozenset()
+    mentioned: set[str] = set()
+    for segment in segments:
+        if not isinstance(segment, dict) or str(segment.get("type") or "") != "at":
+            continue
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("qq", "uin", "target"):
+            value = data.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            normalized = str(value).strip()
+            if normalized:
+                mentioned.add(normalized)
+    return frozenset(mentioned)
+
+
+def _normalize_optional_string_filter(
+    values: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    return tuple(
+        dict.fromkeys(str(value).strip() for value in values if str(value).strip())
+    )
+
+
+def _normalize_optional_integer_filter(
+    values: Sequence[str] | None,
+) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    return tuple(
+        dict.fromkeys(
+            int(value)
+            for value in values
+            if str(value).strip().lstrip("-").isdigit()
+        )
+    )
+
+
+def _retrieval_source_prefilters(
+    *,
+    group_id: int,
+    speaker_ids: Sequence[str] | None,
+) -> list[Any]:
+    """SQL prefilters applied before ranking/limit on document channels."""
+
+    unsafe_document_ids = (
+        select(RetrievalDocumentMessage.document_id)
+        .join(
+            Message,
+            (Message.id == RetrievalDocumentMessage.message_id)
+            & (Message.group_id == RetrievalDocumentMessage.group_id),
+        )
+        .where(
+            RetrievalDocumentMessage.group_id == int(group_id),
+            Message.group_id == int(group_id),
+            func.json_extract(Message.raw_json, "$.delivery_state").in_(
+                _INELIGIBLE_DELIVERY_STATES
+            ),
+        )
+    )
+    filters: list[Any] = [
+        RetrievalDocument.id.not_in(unsafe_document_ids),
+    ]
+    normalized_speakers = _normalize_optional_integer_filter(speaker_ids)
+    if normalized_speakers is not None:
+        if not normalized_speakers:
+            filters.append(RetrievalDocument.id < 0)
+        else:
+            mismatched_document_ids = (
+                select(RetrievalDocumentMessage.document_id)
+                .join(
+                    Message,
+                    (Message.id == RetrievalDocumentMessage.message_id)
+                    & (Message.group_id == RetrievalDocumentMessage.group_id),
+                )
+                .where(
+                    RetrievalDocumentMessage.group_id == int(group_id),
+                    Message.group_id == int(group_id),
+                    Message.user_id.not_in(normalized_speakers),
+                )
+            )
+            filters.append(
+                RetrievalDocument.id.not_in(mismatched_document_ids)
+            )
+    return filters
 
 
 def _delete_active_retrieval_vectors(
@@ -210,6 +315,22 @@ class MessageRepository:
             and raw_json.get("failure_kind") == "qq_sensitive_content"
         )
 
+    @staticmethod
+    def is_delivery_uncertain_outbound(message: Message) -> bool:
+        raw_json = message.raw_json
+        return (
+            isinstance(raw_json, dict)
+            and raw_json.get("delivery_state") == "uncertain"
+            and raw_json.get("failure_kind") == "delivery_result_unknown"
+        )
+
+    @staticmethod
+    def _is_unconfirmed_outbound(message: Message) -> bool:
+        return (
+            MessageRepository.is_qq_blocked_outbound(message)
+            or MessageRepository.is_delivery_uncertain_outbound(message)
+        )
+
     def add_group_message(
         self,
         *,
@@ -268,6 +389,32 @@ class MessageRepository:
     def get_by_platform_msg_id(self, platform_msg_id: str) -> Message | None:
         stmt = select(Message).where(Message.platform_msg_id == platform_msg_id).limit(1)
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def mark_group_message_deleted(
+        self,
+        *,
+        group_id: int,
+        platform_msg_id: str,
+        reason: str = "group_recall",
+    ) -> Message | None:
+        message = self.session.scalars(
+            select(Message).where(
+                Message.group_id == int(group_id),
+                Message.platform_msg_id == str(platform_msg_id),
+            )
+        ).first()
+        if message is None:
+            return None
+        raw_json = (
+            dict(message.raw_json)
+            if isinstance(message.raw_json, dict)
+            else {}
+        )
+        raw_json["delivery_state"] = "deleted"
+        raw_json["deletion_reason"] = str(reason or "group_recall")[:64]
+        message.raw_json = raw_json
+        self.session.add(message)
+        return message
 
     def get_group_messages_by_platform_msg_ids(
         self,
@@ -328,7 +475,7 @@ class MessageRepository:
         )
         recent_messages = []
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
+            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
                 continue
             recent_messages.append(message)
             if len(recent_messages) >= limit:
@@ -391,7 +538,7 @@ class MessageRepository:
             if message.timestamp.date() == day
             and message.user_id not in excluded
             and not self._is_reserved_outbound(message)
-            and not self.is_qq_blocked_outbound(message)
+            and not self._is_unconfirmed_outbound(message)
         ]
 
     def list_group_ids(self) -> list[int]:
@@ -416,7 +563,7 @@ class MessageRepository:
             message
             for message in self.session.scalars(stmt)
             if not self._is_reserved_outbound(message)
-            and not self.is_qq_blocked_outbound(message)
+            and not self._is_unconfirmed_outbound(message)
             and message.user_id not in excluded
         ]
         windows = [
@@ -440,7 +587,7 @@ class MessageRepository:
         )
         rows: list[Message] = []
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
+            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
                 continue
             rows.append(message)
             if len(rows) >= max(1, limit):
@@ -468,7 +615,7 @@ class MessageRepository:
         return [
             message
             for message in self.session.scalars(stmt)
-            if not self._is_reserved_outbound(message) and not self.is_qq_blocked_outbound(message)
+            if not self._is_reserved_outbound(message) and not self._is_unconfirmed_outbound(message)
         ]
 
     def list_recent_group_messages_for_user(self, *, group_id: int, user_id: int, limit: int) -> list[Message]:
@@ -479,7 +626,7 @@ class MessageRepository:
         )
         recent_messages = []
         for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
+            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
                 continue
             recent_messages.append(message)
             if len(recent_messages) >= limit:
@@ -1530,7 +1677,8 @@ class EpisodeRepository:
                 EpisodeMessage.message_id.is_(None),
                 text(
                     "(json_extract(messages.raw_json, '$.delivery_state') IS NULL "
-                    "OR json_extract(messages.raw_json, '$.delivery_state') <> 'reserved')"
+                    "OR json_extract(messages.raw_json, '$.delivery_state') "
+                    "NOT IN ('reserved', 'uncertain'))"
                 ),
             )
         )
@@ -1975,18 +2123,59 @@ class EpisodeRepository:
         content_hash: str,
     ) -> ConversationEpisode | None:
         episode = self.session.get(ConversationEpisode, episode_id)
-        if episode is None:
+        if (
+            episode is None
+            or episode.status != "open"
+            or not bool(episode.is_current)
+        ):
             return None
         closed_at = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
-        episode.status = "closed"
-        episode.ended_at = _normalize_utc_sqlite_timestamp(ended_at)
-        episode.end_message_id = end_message_id
-        episode.boundary_reason = boundary_reason
-        episode.content_hash = content_hash
-        episode.closed_at = closed_at
-        episode.updated_at = closed_at
-        self.session.add(episode)
-        return episode
+        normalized_ended_at = _normalize_utc_sqlite_timestamp(ended_at)
+        segmentation_version = str(episode.segmentation_version or "")
+        duplicate_id = self.session.scalar(
+            select(ConversationEpisode.id).where(
+                ConversationEpisode.id != int(episode_id),
+                ConversationEpisode.group_id == int(episode.group_id),
+                ConversationEpisode.segmentation_version
+                == segmentation_version,
+                ConversationEpisode.start_message_id
+                == int(episode.start_message_id),
+                ConversationEpisode.end_message_id == int(end_message_id),
+            )
+        )
+        if duplicate_id is not None:
+            # A late-arrival replay can deterministically reproduce an older
+            # superseded boundary. Keep both audit rows, but identify the
+            # replay as a derived segmentation generation.
+            segmentation_version = (
+                f"{segmentation_version}:late:{int(episode_id)}"
+            )
+        result = self.session.execute(
+            text(
+                "UPDATE conversation_episodes SET "
+                "status = 'closed', segmentation_version = :segmentation_version, "
+                "ended_at = :ended_at, end_message_id = :end_message_id, "
+                "boundary_reason = :boundary_reason, content_hash = :content_hash, "
+                "closed_at = :closed_at, updated_at = :updated_at "
+                "WHERE id = :episode_id AND group_id = :group_id "
+                "AND status = 'open' AND is_current = 1"
+            ),
+            {
+                "segmentation_version": segmentation_version,
+                "ended_at": normalized_ended_at,
+                "end_message_id": int(end_message_id),
+                "boundary_reason": str(boundary_reason),
+                "content_hash": str(content_hash),
+                "closed_at": closed_at,
+                "updated_at": closed_at,
+                "episode_id": int(episode_id),
+                "group_id": int(episode.group_id),
+            },
+        )
+        self.session.expire_all()
+        if int(result.rowcount or 0) != 1:
+            return None
+        return self.session.get(ConversationEpisode, episode_id)
 
     def list_episode_messages(self, *, episode_id: int, group_id: int) -> list[Message]:
         return list(
@@ -2143,6 +2332,389 @@ class RetrievalDocumentRepository:
         self._sync_fts(document)
         return document
 
+    def project_raw_message_v3(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        embedding_generation: int | None = None,
+    ) -> RetrievalDocument | None:
+        """Idempotently project one canonical message into immediate V3 retrieval.
+
+        The caller owns the transaction, so the canonical document, provenance,
+        and best-effort FTS row become visible together. Unsafe outbound
+        placeholders revoke any older projection without mutating the message.
+        """
+        message = self.session.scalars(
+            select(Message).where(
+                Message.id == int(message_id),
+                Message.group_id == int(group_id),
+            )
+        ).first()
+        if message is None:
+            raise ValueError("raw message projection source is missing or out of scope")
+
+        existing = list(
+            self.session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.group_id == int(group_id),
+                    RetrievalDocument.document_kind == "raw_message_v3",
+                    RetrievalDocument.source_table == "messages",
+                    RetrievalDocument.source_id == str(int(message_id)),
+                )
+            )
+        )
+        content = str(message.plain_text or "").strip()
+        delivery_state = (
+            str(message.raw_json.get("delivery_state") or "")
+            .strip()
+            .casefold()
+            if isinstance(message.raw_json, dict)
+            else ""
+        )
+        unsafe = delivery_state in _INELIGIBLE_DELIVERY_STATES
+        if unsafe or not content:
+            self._deactivate_documents(existing)
+            return None
+
+        generation = (
+            int(embedding_generation)
+            if embedding_generation is not None
+            else None
+        )
+        hash_input = json.dumps(
+            {
+                "kind": "raw_message_v3",
+                "message_id": int(message.id),
+                "group_id": int(message.group_id),
+                "platform_msg_id": str(message.platform_msg_id),
+                "user_id": int(message.user_id),
+                "timestamp": _normalize_utc_sqlite_timestamp(message.timestamp).isoformat(),
+                "content": content,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        content_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+        matching = next(
+            (row for row in existing if row.content_hash == content_hash),
+            None,
+        )
+        if (
+            generation is not None
+            and matching is not None
+            and matching.embedding_generation is not None
+            and int(matching.embedding_generation) > generation
+        ):
+            claimed_state = self.session.execute(
+                text(
+                    "SELECT status, is_active, document_family "
+                    "FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND generation = :generation"
+                ),
+                {"generation": int(matching.embedding_generation)},
+            ).one_or_none()
+            requested_state = self.session.execute(
+                text(
+                    "SELECT is_active, document_family "
+                    "FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND generation = :generation"
+                ),
+                {"generation": generation},
+            ).one_or_none()
+            if (
+                claimed_state is not None
+                and requested_state is not None
+                and str(claimed_state.document_family) == "raw_message_v3"
+                and str(requested_state.document_family) == "raw_message_v3"
+                and str(claimed_state.status) in {"building", "ready"}
+                and not bool(claimed_state.is_active)
+                and bool(requested_state.is_active)
+            ):
+                # A worker pinned to the older active generation must not
+                # erase a newer generation's in-progress document claim.
+                generation = int(matching.embedding_generation)
+        if generation is None and matching is not None:
+            embedding_provider = matching.embedding_provider
+            embedding_model = matching.embedding_model
+            embedding_version = matching.embedding_version
+            embedding_dimensions = matching.embedding_dimensions
+            effective_generation = matching.embedding_generation
+            embedding_eligible = bool(matching.embedding_eligible)
+            embedding_status = matching.embedding_status
+        elif (
+            matching is not None
+            and matching.embedding_generation == generation
+            and matching.embedding_status == "ready"
+        ):
+            embedding_provider = matching.embedding_provider
+            embedding_model = matching.embedding_model
+            embedding_version = matching.embedding_version
+            embedding_dimensions = matching.embedding_dimensions
+            effective_generation = generation
+            embedding_eligible = True
+            embedding_status = "ready"
+        else:
+            embedding_provider = ""
+            embedding_model = ""
+            embedding_version = ""
+            embedding_dimensions = None
+            effective_generation = generation
+            embedding_eligible = generation is not None
+            embedding_status = "pending" if generation is not None else "disabled"
+        document = self.upsert_document(
+            scope_type="group",
+            scope_id=str(int(group_id)),
+            group_id=int(group_id),
+            episode_id=None,
+            document_kind="raw_message_v3",
+            source_table="messages",
+            source_id=str(int(message.id)),
+            start_at=message.timestamp,
+            end_at=message.timestamp,
+            content=content,
+            metadata_json={
+                "platform_msg_id": str(message.platform_msg_id),
+                "speaker_id": str(message.user_id),
+                "reply_to_msg_id": str(message.reply_to_msg_id or ""),
+                "mentioned_bot": bool(message.mentioned_bot),
+                "index_generation": effective_generation,
+            },
+            content_hash=content_hash,
+            source_message_ids=[int(message.id)],
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+            embedding_version=embedding_version,
+            embedding_dimensions=embedding_dimensions,
+            embedding_generation=effective_generation,
+            embedding_eligible=embedding_eligible,
+            embedding_status=embedding_status,
+        )
+        self._deactivate_documents(
+            [row for row in existing if row.id != document.id]
+        )
+        return document
+
+    def list_raw_message_v3_projection_gaps(
+        self,
+        *,
+        projection_job_type: str,
+        embedding_generation: int | None,
+        limit: int,
+    ) -> list[tuple[int, int]]:
+        """Return eligible ledger rows lacking a projection or live repair job."""
+        projection_filters = [
+            RetrievalDocumentMessage.message_id == Message.id,
+            RetrievalDocumentMessage.group_id == Message.group_id,
+            RetrievalDocument.id == RetrievalDocumentMessage.document_id,
+            RetrievalDocument.group_id == Message.group_id,
+            RetrievalDocument.document_kind == "raw_message_v3",
+            RetrievalDocument.source_table == "messages",
+            RetrievalDocument.source_id == cast(Message.id, String),
+            RetrievalDocument.status == "active",
+        ]
+        if embedding_generation is not None:
+            projection_filters.extend(
+                [
+                    RetrievalDocument.embedding_generation
+                    == int(embedding_generation),
+                    RetrievalDocument.embedding_eligible.is_(True),
+                ]
+            )
+        matching_projection = (
+            select(RetrievalDocument.id)
+            .select_from(RetrievalDocumentMessage)
+            .join(
+                RetrievalDocument,
+                RetrievalDocument.id == RetrievalDocumentMessage.document_id,
+            )
+            .where(*projection_filters)
+            .correlate(Message)
+            .exists()
+        )
+        live_or_terminal_failure_job = (
+            select(Job.id)
+            .where(
+                Job.job_type == str(projection_job_type),
+                Job.status.in_(("queued", "running", "failed")),
+                cast(
+                    func.json_extract(Job.payload_json, "$.group_id"),
+                    Integer,
+                )
+                == Message.group_id,
+                cast(
+                    func.json_extract(Job.payload_json, "$.message_id"),
+                    Integer,
+                )
+                == Message.id,
+            )
+            .correlate(Message)
+            .exists()
+        )
+        delivery_state = func.coalesce(
+            func.json_extract(Message.raw_json, "$.delivery_state"),
+            "",
+        )
+        rows = self.session.execute(
+            select(Message.group_id, Message.id)
+            .where(
+                Message.group_id.is_not(None),
+                func.trim(func.coalesce(Message.plain_text, "")) != "",
+                ~delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
+                ~matching_projection,
+                ~live_or_terminal_failure_job,
+            )
+            .order_by(Message.id.asc())
+            .limit(max(1, int(limit)))
+        )
+        return [
+            (int(group_id), int(message_id))
+            for group_id, message_id in rows
+            if group_id is not None
+        ]
+
+    def revoke_unsafe_raw_message_v3_projections(
+        self,
+        *,
+        limit: int,
+    ) -> int:
+        """Deactivate projections whose canonical source became ineligible."""
+        delivery_state = func.coalesce(
+            func.json_extract(Message.raw_json, "$.delivery_state"),
+            "",
+        )
+        documents = list(
+            self.session.scalars(
+                select(RetrievalDocument)
+                .join(
+                    RetrievalDocumentMessage,
+                    (
+                        RetrievalDocumentMessage.document_id
+                        == RetrievalDocument.id
+                    )
+                    & (
+                        RetrievalDocumentMessage.group_id
+                        == RetrievalDocument.group_id
+                    ),
+                )
+                .join(
+                    Message,
+                    (Message.id == RetrievalDocumentMessage.message_id)
+                    & (
+                        Message.group_id
+                        == RetrievalDocumentMessage.group_id
+                    ),
+                )
+                .where(
+                    RetrievalDocument.document_kind == "raw_message_v3",
+                    RetrievalDocument.source_table == "messages",
+                    RetrievalDocument.status == "active",
+                    or_(
+                        func.trim(func.coalesce(Message.plain_text, "")) == "",
+                        delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
+                    ),
+                )
+                .distinct()
+                .order_by(RetrievalDocument.id.asc())
+                .limit(max(1, int(limit)))
+            )
+        )
+        self._deactivate_documents(documents)
+        return len(documents)
+
+    def deactivate_raw_message_v3(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+    ) -> int:
+        documents = list(
+            self.session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.group_id == int(group_id),
+                    RetrievalDocument.document_kind == "raw_message_v3",
+                    RetrievalDocument.source_table == "messages",
+                    RetrievalDocument.source_id == str(int(message_id)),
+                    RetrievalDocument.status == "active",
+                )
+            )
+        )
+        self._deactivate_documents(documents)
+        return len(documents)
+
+    def load_raw_message_embedding_document(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        document_id: int,
+        embedding_generation: int,
+    ) -> RetrievalDocument | None:
+        document = self.session.scalars(
+            select(RetrievalDocument).where(
+                RetrievalDocument.id == int(document_id),
+                RetrievalDocument.group_id == int(group_id),
+                RetrievalDocument.document_kind == "raw_message_v3",
+                RetrievalDocument.source_table == "messages",
+                RetrievalDocument.source_id == str(int(message_id)),
+                RetrievalDocument.status == "active",
+                RetrievalDocument.embedding_eligible.is_(True),
+                RetrievalDocument.embedding_generation == int(embedding_generation),
+            )
+        ).first()
+        if document is None:
+            return None
+        source = self.session.scalars(
+            select(Message)
+            .join(
+                RetrievalDocumentMessage,
+                (RetrievalDocumentMessage.message_id == Message.id)
+                & (RetrievalDocumentMessage.group_id == Message.group_id),
+            )
+            .where(
+                RetrievalDocumentMessage.document_id == document.id,
+                RetrievalDocumentMessage.group_id == int(group_id),
+                Message.id == int(message_id),
+                Message.group_id == int(group_id),
+            )
+        ).first()
+        if (
+            source is None
+            or MessageRepository.is_reserved_outbound(source)
+            or MessageRepository.is_qq_blocked_outbound(source)
+            or MessageRepository.is_delivery_uncertain_outbound(source)
+            or (
+                isinstance(source.raw_json, dict)
+                and str(source.raw_json.get("delivery_state") or "")
+                .strip()
+                .casefold()
+                in _INELIGIBLE_DELIVERY_STATES
+            )
+        ):
+            self._deactivate_documents([document])
+            return None
+        return document
+
+    def _deactivate_documents(
+        self,
+        documents: Sequence[RetrievalDocument],
+    ) -> None:
+        if not documents:
+            return
+        now = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        for document in documents:
+            if document.status != "inactive":
+                document.status = "inactive"
+                document.embedding_status = "stale"
+                document.updated_at = now
+                self.session.add(document)
+            self._sync_fts(document)
+        _delete_active_retrieval_vectors(
+            self.session,
+            document_ids=[document.id for document in documents],
+        )
+
     def list_source_message_ids(self, *, document_id: int, group_id: int) -> list[int]:
         return list(
             self.session.scalars(
@@ -2243,52 +2815,36 @@ class RetrievalDocumentRepository:
         query: str,
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         resolved_limit = max(1, int(limit))
-        terms = [term for term in _fts_search_terms(query) if len(term) >= 3]
-        ranked: list[tuple[int, float]] = []
-        if terms:
-            try:
-                ranked = [
-                    (int(document_id), -float(distance))
-                    for document_id, distance in self.session.execute(
-                        text(
-                            "SELECT d.id, bm25(retrieval_documents_fts) AS distance "
-                            "FROM retrieval_documents_fts "
-                            "JOIN retrieval_documents AS d "
-                            "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
-                            "AND d.group_id = :group_id "
-                            "WHERE retrieval_documents_fts MATCH :match_query "
-                            "AND retrieval_documents_fts.group_id = :group_id_text "
-                            "AND d.status = 'active' "
-                            "ORDER BY distance ASC, d.id ASC LIMIT :limit"
-                        ),
-                        {
-                            "match_query": " OR ".join(
-                                f'"{term}"' for term in terms
-                            ),
-                            "group_id": int(group_id),
-                            "group_id_text": str(int(group_id)),
-                            "limit": resolved_limit,
-                        },
-                    )
-                ]
-            except SQLAlchemyError:
-                ranked = []
-        if not ranked:
-            documents = self.search_group_documents_fts(
-                group_id=group_id,
-                query=query,
-                limit=resolved_limit,
-            )
-            ranked = [
-                (document.id, float(resolved_limit - rank))
-                for rank, document in enumerate(documents)
-            ]
+        documents = self.search_group_documents_fts(
+            group_id=group_id,
+            query=query,
+            limit=resolved_limit,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
+        )
+        ranked = [
+            (document.id, float(resolved_limit - rank))
+            for rank, document in enumerate(documents)
+        ]
         return self._validated_hits(
             group_id=group_id,
             ranked_document_ids=ranked,
             subject_ids=subject_ids,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
         )
 
     def search_group_documents_temporal_hits(
@@ -2299,13 +2855,35 @@ class RetrievalDocumentRepository:
         end_at: datetime | None,
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
+        allow_unbounded: bool = False,
+        sample_time_coverage: bool | None = None,
     ) -> list[RetrievalDocumentHit]:
-        if start_at is None and end_at is None:
+        if start_at is None and end_at is None and not allow_unbounded:
             return []
         stmt = select(RetrievalDocument.id).where(
             RetrievalDocument.group_id == int(group_id),
             RetrievalDocument.status == "active",
+            *_retrieval_source_prefilters(
+                group_id=group_id,
+                speaker_ids=speaker_ids,
+            ),
         )
+        normalized_document_kinds = tuple(
+            dict.fromkeys(
+                str(kind).strip()
+                for kind in (document_kinds or ())
+                if str(kind).strip()
+            )
+        )
+        if document_kinds is not None:
+            if not normalized_document_kinds:
+                return []
+            stmt = stmt.where(
+                RetrievalDocument.document_kind.in_(normalized_document_kinds)
+            )
         if start_at is not None:
             stmt = stmt.where(
                 RetrievalDocument.end_at
@@ -2316,38 +2894,67 @@ class RetrievalDocumentRepository:
                 RetrievalDocument.start_at
                 < _normalize_utc_sqlite_timestamp(end_at)
             )
-        document_ids = list(
-            self.session.scalars(
-                stmt.order_by(
-                    RetrievalDocument.end_at.desc(),
-                    RetrievalDocument.id.desc(),
-                ).limit(max(1, int(limit)))
-            )
+        resolved_limit = max(1, int(limit))
+        use_time_coverage = (
+            bool(allow_unbounded)
+            if sample_time_coverage is None
+            else bool(sample_time_coverage)
         )
-        return self._validated_hits(
+        ordered_stmt = stmt.order_by(
+            RetrievalDocument.start_at.asc()
+            if use_time_coverage
+            else RetrievalDocument.end_at.desc(),
+            RetrievalDocument.id.asc()
+            if use_time_coverage
+            else RetrievalDocument.id.desc(),
+        )
+        if not use_time_coverage and mentioned_user_ids is None:
+            ordered_stmt = ordered_stmt.limit(resolved_limit * 4)
+        document_ids = list(self.session.scalars(ordered_stmt))
+        hits = self._validated_hits(
             group_id=group_id,
             ranked_document_ids=[
                 (int(document_id), float(len(document_ids) - rank))
                 for rank, document_id in enumerate(document_ids)
             ],
             subject_ids=subject_ids,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
         )
+        if len(hits) <= resolved_limit:
+            return hits
+        if not use_time_coverage or resolved_limit == 1:
+            return hits[:resolved_limit]
+        # Deterministic coverage sampling over the full eligible chronology.
+        # Endpoints are pinned and interior slots are evenly distributed.
+        indices = [
+            (slot * (len(hits) - 1)) // (resolved_limit - 1)
+            for slot in range(resolved_limit)
+        ]
+        return [hits[index] for index in dict.fromkeys(indices)]
 
     def search_group_documents_entity_hits(
         self,
         *,
         group_id: int,
         entities: tuple[str, ...],
-        speaker_ids: tuple[str, ...],
+        speaker_ids: Sequence[str] | None,
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         normalized_entities = tuple(
             dict.fromkeys(value.strip() for value in entities if value.strip())
         )[:12]
         normalized_speaker_ids = tuple(
             int(value)
-            for value in dict.fromkeys(speaker_ids)
+            for value in dict.fromkeys(speaker_ids or ())
             if str(value).strip().lstrip("-").isdigit()
         )
         if not normalized_entities and not normalized_speaker_ids:
@@ -2392,12 +2999,39 @@ class RetrievalDocumentRepository:
                 RetrievalDocument.group_id == int(group_id),
                 RetrievalDocument.status == "active",
                 or_(*conditions),
+                *_retrieval_source_prefilters(
+                    group_id=group_id,
+                    speaker_ids=speaker_ids,
+                ),
             )
             .order_by(
                 RetrievalDocument.end_at.desc(),
                 RetrievalDocument.id.desc(),
             )
-            .limit(max(1, int(limit)))
+        )
+        normalized_document_kinds = _normalize_optional_string_filter(
+            document_kinds
+        )
+        if normalized_document_kinds == ():
+            return []
+        if normalized_document_kinds is not None:
+            stmt = stmt.where(
+                RetrievalDocument.document_kind.in_(normalized_document_kinds)
+            )
+        if start_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.end_at
+                >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.start_at
+                < _normalize_utc_sqlite_timestamp(end_at)
+            )
+        stmt = stmt.limit(
+            2_147_483_647
+            if mentioned_user_ids is not None
+            else max(1, int(limit))
         )
         document_ids = list(self.session.scalars(stmt))
         return self._validated_hits(
@@ -2407,6 +3041,11 @@ class RetrievalDocumentRepository:
                 for rank, document_id in enumerate(document_ids)
             ],
             subject_ids=subject_ids,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
         )
 
     def search_group_fact_hits(
@@ -2417,6 +3056,11 @@ class RetrievalDocumentRepository:
         entities: tuple[str, ...],
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         terms = tuple(
             dict.fromkeys(
@@ -2476,6 +3120,11 @@ class RetrievalDocumentRepository:
                 for rank, document_id in enumerate(document_ids)
             ],
             subject_ids=subject_ids,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
         )
 
     def search_group_reference_hits(
@@ -2486,6 +3135,11 @@ class RetrievalDocumentRepository:
         include_replies: bool,
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         references = tuple(
             dict.fromkeys(value.strip() for value in reference_msg_ids if value.strip())
@@ -2497,9 +3151,8 @@ class RetrievalDocumentRepository:
             if include_replies
             else Message.platform_msg_id.in_(references)
         )
-        document_ids = list(
-            self.session.scalars(
-                select(RetrievalDocument.id)
+        stmt = (
+            select(RetrievalDocument.id)
                 .join(
                     RetrievalDocumentMessage,
                     (RetrievalDocumentMessage.document_id == RetrievalDocument.id)
@@ -2516,15 +3169,42 @@ class RetrievalDocumentRepository:
                     RetrievalDocumentMessage.group_id == int(group_id),
                     Message.group_id == int(group_id),
                     reference_condition,
+                    *_retrieval_source_prefilters(
+                        group_id=group_id,
+                        speaker_ids=speaker_ids,
+                    ),
                 )
                 .distinct()
                 .order_by(
                     RetrievalDocument.end_at.desc(),
                     RetrievalDocument.id.desc(),
                 )
-                .limit(max(1, int(limit)))
             )
+        normalized_document_kinds = _normalize_optional_string_filter(
+            document_kinds
         )
+        if normalized_document_kinds == ():
+            return []
+        if normalized_document_kinds is not None:
+            stmt = stmt.where(
+                RetrievalDocument.document_kind.in_(normalized_document_kinds)
+            )
+        if start_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.end_at
+                >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            stmt = stmt.where(
+                RetrievalDocument.start_at
+                < _normalize_utc_sqlite_timestamp(end_at)
+            )
+        stmt = stmt.limit(
+            2_147_483_647
+            if mentioned_user_ids is not None
+            else max(1, int(limit))
+        )
+        document_ids = list(self.session.scalars(stmt))
         return self._validated_hits(
             group_id=group_id,
             ranked_document_ids=[
@@ -2532,6 +3212,11 @@ class RetrievalDocumentRepository:
                 for rank, document_id in enumerate(document_ids)
             ],
             subject_ids=subject_ids,
+            document_kinds=document_kinds,
+            start_at=start_at,
+            end_at=end_at,
+            speaker_ids=speaker_ids,
+            mentioned_user_ids=mentioned_user_ids,
         )
 
     def search_group_documents_vector_hits(
@@ -2543,54 +3228,125 @@ class RetrievalDocumentRepository:
         model: str,
         dimensions: int,
         version: str,
+        generation: int | None = None,
         limit: int,
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if len(embedding) != int(dimensions):
             raise ValueError("query embedding dimensions are incompatible")
-        state = self.session.scalars(
-            select(RetrievalIndexState)
-            .where(
-                RetrievalIndexState.channel == "vector",
-                RetrievalIndexState.is_active.is_(True),
-                RetrievalIndexState.status == "ready",
-                RetrievalIndexState.provider == str(provider),
-                RetrievalIndexState.model == str(model),
-                RetrievalIndexState.dimensions == int(dimensions),
-                RetrievalIndexState.version == str(version),
+        normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
+        normalized_subject_ids = _normalize_optional_string_filter(subject_ids)
+        normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_mentioned_user_ids = _normalize_optional_string_filter(
+            mentioned_user_ids
+        )
+        if (
+            normalized_document_kinds == ()
+            or normalized_speaker_ids == ()
+            or normalized_mentioned_user_ids == ()
+            or (
+                normalized_subject_ids == ()
+                and normalized_document_kinds == ("raw_message_v3",)
             )
-            .limit(1)
-        ).first()
+        ):
+            return []
+        generation_document_family = (
+            "raw_message_v3"
+            if normalized_document_kinds == ("raw_message_v3",)
+            else ""
+        )
+        generation_clause = (
+            "AND generation = :generation "
+            if generation is not None
+            else "AND is_active = 1 "
+        )
+        state = self.session.execute(
+            text(
+                "SELECT generation, physical_table "
+                "FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND status = 'ready' "
+                f"{generation_clause}"
+                "AND provider = :provider AND model = :model "
+                "AND dimensions = :dimensions AND version = :version "
+                "AND document_family = :document_family LIMIT 1"
+            ),
+            {
+                "generation": (
+                    int(generation) if generation is not None else None
+                ),
+                "provider": str(provider),
+                "model": str(model),
+                "dimensions": int(dimensions),
+                "version": str(version),
+                "document_family": generation_document_family,
+            },
+        ).one_or_none()
         if state is None:
             return []
         physical_table = validate_retrieval_vector_table_name(
             state.physical_table,
             generation=state.generation,
         )
-        ranked = [
-            (int(document_id), -float(distance))
-            for document_id, distance in self.session.execute(
+        resolved_limit = max(1, int(limit))
+        available = int(
+            self.session.execute(
                 text(
-                    "SELECT document_id, distance "
-                    f"FROM {physical_table} "
-                    "WHERE embedding MATCH :embedding "
-                    "AND group_id = :group_id AND k = :limit"
+                    f"SELECT count(*) FROM {physical_table} "
+                    "WHERE group_id = :group_id"
                 ),
-                {
-                    "embedding": json.dumps(
-                        [float(value) for value in embedding],
-                        separators=(",", ":"),
-                    ),
-                    "group_id": int(group_id),
-                    "limit": max(1, int(limit)),
-                },
-            )
-        ]
-        return self._validated_hits(
-            group_id=group_id,
-            ranked_document_ids=ranked,
-            subject_ids=subject_ids,
+                {"group_id": int(group_id)},
+            ).scalar_one()
+            or 0
         )
+        if available <= 0:
+            return []
+        fetch_limit = min(resolved_limit, available)
+        serialized_embedding = json.dumps(
+            [float(value) for value in embedding],
+            separators=(",", ":"),
+        )
+        while True:
+            ranked = [
+                (int(document_id), -float(distance))
+                for document_id, distance in self.session.execute(
+                    text(
+                        "SELECT document_id, distance "
+                        f"FROM {physical_table} "
+                        "WHERE embedding MATCH :embedding "
+                        "AND group_id = :group_id AND k = :limit"
+                    ),
+                    {
+                        "embedding": serialized_embedding,
+                        "group_id": int(group_id),
+                        "limit": fetch_limit,
+                    },
+                )
+            ]
+            hits = self._validated_hits(
+                group_id=group_id,
+                ranked_document_ids=ranked,
+                subject_ids=normalized_subject_ids,
+                document_kinds=normalized_document_kinds,
+                start_at=start_at,
+                end_at=end_at,
+                speaker_ids=(
+                    tuple(str(value) for value in normalized_speaker_ids)
+                    if normalized_speaker_ids is not None
+                    else None
+                ),
+                mentioned_user_ids=normalized_mentioned_user_ids,
+            )
+            if len(hits) >= resolved_limit or fetch_limit >= available:
+                return hits[:resolved_limit]
+            fetch_limit = min(
+                available,
+                max(fetch_limit + resolved_limit, fetch_limit * 2),
+            )
 
     def _validated_hits(
         self,
@@ -2598,20 +3354,56 @@ class RetrievalDocumentRepository:
         group_id: int,
         ranked_document_ids: list[tuple[int, float]],
         subject_ids: Sequence[str] | None = None,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if not ranked_document_ids:
+            return []
+        normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
+        normalized_subject_ids = _normalize_optional_string_filter(subject_ids)
+        normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_mentioned_user_ids = _normalize_optional_string_filter(
+            mentioned_user_ids
+        )
+        if (
+            normalized_document_kinds == ()
+            or normalized_speaker_ids == ()
+            or normalized_mentioned_user_ids == ()
+            or (
+                normalized_subject_ids == ()
+                and normalized_document_kinds == ("raw_message_v3",)
+            )
+        ):
             return []
         ordered_ids = list(
             dict.fromkeys(int(document_id) for document_id, _ in ranked_document_ids)
         )
+        document_filters = [
+            RetrievalDocument.id.in_(ordered_ids),
+            RetrievalDocument.group_id == int(group_id),
+            RetrievalDocument.status == "active",
+        ]
+        if normalized_document_kinds is not None:
+            document_filters.append(
+                RetrievalDocument.document_kind.in_(normalized_document_kinds)
+            )
+        if start_at is not None:
+            document_filters.append(
+                RetrievalDocument.end_at
+                >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            document_filters.append(
+                RetrievalDocument.start_at
+                < _normalize_utc_sqlite_timestamp(end_at)
+            )
         documents = {
             document.id: document
             for document in self.session.scalars(
-                select(RetrievalDocument).where(
-                    RetrievalDocument.id.in_(ordered_ids),
-                    RetrievalDocument.group_id == int(group_id),
-                    RetrievalDocument.status == "active",
-                )
+                select(RetrievalDocument).where(*document_filters)
             )
         }
         memory_documents = {
@@ -2620,17 +3412,6 @@ class RetrievalDocumentRepository:
             if document.document_kind == "memory"
         }
         if memory_documents:
-            normalized_subject_ids = (
-                None
-                if subject_ids is None
-                else tuple(
-                    dict.fromkeys(
-                        str(subject_id).strip()
-                        for subject_id in subject_ids
-                        if str(subject_id).strip()
-                    )
-                )
-            )
             if normalized_subject_ids == ():
                 for document_id in memory_documents:
                     documents.pop(document_id, None)
@@ -2683,6 +3464,9 @@ class RetrievalDocumentRepository:
                     RetrievalDocumentMessage.group_id,
                     Message.group_id,
                     Message.platform_msg_id,
+                    Message.user_id,
+                    Message.timestamp,
+                    Message.raw_json,
                     RetrievalDocumentMessage.ordinal,
                 )
                 .join(
@@ -2717,6 +3501,9 @@ class RetrievalDocumentRepository:
             provenance_group_id,
             message_group_id,
             platform_msg_id,
+            user_id,
+            message_timestamp,
+            raw_json,
             _ordinal,
         ) in source_rows:
             if (
@@ -2724,6 +3511,43 @@ class RetrievalDocumentRepository:
                 or int(message_group_id) != int(group_id)
             ):
                 raise ValueError("retrieval provenance failed group validation")
+            delivery_state = (
+                str(raw_json.get("delivery_state") or "")
+                if isinstance(raw_json, dict)
+                else ""
+            )
+            if delivery_state in _INELIGIBLE_DELIVERY_STATES:
+                documents.pop(int(document_id), None)
+                continue
+            if (
+                normalized_speaker_ids is not None
+                and int(user_id) not in normalized_speaker_ids
+            ):
+                documents.pop(int(document_id), None)
+                continue
+            if (
+                normalized_mentioned_user_ids is not None
+                and not set(normalized_mentioned_user_ids).intersection(
+                    _mentioned_user_ids(raw_json)
+                )
+            ):
+                documents.pop(int(document_id), None)
+                continue
+            normalized_timestamp = _normalize_utc_sqlite_timestamp(message_timestamp)
+            if (
+                start_at is not None
+                and normalized_timestamp
+                < _normalize_utc_sqlite_timestamp(start_at)
+            ):
+                documents.pop(int(document_id), None)
+                continue
+            if (
+                end_at is not None
+                and normalized_timestamp
+                >= _normalize_utc_sqlite_timestamp(end_at)
+            ):
+                documents.pop(int(document_id), None)
+                continue
             sources.setdefault(int(document_id), []).append(str(platform_msg_id))
         score_by_id = {
             int(document_id): float(score)
@@ -2760,27 +3584,124 @@ class RetrievalDocumentRepository:
         group_id: int,
         query: str,
         limit: int,
+        document_kinds: Sequence[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        speaker_ids: Sequence[str] | None = None,
+        mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocument]:
         resolved_limit = max(1, int(limit))
+        normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
+        normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_mentioned_user_ids = _normalize_optional_string_filter(
+            mentioned_user_ids
+        )
+        if any(
+            values == ()
+            for values in (
+                normalized_document_kinds,
+                normalized_speaker_ids,
+                normalized_mentioned_user_ids,
+            )
+        ):
+            return []
         terms = [term for term in _fts_search_terms(query) if len(term) >= 3]
         if terms:
             try:
+                clauses = [
+                    "retrieval_documents_fts MATCH :match_query",
+                    "retrieval_documents_fts.group_id = :group_id",
+                    "d.group_id = :group_id_int",
+                    "d.status = 'active'",
+                    "NOT EXISTS ("
+                    "SELECT 1 FROM retrieval_document_messages AS safety_rdm "
+                    "JOIN messages AS safety_m "
+                    "ON safety_m.id = safety_rdm.message_id "
+                    "AND safety_m.group_id = safety_rdm.group_id "
+                    "WHERE safety_rdm.document_id = d.id "
+                    "AND safety_rdm.group_id = :group_id_int "
+                    "AND json_extract(safety_m.raw_json, '$.delivery_state') "
+                    "IN ('reserved','blocked','uncertain','deleted'))",
+                ]
+                parameters: dict[str, Any] = {
+                    "match_query": " OR ".join(f'"{term}"' for term in terms),
+                    "group_id": str(group_id),
+                    "group_id_int": int(group_id),
+                    "limit": resolved_limit,
+                }
+                statement = text(
+                    "SELECT d.id FROM retrieval_documents_fts "
+                    "JOIN retrieval_documents AS d "
+                    "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
+                    "WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY bm25(retrieval_documents_fts), d.id ASC LIMIT :limit"
+                )
+                if normalized_document_kinds is not None:
+                    clauses.append("d.document_kind IN :document_kinds")
+                    parameters["document_kinds"] = normalized_document_kinds
+                if start_at is not None:
+                    clauses.append("d.end_at >= :start_at")
+                    parameters["start_at"] = _normalize_utc_sqlite_timestamp(start_at)
+                if end_at is not None:
+                    clauses.append("d.start_at < :end_at")
+                    parameters["end_at"] = _normalize_utc_sqlite_timestamp(end_at)
+                if normalized_speaker_ids is not None:
+                    clauses.append(
+                        "NOT EXISTS ("
+                        "SELECT 1 FROM retrieval_document_messages AS speaker_rdm "
+                        "JOIN messages AS speaker_m "
+                        "ON speaker_m.id = speaker_rdm.message_id "
+                        "AND speaker_m.group_id = speaker_rdm.group_id "
+                        "WHERE speaker_rdm.document_id = d.id "
+                        "AND speaker_rdm.group_id = :group_id_int "
+                        "AND speaker_m.user_id NOT IN :speaker_ids)"
+                    )
+                    parameters["speaker_ids"] = normalized_speaker_ids
+                if normalized_mentioned_user_ids is not None:
+                    clauses.append(
+                        "EXISTS ("
+                        "SELECT 1 FROM retrieval_document_messages AS mention_rdm "
+                        "JOIN messages AS mention_m "
+                        "ON mention_m.id = mention_rdm.message_id "
+                        "AND mention_m.group_id = mention_rdm.group_id "
+                        "JOIN json_each(CASE "
+                        "WHEN json_type(mention_m.raw_json, '$.message') = 'array' "
+                        "THEN json_extract(mention_m.raw_json, '$.message') "
+                        "ELSE json_extract(mention_m.raw_json, '$.raw_message') END) "
+                        "AS mention_segment "
+                        "WHERE mention_rdm.document_id = d.id "
+                        "AND mention_rdm.group_id = :group_id_int "
+                        "AND json_extract(mention_segment.value, '$.type') = 'at' "
+                        "AND CAST(coalesce("
+                        "json_extract(mention_segment.value, '$.data.qq'), "
+                        "json_extract(mention_segment.value, '$.data.uin'), "
+                        "json_extract(mention_segment.value, '$.data.target')) AS TEXT) "
+                        "IN :mentioned_user_ids)"
+                    )
+                    parameters["mentioned_user_ids"] = normalized_mentioned_user_ids
+                statement = text(
+                    "SELECT d.id FROM retrieval_documents_fts "
+                    "JOIN retrieval_documents AS d "
+                    "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
+                    "WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY bm25(retrieval_documents_fts), d.id ASC LIMIT :limit"
+                )
+                expanding = []
+                if normalized_document_kinds is not None:
+                    expanding.append(bindparam("document_kinds", expanding=True))
+                if normalized_speaker_ids is not None:
+                    expanding.append(bindparam("speaker_ids", expanding=True))
+                if normalized_mentioned_user_ids is not None:
+                    expanding.append(
+                        bindparam("mentioned_user_ids", expanding=True)
+                    )
+                if expanding:
+                    statement = statement.bindparams(*expanding)
                 rows = self.session.execute(
-                    text(
-                        "SELECT d.id FROM retrieval_documents_fts "
-                        "JOIN retrieval_documents AS d "
-                        "ON d.id = CAST(retrieval_documents_fts.document_id AS INTEGER) "
-                        "WHERE retrieval_documents_fts MATCH :match_query "
-                        "AND retrieval_documents_fts.group_id = :group_id "
-                        "AND d.group_id = :group_id_int AND d.status = 'active' "
-                        "ORDER BY bm25(retrieval_documents_fts), d.id ASC LIMIT :limit"
-                    ),
-                    {
-                        "match_query": " OR ".join(f'"{term}"' for term in terms),
-                        "group_id": str(group_id),
-                        "group_id_int": group_id,
-                        "limit": resolved_limit,
-                    },
+                    statement,
+                    parameters,
                 ).scalars()
                 document_ids = [int(document_id) for document_id in rows]
                 if document_ids:
@@ -2795,9 +3716,24 @@ class RetrievalDocumentRepository:
                         )
                     }
                     return [
-                        documents[document_id]
-                        for document_id in document_ids
-                        if document_id in documents
+                        documents[hit.document_id]
+                        for hit in self._validated_hits(
+                            group_id=group_id,
+                            ranked_document_ids=[
+                                (document_id, float(len(document_ids) - rank))
+                                for rank, document_id in enumerate(document_ids)
+                            ],
+                            document_kinds=normalized_document_kinds,
+                            start_at=start_at,
+                            end_at=end_at,
+                            speaker_ids=(
+                                tuple(str(value) for value in normalized_speaker_ids)
+                                if normalized_speaker_ids is not None
+                                else None
+                            ),
+                            mentioned_user_ids=normalized_mentioned_user_ids,
+                        )
+                        if hit.document_id in documents
                     ]
             except SQLAlchemyError:
                 # FTS is optional. The canonical group-scoped LIKE fallback
@@ -2806,18 +3742,69 @@ class RetrievalDocumentRepository:
         normalized_query = str(query or "").strip()
         if not normalized_query:
             return []
-        return list(
+        document_filters = [
+            RetrievalDocument.group_id == int(group_id),
+            RetrievalDocument.status == "active",
+            RetrievalDocument.content.contains(normalized_query),
+            *_retrieval_source_prefilters(
+                group_id=group_id,
+                speaker_ids=(
+                    tuple(str(value) for value in normalized_speaker_ids)
+                    if normalized_speaker_ids is not None
+                    else None
+                ),
+            ),
+        ]
+        if normalized_document_kinds is not None:
+            document_filters.append(
+                RetrievalDocument.document_kind.in_(normalized_document_kinds)
+            )
+        if start_at is not None:
+            document_filters.append(
+                RetrievalDocument.end_at
+                >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            document_filters.append(
+                RetrievalDocument.start_at
+                < _normalize_utc_sqlite_timestamp(end_at)
+            )
+        candidates = list(
             self.session.scalars(
                 select(RetrievalDocument)
-                .where(
-                    RetrievalDocument.group_id == group_id,
-                    RetrievalDocument.status == "active",
-                    RetrievalDocument.content.contains(normalized_query),
-                )
+                .where(*document_filters)
                 .order_by(RetrievalDocument.start_at.desc(), RetrievalDocument.id.desc())
-                .limit(resolved_limit)
+                .limit(
+                    max(resolved_limit * 4, resolved_limit)
+                    if (
+                        normalized_speaker_ids is None
+                        and normalized_mentioned_user_ids is None
+                    )
+                    else 2_147_483_647
+                )
             )
         )
+        candidates_by_id = {document.id: document for document in candidates}
+        return [
+            candidates_by_id[hit.document_id]
+            for hit in self._validated_hits(
+                group_id=group_id,
+                ranked_document_ids=[
+                    (document.id, float(len(candidates) - rank))
+                    for rank, document in enumerate(candidates)
+                ],
+                document_kinds=normalized_document_kinds,
+                start_at=start_at,
+                end_at=end_at,
+                speaker_ids=(
+                    tuple(str(value) for value in normalized_speaker_ids)
+                    if normalized_speaker_ids is not None
+                    else None
+                ),
+                mentioned_user_ids=normalized_mentioned_user_ids,
+            )
+            if hit.document_id in candidates_by_id
+        ][:resolved_limit]
 
     def _sync_fts(self, document: RetrievalDocument) -> None:
         try:

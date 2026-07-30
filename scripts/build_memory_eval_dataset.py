@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -17,8 +17,18 @@ from app.core.memory_backfill_runner import group_watermarks_from_manifest
 
 try:
     from .evaluate_memory_recall import validate_real_dataset, load_evaluation_cases
+    from .evaluate_memory_v3 import (
+        load_message_metadata,
+        validate_v3_dataset_contract,
+        validate_v3_dataset_sources,
+    )
 except ImportError:  # Direct script execution.
     from evaluate_memory_recall import validate_real_dataset, load_evaluation_cases
+    from evaluate_memory_v3 import (
+        load_message_metadata,
+        validate_v3_dataset_contract,
+        validate_v3_dataset_sources,
+    )
 
 
 CATEGORY_COUNTS = {
@@ -30,6 +40,11 @@ CATEGORY_COUNTS = {
     "update": 8,
     "abstention": 8,
 }
+
+_INELIGIBLE_DELIVERY_STATES = frozenset(
+    {"reserved", "blocked", "uncertain", "deleted"}
+)
+_SHANGHAI = timezone(timedelta(hours=8))
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -53,7 +68,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.database,
         group_watermarks=group_watermarks_from_manifest(manifest),
     )
-    cases, review = build_cases(rows)
+    snapshot_rows = _load_snapshot_group_messages(
+        args.database,
+        group_watermarks=group_watermarks_from_manifest(manifest),
+    )
+    cases, review = build_cases(rows, distractor_rows=snapshot_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
         for case in cases:
@@ -68,6 +87,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     loaded, digest = load_evaluation_cases(args.output)
     validate_real_dataset(loaded)
+    validate_v3_dataset_contract(loaded)
+    validate_v3_dataset_sources(
+        loaded,
+        metadata=load_message_metadata(args.database),
+        snapshot_watermarks=group_watermarks_from_manifest(manifest),
+    )
     args.review_output.parent.mkdir(parents=True, exist_ok=True)
     args.review_output.write_text(
         json.dumps(
@@ -114,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _load_safe_group_messages(
+def _load_snapshot_group_messages(
     database: Path,
     *,
     group_watermarks: dict[int, int],
@@ -128,7 +153,7 @@ def _load_safe_group_messages(
                 "SELECT id, platform_msg_id, group_id, user_id, timestamp, "
                 "plain_text, reply_to_msg_id, raw_json FROM messages "
                 "WHERE group_id = ? AND id <= ? "
-                "AND length(trim(plain_text)) BETWEEN 8 AND 400 ORDER BY id",
+                "ORDER BY id",
                 (int(group_id), int(watermark)),
             )
             for row in group_rows:
@@ -137,11 +162,6 @@ def _load_safe_group_messages(
                     payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
                 except json.JSONDecodeError:
                     payload = {}
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("delivery_state") in {"blocked", "reserved"}
-                ):
-                    continue
                 rows.append(
                     {
                         "id": int(row["id"]),
@@ -150,6 +170,13 @@ def _load_safe_group_messages(
                         "user_id": int(row["user_id"]),
                         "timestamp": str(row["timestamp"]),
                         "plain_text": str(row["plain_text"]).strip(),
+                        "delivery_state": (
+                            str(payload.get("delivery_state", ""))
+                            .strip()
+                            .casefold()
+                            if isinstance(payload, dict)
+                            else ""
+                        ),
                         "reply_to_msg_id": (
                             str(row["reply_to_msg_id"])
                             if row["reply_to_msg_id"]
@@ -157,14 +184,36 @@ def _load_safe_group_messages(
                         ),
                     }
                 )
-        if len(rows) < 80:
-            raise ValueError("not enough safe real group messages for evaluation")
         return rows
     finally:
         connection.close()
 
 
-def build_cases(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]:
+def _load_safe_group_messages(
+    database: Path,
+    *,
+    group_watermarks: dict[int, int],
+) -> list[dict[str, Any]]:
+    rows = _load_snapshot_group_messages(
+        database,
+        group_watermarks=group_watermarks,
+    )
+    safe_rows = [
+        row
+        for row in rows
+        if 8 <= len(row["plain_text"]) <= 400
+        and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
+    ]
+    if len(safe_rows) < 80:
+        raise ValueError("not enough safe real group messages for evaluation")
+    return safe_rows
+
+
+def build_cases(
+    rows: list[dict[str, Any]],
+    *,
+    distractor_rows: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict]:
     by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     by_platform_id = {row["platform_msg_id"]: row for row in rows}
     for row in rows:
@@ -270,9 +319,9 @@ def build_cases(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]
             row, cursor = _next_unused(candidates, chosen, cursor)
             excerpt = _excerpt(row["plain_text"])
             query = (
-                f"群里谁说过“{excerpt}”？"
+                f"查找历史原话：“{excerpt}”"
                 if category == "exact"
-                else f"群里谁表达过这样的意思：{_paraphrase(excerpt)}？"
+                else f"查找历史中表达过这个意思的消息：{_paraphrase(excerpt)}"
             )
             add(
                 category=category,
@@ -360,8 +409,8 @@ def build_cases(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]
             category="update",
             row=second,
             query=(
-                f"同一位成员先提到“{_excerpt(first['plain_text'], 18)}”，"
-                f"后来又补充“{_excerpt(second['plain_text'], 18)}”，前后信息是什么？"
+                f"梳理前后信息：“{_excerpt(first['plain_text'], 18)}”与"
+                f"“{_excerpt(second['plain_text'], 18)}”之间有什么变化？"
             ),
             expected=[first["platform_msg_id"], second["platform_msg_id"]],
             recent_ids=following(second),
@@ -382,8 +431,18 @@ def build_cases(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]
             expected=[],
         )
 
+    _attach_v3_contracts(
+        cases,
+        source_rows=distractor_rows if distractor_rows is not None else rows,
+    )
     if len(cases) != 64:
         raise RuntimeError("evaluation builder did not create exactly 64 cases")
+    gate_tag_counts: dict[str, int] = defaultdict(int)
+    forbidden_ids = set()
+    for case in cases:
+        for tag in case["gate_tags"]:
+            gate_tag_counts[tag] += 1
+        forbidden_ids.update(case["forbidden_evidence_message_ids"])
     return cases, {
         "expected_ids_exist": all(
             source_id in by_platform_id
@@ -393,9 +452,191 @@ def build_cases(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict]
         "all_expected_ids_group_scoped": all(
             row["scope_verified"] for row in review_rows
         ),
-        "blocked_or_reserved_sources": 0,
+        "evaluation_schema_version": 3,
+        "gate_tag_counts": dict(sorted(gate_tag_counts.items())),
+        "forbidden_source_count": len(forbidden_ids),
         "case_evidence": review_rows,
     }
+
+
+def _attach_v3_contracts(
+    cases: list[dict[str, Any]],
+    *,
+    source_rows: list[dict[str, Any]],
+) -> None:
+    """Freeze V3 query scopes and derive real provenance-only distractors."""
+
+    by_id = {row["platform_msg_id"]: row for row in source_rows}
+    if len(by_id) != len(source_rows):
+        raise ValueError("snapshot ledger has duplicate platform message IDs")
+    for case in cases:
+        anchor_id = next(
+            iter(case["expected_evidence_message_ids"]),
+            case["recent_context_message_ids"][0],
+        )
+        anchor = by_id.get(anchor_id)
+        if anchor is None:
+            raise ValueError("evaluation case anchor is absent from snapshot ledger")
+        target = by_id.get(case["recent_context_message_ids"][-1])
+        if target is None:
+            raise ValueError("evaluation requester target is absent from snapshot ledger")
+        requester_uin = str(target["user_id"])
+        category = case["category"]
+        time_range = _shanghai_day_range(anchor["timestamp"]) if category == "temporal" else None
+        case.update(
+            {
+                "schema_version": 3,
+                "requester_uin": requester_uin,
+                "allowed_subject_user_ids": None,
+                "allowed_evidence_user_ids": None,
+                "time_range": time_range,
+                "expected_answer_mode": (
+                    "exact"
+                    if category == "vague_reference"
+                    else "dated_history"
+                    if category == "temporal" else "general_history"
+                ),
+                "expected_coverage_strategy": "chronological"
+                if category == "temporal"
+                else "relevance",
+                "minimum_time_bucket_count": 0,
+                "forbidden_evidence_message_ids": [],
+                "gate_tags": [],
+            }
+        )
+
+    first_exact = next(case for case in cases if case["category"] == "exact")
+    exact_source_id = first_exact["expected_evidence_message_ids"][0]
+    exact_source = by_id[exact_source_id]
+    requester_target = next(
+        (
+            row
+            for row in source_rows
+            if row["platform_msg_id"] != exact_source_id
+            and int(row["group_id"]) == int(exact_source["group_id"])
+            and int(row["user_id"]) == int(exact_source["user_id"])
+            and _parse_timestamp(row["timestamp"])
+            > _parse_timestamp(exact_source["timestamp"])
+            and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
+        ),
+        None,
+    )
+    if requester_target is None:
+        raise ValueError("snapshot lacks a same-author requester target")
+    first_exact["recent_context_message_ids"] = [
+        requester_target["platform_msg_id"]
+    ]
+    first_exact["requester_uin"] = str(requester_target["user_id"])
+    first_exact["query"] = f"我在群里说过\u201c{_excerpt(by_id[first_exact['expected_evidence_message_ids'][0]]['plain_text'])}\u201d吗？"
+    first_exact["allowed_subject_user_ids"] = [first_exact["requester_uin"]]
+    first_exact["allowed_evidence_user_ids"] = [first_exact["requester_uin"]]
+    first_exact["gate_tags"].extend(("first_person", "source_resolution", "subject"))
+    first_exact["forbidden_evidence_message_ids"] = _real_v3_distractors(
+        first_exact,
+        source_rows=source_rows,
+    )
+
+    first_abstention = next(
+        case for case in cases if case["category"] == "abstention"
+    )
+    first_abstention["query"] = "他们最近有没有@我？"
+    first_abstention["expected_answer_mode"] = "mention"
+    first_abstention["allowed_subject_user_ids"] = [
+        first_abstention["requester_uin"]
+    ]
+    first_abstention["gate_tags"].append("mention")
+
+    first_temporal = next(case for case in cases if case["category"] == "temporal")
+    temporal_source = by_id[first_temporal["expected_evidence_message_ids"][0]]
+    local_day = (
+        _parse_timestamp(temporal_source["timestamp"])
+        .astimezone(_SHANGHAI)
+        .date()
+        .isoformat()
+    )
+    first_temporal["query"] = f"总结{local_day}的聊天"
+    first_temporal["expected_answer_mode"] = "summary"
+    first_temporal["expected_coverage_strategy"] = "time_buckets"
+    first_temporal["minimum_time_bucket_count"] = 2
+    first_temporal["gate_tags"].extend(
+        ("time_range", "time_bucket", "cross_group", "blocked_reserved")
+    )
+    first_temporal["forbidden_evidence_message_ids"] = _real_v3_distractors(
+        first_temporal,
+        source_rows=source_rows,
+    )
+
+    for case in cases:
+        if case["category"] == "abstention":
+            case["gate_tags"].append("abstention")
+
+
+def _real_v3_distractors(
+    case: dict[str, Any],
+    *,
+    source_rows: list[dict[str, Any]],
+) -> list[str]:
+    group_id = int(case["group_id"])
+    tags = set(case["gate_tags"])
+    allowed_users = set(case["allowed_evidence_user_ids"] or ())
+    time_range = case["time_range"]
+    if time_range is not None:
+        start_at, end_at = (_parse_timestamp(value) for value in time_range.values())
+
+    def choose(label: str, predicate) -> str:
+        for row in source_rows:
+            if predicate(row):
+                return row["platform_msg_id"]
+        raise ValueError(f"snapshot lacks a real {label} V3 distractor")
+
+    selected: list[str] = []
+    if "cross_group" in tags:
+        selected.append(
+            choose("cross-group", lambda row: int(row["group_id"]) != group_id)
+        )
+    if "blocked_reserved" in tags:
+        selected.append(
+            choose(
+                "blocked/reserved",
+                lambda row: row["delivery_state"] in _INELIGIBLE_DELIVERY_STATES,
+            )
+        )
+    if "subject" in tags:
+        selected.append(
+            choose(
+                "wrong-subject",
+                lambda row: int(row["group_id"]) == group_id
+                and str(row["user_id"]) not in allowed_users,
+            )
+        )
+    if "time_range" in tags:
+        if time_range is None:
+            raise ValueError("time-range gate has no frozen range")
+        selected.append(
+            choose(
+                "out-of-range",
+                lambda row: int(row["group_id"]) == group_id
+                and not start_at <= _parse_timestamp(row["timestamp"]) < end_at,
+            )
+        )
+    return list(dict.fromkeys(selected))
+
+
+def _shanghai_day_range(timestamp: str) -> dict[str, str]:
+    local = _parse_timestamp(timestamp).astimezone(_SHANGHAI)
+    start_at = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_at = start_at + timedelta(days=1)
+    return {
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
+    }
+
+
+def _parse_timestamp(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _is_related_update(first: dict[str, Any], second: dict[str, Any]) -> bool:

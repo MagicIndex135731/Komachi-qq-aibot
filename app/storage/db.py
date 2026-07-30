@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -291,6 +291,15 @@ def _apply_schema_migrations(connection) -> None:
             )
         )
 
+    if "retrieval_index_state" in table_names:
+        _add_missing_columns(
+            connection,
+            "retrieval_index_state",
+            {
+                "document_family": "VARCHAR(64) NOT NULL DEFAULT ''",
+            },
+        )
+
 
 def _table_columns(connection, table_name: str) -> set[str]:
     return {
@@ -579,7 +588,8 @@ def ensure_retrieval_vector_generation(
                     "SELECT generation, physical_table FROM retrieval_index_state "
                     "WHERE channel = 'vector' AND provider = :provider "
                     "AND model = :model AND dimensions = :dimensions "
-                    "AND version = :version AND status IN ('building','ready') "
+                    "AND version = :version AND document_family = '' "
+                    "AND status IN ('building','ready') "
                     "ORDER BY is_active DESC, generation DESC LIMIT 1"
                 ),
                 identity,
@@ -653,6 +663,206 @@ def ensure_retrieval_vector_generation(
             return None
 
 
+def create_retrieval_vector_generation(
+    engine: Engine,
+    *,
+    provider: str,
+    model: str,
+    dimensions: int,
+    version: str,
+    document_family: str,
+) -> int | None:
+    """Create a new physical vector generation without reusing compatible state.
+
+    The persisted document kind is an enforcement boundary: writes, coverage,
+    activation, and retrieval may only use documents from that family.
+    """
+
+    resolved_dimensions = int(dimensions)
+    if resolved_dimensions <= 0 or resolved_dimensions > 65_536:
+        raise ValueError("retrieval vector dimensions are invalid")
+    resolved_document_family = str(document_family or "").strip()
+    if (
+        not resolved_document_family
+        or len(resolved_document_family) > 64
+        or re.fullmatch(r"[a-z][a-z0-9_]*", resolved_document_family) is None
+    ):
+        raise ValueError("retrieval vector document family is invalid")
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            connection.execute(text("SELECT vec_version()")).scalar_one()
+            generation = int(
+                connection.execute(
+                    text(
+                        "SELECT coalesce(max(generation), 0) + 1 "
+                        "FROM retrieval_index_state WHERE channel = 'vector'"
+                    )
+                ).scalar_one()
+            )
+            physical_table = retrieval_vector_table_name(generation)
+            connection.execute(
+                text(
+                    "INSERT INTO retrieval_index_state ("
+                    "channel, generation, physical_table, provider, model, dimensions, "
+                    "version, document_family, status, total_documents, indexed_documents, "
+                    "is_active, updated_at"
+                    ") VALUES ("
+                    "'vector', :generation, :physical_table, :provider, :model, :dimensions, "
+                    ":version, :document_family, 'building', 0, 0, 0, :updated_at"
+                    ")"
+                ),
+                {
+                    "generation": generation,
+                    "physical_table": physical_table,
+                    "provider": str(provider),
+                    "model": str(model),
+                    "dimensions": resolved_dimensions,
+                    "version": str(version),
+                    "document_family": resolved_document_family,
+                    "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                },
+            )
+            connection.execute(
+                text(
+                    f"CREATE VIRTUAL TABLE {physical_table} USING vec0("
+                    "document_id INTEGER PRIMARY KEY, "
+                    "group_id INTEGER PARTITION KEY, "
+                    f"embedding float[{resolved_dimensions}])"
+                )
+            )
+            connection.commit()
+            return generation
+        except (SQLAlchemyError, sqlite3.Error):
+            connection.rollback()
+            return None
+
+
+def find_active_retrieval_vector_generation(
+    engine: Engine,
+    *,
+    provider: str,
+    model: str,
+    dimensions: int,
+    version: str,
+    document_family: str,
+) -> int | None:
+    """Return only a ready active generation for the exact vector family."""
+
+    resolved_dimensions = int(dimensions)
+    resolved_document_family = str(document_family or "").strip()
+    if resolved_dimensions <= 0 or not resolved_document_family:
+        return None
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT vec_version()")).scalar_one()
+            state = connection.execute(
+                text(
+                    "SELECT generation, physical_table "
+                    "FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND is_active = 1 "
+                    "AND status = 'ready' AND provider = :provider "
+                    "AND model = :model AND dimensions = :dimensions "
+                    "AND version = :version AND document_family = :document_family "
+                    "LIMIT 1"
+                ),
+                {
+                    "provider": str(provider),
+                    "model": str(model),
+                    "dimensions": resolved_dimensions,
+                    "version": str(version),
+                    "document_family": resolved_document_family,
+                },
+            ).one_or_none()
+            if state is None:
+                return None
+            physical_table = validate_retrieval_vector_table_name(
+                str(state.physical_table),
+                generation=int(state.generation),
+            )
+            physical_exists = connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = :physical_table"
+                ),
+                {"physical_table": physical_table},
+            ).scalar_one_or_none()
+            return int(state.generation) if physical_exists is not None else None
+    except (SQLAlchemyError, sqlite3.Error):
+        return None
+
+
+def resume_retrieval_vector_generation(
+    engine: Engine,
+    *,
+    generation: int,
+    provider: str,
+    model: str,
+    dimensions: int,
+    version: str,
+    document_family: str,
+) -> int | None:
+    """Resume one exact physical generation without creating or reusing another."""
+
+    resolved_generation = int(generation)
+    resolved_dimensions = int(dimensions)
+    resolved_document_family = str(document_family or "").strip()
+    if (
+        resolved_generation <= 0
+        or resolved_dimensions <= 0
+        or not resolved_document_family
+    ):
+        return None
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            connection.execute(text("SELECT vec_version()")).scalar_one()
+            state = connection.execute(
+                text(
+                    "SELECT physical_table, status, is_active "
+                    "FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND generation = :generation "
+                    "AND provider = :provider AND model = :model "
+                    "AND dimensions = :dimensions AND version = :version "
+                    "AND document_family = :document_family"
+                ),
+                {
+                    "generation": resolved_generation,
+                    "provider": str(provider),
+                    "model": str(model),
+                    "dimensions": resolved_dimensions,
+                    "version": str(version),
+                    "document_family": resolved_document_family,
+                },
+            ).one_or_none()
+            if (
+                state is None
+                or str(state.status) not in {"building", "ready"}
+                or bool(state.is_active)
+            ):
+                connection.rollback()
+                return None
+            physical_table = validate_retrieval_vector_table_name(
+                str(state.physical_table),
+                generation=resolved_generation,
+            )
+            physical_exists = connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = :physical_table"
+                ),
+                {"physical_table": physical_table},
+            ).scalar_one_or_none()
+            if physical_exists is None:
+                connection.rollback()
+                return None
+            connection.commit()
+            return resolved_generation
+        except (SQLAlchemyError, sqlite3.Error):
+            connection.rollback()
+            return None
+
+
 def write_retrieval_vector_embeddings(
     engine: Engine,
     *,
@@ -668,7 +878,8 @@ def write_retrieval_vector_embeddings(
         try:
             state = connection.execute(
                 text(
-                    "SELECT physical_table, provider, model, dimensions, version, status "
+                    "SELECT physical_table, provider, model, dimensions, version, "
+                    "document_family, status "
                     "FROM retrieval_index_state WHERE channel = 'vector' "
                     "AND generation = :generation"
                 ),
@@ -697,7 +908,8 @@ def write_retrieval_vector_embeddings(
                 seen_document_ids.add(resolved_document_id)
                 canonical = connection.execute(
                     text(
-                        "SELECT 1 FROM retrieval_documents "
+                        "SELECT document_kind, embedding_generation "
+                        "FROM retrieval_documents "
                         "WHERE id = :document_id AND group_id = :group_id "
                         "AND status = 'active' AND embedding_eligible = 1"
                     ),
@@ -705,9 +917,27 @@ def write_retrieval_vector_embeddings(
                         "document_id": resolved_document_id,
                         "group_id": resolved_group_id,
                     },
-                ).scalar_one_or_none()
+                ).one_or_none()
                 if canonical is None:
                     raise ValueError("retrieval embedding provenance is not active and scoped")
+                document_family = str(state.document_family or "")
+                if (
+                    document_family
+                    and str(canonical.document_kind) != document_family
+                ) or (
+                    not document_family
+                    and str(canonical.document_kind) == "raw_message_v3"
+                ):
+                    raise ValueError(
+                        "retrieval embedding document family does not match generation"
+                    )
+                if (
+                    document_family
+                    and canonical.embedding_generation != int(generation)
+                ):
+                    raise ValueError(
+                        "retrieval embedding generation claim is stale"
+                    )
                 normalized_rows.append(
                     (resolved_document_id, resolved_group_id, values)
                 )
@@ -729,7 +959,7 @@ def write_retrieval_vector_embeddings(
                         "embedding": json.dumps(vector, separators=(",", ":")),
                     },
                 )
-                connection.execute(
+                updated = connection.execute(
                     text(
                         "UPDATE retrieval_documents SET "
                         "embedding_provider = :provider, embedding_model = :model, "
@@ -737,7 +967,11 @@ def write_retrieval_vector_embeddings(
                         "embedding_generation = :generation, embedding_status = 'ready', "
                         "last_error_code = '', updated_at = :updated_at "
                         "WHERE id = :document_id AND group_id = :group_id "
-                        "AND status = 'active' AND embedding_eligible = 1"
+                        "AND status = 'active' AND embedding_eligible = 1 "
+                        "AND ((:document_family = '' "
+                        "AND document_kind <> 'raw_message_v3') "
+                        "OR (document_kind = :document_family "
+                        "AND embedding_generation = :generation))"
                     ),
                     {
                         "provider": str(state.provider),
@@ -747,9 +981,14 @@ def write_retrieval_vector_embeddings(
                         "generation": int(generation),
                         "document_id": document_id,
                         "group_id": group_id,
+                        "document_family": str(state.document_family or ""),
                         "updated_at": datetime.now(UTC).replace(tzinfo=None),
                     },
                 )
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError(
+                        "retrieval embedding generation claim changed during write"
+                    )
             connection.commit()
             return len(normalized_rows)
         except Exception:
@@ -770,7 +1009,7 @@ def mark_retrieval_vector_embeddings_failed(
     with engine.begin() as connection:
         state = connection.execute(
             text(
-                "SELECT provider, model, dimensions, version "
+                "SELECT provider, model, dimensions, version, document_family "
                 "FROM retrieval_index_state WHERE channel = 'vector' "
                 "AND generation = :generation"
             ),
@@ -787,6 +1026,9 @@ def mark_retrieval_vector_embeddings_failed(
                 "last_error_code = :error_code, updated_at = :updated_at "
                 "WHERE status = 'active' AND group_id = :group_id "
                 "AND embedding_eligible = 1 "
+                "AND ((:document_family = '' "
+                "AND document_kind <> 'raw_message_v3') "
+                "OR document_kind = :document_family) "
                 "AND id IN :document_ids"
             ).bindparams(bindparam("document_ids", expanding=True)),
             {
@@ -797,6 +1039,7 @@ def mark_retrieval_vector_embeddings_failed(
                 "generation": int(generation),
                 "group_id": int(group_id),
                 "document_ids": tuple(int(value) for value in document_ids),
+                "document_family": str(state.document_family or ""),
                 "error_code": str(error_code or "")[:96],
                 "updated_at": datetime.now(UTC).replace(tzinfo=None),
             },
@@ -815,7 +1058,8 @@ def refresh_retrieval_vector_generation(
         try:
             state = connection.execute(
                 text(
-                    "SELECT physical_table, provider, model, dimensions, version, status "
+                    "SELECT physical_table, provider, model, dimensions, version, "
+                    "document_family, status "
                     "FROM retrieval_index_state WHERE channel = 'vector' "
                     "AND generation = :generation"
                 ),
@@ -831,8 +1075,17 @@ def refresh_retrieval_vector_generation(
                 connection.execute(
                     text(
                         "SELECT count(*) FROM retrieval_documents "
-                        "WHERE status = 'active' AND embedding_eligible = 1"
-                    )
+                        "WHERE status = 'active' AND embedding_eligible = 1 "
+                        "AND ((:document_family = '' "
+                        "AND document_kind <> 'raw_message_v3') OR ("
+                        ":document_family <> '' "
+                        "AND document_kind = :document_family "
+                        "AND embedding_generation = :generation))"
+                    ),
+                    {
+                        "document_family": str(state.document_family or ""),
+                        "generation": int(generation),
+                    },
                 ).scalar_one()
                 or 0
             )
@@ -842,8 +1095,17 @@ def refresh_retrieval_vector_generation(
                         f"SELECT count(*) FROM {physical_table} AS v "
                         "JOIN retrieval_documents AS d "
                         "ON d.id = v.document_id AND d.group_id = v.group_id "
-                        "WHERE d.status = 'active' AND d.embedding_eligible = 1"
-                    )
+                        "WHERE d.status = 'active' AND d.embedding_eligible = 1 "
+                        "AND ((:document_family = '' "
+                        "AND d.document_kind <> 'raw_message_v3') OR ("
+                        ":document_family <> '' "
+                        "AND d.document_kind = :document_family "
+                        "AND d.embedding_generation = :generation))"
+                    ),
+                    {
+                        "document_family": str(state.document_family or ""),
+                        "generation": int(generation),
+                    },
                 ).scalar_one()
                 or 0
             )
@@ -853,6 +1115,9 @@ def refresh_retrieval_vector_generation(
                         "SELECT count(*) FROM retrieval_documents "
                         "WHERE status = 'active' AND embedding_generation = :generation "
                         "AND embedding_eligible = 1 "
+                        "AND ((:document_family = '' "
+                        "AND document_kind <> 'raw_message_v3') "
+                        "OR document_kind = :document_family) "
                         "AND embedding_status = 'failed' "
                         "AND embedding_provider = :provider AND embedding_model = :model "
                         "AND embedding_version = :version "
@@ -864,14 +1129,39 @@ def refresh_retrieval_vector_generation(
                         "model": str(state.model),
                         "version": str(state.version),
                         "dimensions": int(state.dimensions),
+                        "document_family": str(state.document_family or ""),
                     },
                 ).scalar_one()
                 or 0
             )
+            if str(state.document_family or ""):
+                failed_documents += int(
+                    connection.execute(
+                        text(
+                            f"SELECT count(*) FROM {physical_table} AS v "
+                            "LEFT JOIN retrieval_documents AS d "
+                            "ON d.id = v.document_id AND d.group_id = v.group_id "
+                            "WHERE d.id IS NULL OR d.status <> 'active' "
+                            "OR d.embedding_eligible <> 1 "
+                            "OR d.document_kind <> :document_kind "
+                            "OR d.embedding_generation IS NOT :generation"
+                        ),
+                        {
+                            "document_kind": str(state.document_family),
+                            "generation": int(generation),
+                        },
+                    ).scalar_one()
+                    or 0
+                )
             status = str(state.status)
             if mark_ready:
                 if failed_documents:
                     status = "failed"
+                elif (
+                    str(state.document_family or "")
+                    and total_documents == 0
+                ):
+                    status = "building"
                 elif indexed_documents == total_documents:
                     status = "ready"
                 else:
@@ -909,6 +1199,7 @@ def activate_retrieval_vector_generation(
     *,
     generation: int,
     expected_active_generation: int | None,
+    pre_activation_check: Callable[[], bool] | None = None,
 ) -> bool:
     coverage = refresh_retrieval_vector_generation(
         engine,
@@ -920,6 +1211,12 @@ def activate_retrieval_vector_generation(
     with engine.connect() as connection:
         connection.exec_driver_sql("BEGIN IMMEDIATE")
         try:
+            if (
+                pre_activation_check is not None
+                and not bool(pre_activation_check())
+            ):
+                connection.rollback()
+                return False
             target = connection.execute(
                 text(
                     "SELECT physical_table FROM retrieval_index_state "
@@ -980,6 +1277,105 @@ def activate_retrieval_vector_generation(
                 ),
                 {
                     "generation": int(generation),
+                    "activated_at": activated_at,
+                },
+            )
+            if int(activated.rowcount or 0) != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def rollback_retrieval_vector_generation(
+    engine: Engine,
+    *,
+    generation: int,
+    expected_active_generation: int,
+) -> bool:
+    """CAS-reactivate a preserved ready legacy generation.
+
+    Rollback deliberately validates the generation as it existed at its last
+    successful activation. Newly created legacy documents may require later
+    indexing, but they must not make an emergency raw-to-legacy route rollback
+    impossible.
+    """
+
+    resolved_generation = int(generation)
+    resolved_expected = int(expected_active_generation)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            target = connection.execute(
+                text(
+                    "SELECT physical_table, status, total_documents, "
+                    "indexed_documents, is_active "
+                    "FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND generation = :generation "
+                    "AND document_family = ''"
+                ),
+                {"generation": resolved_generation},
+            ).one_or_none()
+            if (
+                target is None
+                or str(target.status) != "ready"
+                or int(target.total_documents) != int(target.indexed_documents)
+            ):
+                connection.rollback()
+                return False
+            physical_table = validate_retrieval_vector_table_name(
+                str(target.physical_table),
+                generation=resolved_generation,
+            )
+            if connection.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = :physical_table"
+                ),
+                {"physical_table": physical_table},
+            ).scalar_one_or_none() is None:
+                connection.rollback()
+                return False
+            active_generation = connection.execute(
+                text(
+                    "SELECT generation FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND is_active = 1"
+                )
+            ).scalar_one_or_none()
+            if bool(target.is_active):
+                connection.commit()
+                return resolved_expected == resolved_generation
+            if (
+                active_generation is None
+                or int(active_generation) != resolved_expected
+            ):
+                connection.rollback()
+                return False
+            deactivated = connection.execute(
+                text(
+                    "UPDATE retrieval_index_state SET is_active = 0 "
+                    "WHERE channel = 'vector' AND generation = :generation "
+                    "AND is_active = 1"
+                ),
+                {"generation": resolved_expected},
+            )
+            if int(deactivated.rowcount or 0) != 1:
+                connection.rollback()
+                return False
+            activated_at = datetime.now(UTC).replace(tzinfo=None)
+            activated = connection.execute(
+                text(
+                    "UPDATE retrieval_index_state SET is_active = 1, "
+                    "activated_at = :activated_at, updated_at = :activated_at "
+                    "WHERE channel = 'vector' AND generation = :generation "
+                    "AND document_family = '' AND status = 'ready' "
+                    "AND is_active = 0"
+                ),
+                {
+                    "generation": resolved_generation,
                     "activated_at": activated_at,
                 },
             )

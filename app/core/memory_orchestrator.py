@@ -4,6 +4,10 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Protocol
 
+from app.core.memory_context_packer import (
+    MEMORY_GROUNDING_NO_EVIDENCE,
+    PackedMemoryContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,7 @@ class ShadowJobRequest:
 
 ContextProvider = Callable[[GroupMemoryRequest], MemoryContextResult]
 ShadowEnqueuer = Callable[[ShadowJobRequest], None]
+HistoryRequestPredicate = Callable[[GroupMemoryRequest], bool]
 
 
 class MemoryOrchestrator:
@@ -47,6 +52,8 @@ class MemoryOrchestrator:
         legacy_provider: ContextProvider,
         recent_provider: ContextProvider,
         shadow_enqueue: ShadowEnqueuer | None = None,
+        strict_scoped_fallback: bool = False,
+        history_request_predicate: HistoryRequestPredicate | None = None,
     ) -> None:
         self.v2_enabled = bool(v2_enabled)
         self.shadow_mode = bool(shadow_mode) and self.v2_enabled
@@ -54,6 +61,8 @@ class MemoryOrchestrator:
         self.legacy_provider = legacy_provider
         self.recent_provider = recent_provider
         self.shadow_enqueue = shadow_enqueue
+        self.strict_scoped_fallback = bool(strict_scoped_fallback)
+        self.history_request_predicate = history_request_predicate
 
     def build_context(self, request: GroupMemoryRequest) -> MemoryContextResult:
         if not self.v2_enabled:
@@ -76,11 +85,50 @@ class MemoryOrchestrator:
             return self._validate_scope(self.v2_provider(request), request.group_id)
         except Exception as exc:
             logger.warning(
-                "memory_v2_fallback group_id=%s error_type=%s",
+                "memory_v2_safe_fallback group_id=%s error_type=%s "
+                "strict_scoped=%s",
+                request.group_id,
+                type(exc).__name__,
+                self.strict_scoped_fallback,
+            )
+            if self.strict_scoped_fallback:
+                is_history = True
+                if self.history_request_predicate is not None:
+                    try:
+                        is_history = bool(self.history_request_predicate(request))
+                    except Exception:
+                        is_history = True
+                if is_history:
+                    logger.warning(
+                        "memory_fallback route=v3_safe_empty group_id=%s "
+                        "reason=v2_exception",
+                        request.group_id,
+                    )
+                    return self._empty_context(
+                        request.group_id,
+                        mode="v3_safe_empty",
+                    )
+                logger.warning(
+                    "memory_fallback route=scoped_recent group_id=%s "
+                    "reason=ordinary_v2_exception",
+                    request.group_id,
+                )
+                return self._recent_or_empty(request)
+            return self._legacy_or_recent(request)
+
+    def _recent_or_empty(self, request: GroupMemoryRequest) -> MemoryContextResult:
+        try:
+            return self._validate_scope(
+                self.recent_provider(request),
+                request.group_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "memory_recent_fallback_failed group_id=%s error_type=%s",
                 request.group_id,
                 type(exc).__name__,
             )
-            return self._legacy_or_recent(request)
+            return self._empty_context(request.group_id)
 
     def _legacy_or_recent(self, request: GroupMemoryRequest) -> MemoryContextResult:
         try:
@@ -130,13 +178,20 @@ class MemoryOrchestrator:
         )
 
     @staticmethod
-    def _empty_context(group_id: int) -> MemoryContextResult:
+    def _empty_context(group_id: int, *, mode: str = "empty") -> MemoryContextResult:
+        packed = PackedMemoryContext(
+            mode="normal",
+            budget=256,
+            estimated_tokens=len(MEMORY_GROUNDING_NO_EVIDENCE.split()),
+            text=MEMORY_GROUNDING_NO_EVIDENCE,
+            grounding_policy=MEMORY_GROUNDING_NO_EVIDENCE,
+        )
         return MemoryContextResult(
             group_id=int(group_id),
-            packed_context="",
+            packed_context=packed,
             selected_source_msg_ids=(),
-            estimated_tokens=0,
-            mode="empty",
+            estimated_tokens=packed.estimated_tokens,
+            mode=mode,
         )
 
     @staticmethod

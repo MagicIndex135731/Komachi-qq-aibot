@@ -10,7 +10,7 @@ from typing import Callable
 
 import yaml
 
-from app.adapters.sender import OutboundPrivateMessage
+from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncertainError
 
 logger = logging.getLogger(__name__)
 
@@ -127,16 +127,27 @@ class PrivateReminderScheduler:
                 dirty = True
                 continue
 
-            await self.sender.send_private_text(
-                OutboundPrivateMessage(user_id=reminder.user_id, text=reminder.text)
-            )
-            state[reminder.reminder_id] = "sent"
+            try:
+                await self.sender.send_private_text(
+                    OutboundPrivateMessage(user_id=reminder.user_id, text=reminder.text)
+                )
+                delivery_state = "sent"
+            except QQMessageDeliveryUncertainError as exc:
+                delivery_state = "uncertain"
+                logger.warning(
+                    "private_reminder_delivery_uncertain reminder_id=%s user_id=%s error_type=%s",
+                    reminder.reminder_id,
+                    reminder.user_id,
+                    type(exc).__name__,
+                )
+            state[reminder.reminder_id] = delivery_state
             dirty = True
             logger.info(
-                "private_reminder_sent reminder_id=%s user_id=%s run_at=%s",
+                "private_reminder_finished reminder_id=%s user_id=%s run_at=%s delivery_state=%s",
                 reminder.reminder_id,
                 reminder.user_id,
                 reminder.run_at.isoformat(),
+                delivery_state,
             )
         if dirty:
             self._write_state(state)
@@ -154,6 +165,7 @@ class PrivateReminderScheduler:
         return {str(key): str(value) for key, value in payload.items() if str(key).strip()}
 
     def _write_state(self, state: dict[str, str]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",

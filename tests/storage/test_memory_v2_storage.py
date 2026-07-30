@@ -11,14 +11,18 @@ from sqlalchemy.exc import IntegrityError
 from app.storage.db import (
     activate_retrieval_vector_generation,
     build_engine,
+    create_retrieval_vector_generation,
     create_all,
     ensure_retrieval_vector_generation,
+    find_active_retrieval_vector_generation,
     mark_retrieval_vector_embeddings_failed,
     refresh_retrieval_vector_generation,
+    resume_retrieval_vector_generation,
+    rollback_retrieval_vector_generation,
     session_scope,
     write_retrieval_vector_embeddings,
 )
-from app.storage.models import EpisodeMessage
+from app.storage.models import EpisodeMessage, RetrievalDocument
 from app.storage.repositories import (
     EpisodeRepository,
     GroupRepository,
@@ -111,6 +115,446 @@ def _seed_group_message(
     )
     session.flush()
     return message
+
+
+def test_raw_message_v3_projection_is_idempotent_and_revokes_uncertain_source(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-idempotent",
+        )
+        message.plain_text = "即时检索原始消息"
+        documents = RetrievalDocumentRepository(session)
+        first = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        second = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=7,
+        )
+        assert first is not None
+        assert second is not None
+        assert second.id == first.id
+        assert second.embedding_generation == 7
+        assert second.embedding_status == "pending"
+        assert documents.list_source_message_ids(
+            document_id=first.id,
+            group_id=10001,
+        ) == [message.id]
+        assert [
+            hit.document_id
+            for hit in documents.search_group_documents_fts_hits(
+                group_id=10001,
+                query="即时检索",
+                limit=10,
+                document_kinds=("raw_message_v3",),
+            )
+        ] == [first.id]
+
+        message.raw_json = {
+            "delivery_state": "uncertain",
+            "failure_kind": "delivery_result_unknown",
+        }
+        assert (
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=message.id,
+                embedding_generation=7,
+            )
+            is None
+        )
+        assert documents.search_group_documents_fts_hits(
+            group_id=10001,
+            query="即时检索",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        ) == []
+
+
+def test_deleted_raw_message_is_revoked_and_filtered_by_every_active_channel(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-deleted",
+        )
+        message.plain_text = "deleted marker evidence"
+        documents = RetrievalDocumentRepository(session)
+        document = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        assert document is not None
+        message.raw_json = {"delivery_state": "deleted"}
+        session.flush()
+
+        assert documents.search_group_documents_fts_hits(
+            group_id=10001,
+            query="deleted marker",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        ) == []
+        assert documents.search_group_documents_temporal_hits(
+            group_id=10001,
+            start_at=None,
+            end_at=None,
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            allow_unbounded=True,
+        ) == []
+        assert documents.search_group_documents_entity_hits(
+            group_id=10001,
+            entities=("deleted marker",),
+            speaker_ids=("20001",),
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        ) == []
+        assert documents.search_group_reference_hits(
+            group_id=10001,
+            reference_msg_ids=(message.platform_msg_id,),
+            include_replies=False,
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        ) == []
+        assert (
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=message.id,
+            )
+            is None
+        )
+
+
+def test_raw_message_v3_fts_fallback_enforces_kind_time_speaker_and_safety(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        allowed = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-allowed",
+            minute=1,
+        )
+        wrong_speaker = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20002,
+            platform_msg_id="raw-v3-wrong-speaker",
+            minute=2,
+        )
+        blocked = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-blocked",
+            minute=3,
+        )
+        for message in (allowed, wrong_speaker, blocked):
+            message.plain_text = "共同检索文本"
+        blocked.raw_json = {
+            "delivery_state": "blocked",
+            "failure_kind": "qq_sensitive_content",
+        }
+        documents = RetrievalDocumentRepository(session)
+        allowed_document = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=allowed.id,
+            embedding_generation=None,
+        )
+        documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=wrong_speaker.id,
+            embedding_generation=None,
+        )
+        assert (
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=blocked.id,
+                embedding_generation=None,
+            )
+            is None
+        )
+        session.execute(text("DROP TABLE IF EXISTS retrieval_documents_fts"))
+
+        hits = documents.search_group_documents_fts_hits(
+            group_id=10001,
+            query="共同检索",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            start_at=datetime(2026, 7, 23, 8, 1, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 8, 2, tzinfo=UTC),
+            speaker_ids=("20001",),
+        )
+        assert allowed_document is not None
+        assert [hit.document_id for hit in hits] == [allowed_document.id]
+
+
+def test_raw_message_v3_mention_filter_requires_real_onebot_at_segment(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        mentioned = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-mentioned-requester",
+            minute=1,
+        )
+        topical_only = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-not-mentioned",
+            minute=2,
+        )
+        for message in (mentioned, topical_only):
+            message.plain_text = "他们最近有没有叫我"
+        mentioned.raw_json = {
+            "message": [
+                {"type": "at", "data": {"qq": "30001"}},
+                {"type": "text", "data": {"text": "来看看"}},
+            ]
+        }
+        topical_only.raw_json = {
+            "message": [
+                {"type": "text", "data": {"text": "30001 来看看"}},
+            ]
+        }
+        documents = RetrievalDocumentRepository(session)
+        expected = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=mentioned.id,
+        )
+        documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=topical_only.id,
+        )
+
+        hits = documents.search_group_documents_fts_hits(
+            group_id=10001,
+            query="他们最近",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            mentioned_user_ids=("30001",),
+        )
+        assert expected is not None
+        assert [hit.document_id for hit in hits] == [expected.id]
+
+
+def test_raw_message_v3_unbounded_temporal_coverage_samples_full_history(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        expected_source_ids: list[str] = []
+        for minute in range(5):
+            message = _seed_group_message(
+                session,
+                group_id=10001,
+                user_id=20001,
+                platform_msg_id=f"raw-v3-coverage-{minute}",
+                minute=minute,
+            )
+            message.plain_text = f"coverage {minute}"
+            document = documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=message.id,
+            )
+            assert document is not None
+            if minute in {0, 2, 4}:
+                expected_source_ids.append(message.platform_msg_id)
+
+        hits = documents.search_group_documents_temporal_hits(
+            group_id=10001,
+            start_at=None,
+            end_at=None,
+            limit=3,
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+            allow_unbounded=True,
+        )
+        assert [hit.source_msg_ids[0] for hit in hits] == expected_source_ids
+
+
+def test_raw_message_v3_filters_preserve_none_empty_and_exact_states(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-three-state",
+        )
+        message.plain_text = "三态边界检索文本"
+        message.raw_json = {
+            "message": [{"type": "at", "data": {"qq": "30001"}}],
+        }
+        documents = RetrievalDocumentRepository(session)
+        document = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        assert document is not None
+
+        assert documents.search_group_documents_fts(
+            group_id=10001,
+            query="三态边界",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            speaker_ids=None,
+            mentioned_user_ids=None,
+        ) == [document]
+        assert documents.search_group_documents_fts(
+            group_id=10001,
+            query="三态边界",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            speaker_ids=(),
+        ) == []
+        assert documents.search_group_documents_fts(
+            group_id=10001,
+            query="三态边界",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            mentioned_user_ids=(),
+        ) == []
+        assert documents.search_group_documents_fts_hits(
+            group_id=10001,
+            query="三态边界",
+            limit=10,
+            subject_ids=(),
+            document_kinds=("raw_message_v3",),
+        ) == []
+        assert documents.search_group_documents_temporal_hits(
+            group_id=10001,
+            start_at=None,
+            end_at=None,
+            limit=10,
+            subject_ids=(),
+            document_kinds=("raw_message_v3",),
+            allow_unbounded=True,
+        ) == []
+        assert documents.search_group_documents_entity_hits(
+            group_id=10001,
+            entities=("三态边界",),
+            speaker_ids=(),
+            limit=10,
+            subject_ids=(),
+            document_kinds=("raw_message_v3",),
+        ) == []
+        assert documents.search_group_reference_hits(
+            group_id=10001,
+            reference_msg_ids=(message.platform_msg_id,),
+            include_replies=False,
+            limit=10,
+            subject_ids=(),
+            document_kinds=("raw_message_v3",),
+        ) == []
+
+
+def test_raw_entity_and_reference_prefilter_legacy_noise_before_limit(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-prefilter-target",
+        )
+        message.plain_text = "稀疏目标作者关键发言"
+        documents = RetrievalDocumentRepository(session)
+        raw = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        assert raw is not None
+        for index in range(12):
+            documents.upsert_document(
+                scope_type="group",
+                scope_id="10001",
+                group_id=10001,
+                episode_id=None,
+                document_kind="episode",
+                source_table="conversation_episodes",
+                source_id=f"legacy-noise-{index}",
+                start_at=message.timestamp,
+                end_at=message.timestamp,
+                content="稀疏目标作者关键发言",
+                metadata_json={},
+                content_hash=f"legacy-noise-{index}",
+                source_message_ids=[message.id],
+            )
+
+        entity_hits = documents.search_group_documents_entity_hits(
+            group_id=10001,
+            entities=("稀疏目标作者",),
+            speaker_ids=("20001",),
+            limit=1,
+            document_kinds=("raw_message_v3",),
+        )
+        reference_hits = documents.search_group_reference_hits(
+            group_id=10001,
+            reference_msg_ids=(message.platform_msg_id,),
+            include_replies=False,
+            limit=1,
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        )
+
+        assert [hit.document_id for hit in entity_hits] == [raw.id]
+        assert [hit.document_id for hit in reference_hits] == [raw.id]
+
+
+def test_raw_temporal_prefilters_sparse_author_before_limit(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        target = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-sparse-author",
+            minute=0,
+        )
+        expected = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=target.id,
+        )
+        assert expected is not None
+        for minute in range(1, 10):
+            noise = _seed_group_message(
+                session,
+                group_id=10001,
+                user_id=20002,
+                platform_msg_id=f"raw-v3-busy-noise-{minute}",
+                minute=minute,
+            )
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=noise.id,
+            )
+
+        hits = documents.search_group_documents_temporal_hits(
+            group_id=10001,
+            start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
+            limit=1,
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        )
+
+        assert [hit.document_id for hit in hits] == [expected.id]
 
 
 def test_memory_v2_schema_is_additive_and_repeated_initialization_preserves_messages(
@@ -472,6 +916,62 @@ def test_one_message_has_one_episode_and_group_has_one_open_episode(
             )
             session.flush()
         session.rollback()
+
+
+def test_replayed_episode_boundary_gets_a_derived_generation(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="replayed-boundary",
+        )
+        episodes = EpisodeRepository(session)
+        original = episodes.create_episode(
+            group_id=10001,
+            start_message_id=message.id,
+            started_at=message.timestamp,
+            segmentation_version="segment-v2",
+        )
+        session.flush()
+        original_id = original.id
+        assert (
+            episodes.close_episode(
+                episode_id=original_id,
+                ended_at=message.timestamp,
+                end_message_id=message.id,
+                boundary_reason="idle",
+                content_hash="same-content",
+            )
+            is not None
+        )
+        assert episodes.supersede_episode(
+            episode_id=original_id,
+            group_id=10001,
+        )
+        replay = episodes.create_episode(
+            group_id=10001,
+            start_message_id=message.id,
+            started_at=message.timestamp,
+            segmentation_version="segment-v2",
+        )
+        session.flush()
+        replay_id = replay.id
+
+        closed = episodes.close_episode(
+            episode_id=replay_id,
+            ended_at=message.timestamp,
+            end_message_id=message.id,
+            boundary_reason="idle",
+            content_hash="same-content",
+        )
+        session.flush()
+
+        assert closed is not None
+        assert closed.status == "closed"
+        assert closed.segmentation_version == f"segment-v2:late:{replay_id}"
 
 
 def test_guarded_episode_append_rejects_superseded_target(sqlite_engine) -> None:
@@ -1395,6 +1895,671 @@ def test_versioned_vector_generation_keeps_old_active_until_compatible_cas_swap(
         f"retrieval_documents_vec_g{first_generation}",
         f"retrieval_documents_vec_g{second_generation}",
     } <= table_names
+
+
+def test_raw_v3_generation_is_additive_kind_scoped_and_activated_by_cas(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-generation-source",
+        )
+        message.plain_text = "raw generation evidence"
+        documents = RetrievalDocumentRepository(session)
+        raw_document = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=1,
+        )
+        episode_document = documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=None,
+            document_kind="episode",
+            source_table="conversation_episodes",
+            source_id="legacy-episode",
+            start_at=message.timestamp,
+            end_at=message.timestamp,
+            content="legacy episode evidence",
+            metadata_json={},
+            content_hash="legacy-episode",
+            source_message_ids=[message.id],
+            embedding_eligible=True,
+            embedding_status="pending",
+        )
+        assert raw_document is not None
+        raw_document_id = int(raw_document.id)
+        episode_document_id = int(episode_document.id)
+
+    active_generation = ensure_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+    )
+    assert active_generation is not None
+    with session_scope(sqlite_engine) as session:
+        raw_document = session.get(RetrievalDocument, raw_document_id)
+        assert raw_document is not None
+        raw_document.embedding_generation = active_generation
+        episode_document = session.get(RetrievalDocument, episode_document_id)
+        assert episode_document is not None
+        episode_document.embedding_generation = active_generation
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=active_generation,
+        rows=[(episode_document_id, 10001, [0.0, 1.0])],
+    ) == 1
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=active_generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=active_generation,
+        expected_active_generation=None,
+    )
+    assert (
+        find_active_retrieval_vector_generation(
+            sqlite_engine,
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            document_family="raw_message_v3",
+        )
+        is None
+    )
+
+    raw_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert raw_generation is not None
+    assert raw_generation != active_generation
+    with sqlite_engine.connect() as connection:
+        state_kind = connection.execute(
+            text(
+                "SELECT document_family FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND generation = :generation"
+            ),
+            {"generation": raw_generation},
+        ).scalar_one()
+        active_before = connection.execute(
+            text(
+                "SELECT generation FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND is_active = 1"
+            )
+        ).scalar_one()
+    assert state_kind == "raw_message_v3"
+    assert int(active_before) == active_generation
+
+    with session_scope(sqlite_engine) as session:
+        document = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=raw_generation,
+        )
+        assert document is not None
+    with pytest.raises(ValueError, match="document family"):
+        write_retrieval_vector_embeddings(
+            sqlite_engine,
+            generation=raw_generation,
+            rows=[(episode_document_id, 10001, [0.0, 1.0])],
+        )
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=raw_generation,
+        rows=[(raw_document_id, 10001, [1.0, 0.0])],
+    ) == 1
+    coverage = refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        mark_ready=True,
+    )
+    assert coverage.status == "ready"
+    assert coverage.total_documents == 1
+    assert coverage.indexed_documents == 1
+    assert (
+        resume_retrieval_vector_generation(
+            sqlite_engine,
+            generation=raw_generation,
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            document_family="raw_message_v3",
+        )
+        == raw_generation
+    )
+    assert not activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        expected_active_generation=9999,
+    )
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        expected_active_generation=active_generation,
+    )
+    assert (
+        find_active_retrieval_vector_generation(
+            sqlite_engine,
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            document_family="raw_message_v3",
+        )
+        == raw_generation
+    )
+    assert (
+        find_active_retrieval_vector_generation(
+            sqlite_engine,
+            provider="fake",
+            model="other-model",
+            dimensions=2,
+            version="v1",
+            document_family="raw_message_v3",
+        )
+        is None
+    )
+
+
+def test_raw_generation_cannot_be_ready_or_active_without_any_documents(
+    sqlite_engine,
+) -> None:
+    generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-empty",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert generation is not None
+
+    coverage = refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        mark_ready=True,
+    )
+
+    assert coverage.total_documents == 0
+    assert coverage.indexed_documents == 0
+    assert coverage.status == "building"
+    assert not activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        expected_active_generation=None,
+    )
+
+
+def test_stale_raw_generation_write_cannot_steal_a_newer_document_claim(
+    sqlite_engine,
+) -> None:
+    first_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-cas",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    second_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-cas",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert first_generation is not None
+    assert second_generation is not None
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-generation-cas",
+        )
+        document = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=first_generation,
+        )
+        assert document is not None
+        document = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=second_generation,
+        )
+        assert document is not None
+        document_id = int(document.id)
+
+    with pytest.raises(ValueError, match="generation claim"):
+        write_retrieval_vector_embeddings(
+            sqlite_engine,
+            generation=first_generation,
+            rows=[(document_id, 10001, [1.0, 0.0])],
+        )
+
+    with session_scope(sqlite_engine) as session:
+        document = session.get(RetrievalDocument, document_id)
+        assert document is not None
+        assert document.embedding_generation == second_generation
+
+
+def test_active_old_raw_projection_cannot_empty_a_building_new_generation(
+    sqlite_engine,
+) -> None:
+    old_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-projection-cas",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert old_generation is not None
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-projection-generation-cas",
+        )
+        projected = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+            embedding_generation=old_generation,
+        )
+        assert projected is not None
+        document_id = int(projected.id)
+        message_id = int(message.id)
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=old_generation,
+        rows=[(document_id, 10001, [1.0, 0.0])],
+    ) == 1
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=old_generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=old_generation,
+        expected_active_generation=None,
+    )
+
+    new_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-projection-cas",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert new_generation is not None
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        claimed = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message_id,
+            embedding_generation=new_generation,
+        )
+        assert claimed is not None
+        replayed_by_old_worker = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message_id,
+            embedding_generation=old_generation,
+        )
+        assert replayed_by_old_worker is not None
+        assert replayed_by_old_worker.embedding_generation == new_generation
+
+    coverage = refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=new_generation,
+        mark_ready=True,
+    )
+    assert coverage.total_documents == 1
+    assert coverage.indexed_documents == 0
+    assert coverage.status == "building"
+
+
+def test_raw_v3_vector_search_expands_until_scoped_hit_or_generation_exhaustion(
+    sqlite_engine,
+) -> None:
+    generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert generation is not None
+    vector_rows: list[tuple[int, int, list[float]]] = []
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        for minute in range(8):
+            distractor = _seed_group_message(
+                session,
+                group_id=10001,
+                user_id=20002,
+                platform_msg_id=f"raw-v3-vector-distractor-{minute}",
+                minute=minute,
+            )
+            distractor.plain_text = f"distractor {minute}"
+            projected = documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=distractor.id,
+                embedding_generation=generation,
+            )
+            assert projected is not None
+            vector_rows.append((projected.id, 10001, [1.0, minute / 1000]))
+        target = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-vector-target",
+            minute=9,
+        )
+        target.plain_text = "scoped target"
+        projected_target = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=target.id,
+            embedding_generation=generation,
+        )
+        assert projected_target is not None
+        vector_rows.append((projected_target.id, 10001, [0.0, 1.0]))
+        target_document_id = int(projected_target.id)
+
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=generation,
+        rows=vector_rows,
+    ) == len(vector_rows)
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        mark_ready=True,
+    ).status == "ready"
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        assert documents.search_group_documents_vector_hits(
+            group_id=10001,
+            embedding=[1.0, 0.0],
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            limit=1,
+            subject_ids=("20001",),
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        ) == []
+        prepared_hits = documents.search_group_documents_vector_hits(
+            group_id=10001,
+            embedding=[1.0, 0.0],
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            generation=generation,
+            limit=1,
+            subject_ids=("20001",),
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        )
+        assert [hit.document_id for hit in prepared_hits] == [target_document_id]
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        expected_active_generation=None,
+    )
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        hits = documents.search_group_documents_vector_hits(
+            group_id=10001,
+            embedding=[1.0, 0.0],
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            limit=1,
+            subject_ids=("20001",),
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        )
+        assert [hit.document_id for hit in hits] == [target_document_id]
+        assert documents.search_group_documents_vector_hits(
+            group_id=10001,
+            embedding=[1.0, 0.0],
+            provider="fake",
+            model="semantic",
+            dimensions=2,
+            version="v1",
+            limit=1,
+            subject_ids=(),
+            document_kinds=("raw_message_v3",),
+            speaker_ids=("20001",),
+        ) == []
+
+
+def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generations(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="legacy-rollback-source",
+        )
+        message.plain_text = "legacy and raw evidence"
+        documents = RetrievalDocumentRepository(session)
+        episode = documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=None,
+            document_kind="episode",
+            source_table="conversation_episodes",
+            source_id="legacy-rollback-episode",
+            start_at=message.timestamp,
+            end_at=message.timestamp,
+            content="legacy episode",
+            metadata_json={},
+            content_hash="legacy-rollback-episode",
+            source_message_ids=[message.id],
+            embedding_eligible=True,
+            embedding_status="pending",
+        )
+        raw = documents.project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        assert raw is not None
+        episode_id = int(episode.id)
+        raw_id = int(raw.id)
+        message_id = int(message.id)
+
+    legacy_generation = ensure_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+    )
+    assert legacy_generation is not None
+    with session_scope(sqlite_engine) as session:
+        episode = session.get(RetrievalDocument, episode_id)
+        raw = session.get(RetrievalDocument, raw_id)
+        assert episode is not None and raw is not None
+        episode.embedding_generation = legacy_generation
+        raw.embedding_generation = legacy_generation
+        raw.embedding_eligible = True
+        raw.embedding_status = "pending"
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=legacy_generation,
+        rows=[(episode_id, 10001, [1.0, 0.0])],
+    ) == 1
+    with pytest.raises(ValueError, match="document family"):
+        write_retrieval_vector_embeddings(
+            sqlite_engine,
+            generation=legacy_generation,
+            rows=[(raw_id, 10001, [0.0, 1.0])],
+        )
+    legacy_coverage = refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=legacy_generation,
+        mark_ready=True,
+    )
+    assert legacy_coverage.status == "ready"
+    assert legacy_coverage.total_documents == 1
+    assert legacy_coverage.indexed_documents == 1
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=legacy_generation,
+        expected_active_generation=None,
+    )
+
+    raw_generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert raw_generation is not None
+    with session_scope(sqlite_engine) as session:
+        projected = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message_id,
+            embedding_generation=raw_generation,
+        )
+        assert projected is not None
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=raw_generation,
+        rows=[(raw_id, 10001, [0.0, 1.0])],
+    ) == 1
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        expected_active_generation=legacy_generation,
+    )
+
+    assert resume_retrieval_vector_generation(
+        sqlite_engine,
+        generation=raw_generation,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    ) is None
+
+    with session_scope(sqlite_engine) as session:
+        new_episode = RetrievalDocumentRepository(session).upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=None,
+            document_kind="episode",
+            source_table="conversation_episodes",
+            source_id="new-episode-after-raw-activation",
+            start_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
+            content="new legacy coverage must not block emergency rollback",
+            metadata_json={},
+            content_hash="new-episode-after-raw-activation",
+            source_message_ids=[message_id],
+            embedding_eligible=True,
+            embedding_status="pending",
+        )
+        assert new_episode.id is not None
+
+    assert rollback_retrieval_vector_generation(
+        sqlite_engine,
+        generation=legacy_generation,
+        expected_active_generation=raw_generation,
+    )
+    with sqlite_engine.connect() as connection:
+        active = connection.execute(
+            text(
+                "SELECT generation FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND is_active = 1"
+            )
+        ).scalar_one()
+        raw_state = connection.execute(
+            text(
+                "SELECT is_active, document_family, physical_table "
+                "FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND generation = :generation"
+            ),
+            {"generation": raw_generation},
+        ).one()
+        raw_table_exists = connection.execute(
+            text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = :physical_table"
+            ),
+            {"physical_table": raw_state.physical_table},
+        ).scalar_one_or_none()
+    assert int(active) == legacy_generation
+    assert not bool(raw_state.is_active)
+    assert raw_state.document_family == "raw_message_v3"
+    assert raw_table_exists == 1
+
+
+def test_resume_rejects_failed_raw_generation(sqlite_engine) -> None:
+    generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic-failed-resume",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert generation is not None
+    with sqlite_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE retrieval_index_state SET status = 'failed' "
+                "WHERE channel = 'vector' AND generation = :generation"
+            ),
+            {"generation": generation},
+        )
+
+    assert resume_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        provider="fake",
+        model="semantic-failed-resume",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    ) is None
 
 
 def test_vector_generation_refuses_pending_disabled_and_failed_eligible_targets(

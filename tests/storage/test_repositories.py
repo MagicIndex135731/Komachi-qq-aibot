@@ -7,6 +7,7 @@ from app.storage.repositories import (
     GroupRepository,
     DevSessionRepository,
     DevTaskRepository,
+    EpisodeRepository,
     MemoryRepository,
     MessageRepository,
     SummaryRepository,
@@ -145,6 +146,58 @@ def test_qq_blocked_reply_stays_in_context_but_not_memory_compaction_sources(tmp
     assert [message.platform_msg_id for message in chronological] == ["blocked-1"]
     assert compaction_windows == []
     assert compaction_range == []
+
+
+def test_uncertain_reply_stays_in_context_but_not_memory_compaction_sources(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="test-group", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+        uncertain = messages.add_group_message(
+            platform_msg_id="uncertain-1",
+            group_id=10001,
+            user_id=123456789,
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+            plain_text="possibly delivered reply\n\n[system delivery note]",
+            raw_json={
+                "direction": "outbound",
+                "delivery_state": "uncertain",
+                "failure_kind": "delivery_result_unknown",
+            },
+            msg_type="text",
+            reply_to_msg_id="inbound-1",
+            mentioned_bot=False,
+        )
+        session.flush()
+
+        recent = messages.list_recent_group_messages(group_id=10001, limit=10)
+        summary_recent = messages.list_recent_group_messages_for_summarization(group_id=10001, limit=10)
+        chronological = messages.list_group_messages_chronological(group_id=10001)
+        compaction_windows = messages.list_recent_group_message_windows(
+            group_id=10001,
+            batch_size=1,
+            limit_windows=10,
+        )
+        compaction_range = messages.list_group_messages_by_id_range(
+            group_id=10001,
+            start_id=uncertain.id,
+            end_id=uncertain.id,
+        )
+        classified_as_blocked = messages.is_qq_blocked_outbound(uncertain)
+        unassigned_for_v2 = EpisodeRepository(session).list_unassigned_messages(group_id=10001)
+
+    assert [message.platform_msg_id for message in recent] == ["uncertain-1"]
+    assert summary_recent == []
+    assert [message.platform_msg_id for message in chronological] == ["uncertain-1"]
+    assert compaction_windows == []
+    assert compaction_range == []
+    assert classified_as_blocked is False
+    assert unassigned_for_v2 == []
 
 
 def test_dev_repositories_create_owner_session_and_queue_task(tmp_path) -> None:

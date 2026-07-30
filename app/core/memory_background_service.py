@@ -21,10 +21,12 @@ from app.core.memory_compaction import (
 )
 from app.core.summarizer import summarize_window
 from app.storage.db import (
+    find_active_retrieval_vector_generation,
     mark_retrieval_vector_embeddings_failed,
     session_scope,
     write_retrieval_vector_embeddings,
 )
+from app.storage.models import RetrievalDocument
 from app.storage.repositories import (
     EpisodeRepository,
     JobRepository,
@@ -278,6 +280,22 @@ class ShadowEvaluator(Protocol):
 
 
 class MemoryBackgroundStore(Protocol):
+    def enqueue_raw_message_projection(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime,
+    ) -> BackgroundJob | None: ...
+
+    def project_raw_message_and_enqueue_embed(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime,
+    ) -> BackgroundJob | None: ...
+
     def enqueue_allocator(
         self,
         *,
@@ -307,6 +325,13 @@ class MemoryBackgroundStore(Protocol):
     ) -> BackgroundJob: ...
 
     def recover_stale_jobs(self, *, now: datetime) -> int: ...
+
+    def reconcile_raw_message_projections(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> int: ...
 
     def claim_next_job(
         self,
@@ -425,6 +450,15 @@ class MemoryBackgroundStore(Protocol):
         now: datetime,
     ) -> LateArrivalPlan | None: ...
 
+    def load_raw_message_embedding(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        document_id: int,
+        embedding_generation: int,
+    ) -> tuple[int, int, str] | None: ...
+
 
 class SqlAlchemyMemoryBackgroundStore:
     """Repository-backed store used by the runtime composition root."""
@@ -432,6 +466,9 @@ class SqlAlchemyMemoryBackgroundStore:
     allocator_job_type = "episode_allocate"
     episode_job_type = "memory_episode_process"
     shadow_job_type = "memory_shadow_evaluate"
+    raw_message_projection_job_type = "raw_message_project"
+    raw_message_embed_job_type = "raw_message_embed"
+    raw_message_projection_generation = "raw-message-v3"
 
     def __init__(
         self,
@@ -444,6 +481,9 @@ class SqlAlchemyMemoryBackgroundStore:
         embedding_version: str = "",
         embedding_dimensions: int | None = None,
         embedding_generation: int | None = None,
+        raw_message_projection_enabled: bool | None = None,
+        raw_message_embedding_enabled: bool = False,
+        raw_message_embedding_generation: int | None = None,
     ) -> None:
         self.engine = engine
         self.batch_size = max(1, int(batch_size))
@@ -460,6 +500,20 @@ class SqlAlchemyMemoryBackgroundStore:
             int(embedding_generation)
             if embedding_generation is not None
             else None
+        )
+        self.raw_message_embedding_generation = (
+            int(raw_message_embedding_generation)
+            if (
+                raw_message_embedding_enabled
+                and raw_message_embedding_generation is not None
+            )
+            else None
+        )
+        self.raw_message_embedding_enabled = bool(raw_message_embedding_enabled)
+        self.raw_message_projection_enabled = (
+            bool(raw_message_embedding_enabled)
+            if raw_message_projection_enabled is None
+            else bool(raw_message_projection_enabled)
         )
         self.segmentation_generation: str | None = None
         self.compaction_generation: str | None = None
@@ -560,6 +614,90 @@ class SqlAlchemyMemoryBackgroundStore:
             )
             return _background_job(row)
 
+    def project_raw_message_and_enqueue_embed(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime,
+    ) -> BackgroundJob | None:
+        """Publish FTS/provenance, then atomically queue optional vector work."""
+        embedding_generation = self._resolve_raw_message_embedding_generation()
+        with session_scope(self.engine) as session:
+            document = RetrievalDocumentRepository(session).project_raw_message_v3(
+                group_id=int(group_id),
+                message_id=int(message_id),
+                embedding_generation=embedding_generation,
+            )
+            if document is None or embedding_generation is None:
+                return None
+            generation = int(embedding_generation)
+            row = JobRepository(session).enqueue_coalescing_job(
+                job_type=self.raw_message_embed_job_type,
+                job_key=f"raw-message:{int(message_id)}:vector:{generation}",
+                payload_json={
+                    "group_id": int(group_id),
+                    "message_id": int(message_id),
+                    "document_id": int(document.id),
+                    "index_generation": generation,
+                },
+                run_at=now,
+                target_generation=f"vector:{generation}",
+                max_attempts=self.max_attempts,
+            )
+            return _background_job(row)
+
+    def _resolve_raw_message_embedding_generation(self) -> int | None:
+        if not self.raw_message_embedding_enabled:
+            self.raw_message_embedding_generation = None
+            return None
+        if (
+            self.embedding_provider
+            and self.embedding_model
+            and self.embedding_version
+            and self.embedding_dimensions is not None
+        ):
+            self.raw_message_embedding_generation = (
+                find_active_retrieval_vector_generation(
+                    self.engine,
+                    provider=self.embedding_provider,
+                    model=self.embedding_model,
+                    dimensions=self.embedding_dimensions,
+                    version=self.embedding_version,
+                    document_family="raw_message_v3",
+                )
+            )
+        return self.raw_message_embedding_generation
+
+    def enqueue_raw_message_projection(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime,
+    ) -> BackgroundJob | None:
+        """Persist an ID-only request; projection content is reloaded by worker."""
+        if not self.raw_message_projection_enabled:
+            return None
+        resolved_group_id = int(group_id)
+        resolved_message_id = int(message_id)
+        with session_scope(self.engine) as session:
+            row = JobRepository(session).enqueue_coalescing_job(
+                job_type=self.raw_message_projection_job_type,
+                job_key=(
+                    f"raw-message:{resolved_group_id}:{resolved_message_id}:"
+                    "project:v3"
+                ),
+                payload_json={
+                    "group_id": resolved_group_id,
+                    "message_id": resolved_message_id,
+                },
+                run_at=now,
+                target_generation=self.raw_message_projection_generation,
+                max_attempts=self.max_attempts,
+            )
+            return _background_job(row)
+
     def recover_stale_jobs(self, *, now: datetime) -> int:
         with session_scope(self.engine) as session:
             jobs = JobRepository(session)
@@ -569,11 +707,57 @@ class SqlAlchemyMemoryBackgroundStore:
                     now=now,
                 )
                 for job_type in (
+                    self.raw_message_projection_job_type,
+                    self.raw_message_embed_job_type,
                     self.allocator_job_type,
                     self.episode_job_type,
                     self.shadow_job_type,
                 )
             )
+
+    def reconcile_raw_message_projections(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> int:
+        """Repair committed eligible messages that missed projection enqueue."""
+        if not self.raw_message_projection_enabled:
+            return 0
+        generation = self._resolve_raw_message_embedding_generation()
+        with session_scope(self.engine) as session:
+            documents = RetrievalDocumentRepository(session)
+            resolved_limit = max(1, int(limit))
+            revoked = documents.revoke_unsafe_raw_message_v3_projections(
+                limit=resolved_limit,
+            )
+            remaining = max(0, resolved_limit - revoked)
+            gaps = (
+                documents.list_raw_message_v3_projection_gaps(
+                    projection_job_type=self.raw_message_projection_job_type,
+                    embedding_generation=generation,
+                    limit=remaining,
+                )
+                if remaining
+                else []
+            )
+            jobs = JobRepository(session)
+            for group_id, message_id in gaps:
+                jobs.enqueue_coalescing_job(
+                    job_type=self.raw_message_projection_job_type,
+                    job_key=(
+                        f"raw-message:{int(group_id)}:{int(message_id)}:"
+                        "project:v3"
+                    ),
+                    payload_json={
+                        "group_id": int(group_id),
+                        "message_id": int(message_id),
+                    },
+                    run_at=now,
+                    target_generation=self.raw_message_projection_generation,
+                    max_attempts=self.max_attempts,
+                )
+            return revoked + len(gaps)
 
     def claim_next_job(
         self,
@@ -582,20 +766,33 @@ class SqlAlchemyMemoryBackgroundStore:
         now: datetime,
         lease_seconds: int,
     ) -> BackgroundJob | None:
+        raw_embedding_generation = (
+            self._resolve_raw_message_embedding_generation()
+        )
         with session_scope(self.engine) as session:
             jobs = JobRepository(session)
             for job_type in (
+                self.raw_message_projection_job_type,
+                self.raw_message_embed_job_type,
                 self.allocator_job_type,
                 self.episode_job_type,
                 self.shadow_job_type,
             ):
                 target_generation = None
                 include_derived_generations = False
-                if job_type == self.allocator_job_type:
+                if job_type == self.raw_message_projection_job_type:
+                    if not self.raw_message_projection_enabled:
+                        continue
+                    target_generation = self.raw_message_projection_generation
+                elif job_type == self.allocator_job_type:
                     target_generation = self.segmentation_generation
                     include_derived_generations = True
                 elif job_type == self.episode_job_type:
                     target_generation = self.compaction_generation
+                elif job_type == self.raw_message_embed_job_type:
+                    if raw_embedding_generation is None:
+                        continue
+                    target_generation = f"vector:{int(raw_embedding_generation)}"
                 row = jobs.claim_coalescing_job(
                     job_type=job_type,
                     worker_id=worker_id,
@@ -656,7 +853,43 @@ class SqlAlchemyMemoryBackgroundStore:
                         expected_statuses=("processing",),
                         new_status="failed",
                     )
+            elif not will_retry and job.job_type == self.raw_message_embed_job_type:
+                document_id = int(job.payload.get("document_id", 0))
+                generation = int(job.payload.get("index_generation", 0))
+                if document_id and generation:
+                    document = session.get(RetrievalDocument, document_id)
+                    if (
+                        document is not None
+                        and document.group_id == job.group_id
+                        and document.embedding_generation == generation
+                        and document.status == "active"
+                    ):
+                        document.embedding_status = "failed"
+                        document.last_error_code = str(error_code or "")[:96]
+                        document.updated_at = _utc(now).replace(tzinfo=None)
+                        session.add(document)
             return will_retry
+
+    def load_raw_message_embedding(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        document_id: int,
+        embedding_generation: int,
+    ) -> tuple[int, int, str] | None:
+        with session_scope(self.engine) as session:
+            document = RetrievalDocumentRepository(
+                session
+            ).load_raw_message_embedding_document(
+                group_id=int(group_id),
+                message_id=int(message_id),
+                document_id=int(document_id),
+                embedding_generation=int(embedding_generation),
+            )
+            if document is None:
+                return None
+            return document.id, document.group_id, document.content
 
     def persist_shadow_result(
         self,
@@ -1209,6 +1442,8 @@ class MemoryBackgroundService:
     allocator_job_type = "episode_allocate"
     episode_job_type = "memory_episode_process"
     shadow_job_type = "memory_shadow_evaluate"
+    raw_message_projection_job_type = "raw_message_project"
+    raw_message_embed_job_type = "raw_message_embed"
 
     def __init__(
         self,
@@ -1229,6 +1464,8 @@ class MemoryBackgroundService:
         shadow_evaluator: ShadowEvaluator | None = None,
         lease_seconds: int = 60,
         poll_interval_seconds: float = 1.0,
+        reconciliation_interval_seconds: float = 30.0,
+        reconciliation_batch_size: int = 500,
     ) -> None:
         self.store = store
         self.deriver = deriver
@@ -1248,6 +1485,14 @@ class MemoryBackgroundService:
         self.shadow_evaluator = shadow_evaluator
         self.lease_seconds = max(1, int(lease_seconds))
         self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        self.reconciliation_interval_seconds = max(
+            0.1,
+            float(reconciliation_interval_seconds),
+        )
+        self.reconciliation_batch_size = max(
+            1,
+            int(reconciliation_batch_size),
+        )
         configure_generations = getattr(store, "configure_generations", None)
         if callable(configure_generations):
             configure_generations(
@@ -1257,6 +1502,7 @@ class MemoryBackgroundService:
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
+        self._next_reconciliation_at: datetime | None = None
 
     @property
     def worker_task(self) -> asyncio.Task[None] | None:
@@ -1309,6 +1555,23 @@ class MemoryBackgroundService:
             now=_utc(now or datetime.now(UTC)),
         )
         self._wake_event.set()
+        return queued
+
+    def enqueue_raw_message_index(
+        self,
+        *,
+        group_id: int,
+        message_id: int,
+        now: datetime | None = None,
+    ) -> BackgroundJob | None:
+        """Persist an ID-only projection request for retryable worker execution."""
+        queued = self.store.enqueue_raw_message_projection(
+            group_id=int(group_id),
+            message_id=int(message_id),
+            now=_utc(now or datetime.now(UTC)),
+        )
+        if queued is not None:
+            self._wake_event.set()
         return queued
 
     def enqueue_late_arrival(
@@ -1381,6 +1644,11 @@ class MemoryBackgroundService:
             self.store.recover_stale_jobs,
             now=datetime.now(UTC),
         )
+        await asyncio.to_thread(
+            self._reconcile_raw_message_projections,
+            datetime.now(UTC),
+            True,
+        )
         self._worker_task = asyncio.create_task(
             self._worker_loop(),
             name=f"memory-background-{self.worker_id}",
@@ -1440,10 +1708,16 @@ class MemoryBackgroundService:
             lease_seconds=self.lease_seconds,
         )
         if job is None:
+            if self._reconcile_raw_message_projections(resolved_now):
+                return True
             return self._close_idle_episode(resolved_now)
 
         try:
-            if job.job_type == self.allocator_job_type:
+            if job.job_type == self.raw_message_projection_job_type:
+                self._project_raw_message(job=job, now=resolved_now)
+            elif job.job_type == self.raw_message_embed_job_type:
+                self._embed_raw_message(job=job)
+            elif job.job_type == self.allocator_job_type:
                 self._allocate(job=job, now=resolved_now)
             elif job.job_type == self.episode_job_type:
                 self._derive_episode(job=job, now=resolved_now)
@@ -1483,6 +1757,81 @@ class MemoryBackgroundService:
                 job.claimed_generation,
             )
         return True
+
+    def _reconcile_raw_message_projections(
+        self,
+        now: datetime,
+        force: bool = False,
+    ) -> int:
+        if (
+            not force
+            and self._next_reconciliation_at is not None
+            and now < self._next_reconciliation_at
+        ):
+            return 0
+        self._next_reconciliation_at = now + timedelta(
+            seconds=self.reconciliation_interval_seconds
+        )
+        reconcile = getattr(
+            self.store,
+            "reconcile_raw_message_projections",
+            None,
+        )
+        if not callable(reconcile):
+            return 0
+        repaired = int(
+            reconcile(
+                now=now,
+                limit=self.reconciliation_batch_size,
+            )
+            or 0
+        )
+        if repaired >= self.reconciliation_batch_size:
+            self._next_reconciliation_at = now
+        if repaired:
+            self._wake_event.set()
+            logger.info(
+                "raw_message_projection_reconciled repairs=%s",
+                repaired,
+            )
+        return repaired
+
+    def _project_raw_message(
+        self,
+        *,
+        job: BackgroundJob,
+        now: datetime,
+    ) -> None:
+        """Reload canonical source and publish projection before vector enqueue."""
+        queued = self.store.project_raw_message_and_enqueue_embed(
+            group_id=job.group_id,
+            message_id=int(job.payload["message_id"]),
+            now=now,
+        )
+        if queued is not None:
+            self._wake_event.set()
+
+    def _embed_raw_message(self, *, job: BackgroundJob) -> None:
+        generation = int(job.payload["index_generation"])
+        loaded = self.store.load_raw_message_embedding(
+            group_id=job.group_id,
+            message_id=int(job.payload["message_id"]),
+            document_id=int(job.payload["document_id"]),
+            embedding_generation=generation,
+        )
+        if loaded is None:
+            return
+        document_id, group_id, content = loaded
+        if self.embedder is None or not self.embedder.available:
+            raise RuntimeError("raw message embedding provider is unavailable")
+        embeddings = self.embedder.embed_documents([content])
+        if embeddings is None or len(embeddings) != 1:
+            raise RuntimeError("raw message embedding provider returned no vector")
+        write_retrieval_vector_embeddings(
+            self.store.engine,
+            generation=generation,
+            rows=[(document_id, group_id, embeddings[0])],
+        )
 
     def recover_stale_jobs(self, *, now: datetime | None = None) -> int:
         """Release expired leases before a synchronous worker resumes processing."""
@@ -1809,7 +2158,10 @@ def _background_message(row) -> BackgroundMessage:
         ),
         mentioned_bot=bool(row.mentioned_bot),
         is_blocked=MessageRepository.is_qq_blocked_outbound(row),
-        is_reserved=MessageRepository.is_reserved_outbound(row),
+        is_reserved=(
+            MessageRepository.is_reserved_outbound(row)
+            or MessageRepository.is_delivery_uncertain_outbound(row)
+        ),
     )
 
 

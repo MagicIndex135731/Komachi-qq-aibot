@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -87,6 +88,27 @@ def test_reply_ancestor_and_direct_bot_reply_are_atomic_and_cycle_safe() -> None
     assert ("question", "answer") in segment.atomic_source_groups
 
 
+def test_reply_graph_hit_is_pinned_before_history_truncation() -> None:
+    rows = (item("question", 0),)
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: rows,
+        normal_radius=0,
+    )
+    reply_candidate = replace(
+        candidate(("question",)),
+        routes=("reply_graph",),
+        route_ranks=(("reply_graph", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(reply_candidate,),
+        mode="normal",
+    )[0]
+
+    assert segment.pinned is True
+
+
 def test_missing_or_cross_group_provenance_fails_closed() -> None:
     cross_group = (item("hit", 0, group_id=200),)
     expander = MemoryEvidenceExpander(episode_loader=lambda **_: cross_group)
@@ -111,3 +133,25 @@ def test_blocked_neighbor_sets_policy_signal_without_exposing_derived_text() -> 
     assert segment.blocked_output_present is True
     assert tuple(message.source_msg_id for message in segment.messages) == ("hit",)
     assert "text-blocked" not in " ".join(message.content for message in segment.messages)
+
+
+def test_raw_message_document_loads_exact_provenance_without_episode() -> None:
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda *, group_id, source_msg_ids: (
+            item(source_msg_ids[0], 3, group_id=group_id),
+        ),
+    )
+    raw_candidate = replace(
+        candidate(("raw-hit",), episode_id=None),
+        document_kind="raw_message_v3",
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert segment.episode_id == "raw:3"
+    assert tuple(message.source_msg_id for message in segment.messages) == ("raw-hit",)

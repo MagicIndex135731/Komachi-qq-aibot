@@ -34,6 +34,7 @@ class FakeBackgroundService:
         self.woken = 0
         self.enqueued: list[dict] = []
         self.late_enqueued: list[dict] = []
+        self.raw_message_enqueued: list[dict] = []
 
     async def start(self) -> None:
         self.started += 1
@@ -52,6 +53,12 @@ class FakeBackgroundService:
 
     def enqueue_late_arrival(self, **kwargs):
         self.late_enqueued.append(kwargs)
+        return object()
+
+    def enqueue_raw_message_index(self, **kwargs):
+        self.raw_message_enqueued.append(kwargs)
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
         return object()
 
 
@@ -407,6 +414,37 @@ def test_episode_enqueue_failure_is_best_effort_and_does_not_escape_reply_path(
     assert result is None
     assert background.enqueued[0]["group_id"] == 10001
     assert background.enqueued[0]["message_id"] == 99
+
+
+def test_raw_message_index_forward_is_thin_and_best_effort(sqlite_engine) -> None:
+    background = FakeBackgroundService()
+    service = MemoryCompactionService(
+        engine=sqlite_engine,
+        llm_client=FakeCompactionLlm("{}"),
+        background_service=background,
+    )
+    now = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+
+    result = service.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=99,
+        now=now,
+    )
+
+    assert result is not None
+    assert background.raw_message_enqueued == [
+        {"group_id": 10001, "message_id": 99, "now": now}
+    ]
+
+    background.enqueue_error = RuntimeError("index unavailable")
+    assert (
+        service.enqueue_raw_message_index(
+            group_id=10001,
+            message_id=100,
+            now=now,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

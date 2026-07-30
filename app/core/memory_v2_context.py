@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+import json
+import logging
+from time import perf_counter
 from typing import Protocol
 
 from app.core.memory_context_packer import (
     EvidenceMessage,
+    EvidenceSegment,
     MemoryContextPacker,
     MemoryFact,
     MemorySummary,
 )
+from app.core.memory_eligibility import eligible
 from app.core.hybrid_memory_retriever import MemoryScopeViolation
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQuery
 from app.core.member_identity import GroupMemberIdentity
+
+
+logger = logging.getLogger(__name__)
 
 
 class QueryResolver(Protocol):
@@ -29,6 +37,8 @@ class QueryResolver(Protocol):
         now: datetime | None,
         group_members: Sequence[GroupMemberIdentity] = (),
         excluded_member_ids: set[int] | frozenset[int] = frozenset(),
+        group_id: int | None = None,
+        requester_id: int | None = None,
     ) -> ResolvedMemoryQuery: ...
 
 
@@ -84,6 +94,8 @@ class MemoryV2ContextProvider:
         summary_loader: SummaryLoader | None = None,
         member_loader: MemberLoader | None = None,
         excluded_member_ids: set[int] | frozenset[int] = frozenset(),
+        historical_no_hit_omit_recent: bool = False,
+        observability_route: str = "",
     ) -> None:
         self._resolver = resolver
         self._retriever = retriever
@@ -94,37 +106,57 @@ class MemoryV2ContextProvider:
         self._summary_loader = summary_loader or (lambda **_: ())
         self._member_loader = member_loader
         self._excluded_member_ids = frozenset(int(item) for item in excluded_member_ids)
+        self._historical_no_hit_omit_recent = bool(historical_no_hit_omit_recent)
+        self._observability_route = str(observability_route).strip()
 
     def __call__(self, request: MemoryV2Request) -> MemoryContextResult:
         return self.evaluate(request).result
 
     def evaluate(self, request: MemoryV2Request) -> MemoryV2EvaluationTrace:
         """Run V2 and expose an in-memory, content-free evaluation trace."""
+        evaluation_started = perf_counter()
         self._validate_recent_scope(request)
         resolve_kwargs = {
             "recent_messages": request.recent_messages,
             "quoted_message": request.quoted_message,
             "now": request.now,
+            "group_id": request.group_id,
+            "requester_id": getattr(request, "current_user_id", None),
         }
         if self._member_loader is not None:
             resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
             resolve_kwargs["excluded_member_ids"] = self._excluded_member_ids
+        resolve_started = perf_counter()
         resolved = self._resolver.resolve(request.query, **resolve_kwargs)
+        resolve_ms = (perf_counter() - resolve_started) * 1000
+        retrieval_started = perf_counter()
         retrieval_result = self._retriever.retrieve(
             group_id=request.group_id,
             resolved_query=resolved,
         )
-        if bool(getattr(retrieval_result, "all_channels_failed", False)):
-            raise RuntimeError("all memory retrieval channels failed")
-        candidates = tuple(getattr(retrieval_result, "candidates"))
+        # Retrieval accelerators are optional. If every channel is unavailable,
+        # keep the request inside the scoped V3 path and emit explicit
+        # no-evidence grounding instead of falling into unscoped legacy memory.
+        candidates = (
+            ()
+            if bool(getattr(retrieval_result, "all_channels_failed", False))
+            else tuple(getattr(retrieval_result, "candidates"))
+        )
+        retrieval_ms = (perf_counter() - retrieval_started) * 1000
         mode = "detail" if resolved.needs_detail else "normal"
-        segments = tuple(
+        expansion_started = perf_counter()
+        expanded_segments = tuple(
             self._expander.expand(
                 group_id=request.group_id,
                 candidates=candidates,
                 mode=mode,
             )
         )
+        segments = self._pin_required_segments(
+            self._eligible_segments(expanded_segments, resolved),
+            resolved,
+        )
+        expansion_ms = (perf_counter() - expansion_started) * 1000
         facts = tuple(
             self._fact_loader(
                 group_id=request.group_id,
@@ -142,15 +174,38 @@ class MemoryV2ContextProvider:
             facts=facts,
             summaries=summaries,
         )
+        packing_started = perf_counter()
         packed = self._packer.pack(
             mode,
             available_input=request.available_input,
             target_message_id=request.target_message_id,
-            recent_messages=request.recent_messages,
+            recent_messages=(
+                ()
+                if self._historical_no_hit_omit_recent
+                and resolved.needs_history
+                and not segments
+                else request.recent_messages
+            ),
             evidence_segments=segments,
             facts=facts,
             summaries=summaries,
         )
+        if (
+            self._historical_no_hit_omit_recent
+            and resolved.needs_history
+            and packed.recent_messages
+            and not packed.evidence_segments
+        ):
+            packed = self._packer.pack(
+                mode,
+                available_input=request.available_input,
+                target_message_id=request.target_message_id,
+                recent_messages=(),
+                evidence_segments=segments,
+                facts=facts,
+                summaries=summaries,
+            )
+        packing_ms = (perf_counter() - packing_started) * 1000
         if packed.source_msg_ids and not self._source_scope_validator(
             request.group_id,
             packed.source_msg_ids,
@@ -163,6 +218,62 @@ class MemoryV2ContextProvider:
             estimated_tokens=packed.estimated_tokens,
             mode="v2",
         )
+        if self._observability_route:
+            expanded_source_count = sum(
+                len(segment.messages) for segment in expanded_segments
+            )
+            eligible_source_count = sum(
+                len(segment.messages) for segment in segments
+            )
+            logger.info(
+                "memory_query_metrics route=%s group_id=%s answer_mode=%s "
+                "coverage=%s has_subject=%s subject_ambiguous=%s has_time=%s "
+                "attempted_channels=%s failed_channels=%s channel_counts=%s "
+                "candidate_units=%s expanded_sources=%s rejected_sources=%s "
+                "selected_source_ids=%s recent_messages=%s history_messages=%s "
+                "recent_tokens=%s history_tokens=%s total_tokens=%s "
+                "resolve_ms=%.3f retrieval_ms=%.3f expansion_ms=%.3f "
+                "packing_ms=%.3f total_ms=%.3f",
+                self._observability_route,
+                request.group_id,
+                resolved.answer_mode,
+                resolved.coverage_mode,
+                resolved.subject_ids is not None,
+                resolved.subject_ids == (),
+                resolved.time_range is not None,
+                json.dumps(
+                    list(getattr(retrieval_result, "attempted_channels", ())),
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    list(getattr(retrieval_result, "failed_channels", ())),
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    list(
+                        getattr(
+                            retrieval_result,
+                            "channel_candidate_counts",
+                            (),
+                        )
+                    ),
+                    separators=(",", ":"),
+                ),
+                len(candidates),
+                expanded_source_count,
+                max(0, expanded_source_count - eligible_source_count),
+                json.dumps(list(packed.source_msg_ids), separators=(",", ":")),
+                len(packed.recent_messages),
+                sum(len(segment.messages) for segment in packed.evidence_segments),
+                packed.recent_estimated_tokens,
+                packed.history_estimated_tokens,
+                packed.estimated_tokens,
+                resolve_ms,
+                retrieval_ms,
+                expansion_ms,
+                packing_ms,
+                (perf_counter() - evaluation_started) * 1000,
+            )
         retrieved_source_msg_ids = tuple(
             dict.fromkeys(
                 str(source_id)
@@ -206,6 +317,73 @@ class MemoryV2ContextProvider:
                     (),
                 )
             ),
+        )
+
+    @staticmethod
+    def _eligible_segments(
+        segments: Sequence[EvidenceSegment],
+        resolved: ResolvedMemoryQuery,
+    ) -> tuple[EvidenceSegment, ...]:
+        """Revalidate every expanded raw source against the resolved plan."""
+
+        validated: list[EvidenceSegment] = []
+        for segment in segments:
+            allowed_messages = tuple(
+                message for message in segment.messages if eligible(message, resolved)
+            )
+            allowed_ids = {message.source_msg_id for message in allowed_messages}
+            # A hit source is the provenance that authorized this segment. If
+            # any hit fails closed, discard the segment instead of retaining
+            # surrounding context under a different identity/time boundary.
+            if any(
+                source_id not in allowed_ids
+                for source_id in segment.hit_source_msg_ids
+            ):
+                continue
+            if not allowed_messages:
+                continue
+            validated.append(
+                replace(
+                    segment,
+                    messages=allowed_messages,
+                    hit_source_msg_ids=tuple(
+                        source_id
+                        for source_id in segment.hit_source_msg_ids
+                        if source_id in allowed_ids
+                    ),
+                    atomic_source_groups=tuple(
+                        group
+                        for group in segment.atomic_source_groups
+                        if set(group) <= allowed_ids
+                    ),
+                )
+            )
+        return tuple(validated)
+
+    @staticmethod
+    def _pin_required_segments(
+        segments: Sequence[EvidenceSegment],
+        resolved: ResolvedMemoryQuery,
+    ) -> tuple[EvidenceSegment, ...]:
+        """Protect direct references and mention hits from later truncation."""
+
+        required_ids = frozenset(resolved.reference_msg_ids)
+        pin_all = resolved.answer_mode == "mention"
+        return tuple(
+            replace(
+                segment,
+                pinned=(
+                    segment.pinned
+                    or pin_all
+                    or bool(
+                        required_ids.intersection(
+                            message.source_msg_id
+                            for message in segment.messages
+                        )
+                    )
+                ),
+            )
+            for segment in segments
         )
 
     @staticmethod

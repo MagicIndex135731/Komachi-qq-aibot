@@ -23,7 +23,60 @@ from app.main import (
     sync_history_archives,
 )
 from app.runtime_heartbeat import RuntimeHeartbeat
-from app.storage.db import build_engine, create_all
+from app.storage.db import build_engine, create_all, session_scope
+from app.storage.repositories import MessageRepository, RetrievalDocumentRepository
+
+
+def _revoke_group_message_projection(
+    engine,
+    *,
+    group_id: int,
+    platform_msg_id: str,
+) -> tuple[int | None, int]:
+    with session_scope(engine) as session:
+        message = MessageRepository(session).mark_group_message_deleted(
+            group_id=int(group_id),
+            platform_msg_id=str(platform_msg_id),
+            reason="group_recall",
+        )
+        if message is None:
+            return None, 0
+        session.flush()
+        revoked = RetrievalDocumentRepository(
+            session
+        ).deactivate_raw_message_v3(
+            group_id=int(group_id),
+            message_id=int(message.id),
+        )
+        return int(message.id), revoked
+
+
+async def _handle_group_recall_payload(payload: dict, *, engine) -> bool:
+    if (
+        payload.get("post_type") != "notice"
+        or payload.get("notice_type") != "group_recall"
+    ):
+        return False
+    try:
+        group_id = int(payload["group_id"])
+        platform_msg_id = str(payload["message_id"])
+    except (KeyError, TypeError, ValueError):
+        logging.warning("group_recall_invalid_payload")
+        return True
+    message_id, revoked = await asyncio.to_thread(
+        _revoke_group_message_projection,
+        engine,
+        group_id=group_id,
+        platform_msg_id=platform_msg_id,
+    )
+    logging.info(
+        "group_recall_processed group_id=%s message_id=%s found=%s revoked=%s",
+        group_id,
+        platform_msg_id,
+        message_id is not None,
+        revoked,
+    )
+    return True
 
 
 async def run() -> None:
@@ -78,6 +131,8 @@ async def run() -> None:
     )
 
     async def handle_payload(payload: dict) -> None:
+        if await _handle_group_recall_payload(payload, engine=engine):
+            return
         if payload.get("post_type") != "message":
             return
         if payload.get("message_type") != "group":

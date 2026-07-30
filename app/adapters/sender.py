@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import logging
 from pathlib import Path
-
-
-logger = logging.getLogger(__name__)
 
 
 class QQMessageBlockedError(RuntimeError):
     """QQ accepted the request but never echoed the bot message back."""
+
+
+class QQMessageDeliveryUncertainError(RuntimeError):
+    """The send request may have been accepted, so repeating it is unsafe."""
 
 
 @dataclass(slots=True)
@@ -28,9 +28,6 @@ class OutboundPrivateMessage:
 
 
 class Sender:
-    RETRYABLE_RETCODES = {1200}
-    MAX_SEND_ATTEMPTS = 3
-    RETRY_DELAY_SECONDS = 0.25
     MAX_TEXT_CHUNK_LENGTH = 180
 
     def __init__(self, gateway) -> None:
@@ -54,7 +51,7 @@ class Sender:
 
     async def send_group_image(self, *, group_id: int, image_file: str) -> None:
         image_uri = Path(image_file).resolve().as_uri()
-        await self._send_with_retry(
+        await self._send_once(
             action="send_group_msg",
             params={
                 "group_id": group_id,
@@ -69,7 +66,7 @@ class Sender:
 
     async def send_private_image(self, *, user_id: int, image_file: str) -> None:
         image_uri = Path(image_file).resolve().as_uri()
-        await self._send_with_retry(
+        await self._send_once(
             action="send_private_msg",
             params={
                 "user_id": user_id,
@@ -82,30 +79,14 @@ class Sender:
             },
         )
 
-    async def _send_with_retry(self, *, action: str, params: dict) -> None:
-        last_error: Exception | None = None
-        for attempt in range(1, self.MAX_SEND_ATTEMPTS + 1):
-            try:
-                response = await self.gateway.call_api(action, params)
-                self._require_ok(response, action=action)
-                return
-            except Exception as exc:
-                last_error = exc
-                if attempt >= self.MAX_SEND_ATTEMPTS:
-                    if self._is_qq_message_blocked_failure(exc, action=action):
-                        raise QQMessageBlockedError(str(exc)) from exc
-                    raise
-                if not self._is_retryable_send_failure(exc):
-                    raise
-                logger.warning(
-                    "sender_retry action=%s attempt=%s reason=%s",
-                    action,
-                    attempt,
-                    type(exc).__name__,
-                )
-                await asyncio.sleep(self.RETRY_DELAY_SECONDS)
-        if last_error is not None:
-            raise last_error
+    async def _send_once(self, *, action: str, params: dict) -> None:
+        try:
+            response = await self.gateway.call_api(action, params)
+            self._require_ok(response, action=action)
+        except Exception as exc:
+            if self._is_delivery_uncertain_failure(exc, action=action):
+                raise QQMessageDeliveryUncertainError(str(exc)) from exc
+            raise
 
     def _require_ok(self, response: dict | None, *, action: str) -> None:
         payload = response or {}
@@ -116,45 +97,33 @@ class Sender:
         message = str(payload.get("message") or payload.get("wording") or "").strip()
         raise RuntimeError(f"{action} failed: status={status or 'unknown'} retcode={retcode} message={message}")
 
-    def _is_retryable_send_failure(self, error: Exception) -> bool:
+    def _is_delivery_uncertain_failure(self, error: Exception, *, action: str) -> bool:
+        if action not in {"send_group_msg", "send_private_msg"}:
+            return False
         if isinstance(error, asyncio.TimeoutError):
             return True
         if isinstance(error, ConnectionError):
             return True
-        text = str(error)
-        if "retcode=1200" in text:
-            return True
-        return "timeout" in text.lower()
-
-    def _is_qq_message_blocked_failure(self, error: Exception, *, action: str) -> bool:
         text = str(error).lower()
-        return action == "send_group_msg" and "retcode=1200" in text and "waitforselfecho timeout" in text
+        return (
+            "waitforselfecho timeout" in text
+            or ("nodeikernelmsgservice/sendmsg" in text and "timeout" in text)
+        )
 
     async def _send_text_message(self, *, action: str, target_params: dict, text: str, allow_chunking: bool) -> None:
         normalized = str(text).strip()
         if allow_chunking:
             for chunk in self._split_text_chunks(normalized):
-                await self._send_with_retry(
+                await self._send_once(
                     action=action,
                     params={**target_params, "message": chunk},
                 )
             return
 
-        try:
-            await self._send_with_retry(
-                action=action,
-                params={**target_params, "message": normalized},
-            )
-        except Exception as exc:
-            if isinstance(exc, QQMessageBlockedError):
-                raise
-            if not normalized or len(normalized) <= self.MAX_TEXT_CHUNK_LENGTH or not self._is_retryable_send_failure(exc):
-                raise
-            for chunk in self._split_text_chunks(normalized):
-                await self._send_with_retry(
-                    action=action,
-                    params={**target_params, "message": chunk},
-                )
+        await self._send_once(
+            action=action,
+            params={**target_params, "message": normalized},
+        )
 
     def _split_text_chunks(self, text: str) -> list[str]:
         normalized = str(text).strip()

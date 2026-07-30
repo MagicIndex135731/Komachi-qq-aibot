@@ -14,6 +14,7 @@ from app.core.memory_context_packer import EvidenceMessage, EvidenceSegment
 
 ExpansionMode = Literal["normal", "detail"]
 EpisodeLoader = Callable[..., Sequence[EvidenceMessage]]
+SourceLoader = Callable[..., Sequence[EvidenceMessage]]
 
 
 class MemoryEvidenceExpander:
@@ -28,6 +29,7 @@ class MemoryEvidenceExpander:
         self,
         *,
         episode_loader: EpisodeLoader,
+        source_loader: SourceLoader | None = None,
         normal_radius: int = 5,
         detail_radius: int = 10,
         normal_segment_limit: int = 4,
@@ -39,6 +41,7 @@ class MemoryEvidenceExpander:
         if min(normal_segment_limit, detail_segment_limit) <= 0:
             raise ValueError("segment limits must be positive")
         self._episode_loader = episode_loader
+        self._source_loader = source_loader
         self._radii = {"normal": normal_radius, "detail": detail_radius}
         self._limits = {
             "normal": normal_segment_limit,
@@ -78,8 +81,9 @@ class MemoryEvidenceExpander:
                 f"candidate scope mismatch document_id={candidate.document_id}"
             )
         if candidate.episode_id is None:
-            raise MemoryScopeViolation(
-                f"candidate has no episode document_id={candidate.document_id}"
+            return self._expand_source_document(
+                group_id=group_id,
+                candidate=candidate,
             )
         loaded = tuple(
             self._episode_loader(
@@ -150,6 +154,57 @@ class MemoryEvidenceExpander:
             hit_source_msg_ids=candidate.source_msg_ids,
             document_id=str(candidate.document_id),
             atomic_source_groups=tuple(atomic_groups),
-            pinned="exact_quote" in candidate.routes,
+            pinned=bool(
+                {"exact_quote", "reply_graph"}.intersection(candidate.routes)
+            ),
+            blocked_output_present=blocked_output_present,
+        )
+
+    def _expand_source_document(
+        self,
+        *,
+        group_id: int,
+        candidate: FusedRetrievalCandidate,
+    ) -> EvidenceSegment | None:
+        if self._source_loader is None:
+            raise MemoryScopeViolation(
+                f"candidate has no episode document_id={candidate.document_id}"
+            )
+        loaded = tuple(
+            self._source_loader(
+                group_id=group_id,
+                source_msg_ids=candidate.source_msg_ids,
+            )
+        )
+        by_id = {row.source_msg_id: row for row in loaded}
+        if (
+            len(by_id) != len(loaded)
+            or any(
+                row.group_id is None or int(row.group_id) != int(group_id)
+                for row in loaded
+            )
+            or any(source_id not in by_id for source_id in candidate.source_msg_ids)
+        ):
+            raise MemoryScopeViolation(
+                f"unverified raw provenance document_id={candidate.document_id}"
+            )
+        blocked_output_present = any(row.blocked for row in loaded)
+        selected = tuple(
+            sorted(
+                (by_id[source_id] for source_id in candidate.source_msg_ids if not by_id[source_id].blocked),
+                key=lambda row: (row.sent_at, row.source_msg_id),
+            )
+        )
+        if not selected:
+            return None
+        return EvidenceSegment(
+            episode_id=f"raw:{candidate.document_id}",
+            fused_score=candidate.fused_score,
+            messages=selected,
+            hit_source_msg_ids=tuple(row.source_msg_id for row in selected),
+            document_id=str(candidate.document_id),
+            pinned=bool(
+                {"exact_quote", "reply_graph"}.intersection(candidate.routes)
+            ),
             blocked_output_present=blocked_output_present,
         )

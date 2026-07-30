@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.core.memory_background_service import (
     BackgroundEpisode,
@@ -21,7 +21,14 @@ from app.core.memory_background_service import (
     SqlAlchemyMemoryBackgroundStore,
     _compatible_segmentation_generation,
 )
-from app.storage.db import session_scope
+from app.storage.db import (
+    activate_retrieval_vector_generation,
+    create_retrieval_vector_generation,
+    refresh_retrieval_vector_generation,
+    session_scope,
+    write_retrieval_vector_embeddings,
+)
+from app.storage.models import Job, Message, RetrievalDocument
 from app.storage.repositories import (
     EpisodeRepository,
     GroupRepository,
@@ -494,6 +501,13 @@ class FakeEmbedder:
         return [[float(index), 1.0] for index, _document in enumerate(values)]
 
 
+class UnavailableEmbedder:
+    available = False
+
+    def embed_documents(self, documents):
+        raise AssertionError("unavailable embedder must not be called")
+
+
 class FakeShadowEvaluator:
     def __init__(
         self,
@@ -574,6 +588,681 @@ def test_enqueue_is_constant_scope_and_allocation_runs_only_in_worker() -> None:
     assert service.run_once(now=NOW)
     assert len(store.episodes) == 1
     assert [message.id for message in store.episode_messages[1]] == [1]
+
+
+def test_sqlalchemy_raw_message_projection_queues_id_only_jobs_and_fts_survives_embedding_failure(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="test",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=42,
+            nickname="Alice",
+            group_card="Alice",
+        )
+        message = MessageRepository(session).add_group_message(
+            platform_msg_id="raw-message-job",
+            group_id=10001,
+            user_id=42,
+            timestamp=NOW,
+            plain_text="异步向量失败仍然可以全文检索",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        message_id = message.id
+
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=7,
+        max_attempts=3,
+    )
+    service = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="raw-message-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        index_generation="vector:7",
+        embedder=UnavailableEmbedder(),
+    )
+    queued = service.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=message_id,
+        now=NOW,
+    )
+    assert queued is not None
+    assert queued.job_type == "raw_message_project"
+    assert set(queued.payload) == {
+        "group_id",
+        "message_id",
+    }
+    assert "异步向量失败" not in str(queued.payload)
+
+    # The enqueue path only durably records IDs. Projection is worker-owned.
+    with session_scope(sqlite_engine) as session:
+        assert (
+            RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+                group_id=10001,
+                query="全文检索",
+                limit=10,
+                document_kinds=("raw_message_v3",),
+            )
+            == []
+        )
+
+    # Projection succeeds first and only then schedules the embedding job.
+    assert service.run_once(now=NOW)
+    with session_scope(sqlite_engine) as session:
+        projection = session.get(Job, queued.id)
+        embed_jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_embed",
+            statuses=["queued"],
+        )
+        assert projection is not None
+        assert projection.status == "completed"
+        assert len(embed_jobs) == 1
+        assert set(embed_jobs[0].payload_json) == {
+            "group_id",
+            "message_id",
+            "document_id",
+            "index_generation",
+        }
+        assert "异步向量失败" not in str(embed_jobs[0].payload_json)
+
+    assert service.run_once(now=NOW)
+    assert service.run_once(now=NOW + timedelta(seconds=5))
+    assert service.run_once(now=NOW + timedelta(seconds=15))
+
+    with session_scope(sqlite_engine) as session:
+        failed_embed = JobRepository(session).list_jobs(
+            job_type="raw_message_embed",
+            statuses=["failed"],
+        )
+        assert len(failed_embed) == 1
+        hits = RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+            group_id=10001,
+            query="全文检索",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        )
+        assert [hit.source_msg_ids for hit in hits] == [("raw-message-job",)]
+
+
+def test_deleted_message_is_rechecked_before_raw_embedding(sqlite_engine) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="must never reach embedder after delete")],
+    )[0]
+    embedder = FakeEmbedder()
+    service = MemoryBackgroundService(
+        store=SqlAlchemyMemoryBackgroundStore(
+            sqlite_engine,
+            raw_message_projection_enabled=True,
+            raw_message_embedding_enabled=True,
+            raw_message_embedding_generation=7,
+        ),
+        deriver=FakeDeriver(),
+        worker_id="deleted-before-embed",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        index_generation="vector:7",
+        embedder=embedder,
+    )
+    service.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=message_id,
+        now=NOW,
+    )
+    assert service.run_once(now=NOW)
+
+    with session_scope(sqlite_engine) as session:
+        message = session.get(Message, message_id)
+        assert message is not None
+        message.raw_json = {"delivery_state": "deleted"}
+
+    assert service.run_once(now=NOW + timedelta(seconds=1))
+    assert embedder.payloads == []
+    with session_scope(sqlite_engine) as session:
+        document = session.scalars(
+            select(RetrievalDocument).where(
+                RetrievalDocument.document_kind == "raw_message_v3",
+                RetrievalDocument.source_id == str(message_id),
+            )
+        ).one()
+        assert document.status == "inactive"
+        assert document.embedding_status == "stale"
+
+
+def test_sqlalchemy_raw_message_projection_failure_retries_from_persisted_id_job(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="投影失败后恢复的原始消息")],
+    )[0]
+    original_project = RetrievalDocumentRepository.project_raw_message_v3
+    attempts = 0
+
+    def flaky_project(self, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary projection failure")
+        return original_project(self, **kwargs)
+
+    monkeypatch.setattr(
+        RetrievalDocumentRepository,
+        "project_raw_message_v3",
+        flaky_project,
+    )
+    first_store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=7,
+        max_attempts=3,
+    )
+    first_worker = MemoryBackgroundService(
+        store=first_store,
+        deriver=FakeDeriver(),
+        worker_id="projection-worker-before-restart",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        index_generation="vector:7",
+        embedder=UnavailableEmbedder(),
+    )
+    queued = first_worker.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=message_id,
+        now=NOW,
+    )
+
+    assert queued is not None
+    assert queued.job_type == "raw_message_project"
+    assert set(queued.payload) == {"group_id", "message_id"}
+    assert first_worker.run_once(now=NOW)
+    with session_scope(sqlite_engine) as session:
+        persisted = session.get(Job, queued.id)
+        assert persisted is not None
+        assert persisted.status == "queued"
+        assert persisted.attempt_count == 1
+        assert persisted.last_error_code == "RuntimeError"
+        assert (
+            RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+                group_id=10001,
+                query="投影失败",
+                limit=10,
+                document_kinds=("raw_message_v3",),
+            )
+            == []
+        )
+        assert (
+            JobRepository(session).list_jobs(
+                job_type="raw_message_embed",
+                statuses=["queued", "running", "completed", "failed"],
+            )
+            == []
+        )
+
+    # A fresh worker instance can resume the persisted projection job.
+    restarted_store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=7,
+        max_attempts=3,
+    )
+    restarted_worker = MemoryBackgroundService(
+        store=restarted_store,
+        deriver=FakeDeriver(),
+        worker_id="projection-worker-after-restart",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        index_generation="vector:7",
+        embedder=UnavailableEmbedder(),
+    )
+    assert restarted_worker.run_once(now=NOW + timedelta(seconds=5))
+
+    with session_scope(sqlite_engine) as session:
+        persisted = session.get(Job, queued.id)
+        assert persisted is not None
+        assert persisted.status == "completed"
+        hits = RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+            group_id=10001,
+            query="投影失败",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        )
+        assert [hit.source_msg_ids for hit in hits] == [("m-1",)]
+        embed_jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_embed",
+            statuses=["queued"],
+        )
+        assert len(embed_jobs) == 1
+
+
+def test_sqlalchemy_raw_message_projection_recovers_expired_worker_lease(
+    sqlite_engine,
+) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="崩溃 worker 遗留的投影任务")],
+    )[0]
+    base = NOW - timedelta(seconds=10)
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        raw_message_embedding_enabled=False,
+    )
+    queued = store.enqueue_raw_message_projection(
+        group_id=10001,
+        message_id=message_id,
+        now=base,
+    )
+    with session_scope(sqlite_engine) as session:
+        claimed = JobRepository(session).claim_coalescing_job(
+            job_type="raw_message_project",
+            worker_id="crashed-projection-worker",
+            now=base,
+            lease_seconds=1,
+            target_generation="raw-message-v3",
+        )
+        assert claimed is not None
+
+    restarted = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="restarted-projection-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        embedder=UnavailableEmbedder(),
+    )
+    assert restarted.recover_stale_jobs(now=NOW) == 1
+    assert restarted.run_once(now=NOW)
+
+    with session_scope(sqlite_engine) as session:
+        persisted = session.get(Job, queued.id)
+        assert persisted is not None
+        assert persisted.status == "completed"
+        hits = RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+            group_id=10001,
+            query="投影任务",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        )
+        assert [hit.source_msg_ids for hit in hits] == [("m-1",)]
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_committed_message_that_was_never_enqueued(
+    sqlite_engine,
+) -> None:
+    _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="提交后崩溃但从未入队的消息")],
+    )
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        raw_message_embedding_enabled=False,
+    )
+    worker = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="startup-reconciliation-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        poll_interval_seconds=0.01,
+    )
+
+    await worker.start()
+    for _ in range(100):
+        with session_scope(sqlite_engine) as session:
+            hits = RetrievalDocumentRepository(
+                session
+            ).search_group_documents_fts_hits(
+                group_id=10001,
+                query="从未入队",
+                limit=10,
+                document_kinds=("raw_message_v3",),
+            )
+        if hits:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.wait_for(worker.stop(), timeout=1.0)
+
+    assert [hit.source_msg_ids for hit in hits] == [("m-1",)]
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_project",
+            statuses=["completed"],
+        )
+        assert len(jobs) == 1
+        assert set(jobs[0].payload_json) == {"group_id", "message_id"}
+
+
+def test_reconciliation_revokes_an_existing_projection_after_source_deletion(
+    sqlite_engine,
+) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="reconciliation must revoke this projection")],
+    )[0]
+    with session_scope(sqlite_engine) as session:
+        projected = RetrievalDocumentRepository(
+            session
+        ).project_raw_message_v3(
+            group_id=10001,
+            message_id=message_id,
+        )
+        assert projected is not None
+        message = session.get(Message, message_id)
+        assert message is not None
+        message.raw_json = {"delivery_state": "deleted"}
+
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        raw_message_embedding_enabled=False,
+    )
+    assert store.reconcile_raw_message_projections(now=NOW, limit=10) == 1
+
+    with session_scope(sqlite_engine) as session:
+        projected = session.scalars(
+            select(RetrievalDocument).where(
+                RetrievalDocument.document_kind == "raw_message_v3",
+                RetrievalDocument.source_id == str(message_id),
+            )
+        ).one()
+        assert projected.status == "inactive"
+        assert projected.embedding_status == "stale"
+        assert JobRepository(session).list_jobs(
+            job_type="raw_message_project",
+            statuses=["queued", "running", "completed", "failed"],
+        ) == []
+
+
+@pytest.mark.asyncio
+async def test_default_v2_store_does_not_project_or_inherit_legacy_generation(
+    sqlite_engine,
+) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="V2 safe-off 不得扫描或投影")],
+    )[0]
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        # A legacy episode generation must never become the raw generation.
+        embedding_generation=7,
+    )
+    worker = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="v2-safe-off-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        poll_interval_seconds=0.01,
+    )
+
+    assert (
+        worker.enqueue_raw_message_index(
+            group_id=10001,
+            message_id=message_id,
+            now=NOW,
+        )
+        is None
+    )
+    await worker.start()
+    await asyncio.sleep(0.03)
+    await asyncio.wait_for(worker.stop(), timeout=1.0)
+
+    assert store.raw_message_projection_enabled is False
+    assert store.raw_message_embedding_enabled is False
+    assert store.raw_message_embedding_generation is None
+    with session_scope(sqlite_engine) as session:
+        raw_documents = list(
+            session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.document_kind == "raw_message_v3"
+                )
+            )
+        )
+        projection_jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_project",
+            statuses=["queued", "running", "completed", "failed"],
+        )
+        embed_jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_embed",
+            statuses=["queued", "running", "completed", "failed"],
+        )
+        assert raw_documents == []
+        assert projection_jobs == []
+        assert embed_jobs == []
+
+
+def test_periodic_reconciliation_picks_up_runtime_raw_generation_activation(
+    sqlite_engine,
+) -> None:
+    first_message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="激活 generation 前提交的消息")],
+    )[0]
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        embedding_provider="fake",
+        embedding_model="semantic",
+        embedding_version="v1",
+        embedding_dimensions=2,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=None,
+    )
+    worker = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="dynamic-generation-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        reconciliation_interval_seconds=5,
+        embedder=UnavailableEmbedder(),
+    )
+
+    # Before activation the sweep still repairs FTS/provenance, but correctly
+    # creates no embedding job and does not borrow a legacy generation.
+    assert worker.run_once(now=NOW)
+    assert worker.run_once(now=NOW)
+    with session_scope(sqlite_engine) as session:
+        document = RetrievalDocumentRepository(
+            session
+        ).project_raw_message_v3(
+            group_id=10001,
+            message_id=first_message_id,
+        )
+        assert document is not None
+        assert document.embedding_generation is None
+        assert document.embedding_status == "disabled"
+        assert (
+            JobRepository(session).list_jobs(
+                job_type="raw_message_embed",
+                statuses=["queued", "running", "completed", "failed"],
+            )
+            == []
+        )
+
+    generation = create_retrieval_vector_generation(
+        sqlite_engine,
+        provider="fake",
+        model="semantic",
+        dimensions=2,
+        version="v1",
+        document_family="raw_message_v3",
+    )
+    assert generation is not None
+    with session_scope(sqlite_engine) as session:
+        first_document = RetrievalDocumentRepository(
+            session
+        ).project_raw_message_v3(
+            group_id=10001,
+            message_id=first_message_id,
+            embedding_generation=generation,
+        )
+        assert first_document is not None
+        first_document_id = int(first_document.id)
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=generation,
+        rows=[(first_document_id, 10001, [1.0, 0.0])],
+    ) == 1
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        expected_active_generation=None,
+    )
+
+    with session_scope(sqlite_engine) as session:
+        first_document = RetrievalDocumentRepository(
+            session
+        ).load_raw_message_embedding_document(
+            group_id=10001,
+            message_id=first_message_id,
+            document_id=int(
+                session.scalar(
+                    text(
+                        "SELECT id FROM retrieval_documents "
+                        "WHERE document_kind = 'raw_message_v3' "
+                        "AND source_id = :source_id AND status = 'active'"
+                    ),
+                    {"source_id": str(first_message_id)},
+                )
+            ),
+            embedding_generation=generation,
+        )
+        assert first_document is not None
+
+    second_message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(2, minute=1, text="激活后无需重启的新消息")],
+    )[0]
+    worker.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=second_message_id,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert worker.run_once(now=NOW + timedelta(seconds=5))
+    with session_scope(sqlite_engine) as session:
+        active_documents = list(
+            session.execute(
+                text(
+                    "SELECT source_id, embedding_generation "
+                    "FROM retrieval_documents "
+                    "WHERE document_kind = 'raw_message_v3' AND status = 'active' "
+                    "ORDER BY source_id"
+                )
+            )
+        )
+        assert active_documents == [
+            (str(first_message_id), generation),
+            (str(second_message_id), generation),
+        ]
+        embed_jobs = JobRepository(session).list_jobs(
+            job_type="raw_message_embed",
+            statuses=["queued"],
+        )
+        assert len(embed_jobs) == 1
+        assert all(
+            int(job.payload_json["index_generation"]) == generation
+            for job in embed_jobs
+        )
+
+
+@pytest.mark.parametrize(
+    "delivery_state,failure_kind",
+    [
+        ("blocked", "qq_sensitive_content"),
+        ("uncertain", "delivery_result_unknown"),
+    ],
+)
+def test_sqlalchemy_raw_message_projection_job_fails_closed_for_unsafe_outbound(
+    sqlite_engine,
+    delivery_state: str,
+    failure_kind: str,
+) -> None:
+    message_id = _seed_sqlite_messages(
+        sqlite_engine,
+        [_message(1, minute=0, text="绝不能进入检索的待确认输出")],
+    )[0]
+    with session_scope(sqlite_engine) as session:
+        message = MessageRepository(session).get_by_platform_msg_id("m-1")
+        assert message is not None
+        # Seed an old active projection, then change the canonical delivery
+        # state before the durable worker replays the source row.
+        projected = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message_id,
+            embedding_generation=7,
+        )
+        assert projected is not None
+        message.raw_json = {
+            "direction": "outbound",
+            "delivery_state": delivery_state,
+            "failure_kind": failure_kind,
+        }
+        session.add(message)
+
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=7,
+    )
+    worker = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id=f"unsafe-{delivery_state}-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        index_generation="vector:7",
+        embedder=UnavailableEmbedder(),
+    )
+    queued = worker.enqueue_raw_message_index(
+        group_id=10001,
+        message_id=message_id,
+        now=NOW,
+    )
+
+    assert queued is not None
+    assert worker.run_once(now=NOW)
+    with session_scope(sqlite_engine) as session:
+        persisted = session.get(Job, queued.id)
+        assert persisted is not None
+        assert persisted.status == "completed"
+        assert (
+            RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+                group_id=10001,
+                query="绝不能进入检索",
+                limit=10,
+                document_kinds=("raw_message_v3",),
+            )
+            == []
+        )
+        assert (
+            JobRepository(session).list_jobs(
+                job_type="raw_message_embed",
+                statuses=["queued", "running", "completed", "failed"],
+            )
+            == []
+        )
 
 
 def test_allocator_closes_at_boundary_but_extends_continuous_bot_reply() -> None:

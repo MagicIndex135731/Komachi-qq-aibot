@@ -162,6 +162,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
 
     assert settings.memory_orchestration_v2_enabled is False
     assert settings.memory_orchestration_shadow_mode is False
+    assert settings.memory_raw_v3_enabled is False
     assert settings.memory_embedding_provider == "local"
     assert settings.memory_embedding_device == "cpu"
     assert settings.memory_embedding_local_files_only is False
@@ -184,6 +185,8 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_normal_context_budget_tokens == 32000
     assert settings.memory_detail_context_budget_tokens == 64000
     assert settings.memory_recent_context_budget_tokens == 10000
+    assert settings.memory_history_context_budget_tokens == 24000
+    assert settings.memory_max_evidence_messages == 150
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30
     assert settings.memory_final_episode_limit == 6
