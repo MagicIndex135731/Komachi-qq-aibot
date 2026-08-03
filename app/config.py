@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -109,6 +109,45 @@ class AppSettings(BaseSettings):
         default=12000,
         alias="MEMORY_CONTEXT_BUDGET_CHARS",
     )
+    memory_adaptive_context_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_ADAPTIVE_CONTEXT_ENABLED",
+    )
+    memory_adaptive_context_budget_chars: int = Field(
+        default=48000,
+        gt=0,
+        alias="MEMORY_ADAPTIVE_CONTEXT_BUDGET_CHARS",
+    )
+    memory_recent_protected_min_tokens: int = Field(
+        default=1200,
+        ge=0,
+        alias="MEMORY_RECENT_PROTECTED_MIN_TOKENS",
+    )
+    memory_history_protected_min_tokens: int = Field(
+        default=2400,
+        ge=0,
+        alias="MEMORY_HISTORY_PROTECTED_MIN_TOKENS",
+    )
+    memory_recent_protected_min_messages: int = Field(
+        default=1,
+        ge=0,
+        alias="MEMORY_RECENT_PROTECTED_MIN_MESSAGES",
+    )
+    memory_history_protected_min_messages: int = Field(
+        default=1,
+        ge=0,
+        alias="MEMORY_HISTORY_PROTECTED_MIN_MESSAGES",
+    )
+    memory_adaptive_max_recent_messages: int = Field(
+        default=120,
+        gt=0,
+        alias="MEMORY_ADAPTIVE_MAX_RECENT_MESSAGES",
+    )
+    memory_adaptive_max_history_messages: int = Field(
+        default=300,
+        gt=0,
+        alias="MEMORY_ADAPTIVE_MAX_HISTORY_MESSAGES",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",
@@ -122,6 +161,43 @@ class AppSettings(BaseSettings):
     llm_tool_context_reserve_tokens: int = Field(default=32768, alias="LLM_TOOL_CONTEXT_RESERVE_TOKENS")
     config_dir: Path = Path("configs")
     data_dir: Path = Path("data")
+
+    @model_validator(mode="after")
+    def validate_adaptive_memory_budget(self) -> AppSettings:
+        if not self.memory_adaptive_context_enabled:
+            return self
+        if (
+            self.memory_recent_protected_min_messages
+            > self.memory_adaptive_max_recent_messages
+        ):
+            raise ValueError("adaptive recent protected minimum exceeds message safety cap")
+        if (
+            self.memory_history_protected_min_messages
+            > self.memory_adaptive_max_history_messages
+        ):
+            raise ValueError("adaptive history protected minimum exceeds message safety cap")
+        if (
+            self.memory_recent_protected_min_tokens
+            + self.memory_history_protected_min_tokens
+            > self.memory_normal_context_budget_tokens
+        ):
+            raise ValueError("adaptive protected token minima exceed normal memory budget")
+        return self
+
+    @property
+    def memory_recent_snapshot_limit(self) -> int:
+        if not self.memory_adaptive_context_enabled:
+            return int(self.context_recent_limit)
+        return max(
+            int(self.context_recent_limit),
+            int(self.memory_adaptive_max_recent_messages),
+        )
+
+    @property
+    def memory_effective_context_budget_chars(self) -> int:
+        if self.memory_adaptive_context_enabled:
+            return int(self.memory_adaptive_context_budget_chars)
+        return int(self.memory_context_budget_chars)
 
     @property
     def sqlite_path(self) -> Path:

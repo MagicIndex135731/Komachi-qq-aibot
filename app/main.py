@@ -378,7 +378,7 @@ class _DatabaseShadowEvaluator:
                         Message.id <= int(message_id),
                     )
                     .order_by(Message.id.desc())
-                    .limit(max(1, int(self.settings.context_recent_limit)))
+                    .limit(max(1, self.settings.memory_recent_snapshot_limit))
                 )
             )
             rows.reverse()
@@ -570,20 +570,27 @@ def build_memory_runtime(
             ),
             raw_message_v3_only=settings.memory_raw_v3_enabled,
             legacy_v2_only=not settings.memory_raw_v3_enabled,
+            excluded_speaker_ids=(settings.bot_qq,),
         ),
         candidate_limit=max(
             settings.memory_fts_candidate_limit,
             settings.memory_vector_candidate_limit,
             (
-                # Keep one packet of overfetch headroom for fusion and frozen
-                # snapshot filtering without making every channel rank 600 rows.
-                settings.memory_max_evidence_messages * 2
+                (
+                    settings.memory_adaptive_max_history_messages
+                    if settings.memory_adaptive_context_enabled
+                    else settings.memory_max_evidence_messages * 2
+                )
                 if settings.memory_raw_v3_enabled
                 else 1
             ),
         ),
         final_limit=(
-            settings.memory_max_evidence_messages
+            (
+                settings.memory_adaptive_max_history_messages
+                if settings.memory_adaptive_context_enabled
+                else settings.memory_max_evidence_messages
+            )
             if settings.memory_raw_v3_enabled
             else settings.memory_final_episode_limit
         ),
@@ -716,24 +723,39 @@ def build_memory_runtime(
         return members
 
     def validate_source_scope(group_id: int, source_msg_ids: tuple[str, ...]) -> bool:
+        expected_ids = {
+            str(source_id).strip()
+            for source_id in source_msg_ids
+            if str(source_id).strip()
+        }
+        if not expected_ids:
+            return True
         with session_scope(engine) as session:
             messages = MessageRepository(session)
-            return all(
-                (row := messages.get_by_platform_msg_id(source_id)) is not None
-                and int(row.group_id or 0) == int(group_id)
-                for source_id in source_msg_ids
+            scoped = messages.get_group_messages_by_platform_msg_ids(
+                group_id=int(group_id),
+                platform_msg_ids=list(expected_ids),
             )
+        return set(scoped) == expected_ids
 
     expander = MemoryEvidenceExpander(
         episode_loader=load_episode,
         source_loader=load_sources,
         normal_segment_limit=(
-            settings.memory_max_evidence_messages
+            (
+                settings.memory_adaptive_max_history_messages
+                if settings.memory_adaptive_context_enabled
+                else settings.memory_max_evidence_messages
+            )
             if settings.memory_raw_v3_enabled
             else min(4, settings.memory_final_episode_limit)
         ),
         detail_segment_limit=(
-            settings.memory_max_evidence_messages
+            (
+                settings.memory_adaptive_max_history_messages
+                if settings.memory_adaptive_context_enabled
+                else settings.memory_max_evidence_messages
+            )
             if settings.memory_raw_v3_enabled
             else min(6, settings.memory_final_episode_limit)
         ),
@@ -743,9 +765,16 @@ def build_memory_runtime(
         detail_budget=settings.memory_detail_context_budget_tokens,
         recent_budget=settings.memory_recent_context_budget_tokens,
         history_budget=settings.memory_history_context_budget_tokens,
-        context_char_budget=settings.memory_context_budget_chars,
+        context_char_budget=settings.memory_effective_context_budget_chars,
         max_recent_messages=settings.context_recent_limit,
         max_history_messages=settings.memory_max_evidence_messages,
+        adaptive_enabled=settings.memory_adaptive_context_enabled,
+        recent_protected_min_tokens=settings.memory_recent_protected_min_tokens,
+        history_protected_min_tokens=settings.memory_history_protected_min_tokens,
+        recent_protected_min_messages=settings.memory_recent_protected_min_messages,
+        history_protected_min_messages=settings.memory_history_protected_min_messages,
+        adaptive_max_recent_messages=settings.memory_adaptive_max_recent_messages,
+        adaptive_max_history_messages=settings.memory_adaptive_max_history_messages,
     )
     v2_provider = MemoryV2ContextProvider(
         resolver=resolver,
@@ -763,6 +792,8 @@ def build_memory_runtime(
         observability_route=(
             "raw_v3" if settings.memory_raw_v3_enabled else "legacy_v2"
         ),
+        adaptive_context_enabled=settings.memory_adaptive_context_enabled,
+        compact_candidate_limit=settings.memory_max_evidence_messages,
     )
 
     shadow_evaluator = _DatabaseShadowEvaluator(
@@ -860,7 +891,8 @@ def build_memory_runtime(
     identity = embedding_provider.identity
     logging.info(
         "memory_runtime route=%s raw_enabled=%s embedding_provider=%s "
-        "embedding_model=%s embedding_device=%s embedding_generation=%s",
+        "embedding_model=%s embedding_device=%s embedding_generation=%s "
+        "adaptive_enabled=%s",
         "raw_v3" if settings.memory_raw_v3_enabled else "legacy_v2",
         settings.memory_raw_v3_enabled,
         identity.provider,
@@ -871,6 +903,7 @@ def build_memory_runtime(
             if settings.memory_raw_v3_enabled
             else legacy_embedding_generation
         ),
+        settings.memory_adaptive_context_enabled,
     )
     return MemoryRuntimeComposition(
         memory_orchestrator=orchestrator,

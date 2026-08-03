@@ -141,6 +141,17 @@ def test_raw_v3_activation_switch_controls_strict_provider_and_document_family(
     assert raw_runtime.v2_provider._retriever.final_limit == 150
     assert raw_runtime.v2_provider._historical_no_hit_omit_recent is True
 
+    adaptive_runtime = build_memory_runtime(
+        settings=raw_settings.model_copy(
+            update={"memory_adaptive_context_enabled": True}
+        ),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    assert adaptive_runtime.v2_provider._retriever.candidate_limit == 300
+    assert adaptive_runtime.v2_provider._retriever.final_limit == 300
+
 
 def test_build_memory_runtime_passes_resolved_vector_generation_to_background_store(
     sqlite_engine,

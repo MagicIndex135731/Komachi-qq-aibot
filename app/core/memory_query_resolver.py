@@ -56,6 +56,7 @@ AnswerMode = Literal[
 ]
 CoverageMode = Literal["relevance", "chronological", "time_buckets"]
 SubjectBinding = Literal["explicit", "requester", "unbound"]
+TopicExtraction = Literal["none", "deterministic", "fallback"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,10 @@ class ResolvedMemoryQuery:
     subject_binding: SubjectBinding = "unbound"
     answer_mode: AnswerMode = "general_history"
     coverage_mode: CoverageMode = "relevance"
+    topic_query: str | None = None
+    topic_terms: tuple[str, ...] = ()
+    topic_extraction: TopicExtraction = "fallback"
+    subject_aliases_removed: tuple[str, ...] = ()
 
     @property
     def resolved_query(self) -> str:
@@ -161,6 +166,38 @@ _REQUESTER_MENTION_PATTERN = re.compile(
     r"(?:谁|哪些人|有人|他们|她们|大家|群里).*(?:叫|提到|说到|@)\s*我"
 )
 _CURRENT_FACT_PATTERN = re.compile(r"最喜欢|喜欢什么|讨厌什么|不喜欢什么|还记得|记得")
+_TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
+_TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
+_TOPIC_CATEGORY_SUFFIXES = (
+    "动画电影",
+    "动画片",
+    "纪录片",
+    "电视剧",
+    "电影",
+    "动画",
+    "影片",
+    "片子",
+    "作品",
+    "游戏",
+    "小说",
+)
+_ASSESSMENT_SCAFFOLD_PATTERN = re.compile(
+    r"如何(?:评价|点评|分析|看待)|怎么(?:评价|点评|分析|看待)|"
+    r"(?:评价|点评|分析|看待)(?:一下)?|怎么看"
+)
+_CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
+    r"最喜欢什么|喜欢什么|讨厌什么|不喜欢什么|还记得|记得"
+)
+_HISTORY_SCAFFOLD_PATTERN = re.compile(
+    r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
+    r"说过|说了|发过|发了|提过|聊过"
+)
+_SUMMARY_SCAFFOLD_PATTERN = re.compile(
+    r"总结|概括|汇总|发生了什么|"
+    r"(?:都|分别)?(?:说了|说过|发了|发过|讲了|聊了)"
+    r"(?:哪些(?:话|内容)?|几条|什么)?|"
+    r"(?:有|有哪些|有什么|哪些|所有)(?:发言|内容|消息)"
+)
 _COMMON_WORDS = frozenset({"发布", "已经", "那个", "什么", "怎么", "后来", "之前", "最后", "结果", "消息", "延期", "完成", "服务", "迁移", "今天", "昨天", "前天"})
 _RELATIVE_DAY_WORDS = frozenset({"今天", "昨天", "前天"})
 _MEMBER_JOINER_PATTERN = r"(?:再加上|并且|还有|以及|和|与|跟|及|、)"
@@ -284,7 +321,7 @@ class MemoryQueryResolver:
         time_range = self._parse_time_range(original, current_time)
         needs_detail = bool(_DETAIL_PATTERN.search(original))
         answer_mode = self._answer_mode(original, time_range, quoted_message)
-        coverage_mode = self._coverage_mode(answer_mode)
+        coverage_mode = self._coverage_mode(answer_mode, time_range)
         needs_history = bool(
             time_range
             or _FOLLOW_UP_PATTERN.search(original)
@@ -303,7 +340,7 @@ class MemoryQueryResolver:
             if direct_member is None:
                 raise RuntimeError("resolved group member reference is missing its member")
             direct_subject_ids = (str(direct_member.user_id),)
-            return ResolvedMemoryQuery(
+            return self._with_topic_query(ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
                 entities=(direct_member.matched_alias,),
@@ -318,7 +355,7 @@ class MemoryQueryResolver:
                 subject_binding="explicit",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
-            )
+            ), aliases=(direct_member.matched_alias,))
         if direct_reference.status == "ambiguous":
             return ResolvedMemoryQuery(
                 original_query=original,
@@ -340,7 +377,7 @@ class MemoryQueryResolver:
             or self._is_requester_mention_query(original)
         ):
             requester_subject = (normalized_requester_id,)
-            return ResolvedMemoryQuery(
+            return self._with_topic_query(ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
                 speaker_ids=requester_subject,
@@ -354,7 +391,7 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
-            )
+            ), aliases=("我的", "我"))
 
         if answer_mode == "mention":
             return ResolvedMemoryQuery(
@@ -375,7 +412,7 @@ class MemoryQueryResolver:
         deterministic = self._resolve_reference(original, recent, quoted_message)
         if deterministic is not None:
             retrieval_query, entities, speaker_ids, source_ids = deterministic
-            return ResolvedMemoryQuery(
+            plan = ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=retrieval_query,
                 entities=entities,
@@ -394,6 +431,9 @@ class MemoryQueryResolver:
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             )
+            if quoted_message is None and speaker_ids:
+                return self._with_topic_query(plan, aliases=entities)
+            return plan
 
         if self._is_person_memory_query(original):
             return ResolvedMemoryQuery(
@@ -523,6 +563,16 @@ class MemoryQueryResolver:
                     continue
                 if normalized_alias not in normalize_member_alias(query):
                     continue
+                if (
+                    alias_resolution.status == "resolved"
+                    and alias_resolution.member is not None
+                    and int(identity.user_id) != int(alias_resolution.member.user_id)
+                    and MemoryQueryResolver._alias_is_media_topic(
+                        query,
+                        alias=alias,
+                    )
+                ):
+                    continue
                 if MemoryQueryResolver._has_unsafe_member_suffix(
                     query,
                     member=ResolvedGroupMember(
@@ -607,6 +657,17 @@ class MemoryQueryResolver:
         if explicit_resolution.member.user_id != alias_resolution.member.user_id:
             return GroupMemberReferenceResolution("ambiguous")
         return alias_resolution
+
+    @staticmethod
+    def _alias_is_media_topic(query: str, *, alias: str) -> bool:
+        normalized_query = normalize_member_alias(query)
+        normalized_alias = normalize_member_alias(alias)
+        if not normalized_alias or not _ASSESSMENT_PATTERN.search(query):
+            return False
+        return any(
+            f"{normalized_alias}{normalize_member_alias(suffix)}" in normalized_query
+            for suffix in _TOPIC_CATEGORY_SUFFIXES
+        )
 
     @staticmethod
     def _has_restricted_alias_shadow(
@@ -779,6 +840,27 @@ class MemoryQueryResolver:
                     break
         if not remainder:
             return False
+
+        assessment_topic = re.fullmatch(
+            r"^对(?P<topic>.+?)(?:的)?(?:评价|点评|看法|印象)$",
+            remainder,
+        )
+        if assessment_topic is not None:
+            normalized_topic = normalize_member_alias(
+                assessment_topic.group("topic")
+            )
+            if normalized_topic.endswith(_TOPIC_CATEGORY_SUFFIXES):
+                return False
+            other_member_aliases = {
+                normalize_member_alias(alias)
+                for identity in group_members
+                if int(identity.user_id) != int(member.user_id)
+                for alias in (identity.group_card, identity.nickname)
+                if len(normalize_member_alias(alias)) >= 2
+            }
+            return any(
+                alias in normalized_topic for alias in other_member_aliases
+            )
 
         relation_target = re.match(
             r"^(?:的(?P<relation>[\u4e00-\u9fff]{1,4})|说|提到|聊到|问到)"
@@ -1233,12 +1315,71 @@ class MemoryQueryResolver:
         return "general_history"
 
     @staticmethod
-    def _coverage_mode(answer_mode: AnswerMode) -> CoverageMode:
-        if answer_mode in {"summary", "assessment"}:
+    def _coverage_mode(
+        answer_mode: AnswerMode,
+        time_range: TimeRange | None,
+    ) -> CoverageMode:
+        if answer_mode == "summary" or (
+            answer_mode == "assessment" and time_range is not None
+        ):
             return "time_buckets"
         if answer_mode == "dated_history":
             return "chronological"
         return "relevance"
+
+    @staticmethod
+    def _with_topic_query(
+        plan: ResolvedMemoryQuery,
+        *,
+        aliases: Sequence[str],
+    ) -> ResolvedMemoryQuery:
+        topic = plan.original_query
+        removed: list[str] = []
+        for alias in sorted(
+            {value.strip() for value in aliases if value and value.strip()},
+            key=len,
+            reverse=True,
+        ):
+            updated, count = re.subn(re.escape(alias), " ", topic, flags=re.IGNORECASE)
+            if count:
+                topic = updated
+                removed.append(alias)
+
+        scaffold = {
+            "assessment": _ASSESSMENT_SCAFFOLD_PATTERN,
+            "current_fact": _CURRENT_FACT_SCAFFOLD_PATTERN,
+            "general_history": _HISTORY_SCAFFOLD_PATTERN,
+            "summary": _SUMMARY_SCAFFOLD_PATTERN,
+        }.get(plan.answer_mode)
+        if scaffold is not None:
+            topic = scaffold.sub(" ", topic)
+        topic = re.sub(r"^\s*(?:请|麻烦|帮忙|帮我|能否|可以)?\s*", "", topic)
+        topic = re.sub(r"^的|的$", "", topic.strip())
+        topic = re.sub(r"^(?:对|关于)\s*", "", topic).strip()
+        topic = _TOPIC_PUNCTUATION_PATTERN.sub("", topic).strip()
+        topic = re.sub(r"\s+", " ", topic)
+        topic_query = topic or None
+        topic_terms: list[str] = []
+        if topic_query is not None:
+            for term in _TOPIC_TERM_SPLIT_PATTERN.split(topic_query):
+                if not term:
+                    continue
+                topic_terms.append(term)
+                for suffix in _TOPIC_CATEGORY_SUFFIXES:
+                    if not term.endswith(suffix):
+                        continue
+                    core = term[: -len(suffix)].strip()
+                    if len(core) >= 2:
+                        topic_terms.append(core)
+                    break
+        return replace(
+            plan,
+            retrieval_query=topic_query or plan.original_query,
+            topic_query=topic_query,
+            topic_terms=tuple(dict.fromkeys(topic_terms)),
+            topic_extraction="deterministic" if topic_query is not None else "none",
+            subject_aliases_removed=tuple(removed),
+        )
 
     @staticmethod
     def _normalize_group_id(group_id: int | None) -> int | None:
@@ -1494,6 +1635,8 @@ class MemoryQueryResolver:
         return ResolvedMemoryQuery(
             original_query=original,
             retrieval_query=retrieval_query.strip(),
+            topic_query=retrieval_query.strip(),
+            topic_terms=(retrieval_query.strip(),),
             entities=normalized_entities,
             speaker_ids=normalized_speakers,
             subject_ids=normalized_speakers or None,

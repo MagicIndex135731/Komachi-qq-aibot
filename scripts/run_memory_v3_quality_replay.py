@@ -866,12 +866,14 @@ def build_public_sidecar(
     visibility_ms: Sequence[float],
     case_rows: Sequence[Mapping[str, Any]],
     evaluated_at: str,
+    context_profile: str,
 ) -> dict[str, Any]:
     sidecar = quality_sidecar_template(
         dataset_sha256=dataset_sha256,
         snapshot_manifest_sha256=manifest_sha256,
         retrieval_fingerprint=retrieval_fingerprint,
         case_count=len(case_rows),
+        context_profile=context_profile,
     )
     sidecar.update(
         {
@@ -1077,6 +1079,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--visibility-samples", type=int, default=20)
     parser.add_argument("--generation-attempts", type=int, default=2)
+    parser.add_argument(
+        "--context-profile",
+        choices=("legacy", "adaptive"),
+        default="adaptive",
+        help="Context budget contract used for retrieval and answer replay.",
+    )
     return parser
 
 
@@ -1205,6 +1213,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             "memory_orchestration_v2_enabled": True,
             "memory_orchestration_shadow_mode": False,
             "memory_raw_v3_enabled": True,
+            "memory_adaptive_context_enabled": args.context_profile == "adaptive",
             "memory_query_rewrite_enabled": True,
             "memory_llm_rerank_enabled": False,
             "memory_max_evidence_messages": 150,
@@ -1543,6 +1552,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             visibility_ms=visibility_ms,
             case_rows=sidecar_cases,
             evaluated_at=evaluated_at,
+            context_profile=args.context_profile,
         )
         sidecar_sha = _write_json(args.quality_output, sidecar, private=False)
         print(

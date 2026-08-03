@@ -35,6 +35,7 @@ from app.storage.repositories import (
     MessageRepository,
     _initial_vector_fetch_limit,
     _next_vector_fetch_limit,
+    _vector_fetch_ceiling,
 )
 
 
@@ -2386,6 +2387,18 @@ def test_raw_v3_vector_search_expansion_respects_sqlite_vec_knn_cap() -> None:
     assert _next_vector_fetch_limit(2400, requested=150, available=17_704) == 4096
     assert _next_vector_fetch_limit(4096, requested=150, available=17_704) == 4096
     assert _next_vector_fetch_limit(2400, requested=150, available=3000) == 3000
+    assert _vector_fetch_ceiling(
+        requested=30,
+        available=17_704,
+        has_sparse_post_filters=False,
+        has_exclusion_filter=True,
+    ) == 120
+    assert _vector_fetch_ceiling(
+        requested=30,
+        available=17_704,
+        has_sparse_post_filters=True,
+        has_exclusion_filter=True,
+    ) == 4096
 
 
 def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generations(

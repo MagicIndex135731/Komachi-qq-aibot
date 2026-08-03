@@ -6,6 +6,7 @@ from app.core.memory_context_packer import (
     EvidenceMessage,
     EvidenceSegment,
     MEMORY_GROUNDING_NO_EVIDENCE,
+    QQ_BLOCKED_MEMORY_NOTE,
     MemoryContextPacker,
     MemoryFact,
     MemorySummary,
@@ -60,6 +61,53 @@ def test_default_additive_token_counter_counts_each_history_block_once() -> None
 
     assert len(packed.evidence_segments) == 150
     assert calls < 500
+
+
+def test_adaptive_additive_token_counter_does_not_rescan_selected_history() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100_000,
+        detail_budget=100_000,
+        context_char_budget=100_000,
+        adaptive_enabled=True,
+        adaptive_max_history_messages=300,
+    )
+    calls = 0
+
+    def counting_counter(value: str) -> int:
+        nonlocal calls
+        calls += 1
+        return MemoryContextPacker._fallback_token_count(value)
+
+    packer._token_counter = counting_counter
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    segments = tuple(
+        EvidenceSegment(
+            episode_id=f"raw:{index}",
+            document_id=str(index),
+            fused_score=1.0,
+            messages=(
+                EvidenceMessage(
+                    source_msg_id=f"source-{index}",
+                    speaker="member",
+                    content=f"evidence-{index}",
+                    sent_at=now,
+                    group_id=100,
+                ),
+            ),
+            hit_source_msg_ids=(f"source-{index}",),
+        )
+        for index in range(300)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100_000,
+        target_message_id=None,
+        evidence_segments=segments,
+    )
+
+    assert len(packed.evidence_segments) == 300
+    assert calls < 1_000
 
 
 def message(identifier: str, text: str, *, blocked: bool = False) -> EvidenceMessage:
@@ -212,6 +260,30 @@ def test_blocked_neighbor_adds_safe_policy_note_without_raw_text() -> None:
     assert packed.blocked_output_present is True
     assert "QQ blocked" in packed.text
     assert "raw-secret-marker" not in packed.text
+
+
+def test_adaptive_tiny_budget_preserves_blocked_safety_signal_and_flag() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=200,
+        detail_budget=200,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=0,
+    )
+    blocked = message("blocked", "raw-secret-marker", blocked=True)
+    note_budget = packer._fallback_token_count(QQ_BLOCKED_MEMORY_NOTE)
+
+    packed = packer.pack(
+        "normal",
+        available_input=note_budget,
+        target_message_id=None,
+        recent_messages=(blocked,),
+    )
+
+    assert packed.blocked_output_present is True
+    assert packed.text == QQ_BLOCKED_MEMORY_NOTE
+    assert "raw-secret-marker" not in packed.text
+    assert packed.degradation_reason == "blocked_note_only"
 
 
 def test_empty_v2_context_explicitly_marks_memory_evidence_as_insufficient() -> None:
@@ -491,3 +563,194 @@ def test_default_normal_budget_allows_independent_recent_and_history_caps() -> N
     assert packed.history_estimated_tokens == 24
     assert len(packed.recent_messages) == 1
     assert len(packed.evidence_segments) == 2
+
+
+def test_adaptive_pack_never_widens_or_exceeds_one_effective_total() -> None:
+    packer = MemoryContextPacker(
+        adaptive_enabled=True,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    recent = tuple(message(f"r-{index}", "TOKEN " * 1000) for index in range(12))
+    history = tuple(
+        EvidenceSegment(
+            f"ep-{index}",
+            float(20 - index),
+            (message(f"h-{index}", "TOKEN " * 1000),),
+        )
+        for index in range(30)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=31_999,
+        target_message_id=None,
+        recent_messages=recent,
+        evidence_segments=history,
+    )
+
+    assert packed.adaptive_enabled is True
+    assert packed.budget == 31_999
+    assert packed.estimated_tokens <= packed.budget
+    assert packed.recent_estimated_tokens + packed.history_estimated_tokens <= packed.budget
+    assert len(packed.text) <= 12_000
+
+
+def test_adaptive_pack_borrows_unused_recent_capacity_for_history() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=40,
+        detail_budget=40,
+        context_char_budget=20_000,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=5,
+        history_protected_min_tokens=5,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    history = tuple(
+        EvidenceSegment(
+            f"ep-{index}",
+            float(10 - index),
+            (message(f"h-{index}", "TOKEN " * 8),),
+        )
+        for index in range(5)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=40,
+        target_message_id=None,
+        recent_messages=(message("recent", "TOKEN"),),
+        evidence_segments=history,
+    )
+
+    assert packed.recent_source_msg_ids == ("recent",)
+    assert packed.history_estimated_tokens > 5
+    assert packed.estimated_tokens <= 40
+    assert len(packed.source_msg_ids) == len(set(packed.source_msg_ids))
+    assert packed.spillover == "recent_to_history"
+
+
+def test_adaptive_pack_borrows_unused_history_capacity_for_recent() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=25,
+        detail_budget=25,
+        context_char_budget=20_000,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=3,
+        history_protected_min_tokens=5,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    recent = tuple(message(f"r-{index}", "TOKEN " * 3) for index in range(20))
+
+    packed = packer.pack(
+        "normal",
+        available_input=25,
+        target_message_id=None,
+        recent_messages=recent,
+    )
+
+    assert packed.evidence_segments == ()
+    assert packed.recent_estimated_tokens > 3
+    assert packed.recent_source_msg_ids == tuple(f"r-{index}" for index in range(12, 20))
+    assert packed.estimated_tokens <= 25
+    assert packed.spillover == "history_to_recent"
+
+
+def test_adaptive_pack_preserves_pinned_and_recent_before_optional_history() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=15,
+        detail_budget=15,
+        context_char_budget=20_000,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=5,
+        history_protected_min_tokens=5,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    pinned = EvidenceSegment(
+        "pinned",
+        0.01,
+        (message("pin-a", "TOKEN " * 5), message("pin-b", "TOKEN " * 5)),
+        atomic_source_groups=(("pin-a", "pin-b"),),
+        pinned=True,
+    )
+    optional = EvidenceSegment(
+        "optional",
+        100.0,
+        (message("optional", "TOKEN " * 10),),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=15,
+        target_message_id=None,
+        recent_messages=(message("recent", "TOKEN " * 5),),
+        evidence_segments=(pinned, optional),
+    )
+
+    assert tuple(segment.episode_id for segment in packed.evidence_segments) == ("pinned",)
+    assert tuple(item.source_msg_id for item in packed.evidence_segments[0].messages) == (
+        "pin-a",
+        "pin-b",
+    )
+    assert packed.recent_source_msg_ids == ("recent",)
+    assert packed.estimated_tokens == 15
+
+
+def test_adaptive_message_limits_are_emergency_row_caps() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100_000,
+        detail_budget=100_000,
+        context_char_budget=100_000,
+        adaptive_enabled=True,
+        adaptive_max_recent_messages=120,
+        adaptive_max_history_messages=300,
+        token_counter=lambda _value: 1,
+    )
+    recent = tuple(message(f"r-{index}", "short") for index in range(140))
+    history = tuple(
+        EvidenceSegment(
+            f"ep-{index}",
+            float(400 - index),
+            (message(f"h-{index}", "short"),),
+        )
+        for index in range(320)
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100_000,
+        target_message_id=None,
+        recent_messages=recent,
+        evidence_segments=history,
+    )
+
+    assert len(packed.recent_messages) == 120
+    assert sum(len(segment.messages) for segment in packed.evidence_segments) == 300
+
+
+def test_adaptive_pack_degrades_to_no_evidence_policy_under_tiny_budget() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=13,
+        detail_budget=13,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=0,
+    )
+    oversized = EvidenceSegment(
+        "oversized",
+        1.0,
+        (message("source", "中" * 100),),
+        pinned=True,
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=13,
+        target_message_id=None,
+        evidence_segments=(oversized,),
+    )
+
+    assert packed.evidence_segments == ()
+    assert packed.grounding_policy == "No memory evidence; do not infer a person's preference."
+    assert packed.estimated_tokens <= packed.budget
+    assert len(packed.text) <= 12_000
+    assert packed.degradation_reason == "minimal_policy"

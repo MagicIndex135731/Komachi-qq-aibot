@@ -78,6 +78,8 @@ class MemoryV2EvaluationTrace:
     attempted_channels: tuple[str, ...] = ()
     failed_channels: tuple[str, ...] = ()
     channel_candidate_counts: tuple[tuple[str, int], ...] = ()
+    expansion_mode: str = "legacy"
+    expansion_reasons: tuple[str, ...] = ()
 
 
 class MemoryV2ContextProvider:
@@ -99,6 +101,8 @@ class MemoryV2ContextProvider:
         excluded_member_ids: set[int] | frozenset[int] = frozenset(),
         historical_no_hit_omit_recent: bool = False,
         observability_route: str = "",
+        adaptive_context_enabled: bool = False,
+        compact_candidate_limit: int = 150,
     ) -> None:
         self._resolver = resolver
         self._retriever = retriever
@@ -115,6 +119,10 @@ class MemoryV2ContextProvider:
         self._excluded_member_ids = frozenset(int(item) for item in excluded_member_ids)
         self._historical_no_hit_omit_recent = bool(historical_no_hit_omit_recent)
         self._observability_route = str(observability_route).strip()
+        if compact_candidate_limit <= 0:
+            raise ValueError("compact candidate limit must be positive")
+        self._adaptive_context_enabled = bool(adaptive_context_enabled)
+        self._compact_candidate_limit = int(compact_candidate_limit)
 
     def __call__(self, request: MemoryV2Request) -> MemoryContextResult:
         return self.evaluate(request).result
@@ -157,13 +165,20 @@ class MemoryV2ContextProvider:
                     candidates=candidates,
                 )
             )
+        expansion_candidates, expansion_mode, expansion_reasons = (
+            self._select_expansion_candidates(
+                candidates=candidates,
+                retrieval_result=retrieval_result,
+                needs_history=resolved.needs_history,
+            )
+        )
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         mode = "detail" if resolved.needs_detail else "normal"
         expansion_started = perf_counter()
         expanded_segments = tuple(
             self._expander.expand(
                 group_id=request.group_id,
-                candidates=candidates,
+                candidates=expansion_candidates,
                 mode=mode,
             )
         )
@@ -171,6 +186,26 @@ class MemoryV2ContextProvider:
             self._eligible_segments(expanded_segments, resolved),
             resolved,
         )
+        if (
+            self._adaptive_context_enabled
+            and resolved.needs_history
+            and expansion_mode == "compact"
+            and not segments
+            and len(expansion_candidates) < len(candidates)
+        ):
+            expansion_mode = "expanded"
+            expansion_reasons = ("post_eligibility_no_evidence",)
+            expanded_segments = tuple(
+                self._expander.expand(
+                    group_id=request.group_id,
+                    candidates=candidates,
+                    mode=mode,
+                )
+            )
+            segments = self._pin_required_segments(
+                self._eligible_segments(expanded_segments, resolved),
+                resolved,
+            )
         expansion_ms = (perf_counter() - expansion_started) * 1000
         facts = tuple(
             self._fact_loader(
@@ -243,10 +278,14 @@ class MemoryV2ContextProvider:
             logger.info(
                 "memory_query_metrics route=%s group_id=%s answer_mode=%s "
                 "coverage=%s has_subject=%s subject_ambiguous=%s has_time=%s "
+                "topic_extraction=%s topic_terms=%s "
+                "adaptive_enabled=%s expansion_mode=%s expansion_reasons=%s "
                 "attempted_channels=%s failed_channels=%s channel_counts=%s "
+                "pin_counts=%s pin_overflow=%s "
                 "candidate_units=%s expanded_sources=%s rejected_sources=%s "
                 "selected_source_ids=%s recent_messages=%s history_messages=%s "
-                "recent_tokens=%s history_tokens=%s total_tokens=%s "
+                "effective_budget=%s recent_tokens=%s history_tokens=%s total_tokens=%s "
+                "spillover=%s degradation_reason=%s "
                 "resolve_ms=%.3f retrieval_ms=%.3f expansion_ms=%.3f "
                 "packing_ms=%.3f total_ms=%.3f",
                 self._observability_route,
@@ -256,6 +295,11 @@ class MemoryV2ContextProvider:
                 resolved.subject_ids is not None,
                 resolved.subject_ids == (),
                 resolved.time_range is not None,
+                resolved.topic_extraction,
+                len(resolved.topic_terms),
+                self._adaptive_context_enabled,
+                expansion_mode,
+                json.dumps(list(expansion_reasons), separators=(",", ":")),
                 json.dumps(
                     list(getattr(retrieval_result, "attempted_channels", ())),
                     separators=(",", ":"),
@@ -274,15 +318,23 @@ class MemoryV2ContextProvider:
                     ),
                     separators=(",", ":"),
                 ),
+                json.dumps(
+                    list(getattr(retrieval_result, "pin_counts", ())),
+                    separators=(",", ":"),
+                ),
+                int(getattr(retrieval_result, "pin_overflow_count", 0)),
                 len(candidates),
                 expanded_source_count,
                 max(0, expanded_source_count - eligible_source_count),
                 json.dumps(list(packed.source_msg_ids), separators=(",", ":")),
                 len(packed.recent_messages),
                 sum(len(segment.messages) for segment in packed.evidence_segments),
+                packed.budget,
                 packed.recent_estimated_tokens,
                 packed.history_estimated_tokens,
                 packed.estimated_tokens,
+                getattr(packed, "spillover", "none"),
+                getattr(packed, "degradation_reason", ""),
                 resolve_ms,
                 retrieval_ms,
                 expansion_ms,
@@ -332,7 +384,42 @@ class MemoryV2ContextProvider:
                     (),
                 )
             ),
+            expansion_mode=expansion_mode,
+            expansion_reasons=expansion_reasons,
         )
+
+    def _select_expansion_candidates(
+        self,
+        *,
+        candidates: Sequence[object],
+        retrieval_result: object,
+        needs_history: bool,
+    ) -> tuple[tuple[object, ...], str, tuple[str, ...]]:
+        available = tuple(candidates)
+        if not self._adaptive_context_enabled or not needs_history:
+            return available, "legacy", ()
+        if not available:
+            return (), "no_evidence", ("no_candidates",)
+
+        compact = available[: self._compact_candidate_limit]
+        failed_channels = tuple(
+            str(channel)
+            for channel in getattr(retrieval_result, "failed_channels", ())
+        )
+        has_strong_local_signal = any(
+            str(getattr(candidate, "pin_reason", ""))
+            in {"direct", "lexical", "semantic"}
+            or len(set(getattr(candidate, "routes", ()))) >= 2
+            for candidate in compact
+        )
+        reasons: list[str] = []
+        if failed_channels:
+            reasons.append("channel_failure")
+        if not has_strong_local_signal:
+            reasons.append("weak_channel_agreement")
+        if reasons:
+            return available, "expanded", tuple(reasons)
+        return compact, "compact", ()
 
     def _eligible_segments(
         self,
@@ -345,7 +432,9 @@ class MemoryV2ContextProvider:
         direct_reply_counts: dict[str, int] = {}
         for segment in segments:
             allowed_messages = tuple(
-                message for message in segment.messages if eligible(message, resolved)
+                message
+                for message in segment.messages
+                if not message.is_bot and eligible(message, resolved)
             )
             allowed_ids = {message.source_msg_id for message in allowed_messages}
             # A hit source is the provenance that authorized this segment. If

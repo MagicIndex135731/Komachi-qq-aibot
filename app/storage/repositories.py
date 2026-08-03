@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -72,10 +72,30 @@ def _initial_vector_fetch_limit(
     if searchable <= 0:
         return 0
     if has_post_filters:
-        # sqlite-vec can partition by group but speaker/time/mention filters
-        # are validated against canonical source rows afterwards. Starting at
-        # the cap avoids repeating the same KNN scan for sparse hard filters.
+        # sqlite-vec can partition by group but sparse positive filters such
+        # as speaker/time/mention are validated against canonical source rows
+        # afterwards. Starting at the cap avoids repeated KNN scans for them.
         return searchable
+    return min(max(1, int(requested)), searchable)
+
+
+def _vector_fetch_ceiling(
+    *,
+    requested: int,
+    available: int,
+    has_sparse_post_filters: bool,
+    has_exclusion_filter: bool,
+) -> int:
+    searchable = min(max(0, int(available)), _SQLITE_VEC_MAX_K)
+    if searchable <= 0:
+        return 0
+    if has_sparse_post_filters:
+        return searchable
+    if has_exclusion_filter:
+        return min(
+            searchable,
+            max(max(1, int(requested)) * 4, max(1, int(requested)) + 32),
+        )
     return min(max(1, int(requested)), searchable)
 
 
@@ -89,6 +109,7 @@ class RetrievalDocumentHit:
     start_at: datetime
     end_at: datetime
     score: float
+    lexical_exact: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +182,7 @@ def _retrieval_source_prefilters(
     *,
     group_id: int,
     speaker_ids: Sequence[str] | None,
+    excluded_speaker_ids: Sequence[str] | None = None,
 ) -> list[Any]:
     """SQL prefilters applied before ranking/limit on document channels."""
 
@@ -203,6 +225,24 @@ def _retrieval_source_prefilters(
             filters.append(
                 RetrievalDocument.id.not_in(mismatched_document_ids)
             )
+    normalized_excluded_speakers = _normalize_optional_integer_filter(
+        excluded_speaker_ids
+    )
+    if normalized_excluded_speakers:
+        excluded_document_ids = (
+            select(RetrievalDocumentMessage.document_id)
+            .join(
+                Message,
+                (Message.id == RetrievalDocumentMessage.message_id)
+                & (Message.group_id == RetrievalDocumentMessage.group_id),
+            )
+            .where(
+                RetrievalDocumentMessage.group_id == int(group_id),
+                Message.group_id == int(group_id),
+                Message.user_id.in_(normalized_excluded_speakers),
+            )
+        )
+        filters.append(RetrievalDocument.id.not_in(excluded_document_ids))
     return filters
 
 
@@ -2968,6 +3008,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         resolved_limit = max(1, int(limit))
@@ -2979,13 +3020,14 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
         ranked = [
             (document.id, float(resolved_limit - rank))
             for rank, document in enumerate(documents)
         ]
-        return self._validated_hits(
+        hits = self._validated_hits(
             group_id=group_id,
             ranked_document_ids=ranked,
             subject_ids=subject_ids,
@@ -2993,8 +3035,20 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
+        normalized_query = str(query or "").strip().casefold()
+        exact_ids = {
+            int(document.id)
+            for document in documents
+            if normalized_query
+            and normalized_query in str(document.content or "").casefold()
+        }
+        return [
+            replace(hit, lexical_exact=int(hit.document_id) in exact_ids)
+            for hit in hits
+        ]
 
     def search_group_documents_temporal_hits(
         self,
@@ -3006,6 +3060,7 @@ class RetrievalDocumentRepository:
         subject_ids: Sequence[str] | None = None,
         document_kinds: Sequence[str] | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
         allow_unbounded: bool = False,
         sample_time_coverage: bool | None = None,
@@ -3023,6 +3078,7 @@ class RetrievalDocumentRepository:
             *_retrieval_source_prefilters(
                 group_id=group_id,
                 speaker_ids=speaker_ids,
+                excluded_speaker_ids=excluded_speaker_ids,
             ),
         )
         if normalized_mentioned_user_ids is not None:
@@ -3085,6 +3141,7 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
         if len(hits) <= resolved_limit:
@@ -3111,6 +3168,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         normalized_entities = tuple(
             dict.fromkeys(value.strip() for value in entities if value.strip())
@@ -3165,6 +3223,7 @@ class RetrievalDocumentRepository:
                 *_retrieval_source_prefilters(
                     group_id=group_id,
                     speaker_ids=speaker_ids,
+                    excluded_speaker_ids=excluded_speaker_ids,
                 ),
             )
             .order_by(
@@ -3208,6 +3267,7 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
 
@@ -3223,6 +3283,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         terms = tuple(
@@ -3287,6 +3348,7 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
 
@@ -3302,6 +3364,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         references = tuple(
@@ -3335,6 +3398,7 @@ class RetrievalDocumentRepository:
                     *_retrieval_source_prefilters(
                         group_id=group_id,
                         speaker_ids=speaker_ids,
+                        excluded_speaker_ids=excluded_speaker_ids,
                     ),
                 )
                 .distinct()
@@ -3379,6 +3443,7 @@ class RetrievalDocumentRepository:
             start_at=start_at,
             end_at=end_at,
             speaker_ids=speaker_ids,
+            excluded_speaker_ids=excluded_speaker_ids,
             mentioned_user_ids=mentioned_user_ids,
         )
 
@@ -3398,6 +3463,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if len(embedding) != int(dimensions):
@@ -3405,6 +3471,9 @@ class RetrievalDocumentRepository:
         normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
         normalized_subject_ids = _normalize_optional_string_filter(subject_ids)
         normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_excluded_speaker_ids = _normalize_optional_integer_filter(
+            excluded_speaker_ids
+        )
         normalized_mentioned_user_ids = _normalize_optional_string_filter(
             mentioned_user_ids
         )
@@ -3468,20 +3537,26 @@ class RetrievalDocumentRepository:
         )
         if available <= 0:
             return []
-        searchable_available = min(available, _SQLITE_VEC_MAX_K)
-        fetch_limit = _initial_vector_fetch_limit(
+        has_sparse_post_filters = any(
+            value is not None
+            for value in (
+                normalized_subject_ids,
+                normalized_speaker_ids,
+                normalized_mentioned_user_ids,
+                start_at,
+                end_at,
+            )
+        )
+        fetch_ceiling = _vector_fetch_ceiling(
             requested=resolved_limit,
             available=available,
-            has_post_filters=any(
-                value is not None
-                for value in (
-                    normalized_subject_ids,
-                    normalized_speaker_ids,
-                    normalized_mentioned_user_ids,
-                    start_at,
-                    end_at,
-                )
-            ),
+            has_sparse_post_filters=has_sparse_post_filters,
+            has_exclusion_filter=normalized_excluded_speaker_ids is not None,
+        )
+        fetch_limit = _initial_vector_fetch_limit(
+            requested=resolved_limit,
+            available=fetch_ceiling,
+            has_post_filters=has_sparse_post_filters,
         )
         serialized_embedding = json.dumps(
             [float(value) for value in embedding],
@@ -3516,14 +3591,19 @@ class RetrievalDocumentRepository:
                     if normalized_speaker_ids is not None
                     else None
                 ),
+                excluded_speaker_ids=(
+                    tuple(str(value) for value in normalized_excluded_speaker_ids)
+                    if normalized_excluded_speaker_ids is not None
+                    else None
+                ),
                 mentioned_user_ids=normalized_mentioned_user_ids,
             )
-            if len(hits) >= resolved_limit or fetch_limit >= searchable_available:
+            if len(hits) >= resolved_limit or fetch_limit >= fetch_ceiling:
                 return hits[:resolved_limit]
             fetch_limit = _next_vector_fetch_limit(
                 fetch_limit,
                 requested=resolved_limit,
-                available=available,
+                available=fetch_ceiling,
             )
 
     def _validated_hits(
@@ -3536,6 +3616,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocumentHit]:
         if not ranked_document_ids:
@@ -3543,6 +3624,9 @@ class RetrievalDocumentRepository:
         normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
         normalized_subject_ids = _normalize_optional_string_filter(subject_ids)
         normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_excluded_speaker_ids = _normalize_optional_integer_filter(
+            excluded_speaker_ids
+        )
         normalized_mentioned_user_ids = _normalize_optional_string_filter(
             mentioned_user_ids
         )
@@ -3704,6 +3788,12 @@ class RetrievalDocumentRepository:
                 documents.pop(int(document_id), None)
                 continue
             if (
+                normalized_excluded_speaker_ids is not None
+                and int(user_id) in normalized_excluded_speaker_ids
+            ):
+                documents.pop(int(document_id), None)
+                continue
+            if (
                 normalized_mentioned_user_ids is not None
                 and not set(normalized_mentioned_user_ids).intersection(
                     _mentioned_user_ids(raw_json)
@@ -3766,11 +3856,15 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         speaker_ids: Sequence[str] | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
         mentioned_user_ids: Sequence[str] | None = None,
     ) -> list[RetrievalDocument]:
         resolved_limit = max(1, int(limit))
         normalized_document_kinds = _normalize_optional_string_filter(document_kinds)
         normalized_speaker_ids = _normalize_optional_integer_filter(speaker_ids)
+        normalized_excluded_speaker_ids = _normalize_optional_integer_filter(
+            excluded_speaker_ids
+        )
         normalized_mentioned_user_ids = _normalize_optional_string_filter(
             mentioned_user_ids
         )
@@ -3836,6 +3930,18 @@ class RetrievalDocumentRepository:
                         "AND speaker_m.user_id NOT IN :speaker_ids)"
                     )
                     parameters["speaker_ids"] = normalized_speaker_ids
+                if normalized_excluded_speaker_ids:
+                    clauses.append(
+                        "NOT EXISTS ("
+                        "SELECT 1 FROM retrieval_document_messages AS excluded_rdm "
+                        "JOIN messages AS excluded_m "
+                        "ON excluded_m.id = excluded_rdm.message_id "
+                        "AND excluded_m.group_id = excluded_rdm.group_id "
+                        "WHERE excluded_rdm.document_id = d.id "
+                        "AND excluded_rdm.group_id = :group_id_int "
+                        "AND excluded_m.user_id IN :excluded_speaker_ids)"
+                    )
+                    parameters["excluded_speaker_ids"] = normalized_excluded_speaker_ids
                 if normalized_mentioned_user_ids is not None:
                     clauses.append(
                         "EXISTS ("
@@ -3871,6 +3977,10 @@ class RetrievalDocumentRepository:
                     expanding.append(bindparam("document_kinds", expanding=True))
                 if normalized_speaker_ids is not None:
                     expanding.append(bindparam("speaker_ids", expanding=True))
+                if normalized_excluded_speaker_ids:
+                    expanding.append(
+                        bindparam("excluded_speaker_ids", expanding=True)
+                    )
                 if normalized_mentioned_user_ids is not None:
                     expanding.append(
                         bindparam("mentioned_user_ids", expanding=True)
@@ -3909,6 +4019,11 @@ class RetrievalDocumentRepository:
                                 if normalized_speaker_ids is not None
                                 else None
                             ),
+                            excluded_speaker_ids=(
+                                tuple(str(value) for value in normalized_excluded_speaker_ids)
+                                if normalized_excluded_speaker_ids is not None
+                                else None
+                            ),
                             mentioned_user_ids=normalized_mentioned_user_ids,
                         )
                         if hit.document_id in documents
@@ -3929,6 +4044,11 @@ class RetrievalDocumentRepository:
                 speaker_ids=(
                     tuple(str(value) for value in normalized_speaker_ids)
                     if normalized_speaker_ids is not None
+                    else None
+                ),
+                excluded_speaker_ids=(
+                    tuple(str(value) for value in normalized_excluded_speaker_ids)
+                    if normalized_excluded_speaker_ids is not None
                     else None
                 ),
             ),
@@ -3977,6 +4097,11 @@ class RetrievalDocumentRepository:
                 speaker_ids=(
                     tuple(str(value) for value in normalized_speaker_ids)
                     if normalized_speaker_ids is not None
+                    else None
+                ),
+                excluded_speaker_ids=(
+                    tuple(str(value) for value in normalized_excluded_speaker_ids)
+                    if normalized_excluded_speaker_ids is not None
                     else None
                 ),
                 mentioned_user_ids=normalized_mentioned_user_ids,

@@ -93,6 +93,37 @@ class Expander:
         return ()
 
 
+class CandidateCapturingExpander(Expander):
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidate_ids: list[tuple[int, ...]] = []
+
+    def expand(self, *, candidates, mode, **_):
+        self.modes.append(mode)
+        self.candidate_ids.append(
+            tuple(int(candidate.document_id) for candidate in candidates)
+        )
+        if not candidates:
+            return ()
+        source_id = str(candidates[0].source_msg_ids[0])
+        return (
+            EvidenceSegment(
+                episode_id=f"raw:{source_id}",
+                fused_score=1.0,
+                messages=(
+                    EvidenceMessage(
+                        source_id,
+                        "member",
+                        "eligible evidence",
+                        datetime(2026, 7, 22, tzinfo=UTC),
+                        group_id=100,
+                    ),
+                ),
+                hit_source_msg_ids=(source_id,),
+            ),
+        )
+
+
 class OneSegmentExpander(Expander):
     def expand(self, *, mode, **_):
         self.modes.append(mode)
@@ -197,6 +228,131 @@ def test_v2_provider_runs_resolve_retrieve_expand_pack_and_returns_common_contra
     assert result.packed_context.text == "packed"
     assert result.selected_source_msg_ids == ("m-1",)
     assert expander.modes == ["detail"]
+
+
+@pytest.mark.parametrize(
+    ("routes", "failed_channels", "expected_ids", "expected_mode"),
+    (
+        (("bm25",), (), (1,), "compact"),
+        (("vector",), (), (1, 2, 3), "expanded"),
+        (("bm25",), ("vector",), (1, 2, 3), "expanded"),
+    ),
+)
+def test_adaptive_provider_expands_only_when_local_retrieval_is_weak(
+    routes,
+    failed_channels,
+    expected_ids,
+    expected_mode,
+) -> None:
+    class AdaptiveRetriever:
+        def retrieve(self, **_):
+            candidates = tuple(
+                FusedRetrievalCandidate(
+                    document_id=document_id,
+                    group_id=100,
+                    document_kind="raw_message_v3",
+                    episode_id=None,
+                    source_msg_ids=(f"source-{document_id}",),
+                    start_at=datetime(2026, 7, 22, tzinfo=UTC),
+                    end_at=datetime(2026, 7, 22, tzinfo=UTC),
+                    routes=routes,
+                    route_ranks=tuple(
+                        (route, document_id) for route in routes
+                    ),
+                    fused_score=1.0 / document_id,
+                    lexical_match_kind=("exact" if routes == ("bm25",) else "none"),
+                    pin_reason=("lexical" if routes == ("bm25",) else None),
+                )
+                for document_id in range(1, 4)
+            )
+            return HybridRetrievalResult(
+                candidates,
+                attempted_channels=("bm25", "vector"),
+                failed_channels=failed_channels,
+            )
+
+    expander = CandidateCapturingExpander()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=AdaptiveRetriever(),
+        expander=expander,
+        packer=Packer(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        adaptive_context_enabled=True,
+        compact_candidate_limit=1,
+    )
+
+    trace = provider.evaluate(request())
+
+    assert expander.candidate_ids == [expected_ids]
+    assert trace.expansion_mode == expected_mode
+
+
+def test_adaptive_provider_retries_full_candidates_after_compact_fails_eligibility() -> None:
+    candidates = tuple(
+        FusedRetrievalCandidate(
+            document_id=document_id,
+            group_id=100,
+            document_kind="raw_message_v3",
+            episode_id=None,
+            source_msg_ids=(f"source-{document_id}",),
+            start_at=datetime(2026, 7, 22, tzinfo=UTC),
+            end_at=datetime(2026, 7, 22, tzinfo=UTC),
+            routes=("bm25",),
+            route_ranks=(("bm25", document_id),),
+            fused_score=1.0 / document_id,
+            lexical_match_kind="exact",
+            pin_reason="lexical" if document_id == 1 else None,
+        )
+        for document_id in range(1, 3)
+    )
+
+    class AdaptiveRetriever:
+        def retrieve(self, **_):
+            return HybridRetrievalResult(candidates, attempted_channels=("bm25",))
+
+    class EligibilityExpander(Expander):
+        def __init__(self) -> None:
+            super().__init__()
+            self.candidate_ids: list[tuple[int, ...]] = []
+
+        def expand(self, *, candidates, mode, **_):
+            self.candidate_ids.append(tuple(item.document_id for item in candidates))
+            return tuple(
+                EvidenceSegment(
+                    episode_id=f"raw:{item.document_id}",
+                    fused_score=item.fused_score,
+                    messages=(
+                        EvidenceMessage(
+                            f"source-{item.document_id}",
+                            "bot" if item.document_id == 1 else "human",
+                            "generated" if item.document_id == 1 else "human evidence",
+                            datetime(2026, 7, 22, tzinfo=UTC),
+                            group_id=100,
+                            is_bot=item.document_id == 1,
+                        ),
+                    ),
+                    hit_source_msg_ids=(f"source-{item.document_id}",),
+                )
+                for item in candidates
+            )
+
+    expander = EligibilityExpander()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=AdaptiveRetriever(),
+        expander=expander,
+        packer=Packer(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        adaptive_context_enabled=True,
+        compact_candidate_limit=1,
+    )
+
+    trace = provider.evaluate(request())
+
+    assert expander.candidate_ids == [(1,), (1, 2)]
+    assert trace.expansion_mode == "expanded"
+    assert trace.expansion_reasons == ("post_eligibility_no_evidence",)
 
 
 def test_v2_provider_fails_closed_when_recent_snapshot_contains_other_group() -> None:
@@ -588,6 +744,66 @@ def test_direct_reply_quota_is_consumed_only_after_delivery_subject_and_time_che
         message.source_msg_id
         for message in packer.evidence_segments[0].messages
     ) == ("parent", "eligible-third", "eligible-fourth")
+
+
+def test_historical_evidence_excludes_bot_authored_hits_and_attached_replies() -> None:
+    class BotEvidenceExpander:
+        def expand(self, **_):
+            human = EvidenceMessage(
+                "human-source",
+                "member",
+                "supported statement",
+                datetime(2026, 7, 23, tzinfo=UTC),
+                group_id=100,
+                user_id=42,
+            )
+            bot_hit = EvidenceMessage(
+                "bot-hit",
+                "bot",
+                "unsupported generated answer",
+                datetime(2026, 7, 23, 0, 1, tzinfo=UTC),
+                group_id=100,
+                user_id=999,
+                is_bot=True,
+            )
+            bot_reply = replace(
+                bot_hit,
+                source_msg_id="bot-reply",
+                reply_to_msg_id="human-source",
+            )
+            return (
+                EvidenceSegment(
+                    "raw:bot-hit",
+                    10.0,
+                    (bot_hit,),
+                    hit_source_msg_ids=("bot-hit",),
+                ),
+                EvidenceSegment(
+                    "raw:human-hit",
+                    9.0,
+                    (human, bot_reply),
+                    hit_source_msg_ids=("human-source",),
+                ),
+            )
+
+    packer = CapturingSegmentsPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=Retriever(),
+        expander=BotEvidenceExpander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+
+    provider(request())
+
+    assert tuple(segment.episode_id for segment in packer.evidence_segments) == (
+        "raw:human-hit",
+    )
+    assert tuple(
+        message.source_msg_id
+        for message in packer.evidence_segments[0].messages
+    ) == ("human-source",)
 
 
 def test_required_reference_and_mention_segments_are_pinned() -> None:

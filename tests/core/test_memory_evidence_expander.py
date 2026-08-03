@@ -109,6 +109,26 @@ def test_reply_graph_hit_is_pinned_before_history_truncation() -> None:
     assert segment.pinned is True
 
 
+def test_fused_relevance_pin_survives_evidence_expansion() -> None:
+    rows = (item("topic-hit", 0),)
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: rows,
+        normal_radius=0,
+    )
+    lexical_candidate = replace(
+        candidate(("topic-hit",)),
+        pin_reason="lexical",
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(lexical_candidate,),
+        mode="normal",
+    )[0]
+
+    assert segment.pinned is True
+
+
 def test_missing_or_cross_group_provenance_fails_closed() -> None:
     cross_group = (item("hit", 0, group_id=200),)
     expander = MemoryEvidenceExpander(episode_loader=lambda **_: cross_group)

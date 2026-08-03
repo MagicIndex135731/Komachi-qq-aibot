@@ -74,6 +74,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quality-sidecar", type=Path)
     parser.add_argument("--quality-private-replay", type=Path)
     parser.add_argument("--quality-visibility-artifact", type=Path)
+    parser.add_argument("--quality-resume-receipt", type=Path)
+    parser.add_argument("--quality-resume-parent-sidecar", type=Path)
+    parser.add_argument("--quality-resume-parent-private-replay", type=Path)
+    parser.add_argument("--quality-resume-parent-gate-report", type=Path)
+    parser.add_argument("--quality-resume-parent-results", type=Path)
+    parser.add_argument("--quality-resume-parent-benchmark", type=Path)
+    parser.add_argument("--quality-rebind-receipt", type=Path)
+    parser.add_argument("--quality-rebind-parent-sidecar", type=Path)
+    parser.add_argument("--quality-rebind-parent-private-replay", type=Path)
+    parser.add_argument("--quality-rebind-parent-visibility", type=Path)
+    parser.add_argument("--quality-rebind-parent-gate-report", type=Path)
+    parser.add_argument("--quality-rebind-parent-results", type=Path)
+    parser.add_argument("--quality-rebind-parent-benchmark", type=Path)
+    parser.add_argument("--quality-rebind-source-gate-report", type=Path)
+    parser.add_argument("--quality-rebind-source-results", type=Path)
+    parser.add_argument("--quality-rebind-source-benchmark", type=Path)
     parser.add_argument("--results", type=Path)
     parser.add_argument("--benchmark-report", type=Path)
     parser.add_argument("--output", type=Path)
@@ -82,6 +98,55 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-generation", type=int)
     return parser
 
+
+def _validate_quality_resume_artifacts(args: argparse.Namespace) -> dict:
+    from scripts.resume_memory_v3_quality_replay import (
+        validate_quality_resume_receipt,
+    )
+
+    return validate_quality_resume_receipt(
+        args.quality_resume_receipt,
+        dataset_path=args.dataset,
+        manifest_path=args.manifest,
+        prepared_report_path=args.prepared_report,
+        parent_quality_sidecar_path=args.quality_resume_parent_sidecar,
+        parent_private_replay_path=args.quality_resume_parent_private_replay,
+        parent_visibility_path=args.quality_visibility_artifact,
+        parent_gate_report_path=args.quality_resume_parent_gate_report,
+        parent_results_path=args.quality_resume_parent_results,
+        parent_benchmark_path=args.quality_resume_parent_benchmark,
+        child_quality_sidecar_path=args.quality_sidecar,
+        child_private_replay_path=args.quality_private_replay,
+    )
+
+
+def _validate_quality_rebind_artifacts(args: argparse.Namespace) -> dict:
+    from scripts.rebind_memory_v3_quality import validate_quality_rebind_receipt
+
+    return validate_quality_rebind_receipt(
+        args.quality_rebind_receipt,
+        dataset_path=args.dataset,
+        manifest_path=args.manifest,
+        prepared_report_path=args.prepared_report,
+        old_quality_sidecar_path=args.quality_rebind_parent_sidecar,
+        old_private_replay_path=args.quality_rebind_parent_private_replay,
+        old_resume_receipt_path=args.quality_resume_receipt,
+        old_visibility_path=args.quality_rebind_parent_visibility,
+        old_gate_report_path=args.quality_rebind_parent_gate_report,
+        old_results_path=args.quality_rebind_parent_results,
+        old_benchmark_path=args.quality_rebind_parent_benchmark,
+        old_resume_parent_quality_sidecar_path=args.quality_resume_parent_sidecar,
+        old_resume_parent_private_replay_path=args.quality_resume_parent_private_replay,
+        old_resume_parent_gate_report_path=args.quality_resume_parent_gate_report,
+        old_resume_parent_results_path=args.quality_resume_parent_results,
+        old_resume_parent_benchmark_path=args.quality_resume_parent_benchmark,
+        new_failed_gate_report_path=args.quality_rebind_source_gate_report,
+        new_results_path=args.quality_rebind_source_results,
+        new_benchmark_path=args.quality_rebind_source_benchmark,
+        child_quality_sidecar_path=args.quality_sidecar,
+        child_private_replay_path=args.quality_private_replay,
+        child_visibility_path=args.quality_visibility_artifact,
+    )
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
@@ -95,6 +160,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _validate_arguments(args: argparse.Namespace) -> None:
+    resume_paths = (
+        args.quality_resume_receipt,
+        args.quality_resume_parent_sidecar,
+        args.quality_resume_parent_private_replay,
+        args.quality_resume_parent_gate_report,
+        args.quality_resume_parent_results,
+        args.quality_resume_parent_benchmark,
+    )
+    if any(path is not None for path in resume_paths) and not all(
+        path is not None for path in resume_paths
+    ):
+        raise ValueError("quality resume artifacts must be provided together")
+    rebind_paths = (
+        args.quality_rebind_receipt,
+        args.quality_rebind_parent_sidecar,
+        args.quality_rebind_parent_private_replay,
+        args.quality_rebind_parent_visibility,
+        args.quality_rebind_parent_gate_report,
+        args.quality_rebind_parent_results,
+        args.quality_rebind_parent_benchmark,
+        args.quality_rebind_source_gate_report,
+        args.quality_rebind_source_results,
+        args.quality_rebind_source_benchmark,
+    )
+    if any(path is not None for path in rebind_paths) and not all(
+        path is not None for path in rebind_paths
+    ):
+        raise ValueError("quality rebind artifacts must be provided together")
+    if all(path is not None for path in rebind_paths) and not all(
+        path is not None for path in resume_paths
+    ):
+        raise ValueError("quality rebind requires the complete parent resume chain")
     if args.batch_size < 1:
         raise ValueError("batch-size must be positive")
     if args.resume_generation is not None and args.resume_generation < 1:
@@ -110,6 +207,8 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         or args.quality_sidecar is not None
         or args.quality_private_replay is not None
         or args.quality_visibility_artifact is not None
+        or any(path is not None for path in resume_paths)
+        or any(path is not None for path in rebind_paths)
         or args.results is not None
         or args.benchmark_report is not None
     ):
@@ -314,6 +413,17 @@ def _activate_prepared_generation(
         raise ValueError("prepared-report contains no vector identity")
     gate = _load_strict_json(args.gate_report)
     quality_sidecar = _load_strict_json(args.quality_sidecar)
+    quality_version = quality_sidecar.get("quality_version")
+    resume_receipt_sha256 = (
+        _file_sha256(args.quality_resume_receipt)
+        if args.quality_resume_receipt is not None and quality_version == 4
+        else None
+    )
+    rebind_receipt_sha256 = (
+        _file_sha256(args.quality_rebind_receipt)
+        if args.quality_rebind_receipt is not None and quality_version == 5
+        else None
+    )
     _validate_activation_gate(
         gate,
         manifest_sha256=message_ledger_manifest_sha256(manifest),
@@ -327,6 +437,8 @@ def _activate_prepared_generation(
         results_sha256=_file_sha256(args.results),
         benchmark_sha256=_file_sha256(args.benchmark_report),
         quality_sidecar=quality_sidecar,
+        quality_resume_receipt_sha256=resume_receipt_sha256,
+        quality_rebind_receipt_sha256=rebind_receipt_sha256,
     )
     _validate_activation_quality_artifacts(
         args,
@@ -334,6 +446,11 @@ def _activate_prepared_generation(
         manifest_sha256=message_ledger_manifest_sha256(manifest),
         generation=generation,
     )
+    if resume_receipt_sha256 is not None:
+        if rebind_receipt_sha256 is None:
+            _validate_quality_resume_artifacts(args)
+    if rebind_receipt_sha256 is not None:
+        _validate_quality_rebind_artifacts(args)
 
     watermarks = group_watermarks_from_manifest(manifest)
     engine = build_engine(args.database)
@@ -480,6 +597,8 @@ def _activate_prepared_generation(
                 "vector_indexed_documents": coverage.indexed_documents,
                 "ledger_matches": True,
                 "gate_report_sha256": _file_sha256(args.gate_report),
+                "quality_resume_receipt_sha256": resume_receipt_sha256,
+                "quality_rebind_receipt_sha256": rebind_receipt_sha256,
             }
             _emit_report(report, output=args.output)
             return 0
@@ -595,6 +714,8 @@ def _validate_activation_gate(
     results_sha256: str,
     benchmark_sha256: str,
     quality_sidecar: dict,
+    quality_resume_receipt_sha256: str | None = None,
+    quality_rebind_receipt_sha256: str | None = None,
 ) -> None:
     required_fields = {
         "evaluation_schema_version",
@@ -613,6 +734,7 @@ def _validate_activation_gate(
     }
     if not isinstance(gate, dict) or not required_fields <= set(gate):
         raise ValueError("activation gate fields do not match the contract")
+    _activation_retrieval_p95_limit(gate)
     acceptance = gate.get("acceptance")
     if (
         not isinstance(acceptance, dict)
@@ -633,6 +755,11 @@ def _validate_activation_gate(
         raise ValueError("activation gate does not match the dataset")
     if gate.get("quality_sidecar_sha256") != quality_sidecar_sha256:
         raise ValueError("activation gate does not match the quality sidecar")
+    gate_resume_sha256 = gate.get("quality_resume_receipt_sha256")
+    if gate_resume_sha256 != quality_resume_receipt_sha256:
+        raise ValueError("activation gate does not match the quality resume receipt")
+    if gate.get("quality_rebind_receipt_sha256") != quality_rebind_receipt_sha256:
+        raise ValueError("activation gate does not match the quality rebind receipt")
     if gate.get("results_sha256") != results_sha256:
         raise ValueError("activation gate does not match the evaluation results")
     if gate.get("benchmark_sha256") != benchmark_sha256:
@@ -663,6 +790,9 @@ def _validate_activation_gate(
     if int(gate.get("case_count", 0)) < 64:
         raise ValueError("activation gate has insufficient cases")
     metrics = gate.get("metrics")
+    context_profile = gate.get("context_profile", "legacy")
+    if context_profile not in {"legacy", "adaptive"}:
+        raise ValueError("activation gate context profile is unsupported")
     zero_metrics = {
         "group_leak_count",
         "subject_leak_count",
@@ -696,6 +826,27 @@ def _validate_activation_gate(
         "answer_accuracy": 0.80,
         "abstention_f1": 0.90,
     }
+    if context_profile == "adaptive":
+        zero_metrics -= {
+            "retrieval_over_150_count",
+            "packet_over_150_count",
+            "packet_over_24k_count",
+            "recent_over_60_count",
+        }
+        zero_metrics |= {
+            "retrieval_over_300_count",
+            "packet_over_300_count",
+            "packet_over_32k_count",
+            "recent_over_120_count",
+        }
+        minimum_metrics.pop("recall_at_150")
+        minimum_metrics.pop("recall_within_24k")
+        minimum_metrics.update(
+            {
+                "recall_at_300": 0.80,
+                "recall_within_32k": 0.80,
+            }
+        )
     if not isinstance(metrics, dict):
         raise ValueError("activation gate has no metrics")
     if any(_finite_number(metrics.get(name)) != 0.0 for name in zero_metrics):
@@ -723,7 +874,8 @@ def _validate_activation_gate(
     latency_failure = (
         latency_values["index_visibility_p95_ms"] > 5_000.0
         or latency_values["ttft_p95_ms"] > 15_000.0
-        or latency_values["retrieval_p95_ms"] >= 500.0
+        or latency_values["retrieval_p95_ms"]
+        >= _activation_retrieval_p95_limit(gate)
     )
     if below_minimum or latency_failure:
         raise RuntimeError("activation gate metrics do not pass")
@@ -767,10 +919,21 @@ def _validate_activation_quality_artifacts(
         private_replay_path=args.quality_private_replay,
         visibility_artifact_path=args.quality_visibility_artifact,
         expected_vector_generation=generation,
+        expected_context_profile=str(gate.get("context_profile", "legacy")),
         evaluation_cases=evaluation_cases,
         expected_answer_prompt_sha256_by_case={
             index: value for index, value in enumerate(prompt_hashes)
         },
+        resume_receipt_path=(
+            getattr(args, "quality_resume_receipt", None)
+            if _load_strict_json(args.quality_sidecar).get("quality_version") == 4
+            else None
+        ),
+        rebind_receipt_path=(
+            getattr(args, "quality_rebind_receipt", None)
+            if _load_strict_json(args.quality_sidecar).get("quality_version") == 5
+            else None
+        ),
     )
     metadata = load_message_metadata(args.database)
     recomputed = evaluate_v3(
@@ -796,7 +959,23 @@ def _validate_activation_quality_artifacts(
         args.benchmark_report,
         case_count=case_count,
     )
-    failures = _v3_acceptance_failures(report=recomputed, benchmark=benchmark)
+    context_profile = gate.get("context_profile", "legacy")
+    if "context_profile" in gate:
+        recomputed["context_profile"] = context_profile
+    resume_receipt_sha256 = getattr(quality, "resume_receipt_sha256", None)
+    if resume_receipt_sha256 is not None:
+        recomputed["quality_resume_receipt_sha256"] = resume_receipt_sha256
+    rebind_receipt_sha256 = getattr(quality, "rebind_receipt_sha256", None)
+    if rebind_receipt_sha256 is not None:
+        recomputed["quality_rebind_receipt_sha256"] = rebind_receipt_sha256
+    failures = _v3_acceptance_failures(
+        report=recomputed,
+        benchmark=benchmark,
+        adaptive_enabled=context_profile == "adaptive",
+        max_retrieval_p95_ms=_activation_retrieval_p95_limit(gate),
+    )
+    if "acceptance_limits" in gate:
+        recomputed["acceptance_limits"] = gate["acceptance_limits"]
     recomputed["acceptance"] = {
         "status": "failed" if failures else "passed",
         "error_codes": list(failures),
@@ -806,6 +985,18 @@ def _validate_activation_quality_artifacts(
     for field, value in recomputed.items():
         if gate.get(field) != value:
             raise ValueError(f"activation gate field was not reproduced: {field}")
+
+
+def _activation_retrieval_p95_limit(gate: dict) -> float:
+    limits = gate.get("acceptance_limits")
+    if limits is None:
+        return 500.0
+    if not isinstance(limits, dict) or set(limits) != {"retrieval_p95_ms"}:
+        raise ValueError("activation gate acceptance limits are invalid")
+    value = _finite_number(limits.get("retrieval_p95_ms"))
+    if value is None or value <= 0:
+        raise ValueError("activation gate retrieval P95 limit is invalid")
+    return value
     if failures:
         raise RuntimeError("recomputed activation gate did not pass")
 

@@ -109,9 +109,103 @@ def test_direct_nickname_question_binds_unique_group_member_without_rewriting_qu
         group_members=members,
     )
 
-    assert result.retrieval_query == "加菲猫最喜欢什么动画？"
+    assert result.retrieval_query == "动画"
+    assert result.topic_query == "动画"
     assert result.entities == ("加菲猫",)
     assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+
+
+def test_bound_assessment_extracts_subject_independent_topic_query() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "阿渣如何评价八仙动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.original_query == "阿渣如何评价八仙动画？"
+    assert result.retrieval_query == "八仙动画"
+    assert result.topic_query == "八仙动画"
+    assert result.topic_terms == ("八仙动画", "八仙")
+    assert result.topic_extraction == "deterministic"
+    assert result.subject_aliases_removed == ("阿渣",)
+    assert result.subject_ids == ("10001",)
+    assert result.answer_mode == "assessment"
+    assert result.coverage_mode == "relevance"
+
+
+def test_possessive_assessment_binds_speaker_and_extracts_media_core_topic() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "阿渣对八仙电影的评价",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.speaker_ids == ("10001",)
+    assert result.answer_mode == "assessment"
+    assert result.coverage_mode == "relevance"
+    assert result.topic_query == "八仙电影"
+    assert result.topic_terms == ("八仙电影", "八仙")
+
+
+@pytest.mark.parametrize(
+    ("query", "topic"),
+    (
+        ("阿渣如何评价八仙动画？", "八仙动画"),
+        ("阿渣对八仙电影的评价", "八仙电影"),
+    ),
+)
+def test_media_topic_wins_when_title_core_collides_with_member_alias(
+    query: str,
+    topic: str,
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=10002, nickname="八仙"),
+        ),
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.speaker_ids == ("10001",)
+    assert result.topic_query == topic
+    assert result.coverage_mode == "relevance"
+
+
+def test_subject_only_assessment_has_no_topic_instead_of_alias_query_fallback() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "如何评价阿渣？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.original_query == "如何评价阿渣？"
+    assert result.retrieval_query == "如何评价阿渣？"
+    assert result.topic_query is None
+    assert result.topic_terms == ()
+    assert result.topic_extraction == "none"
     assert result.subject_ids == ("10001",)
 
 
@@ -1467,12 +1561,12 @@ def test_query_plan_binds_requester_and_keeps_group_and_typed_modes() -> None:
     assert result.subject_ids == ("10001",)
     assert result.subject_uins == ("10001",)
     assert result.answer_mode == "assessment"
-    assert result.coverage_mode == "time_buckets"
-    assert result.coverage_strategy == "time_buckets"
+    assert result.coverage_mode == "relevance"
+    assert result.coverage_strategy == "relevance"
     assert result.needs_history is True
 
 
-def test_named_assessment_binds_explicit_speaker_and_uses_time_buckets() -> None:
+def test_named_assessment_without_time_range_uses_relevance() -> None:
     resolver = MemoryQueryResolver()
     members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="加菲猫"),)
 
@@ -1489,7 +1583,25 @@ def test_named_assessment_binds_explicit_speaker_and_uses_time_buckets() -> None
     assert result.subject_ids == ("10002",)
     assert result.subject_binding == "explicit"
     assert result.answer_mode == "assessment"
+    assert result.coverage_mode == "relevance"
+    assert result.topic_query == "性格"
+
+
+def test_named_assessment_with_time_range_keeps_time_bucket_coverage() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="加菲猫"),)
+
+    result = resolver.resolve(
+        "评价加菲猫昨天的表现",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.answer_mode == "assessment"
+    assert result.time_range is not None
     assert result.coverage_mode == "time_buckets"
+    assert result.topic_query == "昨天的表现"
 
 
 def test_shanghai_yesterday_is_converted_once_to_strict_utc_boundaries() -> None:

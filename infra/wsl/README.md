@@ -133,6 +133,27 @@ bash scripts/status.sh
 V3 rollout is deliberately split into separate fail-closed phases. Preparing a
 generation never changes the active vector generation:
 
+Production may additionally enable the adaptive context profile:
+
+```dotenv
+MEMORY_ADAPTIVE_CONTEXT_ENABLED=true
+MEMORY_ADAPTIVE_CONTEXT_BUDGET_CHARS=48000
+MEMORY_ADAPTIVE_RECENT_PROTECTED_TOKENS=1200
+MEMORY_ADAPTIVE_HISTORY_PROTECTED_TOKENS=2400
+MEMORY_ADAPTIVE_RECENT_MIN_MESSAGES=1
+MEMORY_ADAPTIVE_HISTORY_MIN_MESSAGES=1
+MEMORY_ADAPTIVE_MAX_RECENT_MESSAGES=120
+MEMORY_ADAPTIVE_MAX_HISTORY_MESSAGES=300
+```
+
+This profile dynamically shares the effective input-token budget between recent
+and historical context. `120/300` are emergency row caps, not fixed quotas and
+not targets to fill. Strong direct, lexical, or multi-channel evidence uses a
+compact history expansion (up to 150 candidates); weak evidence or a failed
+channel may expand up to 300. Disable only
+`MEMORY_ADAPTIVE_CONTEXT_ENABLED` and recreate `xiaomachi` to restore the legacy
+60/150 packer without changing the active V3 generation or restarting LLBot.
+
 ```bash
 python -m scripts.backfill_memory_v3_raw \
   --phase prepare \
@@ -217,7 +238,8 @@ python -m scripts.run_memory_recall_eval \
 Activation requires both the original prepared report and a passing gate
 report. It performs final live catch-up and a locked manifest check before the
 generation CAS. Immediately after this command succeeds, set
-`MEMORY_RAW_V3_ENABLED=true` in `infra/wsl/.env` and recreate only
+`MEMORY_RAW_V3_ENABLED=true` in `infra/wsl/.env` (and
+`MEMORY_ADAPTIVE_CONTEXT_ENABLED=true` when releasing the adaptive profile), then recreate only
 `xiaomachi`; never recreate LLBot. Production retrieval resolves the active
 generation per query, so it does not keep reading the deactivated legacy table
 between the CAS and this bounded restart:

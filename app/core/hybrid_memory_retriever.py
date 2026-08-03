@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import logging
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 
 logger = logging.getLogger(__name__)
@@ -12,6 +12,9 @@ TEMPORAL_RELEVANCE_FINAL_LIMIT = 60
 TEMPORAL_RELEVANCE_PIN_LIMIT = 48
 DATED_HISTORY_FINAL_LIMIT = 1
 VECTOR_CUTOFF_TIE_EPSILON = 1e-6
+DEFAULT_RELEVANCE_PIN_LIMIT = 8
+PinReason = Literal["direct", "lexical", "semantic"]
+LexicalMatchKind = Literal["none", "broad", "exact"]
 
 DEFAULT_CHANNEL_WEIGHTS: dict[str, float] = {
     "exact_quote": 6.0,
@@ -38,6 +41,7 @@ class RetrievalCandidate:
     start_at: datetime
     end_at: datetime
     channel_score: float = 0.0
+    lexical_match_kind: LexicalMatchKind = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +56,16 @@ class FusedRetrievalCandidate:
     routes: tuple[str, ...]
     route_ranks: tuple[tuple[str, int], ...]
     fused_score: float
+    lexical_match_kind: LexicalMatchKind = "none"
+    pin_reason: PinReason | None = None
+
+    @property
+    def pinned(self) -> bool:
+        return self.pin_reason is not None
+
+    @property
+    def relevance_pinned(self) -> bool:
+        return self.pinned
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +74,8 @@ class HybridRetrievalResult:
     failed_channels: tuple[str, ...] = ()
     attempted_channels: tuple[str, ...] = ()
     channel_candidate_counts: tuple[tuple[str, int], ...] = ()
+    pin_counts: tuple[tuple[PinReason, int], ...] = ()
+    pin_overflow_count: int = 0
 
     @property
     def all_channels_failed(self) -> bool:
@@ -87,6 +103,7 @@ class HybridMemoryRetriever:
         final_limit: int = 30,
         rrf_k: int = 60,
         channel_timeout_seconds: float = 0.5,
+        relevance_pin_limit: int = DEFAULT_RELEVANCE_PIN_LIMIT,
     ) -> None:
         if channel_timeout_seconds <= 0:
             raise ValueError("channel_timeout_seconds must be positive")
@@ -99,6 +116,7 @@ class HybridMemoryRetriever:
         self.final_limit = max(1, int(final_limit))
         self.rrf_k = max(1, int(rrf_k))
         self.channel_timeout_seconds = float(channel_timeout_seconds)
+        self.relevance_pin_limit = max(0, int(relevance_pin_limit))
 
     def retrieve(self, *, group_id: int, resolved_query: Any) -> HybridRetrievalResult:
         if not self.channels:
@@ -207,6 +225,7 @@ class HybridMemoryRetriever:
                         "route_ranks": [],
                         "score": 0.0,
                         "source_msg_ids": [],
+                        "lexical_match_kind": "none",
                     },
                 )
                 if channel not in state["routes"]:
@@ -214,6 +233,13 @@ class HybridMemoryRetriever:
                     state["route_ranks"].append((channel, rank))
                     state["score"] += weight / (self.rrf_k + rank)
                 state["source_msg_ids"].extend(item.source_msg_ids)
+                if channel == "bm25":
+                    current_kind = str(state["lexical_match_kind"])
+                    incoming_kind = str(getattr(item, "lexical_match_kind", "none"))
+                    if incoming_kind == "exact" or (
+                        incoming_kind == "broad" and current_kind == "none"
+                    ):
+                        state["lexical_match_kind"] = incoming_kind
 
         fused: list[FusedRetrievalCandidate] = []
         for state in accumulated.values():
@@ -230,6 +256,7 @@ class HybridMemoryRetriever:
                     routes=tuple(state["routes"]),
                     route_ranks=tuple(state["route_ranks"]),
                     fused_score=float(state["score"]),
+                    lexical_match_kind=state["lexical_match_kind"],
                 )
             )
 
@@ -241,7 +268,11 @@ class HybridMemoryRetriever:
                 item.document_id,
             )
         )
-        relevance_order = tuple(fused)
+        relevance_order, pin_counts, pin_overflow_count = self._mark_relevance_pins(
+            fused,
+            limit=min(self.relevance_pin_limit, self.final_limit),
+        )
+        fused = list(relevance_order)
         coverage_mode = getattr(resolved_query, "coverage_mode", "relevance")
         if coverage_mode == "chronological":
             fused.sort(key=lambda item: (item.start_at, item.document_id))
@@ -266,6 +297,11 @@ class HybridMemoryRetriever:
                 relevance_order=relevance_order,
                 limit=resolved_final_limit,
             )
+        fused = self._restore_relevance_pins(
+            coverage_order=fused,
+            relevance_order=relevance_order,
+            limit=resolved_final_limit,
+        )
         return HybridRetrievalResult(
             candidates=tuple(fused[:resolved_final_limit]),
             failed_channels=tuple(failed_channels),
@@ -274,7 +310,70 @@ class HybridMemoryRetriever:
                 (channel, len(channel_results.get(channel, ())))
                 for channel in channel_names
             ),
+            pin_counts=pin_counts,
+            pin_overflow_count=pin_overflow_count,
         )
+
+    @staticmethod
+    def _mark_relevance_pins(
+        candidates: Sequence[FusedRetrievalCandidate],
+        *,
+        limit: int,
+    ) -> tuple[
+        tuple[FusedRetrievalCandidate, ...],
+        tuple[tuple[PinReason, int], ...],
+        int,
+    ]:
+        priorities: tuple[tuple[PinReason, Callable[[FusedRetrievalCandidate], bool]], ...] = (
+            ("direct", lambda item: bool({"exact_quote", "reply_graph"}.intersection(item.routes))),
+            ("lexical", lambda item: item.lexical_match_kind == "exact"),
+            (
+                "semantic",
+                lambda item: "vector" in item.routes
+                and bool({"entity", "fact", "temporal"}.intersection(item.routes)),
+            ),
+        )
+        selected: dict[int, PinReason] = {}
+        eligible_ids: set[int] = set()
+        resolved_limit = max(0, int(limit))
+        for reason, predicate in priorities:
+            for item in candidates:
+                if item.document_id in selected or not predicate(item):
+                    continue
+                if item.document_id in eligible_ids:
+                    continue
+                eligible_ids.add(item.document_id)
+                if len(selected) < resolved_limit:
+                    selected[item.document_id] = reason
+        marked = tuple(
+            replace(item, pin_reason=selected.get(item.document_id))
+            for item in candidates
+        )
+        counts = tuple(
+            (reason, sum(value == reason for value in selected.values()))
+            for reason, _ in priorities
+            if reason in selected.values()
+        )
+        return marked, counts, max(0, len(eligible_ids) - len(selected))
+
+    @staticmethod
+    def _restore_relevance_pins(
+        *,
+        coverage_order: Sequence[FusedRetrievalCandidate],
+        relevance_order: Sequence[FusedRetrievalCandidate],
+        limit: int,
+    ) -> list[FusedRetrievalCandidate]:
+        resolved_limit = max(1, int(limit))
+        selected = [item for item in relevance_order if item.pinned][:resolved_limit]
+        selected_ids = {item.document_id for item in selected}
+        for item in coverage_order:
+            if item.document_id in selected_ids:
+                continue
+            selected.append(item)
+            selected_ids.add(item.document_id)
+            if len(selected) >= resolved_limit:
+                break
+        return selected
 
     @staticmethod
     def _pin_temporal_relevance(

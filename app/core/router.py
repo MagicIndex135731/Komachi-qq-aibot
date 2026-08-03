@@ -1146,7 +1146,7 @@ class InboundRouter:
             )
             recent_messages = messages.list_recent_group_messages(
                 group_id=event.group_id,
-                limit=self.runtime.settings.context_recent_limit,
+                limit=self.runtime.settings.memory_recent_snapshot_limit,
             )
             use_full_history = self._group_policy_bool(
                 group_id=event.group_id,

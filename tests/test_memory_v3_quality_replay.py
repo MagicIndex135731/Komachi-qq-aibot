@@ -932,6 +932,7 @@ def test_public_sidecar_binds_private_artifacts_without_content(tmp_path: Path) 
         visibility_ms=[100.0] * 20,
         case_rows=[row],
         evaluated_at="2026-08-01T00:00:00Z",
+        context_profile="adaptive",
     )
     rendered = json.dumps(sidecar, ensure_ascii=False)
 
@@ -941,6 +942,7 @@ def test_public_sidecar_binds_private_artifacts_without_content(tmp_path: Path) 
     assert sidecar["visibility_artifact_sha256"] == visibility_sha
     assert len(sidecar["prompt_contract_sha256"]) == 64
     assert sidecar["index_visibility_ms"] == [100.0] * 20
+    assert sidecar["context_profile"] == "adaptive"
 
 
 def test_sqlite_backup_reads_source_without_modifying_it(tmp_path: Path) -> None:

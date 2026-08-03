@@ -212,7 +212,8 @@ class MemoryEvidenceExpander:
             document_id=str(candidate.document_id),
             atomic_source_groups=tuple(atomic_groups),
             pinned=bool(
-                {"exact_quote", "reply_graph"}.intersection(candidate.routes)
+                candidate.pinned
+                or {"exact_quote", "reply_graph"}.intersection(candidate.routes)
             ),
             blocked_output_present=blocked_output_present,
         )
@@ -292,7 +293,8 @@ class MemoryEvidenceExpander:
             hit_source_msg_ids=hit_ids,
             document_id=str(candidate.document_id),
             pinned=bool(
-                {"exact_quote", "reply_graph"}.intersection(candidate.routes)
+                candidate.pinned
+                or {"exact_quote", "reply_graph"}.intersection(candidate.routes)
             ),
             blocked_output_present=blocked_output_present,
         )

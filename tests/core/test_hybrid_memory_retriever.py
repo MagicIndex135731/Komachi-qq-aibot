@@ -21,6 +21,7 @@ def candidate(
     source_msg_ids: tuple[str, ...] = (),
     score: float = 0.0,
     at: datetime | None = None,
+    lexical_match_kind: str = "none",
 ) -> RetrievalCandidate:
     timestamp = at or datetime(2026, 7, document_id, tzinfo=UTC)
     return RetrievalCandidate(
@@ -32,6 +33,7 @@ def candidate(
         start_at=timestamp,
         end_at=timestamp,
         channel_score=score,
+        lexical_match_kind=lexical_match_kind,
     )
 
 
@@ -431,6 +433,95 @@ def test_time_bucket_coverage_spans_available_history_deterministically() -> Non
     )
 
     assert [item.document_id for item in result.candidates] == [1, 4, 10]
+
+
+def test_time_bucket_coverage_cannot_evict_bounded_lexical_relevance_pins() -> None:
+    timeline = [
+        candidate(
+            index,
+            at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=index),
+        )
+        for index in range(1, 21)
+    ]
+    lexical_hit = candidate(
+        10,
+        at=timeline[9].start_at,
+        lexical_match_kind="exact",
+    )
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": lambda **_: [lexical_hit],
+            "temporal": lambda **_: timeline,
+        },
+        candidate_limit=20,
+        final_limit=3,
+        relevance_pin_limit=1,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(coverage_mode="time_buckets"),
+    )
+
+    assert result.candidates[0].document_id == lexical_hit.document_id
+    assert result.candidates[0].pin_reason == "lexical"
+    assert result.candidates[0].pinned is True
+    assert result.candidates[0].relevance_pinned is True
+    assert len(result.candidates) == 3
+
+
+def test_relevance_pin_limit_is_finite_and_reports_overflow() -> None:
+    lexical = [
+        candidate(index, lexical_match_kind="exact")
+        for index in range(1, 6)
+    ]
+    retriever = HybridMemoryRetriever(
+        channels={"bm25": lambda **_: lexical},
+        final_limit=5,
+        relevance_pin_limit=2,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(coverage_mode="relevance"),
+    )
+
+    assert [item.document_id for item in result.candidates if item.pinned] == [1, 2]
+    assert result.pin_overflow_count == 3
+    assert result.pin_counts == (("lexical", 2),)
+
+
+def test_direct_pin_has_priority_over_lexical_pin_when_cap_is_exhausted() -> None:
+    retriever = HybridMemoryRetriever(
+        channels={
+            "exact_quote": lambda **_: [candidate(9)],
+            "bm25": lambda **_: [candidate(1, lexical_match_kind="exact")],
+        },
+        final_limit=2,
+        relevance_pin_limit=1,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert result.candidates[0].document_id == 9
+    assert result.candidates[0].pin_reason == "direct"
+    assert result.candidates[1].pinned is False
+    assert result.pin_overflow_count == 1
+
+
+def test_broad_bm25_fallback_is_not_pinned_as_strong_lexical_evidence() -> None:
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": lambda **_: [candidate(1, lexical_match_kind="broad")],
+        },
+        final_limit=1,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert result.candidates[0].lexical_match_kind == "broad"
+    assert result.candidates[0].pin_reason is None
+    assert result.pin_counts == ()
 
 
 def test_time_bucket_coverage_resists_busy_recent_interval() -> None:

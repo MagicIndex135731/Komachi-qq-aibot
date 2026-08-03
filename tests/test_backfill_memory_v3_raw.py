@@ -26,9 +26,82 @@ from app.storage.repositories import (
     UserRepository,
 )
 import scripts.backfill_memory_v3_raw as backfill_v3
+import scripts.resume_memory_v3_quality_replay as resume_v3
+from tests.test_memory_v3_quality_resume import _build_artifacts
 
 
 main = backfill_v3.main
+
+
+def test_activation_forwards_frozen_inputs_to_resume_contract(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = {
+        name: tmp_path / name
+        for name in (
+            "receipt",
+            "dataset",
+            "manifest",
+            "prepared",
+            "parent_sidecar",
+            "parent_private",
+            "visibility",
+            "parent_gate",
+            "parent_results",
+            "parent_benchmark",
+            "child_sidecar",
+            "child_private",
+        )
+    }
+    captured = {}
+
+    def validate(receipt_path, **kwargs):
+        captured["receipt_path"] = receipt_path
+        captured.update(kwargs)
+        raise ValueError("tampered parent digest")
+
+    monkeypatch.setattr(resume_v3, "validate_quality_resume_receipt", validate)
+    args = SimpleNamespace(
+        quality_resume_receipt=paths["receipt"],
+        dataset=paths["dataset"],
+        manifest=paths["manifest"],
+        prepared_report=paths["prepared"],
+        quality_resume_parent_sidecar=paths["parent_sidecar"],
+        quality_resume_parent_private_replay=paths["parent_private"],
+        quality_visibility_artifact=paths["visibility"],
+        quality_resume_parent_gate_report=paths["parent_gate"],
+        quality_resume_parent_results=paths["parent_results"],
+        quality_resume_parent_benchmark=paths["parent_benchmark"],
+        quality_sidecar=paths["child_sidecar"],
+        quality_private_replay=paths["child_private"],
+    )
+    with pytest.raises(ValueError, match="tampered parent digest"):
+        backfill_v3._validate_quality_resume_artifacts(args)
+    assert captured["dataset_path"] == paths["dataset"]
+    assert captured["manifest_path"] == paths["manifest"]
+    assert captured["prepared_report_path"] == paths["prepared"]
+
+
+def test_activation_rejects_changed_parent_prepared_digest(tmp_path) -> None:
+    paths = _build_artifacts(tmp_path)
+    paths["prepared"].write_text('{"tampered":true}\n', encoding="utf-8")
+    args = SimpleNamespace(
+        quality_resume_receipt=paths["receipt"],
+        dataset=paths["dataset"],
+        manifest=paths["manifest"],
+        prepared_report=paths["prepared"],
+        quality_resume_parent_sidecar=paths["parent_public"],
+        quality_resume_parent_private_replay=paths["parent_private"],
+        quality_visibility_artifact=paths["visibility"],
+        quality_resume_parent_gate_report=paths["gate"],
+        quality_resume_parent_results=paths["results"],
+        quality_resume_parent_benchmark=paths["benchmark"],
+        quality_sidecar=paths["child_public"],
+        quality_private_replay=paths["child_private"],
+    )
+    with pytest.raises(ValueError, match="parent artifact hash"):
+        backfill_v3._validate_quality_resume_artifacts(args)
 
 
 def _write_activation_gate(
@@ -185,6 +258,29 @@ def test_activation_gate_binds_dataset_quality_and_retrieval_fingerprint(
         quality_sidecar=quality,
     )
 
+    gate["metrics"]["retrieval_p95_ms"] = 550.0
+    gate["acceptance_limits"] = {"retrieval_p95_ms": 600.0}
+    backfill_v3._validate_activation_gate(
+        gate,
+        manifest_sha256=prepared["manifest_sha256"],
+        generation=2,
+        dataset_sha256=hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        quality_sidecar_sha256=hashlib.sha256(quality_path.read_bytes()).hexdigest(),
+        quality_private_replay_sha256=hashlib.sha256(
+            gate_path.with_suffix(".quality-private.json").read_bytes()
+        ).hexdigest(),
+        quality_visibility_artifact_sha256=hashlib.sha256(
+            gate_path.with_suffix(".quality-visibility.json").read_bytes()
+        ).hexdigest(),
+        results_sha256=hashlib.sha256(
+            gate_path.with_suffix(".results.jsonl").read_bytes()
+        ).hexdigest(),
+        benchmark_sha256=hashlib.sha256(
+            gate_path.with_suffix(".benchmark.json").read_bytes()
+        ).hexdigest(),
+        quality_sidecar=quality,
+    )
+
     gate["dataset_sha256"] = "c" * 64
     with pytest.raises(ValueError, match="dataset"):
         backfill_v3._validate_activation_gate(
@@ -210,6 +306,17 @@ def test_activation_gate_binds_dataset_quality_and_retrieval_fingerprint(
                 gate_path.with_suffix(".benchmark.json").read_bytes()
             ).hexdigest(),
             quality_sidecar=quality,
+        )
+
+
+def test_activation_gate_preserves_explicit_retrieval_latency_limit() -> None:
+    assert backfill_v3._activation_retrieval_p95_limit({}) == 500.0
+    assert backfill_v3._activation_retrieval_p95_limit(
+        {"acceptance_limits": {"retrieval_p95_ms": 600.0}}
+    ) == 600.0
+    with pytest.raises(ValueError, match="retrieval P95 limit"):
+        backfill_v3._activation_retrieval_p95_limit(
+            {"acceptance_limits": {"retrieval_p95_ms": float("nan")}}
         )
 
 
@@ -409,7 +516,10 @@ def test_activation_reparses_full_quality_artifacts(tmp_path, monkeypatch) -> No
         "private_replay_path": private_path,
         "visibility_artifact_path": visibility_path,
         "expected_vector_generation": 2,
+        "expected_context_profile": "legacy",
         "expected_answer_prompt_sha256_by_case": {0: "c" * 64},
+        "resume_receipt_path": None,
+        "rebind_receipt_path": None,
     }
 
 

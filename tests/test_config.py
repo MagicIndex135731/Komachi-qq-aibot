@@ -187,10 +187,58 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_recent_context_budget_tokens == 10000
     assert settings.memory_history_context_budget_tokens == 24000
     assert settings.memory_context_budget_chars == 12000
+    assert settings.memory_adaptive_context_enabled is False
+    assert settings.memory_adaptive_context_budget_chars == 48000
+    assert settings.memory_recent_snapshot_limit == 60
+    assert settings.memory_effective_context_budget_chars == 12000
+    assert settings.memory_recent_protected_min_tokens == 1200
+    assert settings.memory_history_protected_min_tokens == 2400
+    assert settings.memory_recent_protected_min_messages == 1
+    assert settings.memory_history_protected_min_messages == 1
+    assert settings.memory_adaptive_max_recent_messages == 120
+    assert settings.memory_adaptive_max_history_messages == 300
     assert settings.memory_max_evidence_messages == 150
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30
     assert settings.memory_final_episode_limit == 6
+
+
+def test_app_settings_rejects_invalid_enabled_adaptive_budget(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+    monkeypatch.setenv("MEMORY_ADAPTIVE_CONTEXT_ENABLED", "true")
+    monkeypatch.setenv("MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS", "3000")
+
+    with pytest.raises(ValueError, match="protected token minima"):
+        AppSettings(
+            config_dir=tmp_path / "configs",
+            data_dir=tmp_path / "data",
+            _env_file=None,
+        )
+
+
+def test_app_settings_adaptive_profile_uses_wide_snapshot_and_char_safety_cap(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+    monkeypatch.setenv("MEMORY_ADAPTIVE_CONTEXT_ENABLED", "true")
+
+    settings = AppSettings(
+        config_dir=tmp_path / "configs",
+        data_dir=tmp_path / "data",
+        _env_file=None,
+    )
+
+    assert settings.memory_recent_snapshot_limit == 120
+    assert settings.memory_effective_context_budget_chars == 48000
 
 
 def test_app_settings_reads_group_image_timeout(tmp_path, monkeypatch) -> None:

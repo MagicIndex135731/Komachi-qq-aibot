@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import run_memory_recall_eval as recall_runner
+from scripts import resume_memory_v3_quality_replay as resume_runner
+from scripts import run_memory_v3_quality_replay as quality_runner
 from scripts.memory_v3_quality_contract import prompt_contract_sha256
+from tests.test_memory_v3_quality_resume import _build_artifacts
 from scripts.evaluate_memory_recall import EvaluationCase, EvaluationResult, evaluate
 from scripts.evaluate_memory_v3 import (
     MessageMetadata,
@@ -62,6 +65,113 @@ def test_citation_precision_accepts_judge_grounded_alternative_evidence() -> Non
         citations_minimal=True,
         expected_evidence_available=False,
     ) == 1.0
+
+
+@pytest.mark.parametrize("profile", ("legacy", "adaptive"))
+def test_recall_and_quality_producers_accept_explicit_context_profile(profile: str) -> None:
+    recall_args = recall_runner.build_argument_parser().parse_args(
+        [
+            "--database", "db.sqlite",
+            "--manifest", "manifest.json",
+            "--dataset", "cases.jsonl",
+            "--results-output", "results.jsonl",
+            "--report-output", "report.json",
+            "--benchmark-output", "benchmark.json",
+            "--review", "review.json",
+            "--prepared-report", "prepared.json",
+            "--context-profile", profile,
+        ]
+    )
+    quality_args = quality_runner.build_argument_parser().parse_args(
+        [
+            "--database", "db.sqlite",
+            "--manifest", "manifest.json",
+            "--prepared-report", "prepared.json",
+            "--dataset", "cases.jsonl",
+            "--review", "review.json",
+            "--quality-output", "quality.json",
+            "--private-replay-output", "private.json",
+            "--visibility-output", "visibility.json",
+            "--context-profile", profile,
+        ]
+    )
+
+    assert recall_args.context_profile == profile
+    assert quality_args.context_profile == profile
+
+
+def test_recall_gate_forwards_frozen_inputs_to_resume_contract(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = {
+        name: tmp_path / name
+        for name in (
+            "receipt",
+            "dataset",
+            "manifest",
+            "prepared",
+            "parent_sidecar",
+            "parent_private",
+            "visibility",
+            "parent_gate",
+            "parent_results",
+            "parent_benchmark",
+            "child_sidecar",
+            "child_private",
+        )
+    }
+    captured = {}
+
+    def validate(receipt_path, **kwargs):
+        captured["receipt_path"] = receipt_path
+        captured.update(kwargs)
+        raise ValueError("tampered resume contract")
+
+    monkeypatch.setattr(resume_runner, "validate_quality_resume_receipt", validate)
+    args = SimpleNamespace(
+        quality_resume_receipt=paths["receipt"],
+        dataset=paths["dataset"],
+        manifest=paths["manifest"],
+        prepared_report=paths["prepared"],
+        quality_resume_parent_sidecar=paths["parent_sidecar"],
+        quality_resume_parent_private_replay=paths["parent_private"],
+        quality_visibility_artifact=paths["visibility"],
+        quality_resume_parent_gate_report=paths["parent_gate"],
+        quality_resume_parent_results=paths["parent_results"],
+        quality_resume_parent_benchmark=paths["parent_benchmark"],
+        quality_sidecar=paths["child_sidecar"],
+        quality_private_replay=paths["child_private"],
+    )
+    with pytest.raises(ValueError, match="tampered resume contract"):
+        recall_runner._validate_quality_resume_artifacts(args)
+    assert captured["dataset_path"] == paths["dataset"]
+    assert captured["manifest_path"] == paths["manifest"]
+    assert captured["prepared_report_path"] == paths["prepared"]
+
+
+def test_recall_gate_rejects_changed_resume_executable_contract(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _build_artifacts(tmp_path)
+    monkeypatch.setattr(resume_runner, "resume_contract_sha256", lambda: "0" * 64)
+    args = SimpleNamespace(
+        quality_resume_receipt=paths["receipt"],
+        dataset=paths["dataset"],
+        manifest=paths["manifest"],
+        prepared_report=paths["prepared"],
+        quality_resume_parent_sidecar=paths["parent_public"],
+        quality_resume_parent_private_replay=paths["parent_private"],
+        quality_visibility_artifact=paths["visibility"],
+        quality_resume_parent_gate_report=paths["gate"],
+        quality_resume_parent_results=paths["results"],
+        quality_resume_parent_benchmark=paths["benchmark"],
+        quality_sidecar=paths["child_public"],
+        quality_private_replay=paths["child_private"],
+    )
+    with pytest.raises(ValueError, match="executable contract"):
+        recall_runner._validate_quality_resume_artifacts(args)
 
 
 def test_abstention_expectation_accepts_audited_grounded_alternative() -> None:
@@ -300,6 +410,166 @@ def test_v3_acceptance_rejects_non_finite_metrics(
     assert expected_code in failures
 
 
+def test_v3_adaptive_acceptance_uses_wide_safety_caps() -> None:
+    zero_names = (
+        "group_leak_count",
+        "subject_leak_count",
+        "time_leak_count",
+        "ineligible_source_count",
+        "unresolved_source_count",
+        "outside_snapshot_source_count",
+        "forbidden_source_count",
+        "plan_mismatch_count",
+        "derived_evidence_count",
+        "retrieval_over_300_count",
+        "packet_over_300_count",
+        "packet_over_32k_count",
+        "recent_over_120_count",
+        "citation_not_in_packet_count",
+        "citation_forbidden_source_count",
+        "citation_unresolved_source_count",
+        "citation_group_leak_count",
+        "citation_subject_leak_count",
+        "citation_time_leak_count",
+        "citation_ineligible_source_count",
+        "answer_protocol_failure_count",
+    )
+    metrics = {
+        **{name: 0 for name in zero_names},
+        "retrieval_over_150_count": 1,
+        "packet_over_150_count": 1,
+        "packet_over_24k_count": 1,
+        "recent_over_60_count": 1,
+        "recall_at_300": 1.0,
+        "recall_within_32k": 1.0,
+        "time_bucket_coverage_rate": 1.0,
+        "citation_precision": 1.0,
+        "citation_recall": 1.0,
+        "grounded_answer_accuracy": 1.0,
+        "answer_accuracy": 1.0,
+        "abstention_f1": 1.0,
+        "index_visibility_p95_ms": 100.0,
+        "ttft_p95_ms": 100.0,
+    }
+
+    failures = recall_runner._v3_acceptance_failures(
+        report={"metrics": metrics},
+        benchmark={
+            "p95_latency_ms": 100.0,
+            "rerank_enabled": False,
+            "network_enabled": False,
+            "vector_success_verified": True,
+        },
+        adaptive_enabled=True,
+    )
+
+    assert failures == ()
+
+
+def test_v3_acceptance_supports_an_explicit_latency_waiver() -> None:
+    zero_names = (
+        "group_leak_count",
+        "subject_leak_count",
+        "time_leak_count",
+        "ineligible_source_count",
+        "unresolved_source_count",
+        "outside_snapshot_source_count",
+        "forbidden_source_count",
+        "plan_mismatch_count",
+        "derived_evidence_count",
+        "retrieval_over_300_count",
+        "packet_over_300_count",
+        "packet_over_32k_count",
+        "recent_over_120_count",
+        "citation_not_in_packet_count",
+        "citation_forbidden_source_count",
+        "citation_unresolved_source_count",
+        "citation_group_leak_count",
+        "citation_subject_leak_count",
+        "citation_time_leak_count",
+        "citation_ineligible_source_count",
+        "answer_protocol_failure_count",
+    )
+    report = {
+        "metrics": {
+            **{name: 0 for name in zero_names},
+            "recall_at_300": 1.0,
+            "recall_within_32k": 1.0,
+            "time_bucket_coverage_rate": 1.0,
+            "citation_precision": 1.0,
+            "citation_recall": 1.0,
+            "grounded_answer_accuracy": 1.0,
+            "answer_accuracy": 1.0,
+            "abstention_f1": 1.0,
+            "index_visibility_p95_ms": 100.0,
+            "ttft_p95_ms": 100.0,
+        }
+    }
+    benchmark = {
+        "p95_latency_ms": 546.0,
+        "rerank_enabled": False,
+        "network_enabled": False,
+        "vector_success_verified": True,
+    }
+
+    assert "AC_RETRIEVAL_P95" in recall_runner._v3_acceptance_failures(
+        report=report,
+        benchmark=benchmark,
+        adaptive_enabled=True,
+    )
+    assert "AC_RETRIEVAL_P95" not in recall_runner._v3_acceptance_failures(
+        report=report,
+        benchmark=benchmark,
+        adaptive_enabled=True,
+        max_retrieval_p95_ms=600.0,
+    )
+
+
+def test_adaptive_packet_32k_metric_uses_shared_recent_plus_history_total() -> None:
+    case = EvaluationCase(100, "q", (), (), "abstention", schema_version=3)
+    packed = SimpleNamespace(
+        evidence_segments=(),
+        recent_messages=(),
+        facts=(),
+        summaries=(),
+    )
+    trace = SimpleNamespace(
+        retrieved_source_msg_ids=(),
+        retrieved_source_units=(),
+        result=SimpleNamespace(packed_context=packed, estimated_tokens=32_001),
+        resolved_query=SimpleNamespace(
+            subject_ids=None,
+            answer_mode="abstention",
+            coverage_strategy="relevance",
+            time_range=None,
+        ),
+    )
+    observation = build_v3_observation(
+        case_index=0,
+        case=case,
+        trace=trace,
+        requester_uin="42",
+        metadata={},
+        snapshot_watermark=10,
+        history_packet_tokens=100,
+        retrieval_latency_ms=1.0,
+    )
+    fingerprint = retrieval_fingerprint_sha256((observation,))
+
+    report = evaluate_v3(
+        cases=(case,),
+        observations=(observation,),
+        quality=None,
+        dataset_sha256="a" * 64,
+        snapshot_manifest_sha256="b" * 64,
+        retrieval_fingerprint=fingerprint,
+        gate_tag_counts={},
+    )
+
+    assert report["metrics"]["packet_over_32k_count"] == 1
+    assert report["metrics"]["packet_over_24k_count"] == 0
+
+
 def test_v3_dataset_contract_requires_explicit_structural_gate_coverage() -> None:
     case = _v3_case()
 
@@ -446,7 +716,9 @@ def test_v3_observation_uses_raw_source_ids_when_legacy_episode_units_are_empty(
     )
 
     assert report["metrics"]["recall_at_150"] == 1.0
+    assert report["metrics"]["recall_at_300"] == 1.0
     assert report["metrics"]["recall_within_24k"] == 1.0
+    assert report["metrics"]["recall_within_32k"] == 1.0
     assert report["metrics"]["unresolved_source_count"] == 0
     assert "private query" not in json.dumps(report)
 
@@ -529,6 +801,7 @@ def test_quality_sidecar_is_bound_to_retrieval_and_contains_no_answer_text(
         snapshot_manifest_sha256="b" * 64,
         retrieval_fingerprint=fingerprint,
         case_count=1,
+        context_profile="legacy",
     )
     private_path = tmp_path / "quality-private.json"
     answer_prompt = ["private prompt"]
@@ -718,6 +991,7 @@ def test_quality_sidecar_is_bound_to_retrieval_and_contains_no_answer_text(
         expected_answer_prompt_sha256_by_case={
             0: private_payload["cases"][0]["answer_prompt_sha256"]
         },
+        expected_context_profile="legacy",
     )
     audit = audit_v3_quality_sources(
         cases=(case,),
@@ -730,6 +1004,85 @@ def test_quality_sidecar_is_bound_to_retrieval_and_contains_no_answer_text(
     assert quality.cases[0].answer_protocol_failure_codes == ()
     assert all(value == 0 for value in audit.values())
     assert "private query" not in sidecar_path.read_text(encoding="utf-8")
+
+    receipt_path = tmp_path / "quality-resume-receipt.json"
+    receipt_path.write_text('{"resume_version":1}\n', encoding="utf-8")
+    template["quality_version"] = 4
+    template["resume_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    sidecar_path.write_text(json.dumps(template), encoding="utf-8")
+    resumed = load_v3_quality_sidecar(
+        sidecar_path,
+        dataset_sha256="a" * 64,
+        snapshot_manifest_sha256="b" * 64,
+        retrieval_fingerprint=fingerprint,
+        case_count=1,
+        private_replay_path=private_path,
+        visibility_artifact_path=visibility_path,
+        expected_vector_generation=2,
+        evaluation_cases=(case,),
+        expected_answer_prompt_sha256_by_case={
+            0: private_payload["cases"][0]["answer_prompt_sha256"]
+        },
+        expected_context_profile="legacy",
+        resume_receipt_path=receipt_path,
+    )
+    assert resumed.resume_receipt_sha256 == template["resume_receipt_sha256"]
+    with pytest.raises(ValueError, match="valid receipt"):
+        load_v3_quality_sidecar(
+            sidecar_path,
+            dataset_sha256="a" * 64,
+            snapshot_manifest_sha256="b" * 64,
+            retrieval_fingerprint=fingerprint,
+            case_count=1,
+        )
+    rebind_receipt_path = tmp_path / "quality-rebind-receipt.json"
+    rebind_receipt_path.write_text('{"rebind_version":1}\n', encoding="utf-8")
+    template["quality_version"] = 5
+    template.pop("resume_receipt_sha256")
+    template["rebind_receipt_sha256"] = hashlib.sha256(
+        rebind_receipt_path.read_bytes()
+    ).hexdigest()
+    sidecar_path.write_text(json.dumps(template), encoding="utf-8")
+    rebound = load_v3_quality_sidecar(
+        sidecar_path,
+        dataset_sha256="a" * 64,
+        snapshot_manifest_sha256="b" * 64,
+        retrieval_fingerprint=fingerprint,
+        case_count=1,
+        private_replay_path=private_path,
+        visibility_artifact_path=visibility_path,
+        expected_vector_generation=2,
+        evaluation_cases=(case,),
+        expected_answer_prompt_sha256_by_case={
+            0: private_payload["cases"][0]["answer_prompt_sha256"]
+        },
+        expected_context_profile="legacy",
+        rebind_receipt_path=rebind_receipt_path,
+    )
+    assert rebound.rebind_receipt_sha256 == template["rebind_receipt_sha256"]
+    with pytest.raises(ValueError, match="valid receipt"):
+        load_v3_quality_sidecar(
+            sidecar_path,
+            dataset_sha256="a" * 64,
+            snapshot_manifest_sha256="b" * 64,
+            retrieval_fingerprint=fingerprint,
+            case_count=1,
+        )
+    template["quality_version"] = 3
+    template.pop("rebind_receipt_sha256")
+    sidecar_path.write_text(json.dumps(template), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="context profile"):
+        load_v3_quality_sidecar(
+            sidecar_path,
+            dataset_sha256="a" * 64,
+            snapshot_manifest_sha256="b" * 64,
+            retrieval_fingerprint=fingerprint,
+            case_count=1,
+            expected_context_profile="adaptive",
+        )
 
     with pytest.raises(ValueError, match="answer prompt binding"):
         load_v3_quality_sidecar(

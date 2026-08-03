@@ -31,7 +31,9 @@ except ImportError:  # Direct script execution.
 
 
 V3_DATASET_SCHEMA_VERSION = 3
-V3_QUALITY_SIDECAR_VERSION = 2
+V3_QUALITY_SIDECAR_VERSION = 3
+V3_RESUMED_QUALITY_SIDECAR_VERSION = 4
+V3_REBOUND_QUALITY_SIDECAR_VERSION = 5
 V3_ANSWER_MODES = frozenset(
     {
         "exact",
@@ -195,6 +197,8 @@ class V3QualitySidecar:
     evaluated_at: str
     index_visibility_ms: tuple[float, ...]
     cases: tuple[V3QualityCase, ...]
+    resume_receipt_sha256: str | None = None
+    rebind_receipt_sha256: str | None = None
 
 
 def validate_v3_dataset_contract(cases: Sequence[EvaluationCase]) -> dict[str, int]:
@@ -510,14 +514,19 @@ def quality_sidecar_template(
     snapshot_manifest_sha256: str,
     retrieval_fingerprint: str,
     case_count: int,
+    context_profile: str,
 ) -> dict[str, Any]:
     """Return a content-free template for the controlled answer replay."""
+
+    if context_profile not in {"legacy", "adaptive"}:
+        raise ValueError("V3 quality sidecar context profile is invalid")
 
     return {
         "quality_version": V3_QUALITY_SIDECAR_VERSION,
         "dataset_sha256": dataset_sha256,
         "snapshot_manifest_sha256": snapshot_manifest_sha256,
         "retrieval_fingerprint_sha256": retrieval_fingerprint,
+        "context_profile": context_profile,
         "private_replay_sha256": "",
         "visibility_artifact_sha256": "",
         "prompt_contract_sha256": "",
@@ -554,6 +563,9 @@ def load_v3_quality_sidecar(
     expected_vector_generation: int | None = None,
     evaluation_cases: Sequence[EvaluationCase] | None = None,
     expected_answer_prompt_sha256_by_case: Mapping[int, str] | None = None,
+    expected_context_profile: str | None = None,
+    resume_receipt_path: Path | str | None = None,
+    rebind_receipt_path: Path | str | None = None,
 ) -> V3QualitySidecar:
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
@@ -572,6 +584,7 @@ def load_v3_quality_sidecar(
         "dataset_sha256",
         "snapshot_manifest_sha256",
         "retrieval_fingerprint_sha256",
+        "context_profile",
         "private_replay_sha256",
         "visibility_artifact_sha256",
         "prompt_contract_sha256",
@@ -581,10 +594,65 @@ def load_v3_quality_sidecar(
         "index_visibility_ms",
         "cases",
     }
+    quality_version = payload.get("quality_version")
+    if quality_version == V3_RESUMED_QUALITY_SIDECAR_VERSION:
+        expected_fields.add("resume_receipt_sha256")
+    elif quality_version == V3_REBOUND_QUALITY_SIDECAR_VERSION:
+        expected_fields.add("rebind_receipt_sha256")
     if set(payload) != expected_fields:
         raise ValueError("V3 quality sidecar fields do not match the contract")
-    if payload["quality_version"] != V3_QUALITY_SIDECAR_VERSION:
+    if quality_version not in {
+        V3_QUALITY_SIDECAR_VERSION,
+        V3_RESUMED_QUALITY_SIDECAR_VERSION,
+        V3_REBOUND_QUALITY_SIDECAR_VERSION,
+    }:
         raise ValueError("V3 quality sidecar version is unsupported")
+    resume_receipt_sha256: str | None = None
+    if quality_version == V3_RESUMED_QUALITY_SIDECAR_VERSION:
+        resume_receipt_sha256 = payload["resume_receipt_sha256"]
+        if (
+            not isinstance(resume_receipt_sha256, str)
+            or len(resume_receipt_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in resume_receipt_sha256
+            )
+            or resume_receipt_path is None
+        ):
+            raise ValueError("V3 resumed quality sidecar has no valid receipt")
+        try:
+            receipt_bytes = Path(resume_receipt_path).read_bytes()
+        except OSError as exc:
+            raise ValueError("V3 resumed quality receipt cannot be read") from exc
+        if hashlib.sha256(receipt_bytes).hexdigest() != resume_receipt_sha256:
+            raise ValueError("V3 resumed quality receipt hash does not match the sidecar")
+    elif resume_receipt_path is not None:
+        raise ValueError("V3 ordinary quality sidecar cannot use a resume receipt")
+    rebind_receipt_sha256: str | None = None
+    if quality_version == V3_REBOUND_QUALITY_SIDECAR_VERSION:
+        rebind_receipt_sha256 = payload["rebind_receipt_sha256"]
+        if (
+            not isinstance(rebind_receipt_sha256, str)
+            or len(rebind_receipt_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in rebind_receipt_sha256)
+            or rebind_receipt_path is None
+        ):
+            raise ValueError("V3 rebound quality sidecar has no valid receipt")
+        try:
+            rebind_bytes = Path(rebind_receipt_path).read_bytes()
+        except OSError as exc:
+            raise ValueError("V3 rebound quality receipt cannot be read") from exc
+        if hashlib.sha256(rebind_bytes).hexdigest() != rebind_receipt_sha256:
+            raise ValueError("V3 rebound quality receipt hash does not match the sidecar")
+    elif rebind_receipt_path is not None:
+        raise ValueError("non-rebound quality sidecar cannot use a rebind receipt")
+    if payload["context_profile"] not in {"legacy", "adaptive"}:
+        raise ValueError("V3 quality sidecar context profile is invalid")
+    if (
+        expected_context_profile is not None
+        and payload["context_profile"] != expected_context_profile
+    ):
+        raise ValueError("V3 quality sidecar context profile does not match this run")
     bindings = (
         ("dataset_sha256", dataset_sha256),
         ("snapshot_manifest_sha256", snapshot_manifest_sha256),
@@ -1146,6 +1214,8 @@ def load_v3_quality_sidecar(
         evaluated_at=payload["evaluated_at"],
         index_visibility_ms=visibility,
         cases=tuple(parsed_rows),
+        resume_receipt_sha256=resume_receipt_sha256,
+        rebind_receipt_sha256=rebind_receipt_sha256,
     )
 
 
@@ -1202,16 +1272,23 @@ def evaluate_v3(
         raise ValueError("V3 observation case indexes are incomplete")
 
     recalls_150: list[float] = []
+    recalls_300: list[float] = []
     recalls_24k: list[float] = []
     for case, observation in zip(cases, ordered, strict=True):
         gold = set(case.expected_evidence_message_ids)
         retrieved = set(observation.retrieved_source_message_ids[:150])
+        retrieved_300 = set(observation.retrieved_source_message_ids[:300])
         packed = set(observation.history_packet_source_message_ids)
         expected_abstention = not gold
         recalls_150.append(
             float(not retrieved)
             if expected_abstention
             else len(gold & retrieved) / len(gold)
+        )
+        recalls_300.append(
+            float(not retrieved_300)
+            if expected_abstention
+            else len(gold & retrieved_300) / len(gold)
         )
         recalls_24k.append(
             float(not packed)
@@ -1226,7 +1303,9 @@ def evaluate_v3(
     packet_total = sum(packet_counts)
     metrics: dict[str, Any] = {
         "recall_at_150": _mean(recalls_150),
+        "recall_at_300": _mean(recalls_300),
         "recall_within_24k": _mean(recalls_24k),
+        "recall_within_32k": _mean(recalls_24k),
         "group_leak_count": sum(item.group_leak_count for item in ordered),
         "subject_leak_count": sum(item.subject_leak_count for item in ordered),
         "time_leak_count": sum(item.time_leak_count for item in ordered),
@@ -1249,12 +1328,22 @@ def evaluate_v3(
         "retrieval_over_150_count": sum(
             len(item.retrieved_source_message_ids) > 150 for item in ordered
         ),
+        "retrieval_over_300_count": sum(
+            len(item.retrieved_source_message_ids) > 300 for item in ordered
+        ),
         "packet_over_150_count": sum(count > 150 for count in packet_counts),
+        "packet_over_300_count": sum(count > 300 for count in packet_counts),
         "packet_over_24k_count": sum(
             item.history_packet_tokens > 24_000 for item in ordered
         ),
+        "packet_over_32k_count": sum(
+            item.memory_context_tokens > 32_000 for item in ordered
+        ),
         "recent_over_60_count": sum(
             item.recent_message_count > 60 for item in ordered
+        ),
+        "recent_over_120_count": sum(
+            item.recent_message_count > 120 for item in ordered
         ),
         "time_bucket_coverage_rate": _mean(
             [

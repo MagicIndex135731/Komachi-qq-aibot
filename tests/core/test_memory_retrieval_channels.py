@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from contextlib import nullcontext
 
 import pytest
 from sqlalchemy import create_engine
@@ -39,9 +40,10 @@ class _FakeEmbeddingProvider:
             dimensions=dimensions,
         )
         self.available = True
+        self.queries: list[str] = []
 
     def embed_query(self, query: str) -> list[float] | None:
-        del query
+        self.queries.append(query)
         return [1.0, *([0.0] * (self.identity.dimensions - 1))]
 
     def embed_documents(self, documents):
@@ -99,6 +101,340 @@ def _seed_document(
         )
         session.flush()
         return document.id
+
+
+def test_fts_and_vector_channels_use_topic_query_not_subject_bearing_question(
+    monkeypatch,
+) -> None:
+    repository_queries: list[str] = []
+
+    class RecordingRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        def search_group_documents_fts_hits(self, *, query: str, **_):
+            repository_queries.append(query)
+            return ()
+
+        def search_group_documents_vector_hits(self, **_):
+            return ()
+
+    monkeypatch.setattr(
+        "app.core.memory_retrieval_channels.RetrievalDocumentRepository",
+        RecordingRepository,
+    )
+    embedding = _FakeEmbeddingProvider()
+    channels = build_memory_retrieval_channels(
+        session_factory=lambda: nullcontext(object()),
+        embedding_provider=embedding,
+    )
+    resolved = ResolvedMemoryQuery(
+        original_query="阿渣如何评价八仙动画？",
+        retrieval_query="八仙动画",
+        topic_query="八仙动画",
+        topic_terms=("八仙动画", "八仙"),
+        topic_extraction="deterministic",
+        subject_ids=("10001",),
+    )
+
+    channels["bm25"](group_id=100, resolved_query=resolved, limit=20)
+    channels["vector"](group_id=100, resolved_query=resolved, limit=20)
+
+    assert repository_queries == ["八仙动画", "八仙"]
+    assert embedding.queries == ["八仙动画"]
+
+
+def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractors(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=100,
+            group_name="group-100",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="A-Zha",
+            group_card="阿渣",
+        )
+        messages = MessageRepository(session)
+        documents = RetrievalDocumentRepository(session)
+        for index in range(220):
+            row = messages.add_group_message(
+                platform_msg_id=f"distractor-{index}",
+                group_id=100,
+                user_id=20001,
+                timestamp=datetime(2026, 8, 2, 8, index % 60, tzinfo=UTC),
+                plain_text=f"如何评价其他内容 {index}",
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+            session.flush()
+            assert documents.project_raw_message_v3(
+                group_id=100,
+                message_id=row.id,
+            ) is not None
+        source = messages.add_group_message(
+            platform_msg_id="bazha-source",
+            group_id=100,
+            user_id=20001,
+            timestamp=datetime(2026, 8, 2, 20, 0, tzinfo=UTC),
+            plain_text="八仙是真几把难看",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        assert documents.project_raw_message_v3(
+            group_id=100,
+            message_id=source.id,
+        ) is not None
+        second_source = messages.add_group_message(
+            platform_msg_id="bazha-source-2",
+            group_id=100,
+            user_id=20001,
+            timestamp=datetime(2026, 8, 2, 20, 1, tzinfo=UTC),
+            plain_text="八仙确实没啥意思",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        assert documents.project_raw_message_v3(
+            group_id=100,
+            message_id=second_source.id,
+        ) is not None
+
+        GroupRepository(session).upsert_group(
+            group_id=200,
+            group_name="group-200",
+            enabled=True,
+            speak_enabled=True,
+        )
+        cross_group = messages.add_group_message(
+            platform_msg_id="cross-group-eight-source",
+            group_id=200,
+            user_id=20001,
+            timestamp=datetime(2026, 8, 2, 20, 2, tzinfo=UTC),
+            plain_text="八仙跨群干扰",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        assert documents.project_raw_message_v3(
+            group_id=200,
+            message_id=cross_group.id,
+        ) is not None
+
+    hits = build_memory_retrieval_channels(
+        sqlite_engine,
+        raw_message_v3_only=True,
+    )["bm25"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="阿渣如何评价八仙动画？",
+            retrieval_query="八仙动画",
+            topic_query="八仙动画",
+            topic_terms=("八仙动画", "八仙"),
+            topic_extraction="deterministic",
+            subject_ids=("20001",),
+            speaker_ids=("20001",),
+            answer_mode="assessment",
+            coverage_mode="relevance",
+        ),
+        limit=300,
+    )
+
+    source_ids = {
+        source_id
+        for hit in hits
+        for source_id in hit.source_msg_ids
+    }
+    assert {"bazha-source", "bazha-source-2"} <= source_ids
+    assert "cross-group-eight-source" not in source_ids
+
+
+def test_raw_channels_exclude_bot_sources_before_candidate_limit(sqlite_engine) -> None:
+    for index in range(5):
+        _seed_document(
+            sqlite_engine,
+            group_id=100,
+            user_id=999,
+            platform_msg_id=f"bot-eight-{index}",
+            content="八仙 bot generated answer",
+        )
+    _seed_document(
+        sqlite_engine,
+        group_id=100,
+        user_id=20001,
+        platform_msg_id="human-eight-source",
+        content="八仙 human source",
+    )
+
+    hits = build_memory_retrieval_channels(
+        sqlite_engine,
+        excluded_speaker_ids=(999,),
+    )["bm25"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="八仙评价",
+            retrieval_query="八仙",
+            topic_query="八仙",
+            topic_terms=("八仙",),
+            topic_extraction="deterministic",
+        ),
+        limit=1,
+    )
+
+    assert [hit.source_msg_ids for hit in hits] == [("human-eight-source",)]
+    assert hits[0].lexical_match_kind == "exact"
+
+
+def test_vector_channel_fetches_past_excluded_bot_sources(sqlite_engine) -> None:
+    bot_id = _seed_document(
+        sqlite_engine,
+        group_id=100,
+        user_id=999,
+        platform_msg_id="bot-vector-source",
+        content="bot vector answer",
+        embedding_eligible=True,
+    )
+    human_id = _seed_document(
+        sqlite_engine,
+        group_id=100,
+        user_id=20001,
+        platform_msg_id="human-vector-source",
+        content="human vector evidence",
+        embedding_eligible=True,
+    )
+    provider = _FakeEmbeddingProvider()
+    generation = ensure_retrieval_vector_generation(
+        sqlite_engine,
+        provider=provider.identity.provider,
+        model=provider.identity.model,
+        dimensions=provider.identity.dimensions,
+        version=provider.identity.version,
+    )
+    assert generation is not None
+    assert write_retrieval_vector_embeddings(
+        sqlite_engine,
+        generation=generation,
+        rows=[
+            (bot_id, 100, [1.0, 0.0, 0.0]),
+            (human_id, 100, [1.0, 0.0, 0.0]),
+        ],
+    ) == 2
+    assert refresh_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        mark_ready=True,
+    ).status == "ready"
+    assert activate_retrieval_vector_generation(
+        sqlite_engine,
+        generation=generation,
+        expected_active_generation=None,
+    )
+
+    hits = build_memory_retrieval_channels(
+        sqlite_engine,
+        embedding_provider=provider,
+        excluded_speaker_ids=(999,),
+    )["vector"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="human evidence",
+            retrieval_query="human evidence",
+            topic_query="human evidence",
+            topic_terms=("human evidence",),
+            topic_extraction="deterministic",
+        ),
+        limit=1,
+    )
+
+    assert [hit.document_id for hit in hits] == [human_id]
+
+
+@pytest.mark.parametrize("channel_name", ("temporal", "entity"))
+def test_temporal_and_entity_fetch_past_excluded_bot_sources(
+    sqlite_engine,
+    channel_name: str,
+) -> None:
+    human_id = _seed_document(
+        sqlite_engine,
+        group_id=100,
+        user_id=20001,
+        platform_msg_id=f"human-{channel_name}-source",
+        content="八仙 human evidence",
+    )
+    for index in range(5):
+        _seed_document(
+            sqlite_engine,
+            group_id=100,
+            user_id=999,
+            platform_msg_id=f"bot-{channel_name}-{index}",
+            content="八仙 bot generated answer",
+        )
+
+    resolved = ResolvedMemoryQuery(
+        original_query="八仙评价",
+        retrieval_query="八仙",
+        topic_query="八仙",
+        topic_terms=("八仙",),
+        topic_extraction="deterministic",
+        entities=("八仙",),
+        time_range=TimeRange(
+            start=datetime(2026, 7, 23, tzinfo=UTC),
+            end=datetime(2026, 7, 24, tzinfo=UTC),
+        ),
+    )
+    hits = build_memory_retrieval_channels(
+        sqlite_engine,
+        excluded_speaker_ids=(999,),
+    )[channel_name](
+        group_id=100,
+        resolved_query=resolved,
+        limit=1,
+    )
+
+    assert [hit.document_id for hit in hits] == [human_id]
+    assert hits[0].source_msg_ids == (f"human-{channel_name}-source",)
+
+
+def test_empty_topic_skips_fts_and_vector_without_embedding_or_repository_call(
+    monkeypatch,
+) -> None:
+    class UnexpectedRepository:
+        def __init__(self, _session) -> None:
+            raise AssertionError("empty topic must not open a lexical/vector repository")
+
+    monkeypatch.setattr(
+        "app.core.memory_retrieval_channels.RetrievalDocumentRepository",
+        UnexpectedRepository,
+    )
+    embedding = _FakeEmbeddingProvider()
+    channels = build_memory_retrieval_channels(
+        session_factory=lambda: nullcontext(object()),
+        embedding_provider=embedding,
+    )
+    resolved = ResolvedMemoryQuery(
+        original_query="如何评价阿渣？",
+        retrieval_query="如何评价阿渣？",
+        topic_query=None,
+        topic_extraction="none",
+        subject_ids=("10001",),
+    )
+
+    assert channels["bm25"](group_id=100, resolved_query=resolved, limit=20) == ()
+    assert channels["vector"](group_id=100, resolved_query=resolved, limit=20) == ()
+    assert embedding.queries == []
 
 
 def test_entity_channel_uses_bound_speaker_id_without_global_alias_expansion(sqlite_engine) -> None:

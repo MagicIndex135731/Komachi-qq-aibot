@@ -38,6 +38,9 @@ MEMORY_GROUNDING_WITH_EVIDENCE = (
 MEMORY_GROUNDING_MINIMAL = (
     "Discussion is not preference evidence; corrections win."
 )
+MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL = (
+    "No memory evidence; do not infer a person's preference."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,9 @@ class PackedMemoryContext:
     grounding_policy: str = ""
     recent_estimated_tokens: int = 0
     history_estimated_tokens: int = 0
+    adaptive_enabled: bool = False
+    spillover: Literal["none", "recent_to_history", "history_to_recent", "bidirectional"] = "none"
+    degradation_reason: str = ""
 
     @property
     def recent_source_msg_ids(self) -> tuple[str, ...]:
@@ -116,6 +122,13 @@ class MemoryContextPacker:
         context_char_budget: int = 12_000,
         max_recent_messages: int = 60,
         max_history_messages: int = 150,
+        adaptive_enabled: bool = False,
+        recent_protected_min_tokens: int = 1_200,
+        history_protected_min_tokens: int = 2_400,
+        recent_protected_min_messages: int = 1,
+        history_protected_min_messages: int = 1,
+        adaptive_max_recent_messages: int = 120,
+        adaptive_max_history_messages: int = 300,
         token_counter: TokenCounter | None = None,
     ) -> None:
         minimum_char_budget = len(MEMORY_GROUNDING_WITH_EVIDENCE) + len(
@@ -139,10 +152,67 @@ class MemoryContextPacker:
         self._context_char_budget = int(context_char_budget)
         self._max_recent_messages = int(max_recent_messages)
         self._max_history_messages = int(max_history_messages)
+        protected_values = (
+            recent_protected_min_tokens,
+            history_protected_min_tokens,
+            recent_protected_min_messages,
+            history_protected_min_messages,
+        )
+        if min(protected_values) < 0:
+            raise ValueError("adaptive protected minima must be non-negative")
+        if min(adaptive_max_recent_messages, adaptive_max_history_messages) <= 0:
+            raise ValueError("adaptive message safety caps must be positive")
+        if recent_protected_min_messages > adaptive_max_recent_messages:
+            raise ValueError("recent protected message minimum exceeds adaptive safety cap")
+        if history_protected_min_messages > adaptive_max_history_messages:
+            raise ValueError("history protected message minimum exceeds adaptive safety cap")
+        if adaptive_enabled and (
+            recent_protected_min_tokens + history_protected_min_tokens
+            > normal_budget
+        ):
+            raise ValueError("adaptive protected token minima exceed normal memory budget")
+        self._adaptive_enabled = bool(adaptive_enabled)
+        self._recent_protected_min_tokens = int(recent_protected_min_tokens)
+        self._history_protected_min_tokens = int(history_protected_min_tokens)
+        self._recent_protected_min_messages = int(recent_protected_min_messages)
+        self._history_protected_min_messages = int(history_protected_min_messages)
+        self._adaptive_max_recent_messages = int(adaptive_max_recent_messages)
+        self._adaptive_max_history_messages = int(adaptive_max_history_messages)
         self._token_counter = token_counter or self._fallback_token_count
         self._token_counter_is_additive = token_counter is None
 
     def pack(
+        self,
+        mode: PackMode,
+        *,
+        available_input: int,
+        target_message_id: str | None,
+        recent_messages: Sequence[EvidenceMessage] = (),
+        evidence_segments: Sequence[EvidenceSegment] = (),
+        facts: Sequence[MemoryFact] = (),
+        summaries: Sequence[MemorySummary] = (),
+    ) -> PackedMemoryContext:
+        if self._adaptive_enabled:
+            return self._pack_adaptive(
+                mode,
+                available_input=available_input,
+                target_message_id=target_message_id,
+                recent_messages=recent_messages,
+                evidence_segments=evidence_segments,
+                facts=facts,
+                summaries=summaries,
+            )
+        return self._pack_legacy(
+            mode,
+            available_input=available_input,
+            target_message_id=target_message_id,
+            recent_messages=recent_messages,
+            evidence_segments=evidence_segments,
+            facts=facts,
+            summaries=summaries,
+        )
+
+    def _pack_legacy(
         self,
         mode: PackMode,
         *,
@@ -381,6 +451,329 @@ class MemoryContextPacker:
             recent_estimated_tokens=recent_estimated_tokens,
             history_estimated_tokens=history_estimated_tokens,
         )
+
+    def _pack_adaptive(
+        self,
+        mode: PackMode,
+        *,
+        available_input: int,
+        target_message_id: str | None,
+        recent_messages: Sequence[EvidenceMessage],
+        evidence_segments: Sequence[EvidenceSegment],
+        facts: Sequence[MemoryFact],
+        summaries: Sequence[MemorySummary],
+    ) -> PackedMemoryContext:
+        if mode not in self._budgets:
+            raise ValueError(f"unknown pack mode: {mode}")
+        budget = min(self._budgets[mode], max(0, available_input))
+        history_requested = bool(evidence_segments or facts or summaries)
+        blocked_output_present = any(message.blocked for message in recent_messages) or any(
+            segment.blocked_output_present or any(message.blocked for message in segment.messages)
+            for segment in evidence_segments
+        )
+        policy_blocks = [QQ_BLOCKED_MEMORY_NOTE] if blocked_output_present else []
+        reserve_policy = (
+            MEMORY_GROUNDING_MINIMAL
+            if history_requested
+            else MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL
+        )
+        block_token_cache: dict[str, int] = {}
+
+        def block_tokens(block: str) -> int:
+            cached = block_token_cache.get(block)
+            if cached is None:
+                cached = self._estimate(block)
+                block_token_cache[block] = cached
+            return cached
+
+        def joined(recent_blocks: Sequence[str], history_blocks: Sequence[str], policy: str) -> str:
+            return "\n\n".join([*recent_blocks, *policy_blocks, policy, *history_blocks])
+
+        def fits(recent_blocks: Sequence[str], history_blocks: Sequence[str], policy: str = reserve_policy) -> bool:
+            if self._token_counter_is_additive:
+                blocks = [*recent_blocks, *policy_blocks, policy, *history_blocks]
+                rendered_length = sum(len(block) for block in blocks) + max(
+                    0, len(blocks) - 1
+                ) * 2
+                return (
+                    rendered_length <= self._context_char_budget
+                    and sum(block_tokens(block) for block in blocks) <= budget
+                )
+            value = joined(recent_blocks, history_blocks, policy)
+            return len(value) <= self._context_char_budget and self._estimate(value) <= budget
+
+        if not fits((), ()):
+            policy = self._shortest_fitting_policy(
+                budget=budget,
+                policies=(
+                    MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL,
+                    MEMORY_GROUNDING_MINIMAL,
+                ),
+            )
+            text = policy
+            degradation_reason = "policy_only" if policy else "policy_unrepresentable"
+            if blocked_output_present:
+                blocked_fallbacks = tuple(
+                    f"{QQ_BLOCKED_MEMORY_NOTE}\n\n{candidate}"
+                    for candidate in (
+                        MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL,
+                        MEMORY_GROUNDING_MINIMAL,
+                    )
+                ) + (QQ_BLOCKED_MEMORY_NOTE,)
+                text = self._shortest_fitting_policy(
+                    budget=budget,
+                    policies=blocked_fallbacks,
+                )
+                policy = next(
+                    (
+                        candidate
+                        for candidate in (
+                            MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL,
+                            MEMORY_GROUNDING_MINIMAL,
+                        )
+                        if text.endswith(candidate)
+                    ),
+                    "",
+                )
+                degradation_reason = (
+                    "blocked_policy_only"
+                    if policy
+                    else "blocked_note_only"
+                    if text
+                    else "blocked_policy_unrepresentable"
+                )
+            return PackedMemoryContext(
+                mode=mode,
+                budget=budget,
+                estimated_tokens=self._estimate(text),
+                text=text,
+                blocked_output_present=blocked_output_present,
+                grounding_policy=policy,
+                history_estimated_tokens=self._estimate(text),
+                adaptive_enabled=True,
+                degradation_reason=degradation_reason,
+            )
+
+        selected_segments: list[EvidenceSegment] = []
+        selected_facts: list[MemoryFact] = []
+        selected_summaries: list[MemorySummary] = []
+        selected_recent: list[EvidenceMessage] = []
+        history_blocks: list[str] = []
+        selected_history_ids: set[str] = set()
+        history_message_count = 0
+
+        def add_segment(segment: EvidenceSegment) -> bool:
+            nonlocal history_message_count
+            candidate = self._prepare_segment(
+                segment,
+                duplicate_ids=selected_history_ids
+                | {message.source_msg_id for message in selected_recent},
+            )
+            if candidate is None:
+                return True
+            if history_message_count + len(candidate.messages) > self._adaptive_max_history_messages:
+                return False
+            block = self._render_segment(candidate)
+            recent_blocks = [self._render_recent(message) for message in selected_recent]
+            if not fits(recent_blocks, [*history_blocks, block]):
+                return False
+            selected_segments.append(candidate)
+            history_blocks.append(block)
+            selected_history_ids.update(message.source_msg_id for message in candidate.messages)
+            history_message_count += len(candidate.messages)
+            return True
+
+        # A pin is an immutable evidence unit in adaptive mode. If the next pin
+        # cannot fit, optional lower-priority history must not bypass it.
+        pins_fit = True
+        for segment in (item for item in evidence_segments if item.pinned):
+            if not add_segment(segment):
+                pins_fit = False
+                break
+
+        recent_candidates = tuple(
+            message
+            for message in recent_messages
+            if message.source_msg_id != target_message_id
+            and message.source_msg_id not in selected_history_ids
+        )[-self._adaptive_max_recent_messages :]
+
+        # Protect the newest contiguous suffix. A non-fitting newest row stops
+        # the suffix instead of allowing an older row to leapfrog it.
+        for message in reversed(recent_candidates):
+            current_tokens = self._estimate(
+                "\n\n".join(self._render_recent(item) for item in selected_recent)
+            )
+            if (
+                len(selected_recent) >= self._recent_protected_min_messages
+                and current_tokens >= self._recent_protected_min_tokens
+            ):
+                break
+            candidate_recent = [message, *selected_recent]
+            candidate_blocks = [self._render_recent(item) for item in candidate_recent]
+            if not fits(candidate_blocks, history_blocks):
+                break
+            selected_recent = candidate_recent
+
+        def history_content_tokens() -> int:
+            if self._token_counter_is_additive:
+                return sum(block_tokens(block) for block in history_blocks)
+            return self._estimate("\n\n".join(history_blocks))
+
+        ordered_facts = sorted(facts, key=lambda item: (-item.score, item.text))
+        remaining_segments = [item for item in evidence_segments if not item.pinned]
+
+        def add_fact(fact: MemoryFact) -> bool:
+            block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
+            recent_blocks = [self._render_recent(message) for message in selected_recent]
+            if not fits(recent_blocks, [*history_blocks, block]):
+                return False
+            selected_facts.append(fact)
+            history_blocks.append(block)
+            return True
+
+        # Establish the history floor before either section consumes optional
+        # shared capacity. Facts retain their legacy priority over raw segments.
+        if history_requested and pins_fit:
+            for fact in ordered_facts:
+                if (
+                    history_message_count >= self._history_protected_min_messages
+                    and history_content_tokens() >= self._history_protected_min_tokens
+                ):
+                    break
+                if not add_fact(fact):
+                    break
+            for segment in tuple(remaining_segments):
+                if (
+                    history_message_count >= self._history_protected_min_messages
+                    and history_content_tokens() >= self._history_protected_min_tokens
+                ):
+                    break
+                if not add_segment(segment):
+                    break
+                remaining_segments.remove(segment)
+
+        # Historical evidence gets first use of unclaimed shared capacity on a
+        # history turn. Once it is exhausted, recent context borrows the rest.
+        if pins_fit:
+            for fact in ordered_facts:
+                if fact in selected_facts:
+                    continue
+                if not add_fact(fact):
+                    continue
+            for segment in remaining_segments:
+                add_segment(segment)
+
+        if selected_segments:
+            for summary in summaries:
+                if not summary.relevant:
+                    continue
+                block = f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
+                recent_blocks = [self._render_recent(message) for message in selected_recent]
+                if fits(recent_blocks, [*history_blocks, block]):
+                    selected_summaries.append(summary)
+                    history_blocks.append(block)
+
+        selected_recent_ids = {message.source_msg_id for message in selected_recent}
+        for message in reversed(recent_candidates):
+            if (
+                message.source_msg_id in selected_recent_ids
+                or message.source_msg_id in selected_history_ids
+            ):
+                continue
+            candidate_recent = [message, *selected_recent]
+            candidate_blocks = [self._render_recent(item) for item in candidate_recent]
+            if not fits(candidate_blocks, history_blocks):
+                break
+            selected_recent = candidate_recent
+            selected_recent_ids.add(message.source_msg_id)
+
+        recent_blocks = [self._render_recent(message) for message in selected_recent]
+        full_policy = (
+            MEMORY_GROUNDING_WITH_EVIDENCE
+            if selected_facts or selected_segments
+            else MEMORY_GROUNDING_NO_EVIDENCE
+        )
+        fallback_policy = (
+            MEMORY_GROUNDING_MINIMAL
+            if selected_facts or selected_segments
+            else MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL
+        )
+        if fits(recent_blocks, history_blocks, full_policy):
+            grounding_policy = full_policy
+        elif fits(recent_blocks, history_blocks, fallback_policy):
+            grounding_policy = fallback_policy
+        else:
+            grounding_policy = reserve_policy
+        text = joined(recent_blocks, history_blocks, grounding_policy)
+        recent_tokens = self._estimate("\n\n".join(recent_blocks))
+        history_tokens = self._estimate(
+            "\n\n".join([*policy_blocks, grounding_policy, *history_blocks])
+        )
+        total_tokens = self._estimate(text)
+        if len(text) > self._context_char_budget or total_tokens > budget:
+            raise ValueError("packed adaptive memory context exceeds a hard budget")
+
+        recent_borrowed = recent_tokens > self._recent_protected_min_tokens
+        history_borrowed = history_content_tokens() > self._history_protected_min_tokens
+        spillover: Literal["none", "recent_to_history", "history_to_recent", "bidirectional"]
+        if recent_borrowed and history_borrowed:
+            spillover = "bidirectional"
+        elif history_borrowed:
+            spillover = "recent_to_history"
+        elif recent_borrowed:
+            spillover = "history_to_recent"
+        else:
+            spillover = "none"
+        degradation_reason = ""
+        if grounding_policy != full_policy:
+            degradation_reason = "minimal_policy"
+        elif history_requested and (
+            history_message_count < self._history_protected_min_messages
+            or history_content_tokens() < self._history_protected_min_tokens
+        ):
+            degradation_reason = "history_floor_limited"
+        elif recent_candidates and (
+            len(selected_recent) < self._recent_protected_min_messages
+            or recent_tokens < self._recent_protected_min_tokens
+        ):
+            degradation_reason = "recent_floor_limited"
+
+        source_ids = self._source_ids(
+            selected_facts,
+            selected_segments,
+            selected_recent,
+            selected_summaries,
+        )
+        return PackedMemoryContext(
+            mode=mode,
+            budget=budget,
+            estimated_tokens=total_tokens,
+            text=text,
+            recent_messages=tuple(selected_recent),
+            evidence_segments=tuple(selected_segments),
+            facts=tuple(selected_facts),
+            summaries=tuple(selected_summaries),
+            source_msg_ids=source_ids,
+            blocked_output_present=blocked_output_present,
+            grounding_policy=grounding_policy,
+            recent_estimated_tokens=recent_tokens,
+            history_estimated_tokens=history_tokens,
+            adaptive_enabled=True,
+            spillover=spillover,
+            degradation_reason=degradation_reason,
+        )
+
+    def _shortest_fitting_policy(
+        self,
+        *,
+        budget: int,
+        policies: Sequence[str],
+    ) -> str:
+        for policy in sorted(policies, key=len):
+            if len(policy) <= self._context_char_budget and self._estimate(policy) <= budget:
+                return policy
+        return ""
 
     @staticmethod
     def _prepare_segment(

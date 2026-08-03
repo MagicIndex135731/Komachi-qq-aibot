@@ -74,6 +74,55 @@ class AcceptanceGateError(RuntimeError):
         self.codes = tuple(codes)
 
 
+def _validate_quality_resume_artifacts(args: argparse.Namespace) -> dict:
+    from scripts.resume_memory_v3_quality_replay import (
+        validate_quality_resume_receipt,
+    )
+
+    return validate_quality_resume_receipt(
+        args.quality_resume_receipt,
+        dataset_path=args.dataset,
+        manifest_path=args.manifest,
+        prepared_report_path=args.prepared_report,
+        parent_quality_sidecar_path=args.quality_resume_parent_sidecar,
+        parent_private_replay_path=args.quality_resume_parent_private_replay,
+        parent_visibility_path=args.quality_visibility_artifact,
+        parent_gate_report_path=args.quality_resume_parent_gate_report,
+        parent_results_path=args.quality_resume_parent_results,
+        parent_benchmark_path=args.quality_resume_parent_benchmark,
+        child_quality_sidecar_path=args.quality_sidecar,
+        child_private_replay_path=args.quality_private_replay,
+    )
+
+
+def _validate_quality_rebind_artifacts(args: argparse.Namespace) -> dict:
+    from scripts.rebind_memory_v3_quality import validate_quality_rebind_receipt
+
+    return validate_quality_rebind_receipt(
+        args.quality_rebind_receipt,
+        dataset_path=args.dataset,
+        manifest_path=args.manifest,
+        prepared_report_path=args.prepared_report,
+        old_quality_sidecar_path=args.quality_rebind_parent_sidecar,
+        old_private_replay_path=args.quality_rebind_parent_private_replay,
+        old_resume_receipt_path=args.quality_resume_receipt,
+        old_visibility_path=args.quality_rebind_parent_visibility,
+        old_gate_report_path=args.quality_rebind_parent_gate_report,
+        old_results_path=args.quality_rebind_parent_results,
+        old_benchmark_path=args.quality_rebind_parent_benchmark,
+        old_resume_parent_quality_sidecar_path=args.quality_resume_parent_sidecar,
+        old_resume_parent_private_replay_path=args.quality_resume_parent_private_replay,
+        old_resume_parent_gate_report_path=args.quality_resume_parent_gate_report,
+        old_resume_parent_results_path=args.quality_resume_parent_results,
+        old_resume_parent_benchmark_path=args.quality_resume_parent_benchmark,
+        new_failed_gate_report_path=args.quality_rebind_source_gate_report,
+        new_results_path=args.quality_rebind_source_results,
+        new_benchmark_path=args.quality_rebind_source_benchmark,
+        child_quality_sidecar_path=args.quality_sidecar,
+        child_private_replay_path=args.quality_private_replay,
+        child_visibility_path=args.quality_visibility_artifact,
+    )
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Execute the fail-closed raw-message V3 production evaluation."
@@ -106,6 +155,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Disposable-clone visibility artifact bound by the quality sidecar",
     )
+    parser.add_argument("--quality-resume-receipt", type=Path)
+    parser.add_argument("--quality-resume-parent-sidecar", type=Path)
+    parser.add_argument("--quality-resume-parent-private-replay", type=Path)
+    parser.add_argument("--quality-resume-parent-gate-report", type=Path)
+    parser.add_argument("--quality-resume-parent-results", type=Path)
+    parser.add_argument("--quality-resume-parent-benchmark", type=Path)
+    parser.add_argument("--quality-rebind-receipt", type=Path)
+    parser.add_argument("--quality-rebind-parent-sidecar", type=Path)
+    parser.add_argument("--quality-rebind-parent-private-replay", type=Path)
+    parser.add_argument("--quality-rebind-parent-visibility", type=Path)
+    parser.add_argument("--quality-rebind-parent-gate-report", type=Path)
+    parser.add_argument("--quality-rebind-parent-results", type=Path)
+    parser.add_argument("--quality-rebind-parent-benchmark", type=Path)
+    parser.add_argument("--quality-rebind-source-gate-report", type=Path)
+    parser.add_argument("--quality-rebind-source-results", type=Path)
+    parser.add_argument("--quality-rebind-source-benchmark", type=Path)
     parser.add_argument(
         "--quality-template-output",
         type=Path,
@@ -113,6 +178,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--benchmark-runs", type=int, default=250)
+    parser.add_argument(
+        "--max-retrieval-p95-ms",
+        type=float,
+        default=500.0,
+        help="Maximum accepted local retrieval P95 in milliseconds (default: 500)",
+    )
+    parser.add_argument(
+        "--context-profile",
+        choices=("legacy", "adaptive"),
+        default="adaptive",
+        help="Context budget contract to evaluate and bind into the gate report.",
+    )
     parser.add_argument("--enforce-real-dataset", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -132,6 +209,40 @@ def _run(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     if args.warmup < 20:
         raise ValueError("warmup must be at least 20")
+    if not math.isfinite(args.max_retrieval_p95_ms) or args.max_retrieval_p95_ms <= 0:
+        raise ValueError("max-retrieval-p95-ms must be a positive finite number")
+    resume_paths = (
+        args.quality_resume_receipt,
+        args.quality_resume_parent_sidecar,
+        args.quality_resume_parent_private_replay,
+        args.quality_resume_parent_gate_report,
+        args.quality_resume_parent_results,
+        args.quality_resume_parent_benchmark,
+    )
+    if any(path is not None for path in resume_paths) and not all(
+        path is not None for path in resume_paths
+    ):
+        raise ValueError("quality resume artifacts must be provided together")
+    rebind_paths = (
+        args.quality_rebind_receipt,
+        args.quality_rebind_parent_sidecar,
+        args.quality_rebind_parent_private_replay,
+        args.quality_rebind_parent_visibility,
+        args.quality_rebind_parent_gate_report,
+        args.quality_rebind_parent_results,
+        args.quality_rebind_parent_benchmark,
+        args.quality_rebind_source_gate_report,
+        args.quality_rebind_source_results,
+        args.quality_rebind_source_benchmark,
+    )
+    if any(path is not None for path in rebind_paths) and not all(
+        path is not None for path in rebind_paths
+    ):
+        raise ValueError("quality rebind artifacts must be provided together")
+    if all(path is not None for path in rebind_paths) and not all(
+        path is not None for path in resume_paths
+    ):
+        raise ValueError("quality rebind requires the complete parent resume chain")
     cases, dataset_sha256 = load_evaluation_cases(args.dataset)
     try:
         gate_tag_counts = validate_v3_dataset_contract(cases)
@@ -144,6 +255,7 @@ def _run(argv: Sequence[str] | None = None) -> int:
             "memory_orchestration_v2_enabled": True,
             "memory_orchestration_shadow_mode": False,
             "memory_raw_v3_enabled": True,
+            "memory_adaptive_context_enabled": args.context_profile == "adaptive",
             "memory_query_rewrite_enabled": True,
             "memory_llm_rerank_enabled": False,
             "memory_max_evidence_messages": 150,
@@ -285,6 +397,7 @@ def _run(argv: Sequence[str] | None = None) -> int:
             snapshot_manifest_sha256=snapshot_manifest_sha256,
             retrieval_fingerprint=retrieval_fingerprint,
             case_count=len(cases),
+            context_profile=args.context_profile,
         )
         if args.quality_template_output is not None:
             _write_json(args.quality_template_output, quality_template)
@@ -299,6 +412,9 @@ def _run(argv: Sequence[str] | None = None) -> int:
             input_failures.append("AC_QUALITY_VISIBILITY_ARTIFACT_REQUIRED")
         else:
             try:
+                quality_version = _load_strict_json_object(args.quality_sidecar).get(
+                    "quality_version"
+                )
                 quality = load_v3_quality_sidecar(
                     args.quality_sidecar,
                     dataset_sha256=dataset_sha256,
@@ -308,14 +424,42 @@ def _run(argv: Sequence[str] | None = None) -> int:
                     private_replay_path=args.quality_private_replay,
                     visibility_artifact_path=args.quality_visibility_artifact,
                     expected_vector_generation=prepared_generation,
+                    expected_context_profile=args.context_profile,
                     evaluation_cases=cases,
                     expected_answer_prompt_sha256_by_case={
                         index: value
                         for index, value in enumerate(answer_prompt_sha256_by_case)
                     },
+                    resume_receipt_path=(
+                        args.quality_resume_receipt if quality_version == 4 else None
+                    ),
+                    rebind_receipt_path=(
+                        args.quality_rebind_receipt if quality_version == 5 else None
+                    ),
                 )
             except ValueError:
                 input_failures.append("AC_QUALITY_SIDECAR_INVALID")
+
+        resume_receipt_sha256: str | None = None
+        if quality is not None and quality.resume_receipt_sha256 is not None:
+            try:
+                _validate_quality_resume_artifacts(args)
+                resume_receipt_sha256 = quality.resume_receipt_sha256
+            except (OSError, ValueError):
+                input_failures.append("AC_QUALITY_RESUME_RECEIPT_INVALID")
+        elif all(path is not None for path in resume_paths):
+            if not all(path is not None for path in rebind_paths):
+                input_failures.append("AC_QUALITY_RESUME_RECEIPT_INVALID")
+
+        rebind_receipt_sha256: str | None = None
+        if quality is not None and quality.rebind_receipt_sha256 is not None:
+            try:
+                _validate_quality_rebind_artifacts(args)
+                rebind_receipt_sha256 = quality.rebind_receipt_sha256
+            except (OSError, ValueError):
+                input_failures.append("AC_QUALITY_REBIND_RECEIPT_INVALID")
+        elif all(path is not None for path in rebind_paths):
+            input_failures.append("AC_QUALITY_REBIND_RECEIPT_INVALID")
 
         report = evaluate_v3(
             cases=cases,
@@ -326,7 +470,19 @@ def _run(argv: Sequence[str] | None = None) -> int:
             retrieval_fingerprint=retrieval_fingerprint,
             gate_tag_counts=gate_tag_counts,
         )
+        if resume_receipt_sha256 is not None:
+            report["quality_resume_receipt_sha256"] = resume_receipt_sha256
+        if rebind_receipt_sha256 is not None:
+            report["quality_rebind_receipt_sha256"] = rebind_receipt_sha256
         report["vector_generation"] = prepared_generation
+        report["context_profile"] = (
+            "adaptive"
+            if functional_settings.memory_adaptive_context_enabled
+            else "legacy"
+        )
+        report["acceptance_limits"] = {
+            "retrieval_p95_ms": float(args.max_retrieval_p95_ms),
+        }
         report["quality_sidecar_sha256"] = (
             _file_sha256(args.quality_sidecar)
             if quality is not None and args.quality_sidecar is not None
@@ -348,6 +504,8 @@ def _run(argv: Sequence[str] | None = None) -> int:
                     *_v3_acceptance_failures(
                         report=report,
                         benchmark=benchmark,
+                        adaptive_enabled=functional_settings.memory_adaptive_context_enabled,
+                        max_retrieval_p95_ms=args.max_retrieval_p95_ms,
                     ),
                 )
             )
@@ -603,12 +761,22 @@ def _validate_v3_runtime_settings(settings: AppSettings) -> None:
         raise AcceptanceGateError(("AC_V3_PATH_DISABLED",))
     if settings.memory_llm_rerank_enabled:
         raise AcceptanceGateError(("AC_RERANK_FORBIDDEN",))
-    if settings.memory_max_evidence_messages != 150:
-        raise AcceptanceGateError(("AC_PACKET_MESSAGE_LIMIT_CONFIG",))
-    if settings.memory_history_context_budget_tokens != 24_000:
-        raise AcceptanceGateError(("AC_PACKET_TOKEN_LIMIT_CONFIG",))
-    if settings.context_recent_limit != 60:
-        raise AcceptanceGateError(("AC_RECENT_LIMIT_CONFIG",))
+    if settings.memory_adaptive_context_enabled:
+        if settings.memory_adaptive_max_history_messages != 300:
+            raise AcceptanceGateError(("AC_PACKET_MESSAGE_LIMIT_CONFIG",))
+        if settings.memory_adaptive_max_recent_messages != 120:
+            raise AcceptanceGateError(("AC_RECENT_LIMIT_CONFIG",))
+        if settings.memory_normal_context_budget_tokens != 32_000:
+            raise AcceptanceGateError(("AC_PACKET_TOKEN_LIMIT_CONFIG",))
+        if settings.memory_effective_context_budget_chars != 48_000:
+            raise AcceptanceGateError(("AC_PACKET_CHAR_LIMIT_CONFIG",))
+    else:
+        if settings.memory_max_evidence_messages != 150:
+            raise AcceptanceGateError(("AC_PACKET_MESSAGE_LIMIT_CONFIG",))
+        if settings.memory_history_context_budget_tokens != 24_000:
+            raise AcceptanceGateError(("AC_PACKET_TOKEN_LIMIT_CONFIG",))
+        if settings.context_recent_limit != 60:
+            raise AcceptanceGateError(("AC_RECENT_LIMIT_CONFIG",))
 
 
 def _load_prepared_report(
@@ -641,6 +809,8 @@ def _v3_acceptance_failures(
     *,
     report: dict,
     benchmark: dict,
+    adaptive_enabled: bool = False,
+    max_retrieval_p95_ms: float = 500.0,
 ) -> tuple[str, ...]:
     metrics = report["metrics"]
     failures: list[str] = []
@@ -667,6 +837,21 @@ def _v3_acceptance_failures(
         ("citation_ineligible_source_count", "AC_CITATION_INELIGIBLE_SOURCE"),
         ("answer_protocol_failure_count", "AC_ANSWER_PROTOCOL"),
     )
+    if adaptive_enabled:
+        legacy_limit_metrics = {
+            "retrieval_over_150_count",
+            "packet_over_150_count",
+            "packet_over_24k_count",
+            "recent_over_60_count",
+        }
+        zero_gates = tuple(
+            item for item in zero_gates if item[0] not in legacy_limit_metrics
+        ) + (
+            ("retrieval_over_300_count", "AC_RECALL_CANDIDATE_LIMIT"),
+            ("packet_over_300_count", "AC_PACKET_MESSAGE_LIMIT"),
+            ("packet_over_32k_count", "AC_PACKET_TOKEN_LIMIT"),
+            ("recent_over_120_count", "AC_RECENT_MESSAGE_LIMIT"),
+        )
     for metric_name, error_code in zero_gates:
         value = _finite_number(metrics.get(metric_name))
         if value is None or value != 0.0:
@@ -681,6 +866,15 @@ def _v3_acceptance_failures(
         ("answer_accuracy", 0.80, "AC_ANSWER_ACCURACY"),
         ("abstention_f1", 0.90, "AC_ABSTENTION_F1"),
     )
+    if adaptive_enabled:
+        threshold_gates = tuple(
+            item
+            for item in threshold_gates
+            if item[0] not in {"recall_at_150", "recall_within_24k"}
+        ) + (
+            ("recall_at_300", 0.80, "AC_RECALL_AT_300"),
+            ("recall_within_32k", 0.80, "AC_RECALL_WITHIN_32K"),
+        )
     for metric_name, threshold, error_code in threshold_gates:
         value = _finite_number(metrics.get(metric_name))
         if value is None or value < threshold:
@@ -692,7 +886,7 @@ def _v3_acceptance_failures(
     if ttft_p95 is None or ttft_p95 > 15_000.0:
         failures.append("AC_TTFT_P95")
     retrieval_p95 = _finite_number(benchmark.get("p95_latency_ms"))
-    if retrieval_p95 is None or retrieval_p95 >= 500.0:
+    if retrieval_p95 is None or retrieval_p95 >= float(max_retrieval_p95_ms):
         failures.append("AC_RETRIEVAL_P95")
     if benchmark.get("rerank_enabled") is not False:
         failures.append("AC_RERANK_FORBIDDEN")
