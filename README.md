@@ -2,6 +2,8 @@
 
 当前唯一受支持的部署方式是 WSL2 + Docker。默认 QQ 平台为 LLBot；NapCat 保留为本地回退选项。两者共享小町 Python 进程、数据库、模型配置和业务代码，但 QQ 登录态彼此独立。
 
+完整的系统架构、消息工作流、商用 API、QQ/OneBot 服务和 Memory V3 原理见 [小町工程设计与运行原理](docs/ARCHITECTURE.md)。
+
 ## 日常操作
 
 在资源管理器中双击：
@@ -69,7 +71,7 @@
 - `CONTEXT_RECENT_LIMIT`（默认 60 条近期实际消息）、`CONTEXT_SUMMARY_LIMIT`、`CONTEXT_HISTORY_LIMIT`；带有旧话题承接、人物指代或时间回顾语义的问题会自动扩大详细历史回溯。
 - `MEMORY_COMPACTION_ENABLED`、`MEMORY_COMPACTION_BATCH_SIZE`、`MEMORY_COMPACTION_BACKFILL_WINDOWS`
 - `MEMORY_EPISODE_IDLE_MINUTES`（默认 10 分钟）控制普通语义聊天停止多久后封闭 episode 并进入长期记忆提炼；它与 `CONTEXT_RECENT_LIMIT` 相互独立。
-- 生图直接复用主模型的 Responses `image_generation` 工具；横图使用 `1536x1024`，竖图使用 `1024x1536`，质量固定为 `high`；仅单独配置 `GROUP_IMAGE_QUEUE_CAPACITY` 和 `GROUP_IMAGE_TIMEOUT_SECONDS`
+- 群聊生图使用独立的 OpenAI 兼容图片服务配置；模型、接口、队列和超时见 `GROUP_IMAGE_*` 环境变量
 
 `LLM_TEXT_ENDPOINT=responses` 且 `LLM_BUILTIN_WEB_SEARCH=true` 时，文本请求可使用主模型的内置 `web_search` 工具。明确写出“联网”“搜索”“查资料”等请求会强制调用检索；普通聊天则由模型自行决定是否检索。实际工具调用会记录在未纳入 Git 的 `infra/wsl/runtime/logs/responses-tool-events.jsonl`，用于核验是否真的联网。
 
@@ -83,6 +85,8 @@ docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiao
 ```
 
 ### 群聊记忆编排 V2 灰度与回滚
+
+> Memory V3 是通过发布门禁后启用的生产历史查询路径；仓库模板仍安全默认关闭。以下 V2 内容用于理解兼容路径和底层 generation；新的生产发布、评测与回滚以 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 为准。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
 
 `infra/wsl/.env.example` 给出了全部 `MEMORY_*` 配置的无秘密示例。初始值保持
 `MEMORY_ORCHESTRATION_V2_ENABLED=true` 与
@@ -116,6 +120,8 @@ docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiao
 
 ### 群聊记忆 V2 迁移与评测
 
+> 本节保留用于 legacy V2 数据维护，不是 Memory V3 的发布入口。
+
 迁移必须严格按“在线备份 → 水位内回填 → 真实数据集评测 → 启用 V2”执行。以下命令只针对
 `xiaomachi-bot` 的数据库；不要把 LLBot 数据卷或 `.env` 作为参数。
 
@@ -134,6 +140,7 @@ python scripts/backfill_memory_v2.py \
 python scripts/build_memory_eval_dataset.py \
   --database /workspace/data/backups/bot-pre-memory-v2-YYYYMMDDTHHMMSSZ.db \
   --manifest /workspace/data/backups/bot-pre-memory-v2-YYYYMMDDTHHMMSSZ.manifest.json \
+  --paraphrase-overrides /workspace/data/memory_eval/paraphrase-overrides.json \
   --output /workspace/data/memory_eval/cases.jsonl \
   --review-output /workspace/data/memory_eval/cases-review.json
 

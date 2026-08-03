@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from sqlalchemy import select, text
 
@@ -30,6 +30,30 @@ from app.storage.db import (
 )
 from app.storage.models import Message, RetrievalDocument, RetrievalDocumentMessage
 from app.storage.repositories import RetrievalDocumentRepository
+try:
+    from .evaluate_memory_v3 import (
+        V3Observation,
+        audit_v3_quality_sources,
+        evaluate_v3,
+        load_message_metadata,
+        load_v3_quality_sidecar,
+        retrieval_fingerprint_sha256,
+        validate_v3_dataset_contract,
+    )
+    from .evaluate_memory_recall import load_evaluation_cases
+    from .run_memory_recall_eval import _v3_acceptance_failures
+except ImportError:  # Direct script execution.
+    from evaluate_memory_v3 import (
+        V3Observation,
+        audit_v3_quality_sources,
+        evaluate_v3,
+        load_message_metadata,
+        load_v3_quality_sidecar,
+        retrieval_fingerprint_sha256,
+        validate_v3_dataset_contract,
+    )
+    from evaluate_memory_recall import load_evaluation_cases
+    from run_memory_recall_eval import _v3_acceptance_failures
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -48,6 +72,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-report", type=Path)
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--quality-sidecar", type=Path)
+    parser.add_argument("--quality-private-replay", type=Path)
+    parser.add_argument("--quality-visibility-artifact", type=Path)
+    parser.add_argument("--results", type=Path)
+    parser.add_argument("--benchmark-report", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--fts-only", action="store_true")
@@ -78,9 +106,16 @@ def _validate_arguments(args: argparse.Namespace) -> None:
     if args.phase != "activate" and args.gate_report is not None:
         raise ValueError("gate-report is only valid for activate")
     if args.phase != "activate" and (
-        args.dataset is not None or args.quality_sidecar is not None
+        args.dataset is not None
+        or args.quality_sidecar is not None
+        or args.quality_private_replay is not None
+        or args.quality_visibility_artifact is not None
+        or args.results is not None
+        or args.benchmark_report is not None
     ):
-        raise ValueError("dataset and quality-sidecar are only valid for activate")
+        raise ValueError(
+            "quality artifacts are only valid for activate"
+        )
     if args.phase == "activate":
         if args.prepared_report is None:
             raise ValueError("activate requires prepared-report")
@@ -90,6 +125,14 @@ def _validate_arguments(args: argparse.Namespace) -> None:
             raise ValueError("activate requires dataset")
         if args.quality_sidecar is None:
             raise ValueError("activate requires quality-sidecar")
+        if args.quality_private_replay is None:
+            raise ValueError("activate requires quality-private-replay")
+        if args.quality_visibility_artifact is None:
+            raise ValueError("activate requires quality-visibility-artifact")
+        if args.results is None:
+            raise ValueError("activate requires results")
+        if args.benchmark_report is None:
+            raise ValueError("activate requires benchmark-report")
         if args.fts_only:
             raise ValueError("fts-only generations cannot be activated")
         if args.resume_generation is not None:
@@ -277,7 +320,19 @@ def _activate_prepared_generation(
         generation=generation,
         dataset_sha256=_file_sha256(args.dataset),
         quality_sidecar_sha256=_file_sha256(args.quality_sidecar),
+        quality_private_replay_sha256=_file_sha256(args.quality_private_replay),
+        quality_visibility_artifact_sha256=_file_sha256(
+            args.quality_visibility_artifact
+        ),
+        results_sha256=_file_sha256(args.results),
+        benchmark_sha256=_file_sha256(args.benchmark_report),
         quality_sidecar=quality_sidecar,
+    )
+    _validate_activation_quality_artifacts(
+        args,
+        gate=gate,
+        manifest_sha256=message_ledger_manifest_sha256(manifest),
+        generation=generation,
     )
 
     watermarks = group_watermarks_from_manifest(manifest)
@@ -371,59 +426,85 @@ def _activate_prepared_generation(
                 "vector generation activation or locked ledger check was rejected"
             )
 
-        post_activation_live_bounds = _snapshot_live_high_watermarks(
-            engine,
-            manifest_watermarks=watermarks,
-        )
-        projected += _project_raw_ranges(
-            engine,
-            generation=generation,
-            lower_bounds=pre_activation_live_bounds,
-            upper_bounds=post_activation_live_bounds,
-            batch_size=args.batch_size,
-        )
-        final_target_bounds = _merge_high_watermarks(
-            watermarks,
-            post_activation_live_bounds,
-        )
-        embedded += _embed_raw_generation(
-            engine,
-            provider=provider,
-            generation=generation,
-            upper_bounds=final_target_bounds,
-            batch_size=args.batch_size,
-        )
-        coverage = refresh_retrieval_vector_generation(
-            engine,
-            generation=generation,
-            mark_ready=True,
-        )
-        if coverage.status != "ready":
-            raise RuntimeError("post-activation raw_message_v3 catch-up is incomplete")
-
-        report = {
-            **prepared,
-            "phase": "activated",
-            "completed_at": datetime.now(UTC).isoformat(),
-            "projected_eligible_messages": projected,
-            "embedded_documents": embedded,
-            "live_above_watermark": _count_live_messages(
+        try:
+            post_activation_live_bounds = _snapshot_live_high_watermarks(
                 engine,
                 manifest_watermarks=watermarks,
-                live_high_watermarks=post_activation_live_bounds,
-            ),
-            "live_catchup_high_watermarks": {
-                str(group_id): watermark
-                for group_id, watermark in sorted(post_activation_live_bounds.items())
-            },
-            "vector_status": coverage.status,
-            "vector_total_documents": coverage.total_documents,
-            "vector_indexed_documents": coverage.indexed_documents,
-            "ledger_matches": True,
-            "gate_report_sha256": _file_sha256(args.gate_report),
-        }
-        _emit_report(report, output=args.output)
-        return 0
+            )
+            projected += _project_raw_ranges(
+                engine,
+                generation=generation,
+                lower_bounds=pre_activation_live_bounds,
+                upper_bounds=post_activation_live_bounds,
+                batch_size=args.batch_size,
+            )
+            final_target_bounds = _merge_high_watermarks(
+                watermarks,
+                post_activation_live_bounds,
+            )
+            embedded += _embed_raw_generation(
+                engine,
+                provider=provider,
+                generation=generation,
+                upper_bounds=final_target_bounds,
+                batch_size=args.batch_size,
+            )
+            coverage = refresh_retrieval_vector_generation(
+                engine,
+                generation=generation,
+                mark_ready=True,
+            )
+            if coverage.status != "ready":
+                raise RuntimeError(
+                    "post-activation raw_message_v3 catch-up is incomplete"
+                )
+            report = {
+                **prepared,
+                "phase": "activated",
+                "completed_at": datetime.now(UTC).isoformat(),
+                "projected_eligible_messages": projected,
+                "embedded_documents": embedded,
+                "live_above_watermark": _count_live_messages(
+                    engine,
+                    manifest_watermarks=watermarks,
+                    live_high_watermarks=post_activation_live_bounds,
+                ),
+                "live_catchup_high_watermarks": {
+                    str(group_id): watermark
+                    for group_id, watermark in sorted(
+                        post_activation_live_bounds.items()
+                    )
+                },
+                "vector_status": coverage.status,
+                "vector_total_documents": coverage.total_documents,
+                "vector_indexed_documents": coverage.indexed_documents,
+                "ledger_matches": True,
+                "gate_report_sha256": _file_sha256(args.gate_report),
+            }
+            _emit_report(report, output=args.output)
+            return 0
+        except Exception as activation_error:
+            if expected_active_generation is None:
+                raise RuntimeError(
+                    "activation failed after CAS and no rollback generation exists"
+                ) from activation_error
+            try:
+                rolled_back = rollback_retrieval_vector_generation(
+                    engine,
+                    generation=expected_active_generation,
+                    expected_active_generation=generation,
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "activation and automatic rollback both failed"
+                ) from rollback_error
+            if not rolled_back:
+                raise RuntimeError(
+                    "activation failed and automatic rollback was rejected"
+                ) from activation_error
+            raise RuntimeError(
+                "activation failed after CAS; legacy generation was restored"
+            ) from activation_error
     finally:
         engine.dispose()
 
@@ -509,6 +590,10 @@ def _validate_activation_gate(
     generation: int,
     dataset_sha256: str,
     quality_sidecar_sha256: str,
+    quality_private_replay_sha256: str,
+    quality_visibility_artifact_sha256: str,
+    results_sha256: str,
+    benchmark_sha256: str,
     quality_sidecar: dict,
 ) -> None:
     required_fields = {
@@ -520,6 +605,8 @@ def _validate_activation_gate(
         "case_count",
         "quality_sidecar_present",
         "quality_sidecar_sha256",
+        "results_sha256",
+        "benchmark_sha256",
         "metrics",
         "vector_generation",
         "acceptance",
@@ -546,10 +633,21 @@ def _validate_activation_gate(
         raise ValueError("activation gate does not match the dataset")
     if gate.get("quality_sidecar_sha256") != quality_sidecar_sha256:
         raise ValueError("activation gate does not match the quality sidecar")
+    if gate.get("results_sha256") != results_sha256:
+        raise ValueError("activation gate does not match the evaluation results")
+    if gate.get("benchmark_sha256") != benchmark_sha256:
+        raise ValueError("activation gate does not match the benchmark")
     if gate.get("quality_sidecar_present") is not True:
         raise RuntimeError("activation gate has no reviewed quality sidecar")
     if not isinstance(quality_sidecar, dict):
         raise ValueError("quality sidecar is not an object")
+    if quality_sidecar.get("private_replay_sha256") != quality_private_replay_sha256:
+        raise ValueError("private replay artifact does not match the quality sidecar")
+    if (
+        quality_sidecar.get("visibility_artifact_sha256")
+        != quality_visibility_artifact_sha256
+    ):
+        raise ValueError("visibility artifact does not match the quality sidecar")
     quality_bindings = {
         "dataset_sha256": dataset_sha256,
         "snapshot_manifest_sha256": manifest_sha256,
@@ -586,6 +684,7 @@ def _validate_activation_gate(
         "citation_subject_leak_count",
         "citation_time_leak_count",
         "citation_ineligible_source_count",
+        "answer_protocol_failure_count",
     }
     minimum_metrics = {
         "recall_at_150": 0.80,
@@ -628,6 +727,201 @@ def _validate_activation_gate(
     )
     if below_minimum or latency_failure:
         raise RuntimeError("activation gate metrics do not pass")
+
+
+def _validate_activation_quality_artifacts(
+    args: argparse.Namespace,
+    *,
+    gate: dict,
+    manifest_sha256: str,
+    generation: int,
+) -> None:
+    case_count = gate.get("case_count")
+    retrieval_fingerprint = gate.get("retrieval_fingerprint_sha256")
+    if (
+        isinstance(case_count, bool)
+        or not isinstance(case_count, int)
+        or case_count < 64
+        or not isinstance(retrieval_fingerprint, str)
+        or len(retrieval_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in retrieval_fingerprint)
+    ):
+        raise ValueError("activation gate quality bindings are invalid")
+    evaluation_cases, dataset_sha256 = load_evaluation_cases(args.dataset)
+    if dataset_sha256 != _file_sha256(args.dataset):
+        raise ValueError("activation dataset hash is invalid")
+    gate_tag_counts = validate_v3_dataset_contract(evaluation_cases)
+    observations, prompt_hashes = _load_activation_results(
+        args.results,
+        case_count=case_count,
+    )
+    computed_fingerprint = retrieval_fingerprint_sha256(observations)
+    if computed_fingerprint != retrieval_fingerprint:
+        raise ValueError("activation results do not match the retrieval fingerprint")
+    quality = load_v3_quality_sidecar(
+        args.quality_sidecar,
+        dataset_sha256=_file_sha256(args.dataset),
+        snapshot_manifest_sha256=manifest_sha256,
+        retrieval_fingerprint=retrieval_fingerprint,
+        case_count=case_count,
+        private_replay_path=args.quality_private_replay,
+        visibility_artifact_path=args.quality_visibility_artifact,
+        expected_vector_generation=generation,
+        evaluation_cases=evaluation_cases,
+        expected_answer_prompt_sha256_by_case={
+            index: value for index, value in enumerate(prompt_hashes)
+        },
+    )
+    metadata = load_message_metadata(args.database)
+    recomputed = evaluate_v3(
+        cases=evaluation_cases,
+        observations=observations,
+        quality=quality,
+        dataset_sha256=dataset_sha256,
+        snapshot_manifest_sha256=manifest_sha256,
+        retrieval_fingerprint=computed_fingerprint,
+        gate_tag_counts=gate_tag_counts,
+    )
+    recomputed["vector_generation"] = generation
+    recomputed["quality_sidecar_sha256"] = _file_sha256(args.quality_sidecar)
+    recomputed["metrics"].update(
+        audit_v3_quality_sources(
+            cases=evaluation_cases,
+            observations=observations,
+            quality=quality,
+            metadata=metadata,
+        )
+    )
+    benchmark = _load_activation_benchmark(
+        args.benchmark_report,
+        case_count=case_count,
+    )
+    failures = _v3_acceptance_failures(report=recomputed, benchmark=benchmark)
+    recomputed["acceptance"] = {
+        "status": "failed" if failures else "passed",
+        "error_codes": list(failures),
+    }
+    recomputed["results_sha256"] = _file_sha256(args.results)
+    recomputed["benchmark_sha256"] = _file_sha256(args.benchmark_report)
+    for field, value in recomputed.items():
+        if gate.get(field) != value:
+            raise ValueError(f"activation gate field was not reproduced: {field}")
+    if failures:
+        raise RuntimeError("recomputed activation gate did not pass")
+
+
+_OBSERVATION_SEQUENCE_FIELDS = {
+    "retrieved_source_message_ids",
+    "history_packet_source_message_ids",
+}
+_OBSERVATION_FLOAT_FIELDS = {"retrieval_latency_ms"}
+
+
+def _load_activation_results(
+    path: Path,
+    *,
+    case_count: int,
+) -> tuple[tuple[V3Observation, ...], tuple[str, ...]]:
+    observation_fields = tuple(V3Observation.__dataclass_fields__)
+    expected_fields = {
+        *observation_fields,
+        "variant",
+        "answer_prompt_sha256",
+    }
+    observations: list[V3Observation] = []
+    prompt_hashes: list[str] = []
+    for index, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+        if not raw_line.strip():
+            continue
+        row = json.loads(raw_line, parse_constant=_reject_json_constant)
+        if not isinstance(row, dict) or set(row) != expected_fields:
+            raise ValueError("activation result fields do not match the contract")
+        if row.get("variant") != "v3":
+            raise ValueError("activation result is not for V3")
+        case_index = row.get("case_index")
+        if (
+            isinstance(case_index, bool)
+            or not isinstance(case_index, int)
+            or case_index != index
+        ):
+            raise ValueError("activation result case indexes are invalid")
+        prompt_hash = row.get("answer_prompt_sha256")
+        if not _is_sha256(prompt_hash):
+            raise ValueError("activation result prompt hash is invalid")
+        values: dict[str, Any] = {}
+        for field in observation_fields:
+            value = row[field]
+            if field in _OBSERVATION_SEQUENCE_FIELDS:
+                if (
+                    not isinstance(value, list)
+                    or any(not isinstance(item, str) or not item for item in value)
+                    or len(value) != len(set(value))
+                ):
+                    raise ValueError("activation result source IDs are invalid")
+                values[field] = tuple(value)
+            elif field in _OBSERVATION_FLOAT_FIELDS:
+                resolved = _finite_number(value)
+                if resolved is None or resolved < 0:
+                    raise ValueError("activation result latency is invalid")
+                values[field] = resolved
+            else:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("activation result counters are invalid")
+                values[field] = value
+        observations.append(V3Observation(**values))
+        prompt_hashes.append(prompt_hash)
+    if len(observations) != case_count:
+        raise ValueError("activation results do not contain exactly one row per case")
+    return tuple(observations), tuple(prompt_hashes)
+
+
+def _load_activation_benchmark(path: Path, *, case_count: int) -> dict:
+    benchmark = _load_strict_json(path)
+    expected_fields = {
+        "warmup_runs",
+        "measured_runs",
+        "mean_latency_ms",
+        "p50_latency_ms",
+        "p95_latency_ms",
+        "rewrite_enabled",
+        "rerank_enabled",
+        "network_enabled",
+        "vector_success_verified",
+    }
+    if set(benchmark) != expected_fields:
+        raise ValueError("activation benchmark fields do not match the contract")
+    for field in ("warmup_runs", "measured_runs"):
+        value = benchmark[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("activation benchmark run counts are invalid")
+    if benchmark["warmup_runs"] < 20:
+        raise ValueError("activation benchmark warmup is insufficient")
+    if benchmark["measured_runs"] < max(250, int(case_count) * 5):
+        raise ValueError("activation benchmark sample count is insufficient")
+    for field in ("mean_latency_ms", "p50_latency_ms", "p95_latency_ms"):
+        value = _finite_number(benchmark[field])
+        if value is None or value < 0:
+            raise ValueError("activation benchmark latency is invalid")
+    if (
+        benchmark["rewrite_enabled"] is not False
+        or benchmark["rerank_enabled"] is not False
+        or benchmark["network_enabled"] is not False
+        or benchmark["vector_success_verified"] is not True
+    ):
+        raise ValueError("activation benchmark runtime contract is invalid")
+    return benchmark
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _finite_number(value: object) -> float | None:

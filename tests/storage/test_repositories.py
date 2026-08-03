@@ -47,6 +47,71 @@ def test_repositories_store_groups_users_and_messages(tmp_path) -> None:
     assert message_count == 1
 
 
+def test_message_repository_lists_all_direct_replies_in_group_and_time_order(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        for group_id in (10001, 10002):
+            groups.upsert_group(
+                group_id=group_id,
+                group_name=f"group-{group_id}",
+                enabled=True,
+                speak_enabled=True,
+            )
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        for source_id, group_id, minute, reply_to in (
+            ("later", 10001, 2, "parent"),
+            ("earlier", 10001, 1, "parent"),
+            ("second-parent", 10001, 3, "parent-2"),
+            ("other-parent", 10001, 0, "different"),
+            ("cross-group", 10002, 0, "parent"),
+        ):
+            messages.add_group_message(
+                platform_msg_id=source_id,
+                group_id=group_id,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 12, minute, tzinfo=UTC),
+                plain_text=source_id,
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=reply_to,
+                mentioned_bot=False,
+            )
+        messages.add_group_message(
+            platform_msg_id="deleted-before-eligible",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 9, 11, 59, tzinfo=UTC),
+            plain_text="deleted",
+            raw_json={"delivery_state": "deleted"},
+            msg_type="text",
+            reply_to_msg_id="parent",
+            mentioned_bot=False,
+        )
+
+        replies = messages.list_direct_group_replies(
+            group_id=10001,
+            parent_platform_msg_ids=["parent", "parent-2"],
+            scan_limit_per_parent=32,
+        )
+        bounded = messages.list_direct_group_replies(
+            group_id=10001,
+            parent_platform_msg_ids=["parent", "parent-2"],
+            scan_limit_per_parent=1,
+        )
+
+    assert [row.platform_msg_id for row in replies] == [
+        "earlier",
+        "later",
+        "second-parent",
+    ]
+    assert [row.platform_msg_id for row in bounded] == ["earlier", "second-parent"]
+
+
 def test_message_repository_lists_all_delivered_group_messages_chronologically(tmp_path) -> None:
     engine = build_engine(tmp_path / "bot.db")
     create_all(engine)

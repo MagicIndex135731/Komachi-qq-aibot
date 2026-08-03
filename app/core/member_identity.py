@@ -16,6 +16,7 @@ class GroupMemberIdentity:
     user_id: int
     nickname: str = ""
     group_card: str = ""
+    in_scope: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,7 @@ class GroupMemberReferenceResolution:
 
 class GroupMemberMessage(Protocol):
     user_id: int
+    group_id: int | None
     raw_json: object
 
 
@@ -42,11 +44,13 @@ def normalize_member_alias(value: str) -> str:
 
 def group_member_identities_from_messages(
     messages: Sequence[GroupMemberMessage],
+    *,
+    target_group_id: int | None = None,
 ) -> tuple[GroupMemberIdentity, ...]:
-    """Build aliases only from sender snapshots captured in the target group."""
+    """Build scoped identities from latest sender snapshots across groups."""
 
     identities: list[GroupMemberIdentity] = []
-    seen: set[tuple[int, str, str]] = set()
+    seen: set[tuple[int, str, str, bool]] = set()
     for message in messages:
         raw_json = message.raw_json if isinstance(message.raw_json, dict) else {}
         sender = raw_json.get("sender")
@@ -55,7 +59,12 @@ def group_member_identities_from_messages(
         group_card = str(sender.get("card", "") or "").strip()
         if not nickname and not group_card:
             continue
-        identity = (int(message.user_id), nickname, group_card)
+        in_scope = (
+            target_group_id is None
+            or int(getattr(message, "group_id", 0) or 0)
+            == int(target_group_id)
+        )
+        identity = (int(message.user_id), nickname, group_card, in_scope)
         if identity in seen:
             continue
         seen.add(identity)
@@ -64,6 +73,7 @@ def group_member_identities_from_messages(
                 user_id=identity[0],
                 nickname=nickname,
                 group_card=group_card,
+                in_scope=identity[3],
             )
         )
     return tuple(identities)

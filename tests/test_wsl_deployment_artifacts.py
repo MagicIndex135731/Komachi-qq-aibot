@@ -225,6 +225,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         "MEMORY_DETAIL_CONTEXT_BUDGET_TOKENS=64000",
         "MEMORY_RECENT_CONTEXT_BUDGET_TOKENS=10000",
         "MEMORY_HISTORY_CONTEXT_BUDGET_TOKENS=24000",
+        "MEMORY_CONTEXT_BUDGET_CHARS=12000",
         "MEMORY_MAX_EVIDENCE_MESSAGES=150",
         "MEMORY_FTS_CANDIDATE_LIMIT=30",
         "MEMORY_VECTOR_CANDIDATE_LIMIT=30",
@@ -419,3 +420,20 @@ def test_stop_terminates_the_keepalive_process_group_before_state_cleanup() -> N
     kill_group = stop_script.index('kill -- "-${existing_pid}"')
     remove_state = stop_script.index('"${runtime_dir}"/onebot-watchdog-*.json')
     assert remove_flag < kill_group < remove_state
+
+
+def test_memory_v3_runbook_includes_all_final_gate_and_activation_artifacts() -> None:
+    readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
+
+    assert "python -m scripts.run_memory_v3_quality_replay" in readme
+    assert "--quality-output /workspace/data/backups/memory-v3-quality.json" in readme
+    assert "--private-replay-output" in readme
+    assert "--visibility-output" in readme
+    assert readme.count("--quality-private-replay") >= 2
+    assert readme.count("--quality-visibility-artifact") >= 2
+    assert "--results /workspace/data/backups/memory-v3-results.jsonl" in readme
+    assert "--benchmark-report /workspace/data/backups/memory-v3-benchmark.json" in readme
+    assert (
+        "--benchmark-output /workspace/data/backups/memory-v3-benchmark.json \\\n"
+        "  --warmup 20 --benchmark-runs 320"
+    ) in readme

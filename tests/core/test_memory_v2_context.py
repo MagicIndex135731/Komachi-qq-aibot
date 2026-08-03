@@ -18,6 +18,7 @@ from app.core.memory_context_packer import (
 )
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import ResolvedMemoryQuery, TimeRange
+from app.core.memory_evidence_expander import MemoryEvidenceExpander
 from app.core.memory_v2_context import MemoryV2ContextProvider, MemoryV2Request
 
 
@@ -321,6 +322,22 @@ def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
     assert trace.resolved_query.retrieval_query
 
 
+def test_evaluation_candidate_filter_runs_before_expansion_and_trace() -> None:
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=TracedRetriever(),
+        expander=Expander(),
+        packer=Packer(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        candidate_filter=lambda **values: tuple(values["candidates"])[1:],
+    )
+
+    trace = provider.evaluate(request())
+
+    assert trace.retrieved_source_msg_ids == ("evidence-1", "evidence-2")
+    assert trace.candidate_scores == ((1, 0.75),)
+
+
 def test_v3_observability_logs_metrics_without_query_or_message_content(
     caplog,
 ) -> None:
@@ -461,6 +478,116 @@ def test_expanded_sources_are_revalidated_against_subject_time_and_group() -> No
     assert tuple(
         segment.episode_id for segment in packer.evidence_segments
     ) == ("raw:eligible",)
+
+
+def test_direct_reply_quota_is_consumed_only_after_delivery_subject_and_time_checks() -> None:
+    class ScopedResolver:
+        def resolve(self, query, **_):
+            return ResolvedMemoryQuery(
+                original_query=query,
+                retrieval_query=query,
+                needs_history=True,
+                group_id=100,
+                subject_ids=("42",),
+                answer_mode="dated_history",
+                time_range=TimeRange(
+                    start=datetime(2026, 7, 23, tzinfo=UTC),
+                    end=datetime(2026, 7, 24, tzinfo=UTC),
+                ),
+            )
+
+    class RawReplyRetriever:
+        def retrieve(self, **_):
+            return HybridRetrievalResult(
+                (
+                    FusedRetrievalCandidate(
+                        document_id=10,
+                        group_id=100,
+                        document_kind="raw_message_v3",
+                        episode_id=None,
+                        source_msg_ids=("parent",),
+                        start_at=datetime(2026, 7, 23, tzinfo=UTC),
+                        end_at=datetime(2026, 7, 23, tzinfo=UTC),
+                        routes=("bm25",),
+                        route_ranks=(("bm25", 1),),
+                        fused_score=1.0,
+                    ),
+                )
+            )
+
+    def message(
+        source_id: str,
+        *,
+        sent_at: datetime,
+        user_id: int = 42,
+        delivery_state: str = "",
+        reply_to: str | None = None,
+    ) -> EvidenceMessage:
+        return EvidenceMessage(
+            source_id,
+            "member",
+            source_id,
+            sent_at,
+            group_id=100,
+            user_id=user_id,
+            delivery_state=delivery_state,
+            reply_to_msg_id=reply_to,
+        )
+
+    rows = (
+        message("parent", sent_at=datetime(2026, 7, 23, 10, tzinfo=UTC)),
+        message(
+            "outside-time",
+            sent_at=datetime(2026, 7, 22, 23, 59, tzinfo=UTC),
+            reply_to="parent",
+        ),
+        message(
+            "deleted",
+            sent_at=datetime(2026, 7, 23, 10, 1, tzinfo=UTC),
+            delivery_state="deleted",
+            reply_to="parent",
+        ),
+        message(
+            "wrong-subject",
+            sent_at=datetime(2026, 7, 23, 10, 2, tzinfo=UTC),
+            user_id=99,
+            reply_to="parent",
+        ),
+        message(
+            "eligible-third",
+            sent_at=datetime(2026, 7, 23, 10, 3, tzinfo=UTC),
+            reply_to="parent",
+        ),
+        message(
+            "eligible-fourth",
+            sent_at=datetime(2026, 7, 23, 10, 4, tzinfo=UTC),
+            reply_to="parent",
+        ),
+        message(
+            "eligible-fifth",
+            sent_at=datetime(2026, 7, 23, 10, 5, tzinfo=UTC),
+            reply_to="parent",
+        ),
+    )
+    packer = CapturingSegmentsPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=ScopedResolver(),
+        retriever=RawReplyRetriever(),
+        expander=MemoryEvidenceExpander(
+            episode_loader=lambda **_: (),
+            source_loader=lambda **_: rows,
+        ),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        max_direct_replies_per_source=2,
+    )
+
+    provider(request())
+
+    assert tuple(
+        message.source_msg_id
+        for message in packer.evidence_segments[0].messages
+    ) == ("parent", "eligible-third", "eligible-fourth")
 
 
 def test_required_reference_and_mention_segments_are_pinned() -> None:

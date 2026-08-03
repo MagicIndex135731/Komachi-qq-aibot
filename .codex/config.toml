@@ -26,3 +26,8 @@ project_doc_fallback_filenames = ["AGENTS.md"]
 # aborts the entire config load and blocks Codex from starting. Codex's own
 # default for multi_agent_v2 is used instead; tune it in your user-level
 # config if needed.
+
+# Allow the main session to delegate once, but prevent a child agent from
+# recursively creating further agents. This is a hard safety cap.
+[agents]
+max_depth = 1

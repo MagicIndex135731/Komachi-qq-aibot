@@ -137,6 +137,8 @@ def test_raw_v3_activation_switch_controls_strict_provider_and_document_family(
     )
     assert raw_runtime.memory_orchestrator.strict_scoped_fallback is True
     assert "fact" not in raw_runtime.v2_provider._retriever.channels
+    assert raw_runtime.v2_provider._retriever.candidate_limit == 300
+    assert raw_runtime.v2_provider._retriever.final_limit == 150
     assert raw_runtime.v2_provider._historical_no_hit_omit_recent is True
 
 
@@ -795,6 +797,157 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             if segment.document_id is not None
         }
         assert segment_ids == set()
+
+
+def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(update={"memory_raw_v3_enabled": True})
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        for group_id in (10001, 10002):
+            groups.upsert_group(
+                group_id=group_id,
+                group_name=str(group_id),
+                enabled=True,
+                speak_enabled=True,
+            )
+        for user_id in (42, 43, 44, 45, 46):
+            users.upsert_user(user_id=user_id, nickname=f"user-{user_id}", group_card="")
+
+        def seed(
+            message_id: str,
+            *,
+            group_id: int,
+            user_id: int,
+            card: str,
+            offset: int,
+            delivery_state: str = "",
+        ) -> None:
+            messages.add_group_message(
+                platform_msg_id=message_id,
+                group_id=group_id,
+                user_id=user_id,
+                timestamp=observed_at + timedelta(minutes=offset),
+                plain_text="sender snapshot",
+                raw_json={
+                    "sender": {"nickname": f"user-{user_id}", "card": card},
+                    "delivery_state": delivery_state,
+                },
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+        seed("eligible-azha", group_id=10001, user_id=42, card="阿渣", offset=0)
+        seed(
+            "blocked-renamed",
+            group_id=10001,
+            user_id=42,
+            card="污染名",
+            offset=3,
+            delivery_state="blocked",
+        )
+        seed(
+            "reserved-yesterday",
+            group_id=10001,
+            user_id=44,
+            card="昨天",
+            offset=2,
+            delivery_state="reserved",
+        )
+        seed("cross-group-azha", group_id=10002, user_id=43, card="阿渣", offset=1)
+        messages.add_private_message(
+            platform_msg_id="private-sender-snapshot",
+            user_id=46,
+            timestamp=observed_at + timedelta(minutes=6),
+            plain_text="private sender snapshot",
+            raw_json={"sender": {"nickname": "private", "card": "私聊别名"}},
+        )
+        seed(
+            "uncertain-result",
+            group_id=10001,
+            user_id=45,
+            card="结果",
+            offset=4,
+            delivery_state="uncertain",
+        )
+        seed(
+            "deleted-message",
+            group_id=10001,
+            user_id=46,
+            card="消息",
+            offset=5,
+            delivery_state="deleted",
+        )
+        member_snapshots = messages.list_recent_group_member_messages(
+            group_id=10001,
+            limit=20,
+        )
+        assert {row.user_id for row in member_snapshots} == {42}
+        all_snapshots = messages.list_recent_group_member_messages(
+            group_id=None,
+            limit=20,
+        )
+        assert {row.user_id for row in all_snapshots} == {42, 43}
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        MemoryV2Request(
+            group_id=10001,
+            query="阿渣昨天的劲爆发言",
+            recent_messages=(),
+            quoted_message=None,
+            target_message_id=None,
+            available_input=10_000,
+            now=observed_at,
+        )
+    )
+
+    assert trace.resolved_query.speaker_ids == ("42",)
+    assert trace.resolved_query.subject_ids == ("42",)
+
+    with session_scope(sqlite_engine) as session:
+        MessageRepository(session).add_group_message(
+            platform_msg_id="new-cross-group-superstring",
+            group_id=10002,
+            user_id=43,
+            timestamp=observed_at + timedelta(minutes=10),
+            plain_text="sender snapshot",
+            raw_json={"sender": {"nickname": "user-43", "card": "王阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    refreshed_trace = runtime.v2_provider.evaluate(
+        MemoryV2Request(
+            group_id=10001,
+            query="王阿渣昨天的劲爆发言",
+            recent_messages=(),
+            quoted_message=None,
+            target_message_id=None,
+            available_input=10_000,
+            now=observed_at,
+        )
+    )
+
+    assert refreshed_trace.resolved_query.speaker_ids == ()
+    assert refreshed_trace.resolved_query.subject_ids == ()
 
 
 def test_shadow_evaluator_records_rewrite_flag_from_real_v2_trace(

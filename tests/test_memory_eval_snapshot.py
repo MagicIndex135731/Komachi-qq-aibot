@@ -10,7 +10,10 @@ import pytest
 from app.core.memory_query_resolver import MemoryQueryResolver
 from scripts import build_memory_eval_dataset as builder
 from scripts import export_memory_eval_review_bundle as review_exporter
-from scripts.build_memory_eval_dataset import _load_safe_group_messages
+from scripts.build_memory_eval_dataset import (
+    _load_paraphrase_overrides,
+    _load_safe_group_messages,
+)
 from scripts.evaluate_memory_recall import (
     EvaluationCase,
     load_evaluation_cases,
@@ -100,6 +103,26 @@ def test_eval_candidates_are_bounded_by_manifest_group_watermarks(tmp_path) -> N
         )
 
 
+def test_paraphrase_overrides_require_strict_bound_human_approval(tmp_path) -> None:
+    path = tmp_path / "paraphrase-overrides.json"
+    path.write_text('{"schema_version":1,"snapshot_manifest_sha256":NaN,"items":[]}', encoding="utf-8")
+    with pytest.raises(ValueError, match="non-standard JSON constant"):
+        _load_paraphrase_overrides(path, snapshot_manifest_sha256="a" * 64)
+
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "snapshot_manifest_sha256": "b" * 64,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="snapshot manifest mismatch"):
+        _load_paraphrase_overrides(path, snapshot_manifest_sha256="a" * 64)
+
+
 def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
     tmp_path,
     monkeypatch,
@@ -116,6 +139,7 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
         rows = []
         for index in range(1, 151):
             day = "2026-07-20" if index <= 90 else "2026-07-22"
+            hour = "14" if 30 <= index <= 90 else "00"
             user_id = 1 if index <= 120 else 2
             reply_to = f"safe-{index - 1}" if index % 2 == 0 and index <= 70 else None
             delivery_state = "blocked" if index == 145 else ""
@@ -125,7 +149,7 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
                     f"safe-{index}",
                     100,
                     user_id,
-                    f"{day}T00:{index % 60:02d}:00+00:00",
+                    f"{day}T{hour}:{index % 60:02d}:00+00:00",
                     f"detailed source message {index} with unique evaluation context",
                     reply_to,
                     json.dumps({"delivery_state": delivery_state}),
@@ -153,6 +177,25 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
     manifest.write_text("{}", encoding="utf-8")
     dataset = tmp_path / "dataset.jsonl"
     review = tmp_path / "review.json"
+    paraphrase_overrides = tmp_path / "paraphrase-overrides.json"
+    paraphrase_overrides.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "snapshot_manifest_sha256": "a" * 64,
+                "items": [
+                    {
+                        "source_message_id": f"safe-{index}",
+                        "query": f"curated equivalent evaluation query {index}",
+                        "reviewer": "fixture",
+                        "semantic_equivalence_approved": True,
+                    }
+                    for index in range(11, 21)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     watermarks = {100: 150, 200: 155}
     monkeypatch.setattr(
         builder,
@@ -172,6 +215,8 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
             str(dataset),
             "--review-output",
             str(review),
+            "--paraphrase-overrides",
+            str(paraphrase_overrides),
         ]
     ) == 0
 
@@ -186,6 +231,10 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
     assert all(
         case.requester_uin
         == metadata[case.recent_context_message_ids[-1]].user_id
+        for case in cases
+    )
+    assert all(
+        metadata[case.recent_context_message_ids[-1]].reply_to_message_id is None
         for case in cases
     )
     first_person = next(case for case in cases if "first_person" in case.gate_tags)
@@ -235,7 +284,7 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
     assert bundle["contains_private_chat_content"] is True
 
     resolver = MemoryQueryResolver()
-    for case in cases:
+    for case_index, case in enumerate(cases):
         target = metadata[case.recent_context_message_ids[-1]]
         quoted = (
             SimpleNamespace(
@@ -259,9 +308,9 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
             group_id=case.group_id,
             requester_id=case.requester_uin,
         )
-        assert plan.answer_mode == case.expected_answer_mode
-        assert plan.coverage_strategy == case.expected_coverage_strategy
-        assert plan.subject_ids == case.allowed_subject_user_ids
+        assert plan.answer_mode == case.expected_answer_mode, case_index
+        assert plan.coverage_strategy == case.expected_coverage_strategy, case_index
+        assert plan.subject_ids == case.allowed_subject_user_ids, case_index
         actual_range = (
             None
             if plan.time_range is None
@@ -278,4 +327,4 @@ def test_builder_emits_v3_contracts_and_unapproved_real_snapshot_review(
                 for value in case.time_range
             )
         )
-        assert actual_range == expected_range
+        assert actual_range == expected_range, case_index

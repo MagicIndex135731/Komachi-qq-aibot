@@ -27,8 +27,13 @@ MEMORY_GROUNDING_NO_EVIDENCE = (
     "Do not infer a person's preference from topical discussion; state that memory evidence is insufficient."
 )
 MEMORY_GROUNDING_WITH_EVIDENCE = (
-    "Memory grounding policy: Explicit current memory facts and later corrections or newer evidence "
-    "take precedence over conflicting historical chat. Topical discussion alone does not prove a personal preference."
+    "Memory grounding policy: Answer historical-memory questions only with facts directly and "
+    "unambiguously supported by the retrieved evidence. Do not infer, generalize, embellish, add "
+    "reactions, or treat topical discussion as proof of a personal preference. Use the smallest "
+    "sufficient set of evidence. For a single-event dated question, state only one fact from the "
+    "top direct source and preserve its wording with minimal paraphrase; later corrections or newer "
+    "evidence take precedence. If the "
+    "retrieved evidence does not directly answer the question, state that memory evidence is insufficient."
 )
 MEMORY_GROUNDING_MINIMAL = (
     "Discussion is not preference evidence; corrections win."
@@ -108,25 +113,34 @@ class MemoryContextPacker:
         detail_budget: int = 64_000,
         recent_budget: int = 10_000,
         history_budget: int = 24_000,
+        context_char_budget: int = 12_000,
         max_recent_messages: int = 60,
         max_history_messages: int = 150,
         token_counter: TokenCounter | None = None,
     ) -> None:
+        minimum_char_budget = len(MEMORY_GROUNDING_WITH_EVIDENCE) + len(
+            QQ_BLOCKED_MEMORY_NOTE
+        ) + 4
         if min(
             normal_budget,
             detail_budget,
             recent_budget,
             history_budget,
+            context_char_budget,
             max_recent_messages,
             max_history_messages,
         ) <= 0:
             raise ValueError("memory budgets must be positive")
+        if context_char_budget < minimum_char_budget:
+            raise ValueError("memory context character budget is too small for safety policies")
         self._budgets = {"normal": normal_budget, "detail": detail_budget}
         self._recent_budget = recent_budget
         self._history_budget = history_budget
+        self._context_char_budget = int(context_char_budget)
         self._max_recent_messages = int(max_recent_messages)
         self._max_history_messages = int(max_history_messages)
         self._token_counter = token_counter or self._fallback_token_count
+        self._token_counter_is_additive = token_counter is None
 
     def pack(
         self,
@@ -146,12 +160,56 @@ class MemoryContextPacker:
             self._recent_budget + self._history_budget,
         )
         budget = min(configured_budget, max(0, available_input))
+        history_requested = bool(evidence_segments or facts or summaries)
+        blocked_input_present = any(message.blocked for message in recent_messages) or any(
+            segment.blocked_output_present or any(message.blocked for message in segment.messages)
+            for segment in evidence_segments
+        )
+        reserved_policy = (
+            MEMORY_GROUNDING_MINIMAL
+            if history_requested
+            else MEMORY_GROUNDING_NO_EVIDENCE
+        )
+        if blocked_input_present:
+            reserved_policy = f"{QQ_BLOCKED_MEMORY_NOTE}\n\n{reserved_policy}"
+        reserved_policy_tokens = self._estimate(reserved_policy)
+        recent_char_budget = max(0, self._context_char_budget - len(reserved_policy) - 2)
+        if history_requested:
+            recent_char_budget //= 3
         recent = self._select_recent(
             recent_messages,
             target_message_id,
-            min(budget, self._recent_budget),
+            max(0, min(budget, self._recent_budget) - reserved_policy_tokens),
+            recent_char_budget,
         )
         recent_blocks = tuple(self._render_recent(message) for message in recent)
+        block_token_cache: dict[str, int] = {}
+
+        def fits_history(history_blocks: Sequence[str]) -> bool:
+            combined_text = "\n\n".join([*recent_blocks, *history_blocks])
+            if len(combined_text) > self._context_char_budget:
+                return False
+            if not self._token_counter_is_additive:
+                return self._fits_history(
+                    budget=budget,
+                    recent_blocks=recent_blocks,
+                    history_blocks=history_blocks,
+                )
+
+            def block_tokens(block: str) -> int:
+                cached = block_token_cache.get(block)
+                if cached is None:
+                    cached = self._estimate(block)
+                    block_token_cache[block] = cached
+                return cached
+
+            recent_tokens = sum(block_tokens(block) for block in recent_blocks)
+            history_tokens = sum(block_tokens(block) for block in history_blocks)
+            return (
+                history_tokens <= self._history_budget
+                and recent_tokens + history_tokens <= budget
+            )
+
         occupied_ids = {message.source_msg_id for message in recent}
         blocked_output_present = any(message.blocked for message in recent) or any(
             segment.blocked_output_present or any(message.blocked for message in segment.messages)
@@ -182,10 +240,8 @@ class MemoryContextPacker:
             ):
                 continue
             block = self._render_segment(candidate_segment)
-            if not self._fits_history(
-                budget=budget,
-                recent_blocks=recent_blocks,
-                history_blocks=[*evidence_policy_blocks, *segment_blocks, block],
+            if not fits_history(
+                [*evidence_policy_blocks, *segment_blocks, block]
             ):
                 continue
             selected_segments.append(candidate_segment)
@@ -198,15 +254,13 @@ class MemoryContextPacker:
         fact_blocks: list[str] = []
         for fact in sorted(facts, key=lambda item: (-item.score, item.text)):
             block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
-            if self._fits_history(
-                budget=budget,
-                recent_blocks=recent_blocks,
-                history_blocks=[
+            if fits_history(
+                [
                     *evidence_policy_blocks,
                     *fact_blocks,
                     *segment_blocks,
                     block,
-                ],
+                ]
             ):
                 selected_facts.append(fact)
                 fact_blocks.append(block)
@@ -225,15 +279,13 @@ class MemoryContextPacker:
             ):
                 continue
             block = self._render_segment(candidate_segment)
-            if not self._fits_history(
-                budget=budget,
-                recent_blocks=recent_blocks,
-                history_blocks=[
+            if not fits_history(
+                [
                     *evidence_policy_blocks,
                     *fact_blocks,
                     *segment_blocks,
                     block,
-                ],
+                ]
             ):
                 continue
             selected_segments.append(candidate_segment)
@@ -250,16 +302,14 @@ class MemoryContextPacker:
                 if not summary.relevant:
                     continue
                 block = f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
-                if self._fits_history(
-                    budget=budget,
-                    recent_blocks=recent_blocks,
-                    history_blocks=[
+                if fits_history(
+                    [
                         *evidence_policy_blocks,
                         *fact_blocks,
                         *segment_blocks,
                         *summary_blocks,
                         block,
-                    ],
+                    ]
                 ):
                     selected_summaries.append(summary)
                     summary_blocks.append(block)
@@ -284,11 +334,7 @@ class MemoryContextPacker:
         ]
         grounding_policy = (
             full_grounding_policy
-            if self._fits_history(
-                budget=budget,
-                recent_blocks=recent_blocks,
-                history_blocks=[*history_content_blocks, full_grounding_policy],
-            )
+            if fits_history([*history_content_blocks, full_grounding_policy])
             else MEMORY_GROUNDING_MINIMAL
         )
         blocks = [
@@ -313,10 +359,17 @@ class MemoryContextPacker:
                 ]
             )
         )
+        total_estimated_tokens = self._estimate(text)
+        if (
+            len(text) > self._context_char_budget
+            or history_estimated_tokens > self._history_budget
+            or total_estimated_tokens > budget
+        ):
+            raise ValueError("packed memory context exceeds a hard budget")
         return PackedMemoryContext(
             mode=mode,
             budget=budget,
-            estimated_tokens=self._estimate(text),
+            estimated_tokens=total_estimated_tokens,
             text=text,
             recent_messages=recent,
             evidence_segments=tuple(selected_segments),
@@ -365,6 +418,7 @@ class MemoryContextPacker:
         messages: Sequence[EvidenceMessage],
         target_message_id: str | None,
         budget: int,
+        char_budget: int,
     ) -> tuple[EvidenceMessage, ...]:
         filtered = tuple(
             message
@@ -375,7 +429,8 @@ class MemoryContextPacker:
         for message in reversed(filtered):
             block = self._render_recent(message)
             candidate_blocks = [block, *(self._render_recent(item) for item in reversed(selected))]
-            if self._estimate("\n\n".join(candidate_blocks)) > budget:
+            candidate_text = "\n\n".join(candidate_blocks)
+            if self._estimate(candidate_text) > budget or len(candidate_text) > char_budget:
                 break
             selected.append(message)
         selected.reverse()
@@ -421,6 +476,8 @@ class MemoryContextPacker:
         history_blocks: Sequence[str],
     ) -> bool:
         history_text = "\n\n".join(history_blocks)
+        if len("\n\n".join([*recent_blocks, *history_blocks])) > self._context_char_budget:
+            return False
         if self._estimate(history_text) > self._history_budget:
             return False
         return self._estimate("\n\n".join([*recent_blocks, *history_blocks])) <= budget

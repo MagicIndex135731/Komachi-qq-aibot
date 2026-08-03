@@ -714,7 +714,7 @@ def test_temporal_entity_fact_exact_and_reply_channels_use_scoped_provenance(
         reply = messages.add_group_message(
             platform_msg_id="reply-message",
             group_id=10001,
-            user_id=20001,
+            user_id=20002,
             timestamp=datetime(2026, 7, 23, 8, 1, tzinfo=UTC),
             plain_text="收到，按周五发布",
             raw_json={},
@@ -865,7 +865,8 @@ def test_temporal_entity_fact_exact_and_reply_channels_use_scoped_provenance(
         )
     }
 
-    assert {quoted_document_id, reply_document_id, fact_document_id} <= temporal_ids
+    assert {quoted_document_id, fact_document_id} <= temporal_ids
+    assert reply_document_id not in temporal_ids
     assert quoted_document_id in entity_ids
     assert fact_ids == {fact_document_id}
     assert quoted_document_id in exact_ids

@@ -105,6 +105,10 @@ class AppSettings(BaseSettings):
         default=24000,
         alias="MEMORY_HISTORY_CONTEXT_BUDGET_TOKENS",
     )
+    memory_context_budget_chars: int = Field(
+        default=12000,
+        alias="MEMORY_CONTEXT_BUDGET_CHARS",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",

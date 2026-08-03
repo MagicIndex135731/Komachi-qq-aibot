@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any, Sequence
 
-from sqlalchemy import Integer, String, bindparam, cast, func, or_, select, text
+from sqlalchemy import Integer, String, bindparam, cast, func, or_, select, text, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,43 @@ _INELIGIBLE_DELIVERY_STATES = (
     "uncertain",
     "deleted",
 )
+
+# sqlite-vec rejects KNN queries above this engine limit.  Hard filters such
+# as speaker/time are validated after vector ranking, so expansion may reach
+# the cap on large groups even when the caller only requests 150 final hits.
+_SQLITE_VEC_MAX_K = 4096
+
+
+def _next_vector_fetch_limit(
+    current: int,
+    *,
+    requested: int,
+    available: int,
+) -> int:
+    searchable = min(max(0, int(available)), _SQLITE_VEC_MAX_K)
+    if searchable <= 0:
+        return 0
+    return min(
+        searchable,
+        max(int(current) + max(1, int(requested)), int(current) * 2),
+    )
+
+
+def _initial_vector_fetch_limit(
+    *,
+    requested: int,
+    available: int,
+    has_post_filters: bool,
+) -> int:
+    searchable = min(max(0, int(available)), _SQLITE_VEC_MAX_K)
+    if searchable <= 0:
+        return 0
+    if has_post_filters:
+        # sqlite-vec can partition by group but speaker/time/mention filters
+        # are validated against canonical source rows afterwards. Starting at
+        # the cap avoids repeating the same KNN scan for sparse hard filters.
+        return searchable
+    return min(max(1, int(requested)), searchable)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +204,40 @@ def _retrieval_source_prefilters(
                 RetrievalDocument.id.not_in(mismatched_document_ids)
             )
     return filters
+
+
+def _retrieval_mention_document_ids(
+    *,
+    group_id: int,
+    mentioned_user_ids: Sequence[str],
+):
+    """Select documents backed by a real OneBot ``at`` segment."""
+
+    normalized_mentions = _normalize_optional_string_filter(mentioned_user_ids)
+    if not normalized_mentions:
+        return select(RetrievalDocument.id).where(RetrievalDocument.id < 0)
+    segments = func.json_each(
+        Message.raw_json,
+        "$.message",
+    ).table_valued("value").alias("mention_segment")
+    return (
+        select(RetrievalDocumentMessage.document_id)
+        .join(
+            Message,
+            (Message.id == RetrievalDocumentMessage.message_id)
+            & (Message.group_id == RetrievalDocumentMessage.group_id),
+        )
+        .join(segments, true())
+        .where(
+            RetrievalDocumentMessage.group_id == int(group_id),
+            Message.group_id == int(group_id),
+            func.json_extract(segments.c.value, "$.type") == "at",
+            cast(
+                func.json_extract(segments.c.value, "$.data.qq"),
+                String,
+            ).in_(normalized_mentions),
+        )
+    )
 
 
 def _delete_active_retrieval_vectors(
@@ -432,6 +503,62 @@ class MessageRepository:
             )
         )
         return {str(message.platform_msg_id): message for message in rows}
+
+    def list_direct_group_replies(
+        self,
+        *,
+        group_id: int,
+        parent_platform_msg_ids: list[str],
+        scan_limit_per_parent: int,
+    ) -> list[Message]:
+        """Load a bounded direct-reply scan for scoped parents in stable order.
+
+        The reply quota is applied after the query plan's delivery, subject,
+        and time eligibility checks. This larger scan bound prevents unbounded
+        ORM hydration without consuming the final two-reply eligibility quota.
+        """
+        if scan_limit_per_parent < 1:
+            raise ValueError("direct reply scan limit must be positive")
+        parent_ids = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in parent_platform_msg_ids
+                if str(item).strip()
+            )
+        )
+        if not parent_ids:
+            return []
+        ranked = (
+            select(
+                Message.id.label("message_id"),
+                func.row_number()
+                .over(
+                    partition_by=Message.reply_to_msg_id,
+                    order_by=(Message.timestamp.asc(), Message.id.asc()),
+                )
+                .label("reply_rank"),
+            )
+            .where(
+                Message.group_id == int(group_id),
+                Message.reply_to_msg_id.in_(parent_ids),
+                ~func.coalesce(
+                    func.json_extract(Message.raw_json, "$.delivery_state"),
+                    "",
+                ).in_(_INELIGIBLE_DELIVERY_STATES),
+            )
+            .subquery()
+        )
+        stmt = (
+            select(Message)
+            .join(ranked, ranked.c.message_id == Message.id)
+            .where(ranked.c.reply_rank <= int(scan_limit_per_parent))
+            .order_by(
+                Message.reply_to_msg_id.asc(),
+                Message.timestamp.asc(),
+                Message.id.asc(),
+            )
+        )
+        return list(self.session.scalars(stmt))
 
     def is_late_group_message(
         self,
@@ -725,22 +852,43 @@ class MessageRepository:
         )
         return [int(user_id) for user_id, _latest in self.session.execute(stmt)]
 
-    def list_recent_group_member_messages(self, *, group_id: int, limit: int) -> list[Message]:
-        """Return the latest target-group sender snapshot for each recent member."""
+    def list_recent_group_member_messages(
+        self,
+        *,
+        group_id: int | None,
+        limit: int | None,
+    ) -> list[Message]:
+        """Return latest eligible sender snapshots, optionally across all groups."""
 
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             return []
+        rank_partition = (
+            (Message.group_id, Message.user_id)
+            if group_id is None
+            else Message.user_id
+        )
+        filters = (
+            [Message.group_id.is_not(None)]
+            if group_id is None
+            else [Message.group_id == int(group_id)]
+        )
         ranked = (
             select(
                 Message.id.label("message_id"),
                 func.row_number()
                 .over(
-                    partition_by=Message.user_id,
+                    partition_by=rank_partition,
                     order_by=(Message.timestamp.desc(), Message.id.desc()),
                 )
                 .label("member_rank"),
             )
-            .where(Message.group_id == int(group_id))
+            .where(
+                *filters,
+                ~func.coalesce(
+                    func.json_extract(Message.raw_json, "$.delivery_state"),
+                    "",
+                ).in_(_INELIGIBLE_DELIVERY_STATES),
+            )
             .subquery()
         )
         stmt = (
@@ -748,8 +896,9 @@ class MessageRepository:
             .join(ranked, ranked.c.message_id == Message.id)
             .where(ranked.c.member_rank == 1)
             .order_by(Message.timestamp.desc(), Message.id.desc())
-            .limit(int(limit))
         )
+        if limit is not None:
+            stmt = stmt.limit(int(limit))
         return list(self.session.scalars(stmt))
 
     def last_bot_reply_at(self, *, group_id: int, bot_user_id: int) -> datetime | None:
@@ -2863,6 +3012,11 @@ class RetrievalDocumentRepository:
     ) -> list[RetrievalDocumentHit]:
         if start_at is None and end_at is None and not allow_unbounded:
             return []
+        normalized_mentioned_user_ids = _normalize_optional_string_filter(
+            mentioned_user_ids
+        )
+        if normalized_mentioned_user_ids == ():
+            return []
         stmt = select(RetrievalDocument.id).where(
             RetrievalDocument.group_id == int(group_id),
             RetrievalDocument.status == "active",
@@ -2871,6 +3025,15 @@ class RetrievalDocumentRepository:
                 speaker_ids=speaker_ids,
             ),
         )
+        if normalized_mentioned_user_ids is not None:
+            stmt = stmt.where(
+                RetrievalDocument.id.in_(
+                    _retrieval_mention_document_ids(
+                        group_id=group_id,
+                        mentioned_user_ids=normalized_mentioned_user_ids,
+                    )
+                )
+            )
         normalized_document_kinds = tuple(
             dict.fromkeys(
                 str(kind).strip()
@@ -2908,7 +3071,7 @@ class RetrievalDocumentRepository:
             if use_time_coverage
             else RetrievalDocument.id.desc(),
         )
-        if not use_time_coverage and mentioned_user_ids is None:
+        if not use_time_coverage:
             ordered_stmt = ordered_stmt.limit(resolved_limit * 4)
         document_ids = list(self.session.scalars(ordered_stmt))
         hits = self._validated_hits(
@@ -3305,7 +3468,21 @@ class RetrievalDocumentRepository:
         )
         if available <= 0:
             return []
-        fetch_limit = min(resolved_limit, available)
+        searchable_available = min(available, _SQLITE_VEC_MAX_K)
+        fetch_limit = _initial_vector_fetch_limit(
+            requested=resolved_limit,
+            available=available,
+            has_post_filters=any(
+                value is not None
+                for value in (
+                    normalized_subject_ids,
+                    normalized_speaker_ids,
+                    normalized_mentioned_user_ids,
+                    start_at,
+                    end_at,
+                )
+            ),
+        )
         serialized_embedding = json.dumps(
             [float(value) for value in embedding],
             separators=(",", ":"),
@@ -3341,11 +3518,12 @@ class RetrievalDocumentRepository:
                 ),
                 mentioned_user_ids=normalized_mentioned_user_ids,
             )
-            if len(hits) >= resolved_limit or fetch_limit >= available:
+            if len(hits) >= resolved_limit or fetch_limit >= searchable_available:
                 return hits[:resolved_limit]
-            fetch_limit = min(
-                available,
-                max(fetch_limit + resolved_limit, fetch_limit * 2),
+            fetch_limit = _next_vector_fetch_limit(
+                fetch_limit,
+                requested=resolved_limit,
+                available=available,
             )
 
     def _validated_hits(

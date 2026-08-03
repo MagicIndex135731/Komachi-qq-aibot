@@ -8,6 +8,25 @@ from app.core.member_identity import (
 )
 
 
+def test_same_alias_snapshot_keeps_target_and_external_scope_separate() -> None:
+    messages = (
+        SimpleNamespace(
+            user_id=42,
+            group_id=200,
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+        ),
+        SimpleNamespace(
+            user_id=42,
+            group_id=100,
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+        ),
+    )
+
+    members = group_member_identities_from_messages(messages, target_group_id=100)
+
+    assert {member.in_scope for member in members} == {False, True}
+
+
 def test_exact_member_resolution_groups_card_and_nickname_by_user_id() -> None:
     members = (
         GroupMemberIdentity(user_id=42, nickname="A-Zha", group_card="阿渣"),

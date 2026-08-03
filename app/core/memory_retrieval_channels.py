@@ -206,6 +206,11 @@ class ScopedMemoryRetrievalChannels:
         resolved_query: Any,
         limit: int,
     ) -> Sequence[RetrievalCandidate]:
+        hard_filters = self._hard_filters(resolved_query)
+        # The reply author is not required to be the quoted message author.
+        # Keeping the quoted speaker filter here silently drops normal
+        # cross-speaker replies from deterministic reference retrieval.
+        hard_filters["speaker_ids"] = None
         with self._session_factory() as session:
             hits = RetrievalDocumentRepository(
                 session
@@ -217,7 +222,7 @@ class ScopedMemoryRetrievalChannels:
                 include_replies=True,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
-                **self._hard_filters(resolved_query),
+                **hard_filters,
             )
             return self._adapt(group_id=group_id, hits=hits)
 

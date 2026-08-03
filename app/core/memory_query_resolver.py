@@ -17,7 +17,10 @@ from zoneinfo import ZoneInfo
 
 from app.core.member_identity import (
     GroupMemberIdentity,
+    GroupMemberReferenceResolution,
+    ResolvedGroupMember,
     classify_group_member_reference,
+    normalize_member_alias,
 )
 
 
@@ -142,7 +145,13 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:我|我的)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么|过去|以前|历史)"
 )
 _ASSESSMENT_PATTERN = re.compile(r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)")
-_SUMMARY_PATTERN = re.compile(r"总结|概括|汇总|发生了什么|聊了什么|都说了什么")
+_SUMMARY_PATTERN = re.compile(
+    r"总结|概括|汇总|发生了什么|"
+    r"(?:今天|昨天|前天|本周|这周|上周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?).*?"
+    r"(?:都|分别)(?:说了|说过|发了|发过|讲了|聊了)什么|"
+    r"(?:说了|说过|发了|发过|讲了|聊了)(?:哪些(?:话|内容)?|几条)|"
+    r"(?:有|有哪些|有什么)(?:发言|内容|消息)|(?:哪些|所有)(?:发言|内容|消息)"
+)
 _MENTION_PATTERN = re.compile(
     r"(?:谁|哪些人|有人).*(?:提到|说到|叫|@)|"
     r"(?:提到|说到|叫|@).*(?:谁|哪些人)|"
@@ -153,6 +162,16 @@ _REQUESTER_MENTION_PATTERN = re.compile(
 )
 _CURRENT_FACT_PATTERN = re.compile(r"最喜欢|喜欢什么|讨厌什么|不喜欢什么|还记得|记得")
 _COMMON_WORDS = frozenset({"发布", "已经", "那个", "什么", "怎么", "后来", "之前", "最后", "结果", "消息", "延期", "完成", "服务", "迁移", "今天", "昨天", "前天"})
+_RELATIVE_DAY_WORDS = frozenset({"今天", "昨天", "前天"})
+_MEMBER_JOINER_PATTERN = r"(?:再加上|并且|还有|以及|和|与|跟|及|、)"
+_JOINED_RELATIVE_DAY_QUERY_PATTERN = re.compile(
+    rf"^\s*(?:今天|昨天|前天)"
+    rf"(?:\s*{_MEMBER_JOINER_PATTERN}\s*(?:今天|昨天|前天))+"
+    r"\s*(?:发生|群里|聊了|都发生|都聊)"
+)
+_SUBJECTLESS_RELATIVE_EVENT_PATTERN = re.compile(
+    r"^\s*(?:今天|昨天|前天).*(?:发生了什么|群里发生|都发生)"
+)
 _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
     r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么)"
 )
@@ -273,11 +292,11 @@ class MemoryQueryResolver:
             or answer_mode in {"mention", "summary", "assessment"}
         )
 
-        direct_reference = classify_group_member_reference(
+        direct_reference = self._classify_direct_member_reference(
             original,
             group_members,
-            match_mode="contained",
             exclude_user_ids=excluded_member_ids,
+            has_time_range=time_range is not None,
         )
         if direct_reference.status == "resolved":
             direct_member = direct_reference.member
@@ -425,8 +444,750 @@ class MemoryQueryResolver:
         )
 
     @staticmethod
+    def _classify_direct_member_reference(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+        *,
+        exclude_user_ids: set[int] | frozenset[int],
+        has_time_range: bool,
+    ) -> GroupMemberReferenceResolution:
+        if (
+            _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query)
+            or _SUBJECTLESS_RELATIVE_EVENT_PATTERN.search(query)
+        ):
+            return GroupMemberReferenceResolution("unbound")
+        allowed_members = tuple(
+            member
+            for member in group_members
+            if member.in_scope and int(member.user_id) not in exclude_user_ids
+        )
+        alias_resolution = classify_group_member_reference(
+            query,
+            allowed_members,
+            match_mode="contained",
+        )
+        strong_resolution = MemoryQueryResolver._classify_prefix_member_alias(
+            query,
+            group_members,
+            has_time_range=has_time_range,
+            exclude_user_ids=exclude_user_ids,
+        )
+        if strong_resolution.status == "ambiguous":
+            return strong_resolution
+        if strong_resolution.status == "resolved":
+            if strong_resolution.member is None:
+                raise RuntimeError("resolved strong member reference is missing its member")
+            if MemoryQueryResolver._has_unsafe_member_suffix(
+                query,
+                member=strong_resolution.member,
+                group_members=group_members,
+                has_time_range=has_time_range,
+                exclude_user_ids=exclude_user_ids,
+            ):
+                return GroupMemberReferenceResolution("ambiguous")
+            alias_resolution = strong_resolution
+        if strong_resolution.status != "resolved":
+            alias_resolution = MemoryQueryResolver._deprioritize_weak_aliases(
+                query,
+                allowed_members,
+                resolution=alias_resolution,
+                exclude_user_ids=exclude_user_ids,
+            )
+        if (
+            alias_resolution.status == "resolved"
+            and alias_resolution.member is not None
+            and MemoryQueryResolver._has_restricted_alias_shadow(
+                query,
+                member=alias_resolution.member,
+                group_members=group_members,
+                exclude_user_ids=exclude_user_ids,
+            )
+        ):
+            return GroupMemberReferenceResolution("ambiguous")
+        for identity in allowed_members:
+            for alias in dict.fromkeys((identity.group_card, identity.nickname)):
+                normalized_alias = normalize_member_alias(alias)
+                if len(normalized_alias) < 2:
+                    continue
+                if (
+                    normalized_alias
+                    in {
+                        normalize_member_alias(value)
+                        for value in _COMMON_WORDS
+                    }
+                    and not MemoryQueryResolver._weak_alias_is_explicit_member(
+                        query,
+                        group_members,
+                    )
+                ):
+                    continue
+                if normalized_alias not in normalize_member_alias(query):
+                    continue
+                if MemoryQueryResolver._has_unsafe_member_suffix(
+                    query,
+                    member=ResolvedGroupMember(
+                        user_id=int(identity.user_id),
+                        matched_alias=alias,
+                    ),
+                    group_members=group_members,
+                    has_time_range=has_time_range,
+                    exclude_user_ids=exclude_user_ids,
+                ):
+                    return GroupMemberReferenceResolution("ambiguous")
+        explicit_resolution = MemoryQueryResolver._classify_explicit_member_ids(
+            query,
+            group_members,
+            exclude_user_ids=exclude_user_ids,
+        )
+        if explicit_resolution.status == "resolved":
+            if explicit_resolution.member is None:
+                raise RuntimeError("resolved explicit member reference is missing its member")
+            remainder_resolution = MemoryQueryResolver._classify_prefix_member_alias(
+                re.sub(
+                    r"^\s*(?:@\s*|QQ\s*(?:号\s*)?[:：]?\s*)\d{5,12}\s*",
+                    "",
+                    query,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ),
+                group_members,
+                has_time_range=has_time_range,
+                exclude_user_ids=exclude_user_ids,
+            )
+            if (
+                remainder_resolution.status == "resolved"
+                and remainder_resolution.member is not None
+                and remainder_resolution.member.user_id
+                != explicit_resolution.member.user_id
+            ):
+                return GroupMemberReferenceResolution("ambiguous")
+            if (
+                remainder_resolution.status == "resolved"
+                and remainder_resolution.member is not None
+                and remainder_resolution.member.user_id
+                == explicit_resolution.member.user_id
+            ):
+                alias_resolution = remainder_resolution
+            if MemoryQueryResolver._has_unsafe_member_suffix(
+                query,
+                member=explicit_resolution.member,
+                group_members=group_members,
+                has_time_range=has_time_range,
+                exclude_user_ids=exclude_user_ids,
+            ):
+                return GroupMemberReferenceResolution("ambiguous")
+        if MemoryQueryResolver._has_unknown_joined_member(
+            query,
+            group_members,
+            exclude_user_ids=exclude_user_ids,
+        ):
+            return GroupMemberReferenceResolution("ambiguous")
+        if explicit_resolution.status == "unbound":
+            return alias_resolution
+        if explicit_resolution.status == "ambiguous":
+            return explicit_resolution
+        if alias_resolution.status == "unbound":
+            return explicit_resolution
+        if alias_resolution.status == "ambiguous":
+            return alias_resolution
+        if explicit_resolution.member is None or alias_resolution.member is None:
+            raise RuntimeError("resolved member reference is missing its member")
+        if (
+            normalize_member_alias(alias_resolution.member.matched_alias)
+            in {
+                normalize_member_alias(value)
+                for value in _COMMON_WORDS
+            }
+            and not MemoryQueryResolver._weak_alias_is_explicit_member(
+                query,
+                group_members,
+            )
+        ):
+            return explicit_resolution
+        if explicit_resolution.member.user_id != alias_resolution.member.user_id:
+            return GroupMemberReferenceResolution("ambiguous")
+        return alias_resolution
+
+    @staticmethod
+    def _has_restricted_alias_shadow(
+        query: str,
+        *,
+        member: ResolvedGroupMember,
+        group_members: Sequence[GroupMemberIdentity],
+        exclude_user_ids: set[int] | frozenset[int],
+    ) -> bool:
+        """Reject a target alias embedded inside a longer unavailable alias.
+
+        The check is position-based instead of relying on a finite list of
+        polite prefixes, so cross-group and excluded aliases cannot be made to
+        bind a shorter target alias by adding arbitrary text before them.
+        """
+
+        normalized_query = normalize_member_alias(query)
+        target_aliases = {
+            normalize_member_alias(alias)
+            for identity in group_members
+            if identity.in_scope and int(identity.user_id) == int(member.user_id)
+            for alias in (identity.group_card, identity.nickname)
+            if normalize_member_alias(alias)
+            and normalize_member_alias(alias) in normalized_query
+        }
+        if not target_aliases:
+            return False
+        target_spans = tuple(
+            (target_alias, target_match.start(), target_match.end())
+            for target_alias in target_aliases
+            for target_match in re.finditer(re.escape(target_alias), normalized_query)
+        )
+        for identity in group_members:
+            if identity.in_scope and int(identity.user_id) not in exclude_user_ids:
+                continue
+            for alias in dict.fromkeys((identity.group_card, identity.nickname)):
+                restricted_alias = normalize_member_alias(alias)
+                if not restricted_alias:
+                    continue
+                for restricted_match in re.finditer(
+                    re.escape(restricted_alias),
+                    normalized_query,
+                ):
+                    restricted_start, restricted_end = restricted_match.span()
+                    if restricted_alias in target_aliases:
+                        continue
+                    if any(
+                        len(target_alias) > len(restricted_alias)
+                        and target_start <= restricted_start
+                        and restricted_end <= target_end
+                        for target_alias, target_start, target_end in target_spans
+                    ):
+                        # A shorter external prefix inside the complete target
+                        # alias is only a weak collision, not a second person.
+                        continue
+                    return True
+        return False
+
+    @staticmethod
+    def _classify_prefix_member_alias(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+        *,
+        has_time_range: bool,
+        exclude_user_ids: set[int] | frozenset[int] = frozenset(),
+    ) -> GroupMemberReferenceResolution:
+        if query.lstrip().startswith("@") and not re.match(
+            r"^\s*@\s*[^\d]",
+            query,
+        ):
+            return GroupMemberReferenceResolution("unbound")
+        normalized = normalize_member_alias(query)
+        for prefix in (
+            "如何评价",
+            "怎么评价",
+            "评价",
+            "点评",
+            "分析",
+            "怎么看待",
+            "怎么看",
+            "说说",
+            "请问",
+            "关于",
+            "帮我看看",
+            "麻烦说说",
+            "想问",
+        ):
+            normalized_prefix = normalize_member_alias(prefix)
+            if normalized.startswith(normalized_prefix):
+                normalized = normalized[len(normalized_prefix) :]
+                break
+        if has_time_range:
+            for value in _RELATIVE_DAY_WORDS:
+                normalized_day = normalize_member_alias(value)
+                if normalized.startswith(normalized_day):
+                    normalized = normalized[len(normalized_day) :]
+                    break
+        matches: list[tuple[GroupMemberIdentity, str, str]] = []
+        for member in group_members:
+            for alias in dict.fromkeys((member.group_card, member.nickname)):
+                normalized_alias = normalize_member_alias(alias)
+                if len(normalized_alias) >= 2 and normalized.startswith(normalized_alias):
+                    matches.append((member, alias, normalized_alias))
+        if not matches:
+            return GroupMemberReferenceResolution("unbound")
+        longest_length = max(len(item[2]) for item in matches)
+        longest_matches = tuple(
+            item for item in matches if len(item[2]) == longest_length
+        )
+        allowed_matches = tuple(
+            item
+            for item in longest_matches
+            if item[0].in_scope and int(item[0].user_id) not in exclude_user_ids
+        )
+        if not allowed_matches:
+            # A longer excluded or cross-group alias must shadow every shorter
+            # target-group substring.  Otherwise "王小明..." could bind "小明".
+            if any(not item[0].in_scope for item in longest_matches):
+                return GroupMemberReferenceResolution("ambiguous")
+            return GroupMemberReferenceResolution("unbound")
+        matched_ids = {int(item[0].user_id) for item in allowed_matches}
+        if len(matched_ids) != 1:
+            return GroupMemberReferenceResolution("ambiguous")
+        user_id = next(iter(matched_ids))
+        aliases = [item[1] for item in allowed_matches]
+        return GroupMemberReferenceResolution(
+            "resolved",
+            ResolvedGroupMember(
+                user_id=user_id,
+                matched_alias=max(aliases, key=lambda value: len(normalize_member_alias(value))),
+            ),
+        )
+
+    @staticmethod
+    def _has_unsafe_member_suffix(
+        query: str,
+        *,
+        member: ResolvedGroupMember,
+        group_members: Sequence[GroupMemberIdentity],
+        has_time_range: bool,
+        exclude_user_ids: set[int] | frozenset[int],
+    ) -> bool:
+        normalized = normalize_member_alias(query)
+        normalized_alias = normalize_member_alias(member.matched_alias)
+        if not normalized_alias:
+            return False
+        start = normalized.find(normalized_alias)
+        if start < 0:
+            return False
+        remainder = normalized[start + len(normalized_alias) :]
+        same_member_aliases = sorted(
+            {
+                normalize_member_alias(alias)
+                for identity in group_members
+                if identity.in_scope and int(identity.user_id) == int(member.user_id)
+                for alias in (identity.group_card, identity.nickname)
+                if normalize_member_alias(alias)
+                and normalize_member_alias(alias) != normalized_alias
+            },
+            key=len,
+            reverse=True,
+        )
+        stripped_same_alias = True
+        while stripped_same_alias:
+            stripped_same_alias = False
+            for alias in same_member_aliases:
+                if remainder.startswith(alias):
+                    remainder = remainder[len(alias) :]
+                    stripped_same_alias = True
+                    break
+        if not remainder:
+            return False
+
+        relation_target = re.match(
+            r"^(?:的(?P<relation>[\u4e00-\u9fff]{1,4})|说|提到|聊到|问到)"
+            r"(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{2,}?)"
+            r"(?=最近|刚刚|刚才|之前|上次|昨天|今天|前天|上周|"
+            r"说|做|发|提|聊|的事|[？?]|$)",
+            remainder,
+        )
+        if relation_target is not None:
+            subject = normalize_member_alias(relation_target.group("subject"))
+            known_aliases = {
+                normalize_member_alias(alias)
+                for identity in group_members
+                for alias in (identity.group_card, identity.nickname)
+                if normalize_member_alias(alias)
+            }
+            restricted_aliases = {
+                normalize_member_alias(alias)
+                for identity in group_members
+                if not identity.in_scope
+                or int(identity.user_id) in exclude_user_ids
+                for alias in (identity.group_card, identity.nickname)
+                if normalize_member_alias(alias)
+            }
+            relation_slot = relation_target.group("relation") is not None
+            person_shaped = bool(
+                re.search(r"(?:人|猫|哥|姐|老师|同学|君|酱)$", subject)
+                or re.match(r"(?:小|老)[\u4e00-\u9fffA-Za-z0-9_-]{1,5}$", subject)
+            )
+            if relation_slot:
+                return True
+            if subject in restricted_aliases:
+                return True
+            if (subject in known_aliases or person_shaped) and subject not in {
+                normalize_member_alias(value)
+                for value in _NON_PERSON_MEMORY_SUBJECTS | _COMMON_WORDS
+            }:
+                return True
+
+        other_aliases = {
+            normalize_member_alias(alias)
+            for identity in group_members
+            if not identity.in_scope or int(identity.user_id) != int(member.user_id)
+            for alias in (identity.group_card, identity.nickname)
+            if len(normalize_member_alias(alias)) >= 2
+            and (
+                not identity.in_scope
+                or int(identity.user_id) in exclude_user_ids
+                or normalize_member_alias(alias)
+                not in {
+                    normalize_member_alias(value)
+                    for value in _COMMON_WORDS
+                }
+            )
+        }
+        member_follow_markers = (
+            "最近",
+            "昨天",
+            "今天",
+            "前天",
+            "以前",
+            "曾经",
+            "过去",
+            "当时",
+            "上周",
+            "说",
+            "发",
+            "提",
+            "聊",
+            "做",
+            "表现",
+            "最喜欢",
+            "喜欢",
+        )
+        for alias in other_aliases:
+            offset = remainder.find(alias)
+            if offset < 0:
+                continue
+            following = remainder[offset + len(alias) :]
+            if following.startswith(member_follow_markers):
+                return True
+
+        time_prefix = re.compile(
+            r"^(?:"
+            r"\d{8}|"
+            r"\d{4}年?\d{1,2}月\d{1,2}日?|"
+            r"\d{1,2}月\d{1,2}日|"
+            r"上周|本周|这周|下周|上个月|本月|这个月|"
+            r"最近|刚刚|刚才|之前|上次|昨天|今天|前天|以前|曾经|曾|过去|当时"
+            r")"
+        )
+        consumable_prefixes = (
+            "在这个群里",
+            "在这个群",
+            "在群里",
+            "在群中",
+            "也",
+            "还",
+            "都",
+            "到底",
+            "究竟",
+            "为什么",
+        )
+        while remainder:
+            time_match = time_prefix.match(remainder)
+            if time_match is not None:
+                remainder = remainder[time_match.end() :]
+                continue
+            if has_time_range:
+                compact_date = re.match(r"^\d{3,4}", remainder)
+                if compact_date is not None:
+                    remainder = remainder[compact_date.end() :]
+                    continue
+            consumed = next(
+                (value for value in consumable_prefixes if remainder.startswith(value)),
+                None,
+            )
+            if consumed is None:
+                break
+            remainder = remainder[len(consumed) :]
+        if not remainder:
+            return False
+        terminal_continuations = (
+            "的",
+            "说",
+            "发",
+            "提",
+            "聊",
+            "最",
+            "喜欢",
+            "讨厌",
+            "不喜欢",
+            "怎么了",
+            "发生",
+            "表现",
+            "做",
+            "有没有",
+            "是否",
+            "是谁",
+            "有",
+            "如何",
+            "为什么",
+            "哪",
+        )
+        # Fail closed for every unknown continuation. This deliberately uses
+        # an allow-list of single-subject grammar rather than trying to
+        # enumerate all possible conjunctions between two people.
+        return not remainder.startswith(terminal_continuations)
+
+    @staticmethod
+    def _classify_explicit_member_ids(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+        *,
+        exclude_user_ids: set[int] | frozenset[int],
+    ) -> GroupMemberReferenceResolution:
+        member_ids = {
+            int(member.user_id)
+            for member in group_members
+            if member.in_scope
+        }
+        prefixed_ids = tuple(
+            int(value)
+            for value in re.findall(
+                r"(?:@\s*|QQ\s*(?:号\s*)?[:：]?\s*)(\d{5,12})(?!\d)",
+                query,
+                flags=re.IGNORECASE,
+            )
+        )
+        bare_ids = tuple(
+            int(value)
+            for value in re.findall(r"(?<![@\d])(\d{5,12})(?!\d)", query)
+        )
+        joined_bare_ids = bool(
+            re.search(
+                rf"\d{{5,12}}\s*{_MEMBER_JOINER_PATTERN}\s*\d{{5,12}}",
+                query,
+            )
+        )
+        explicit_ids = (
+            *prefixed_ids,
+            *(
+                bare_ids
+                if joined_bare_ids and any(value in member_ids for value in bare_ids)
+                else tuple(value for value in bare_ids if value in member_ids)
+            ),
+        )
+        if any(
+            user_id not in member_ids or user_id in exclude_user_ids
+            for user_id in explicit_ids
+        ):
+            return GroupMemberReferenceResolution("ambiguous")
+        matched_ids = set(explicit_ids)
+        excluded_mention_seen = False
+        for mention in re.findall(r"@\s*([^\s@]{1,64})", query):
+            if re.match(r"\d{5,12}(?!\d)", mention):
+                continue
+            normalized_mention = normalize_member_alias(mention)
+            if normalized_mention in {
+                normalize_member_alias(value)
+                for value in _NON_PERSON_MEMORY_SUBJECTS
+            }:
+                continue
+            mention_matches = tuple(
+                (int(member.user_id), bool(member.in_scope), normalize_member_alias(alias))
+                for member in group_members
+                for alias in (member.group_card, member.nickname)
+                if normalize_member_alias(alias)
+                and normalized_mention.startswith(normalize_member_alias(alias))
+            )
+            if not mention_matches:
+                return GroupMemberReferenceResolution("ambiguous")
+            longest_length = max(len(item[2]) for item in mention_matches)
+            mentioned_identities = {
+                (user_id, in_scope)
+                for user_id, in_scope, alias in mention_matches
+                if len(alias) == longest_length
+            }
+            mentioned_members = {
+                user_id
+                for user_id, in_scope in mentioned_identities
+                if in_scope
+            }
+            # An exact longest target-group alias wins over an equally named
+            # cross-group alias, matching the bare-alias contract.  A longer
+            # external alias already wins the longest-match filter above and
+            # therefore leaves mentioned_members empty.
+            if not mentioned_members:
+                return GroupMemberReferenceResolution("ambiguous")
+            if mentioned_members & set(exclude_user_ids):
+                excluded_mention_seen = True
+            allowed_mentioned = mentioned_members - set(exclude_user_ids)
+            if allowed_mentioned and allowed_mentioned != mentioned_members:
+                return GroupMemberReferenceResolution("ambiguous")
+            matched_ids.update(allowed_mentioned)
+        if excluded_mention_seen and matched_ids:
+            return GroupMemberReferenceResolution("ambiguous")
+        if not matched_ids:
+            return GroupMemberReferenceResolution("unbound")
+        if any(
+            user_id not in member_ids or user_id in exclude_user_ids
+            for user_id in matched_ids
+        ):
+            return GroupMemberReferenceResolution("ambiguous")
+        matched_ids = {
+            int(user_id)
+            for user_id in matched_ids
+        }
+        if len(matched_ids) != 1:
+            return GroupMemberReferenceResolution("ambiguous")
+        user_id = next(iter(matched_ids))
+        return GroupMemberReferenceResolution(
+            "resolved",
+            ResolvedGroupMember(user_id=user_id, matched_alias=str(user_id)),
+        )
+
+    @staticmethod
+    def _deprioritize_weak_aliases(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+        *,
+        resolution: GroupMemberReferenceResolution,
+        exclude_user_ids: set[int] | frozenset[int],
+    ) -> GroupMemberReferenceResolution:
+        if resolution.status == "unbound":
+            return resolution
+
+        # Historical QQ cards occasionally equal ordinary query vocabulary.
+        # Such contained aliases are weak unless the syntax explicitly places
+        # them in a member slot; unique prefix aliases are handled earlier.
+        if MemoryQueryResolver._weak_alias_is_explicit_member(query, group_members):
+            return resolution
+        common_aliases = {
+            normalize_member_alias(value)
+            for value in _COMMON_WORDS
+        }
+        strong_members = tuple(
+            GroupMemberIdentity(
+                user_id=member.user_id,
+                nickname=(
+                    ""
+                    if normalize_member_alias(member.nickname) in common_aliases
+                    else member.nickname
+                ),
+                group_card=(
+                    ""
+                    if normalize_member_alias(member.group_card) in common_aliases
+                    else member.group_card
+                ),
+            )
+            for member in group_members
+        )
+        strong_resolution = classify_group_member_reference(
+            query,
+            strong_members,
+            match_mode="contained",
+            exclude_user_ids=exclude_user_ids,
+        )
+        if resolution.status == "ambiguous":
+            return (
+                strong_resolution
+                if strong_resolution.status in {"resolved", "unbound"}
+                else resolution
+            )
+        if resolution.member is None:
+            raise RuntimeError("resolved member reference is missing its member")
+        if normalize_member_alias(resolution.member.matched_alias) not in common_aliases:
+            return resolution
+        unfiltered_strong = classify_group_member_reference(
+            query,
+            strong_members,
+            match_mode="contained",
+        )
+        if unfiltered_strong.status != "unbound":
+            return GroupMemberReferenceResolution("ambiguous")
+        # A bare weak vocabulary alias is not enough evidence to bind a person.
+        # Let the normal person-query classifier decide whether another
+        # unknown subject should fail closed.
+        return GroupMemberReferenceResolution("unbound")
+
+    @staticmethod
+    def _weak_alias_is_explicit_member(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+    ) -> bool:
+        weak_words = {
+            normalize_member_alias(value)
+            for value in _COMMON_WORDS
+        }
+        if any(
+            re.search(rf"@\s*{re.escape(value)}", query)
+            for value in _COMMON_WORDS
+        ):
+            return True
+        parts = re.split(rf"\s*{_MEMBER_JOINER_PATTERN}\s*", query)
+        if len(parts) < 2:
+            return False
+        member_aliases = {
+            normalize_member_alias(alias)
+            for member in group_members
+            for alias in (member.group_card, member.nickname)
+            if normalize_member_alias(alias)
+        }
+        part_aliases = tuple(
+            {
+                alias
+                for alias in member_aliases
+                if alias and alias in normalize_member_alias(part)
+            }
+            for part in parts
+        )
+        has_weak_alias = any(aliases & weak_words for aliases in part_aliases)
+        has_strong_alias = any(aliases - weak_words for aliases in part_aliases)
+        return has_weak_alias and has_strong_alias
+
+    @staticmethod
+    def _has_unknown_joined_member(
+        query: str,
+        group_members: Sequence[GroupMemberIdentity],
+        *,
+        exclude_user_ids: set[int] | frozenset[int],
+    ) -> bool:
+        if _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query):
+            return False
+        parts = re.split(rf"\s*{_MEMBER_JOINER_PATTERN}\s*", query)
+        if len(parts) < 2:
+            return False
+        known_aliases = {
+            normalize_member_alias(alias)
+            for member in group_members
+            for alias in (member.group_card, member.nickname, str(member.user_id))
+            if normalize_member_alias(alias)
+        }
+        excluded_aliases = {
+            normalize_member_alias(alias)
+            for member in group_members
+            if int(member.user_id) in exclude_user_ids or not member.in_scope
+            for alias in (member.group_card, member.nickname, str(member.user_id))
+            if normalize_member_alias(alias)
+        }
+        candidates: list[str] = []
+        for part in parts:
+            match = re.match(
+                r"\s*@?\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
+                r"(?=今天|昨天|前天|最近|以前|曾经|过去|当时|"
+                r"说过|说了|发过|发言|提到|聊过|最喜欢|喜欢什么|"
+                r"讨厌什么|不喜欢什么|都|[？?]|$)",
+                part,
+            )
+            if match is not None:
+                candidates.append(normalize_member_alias(match.group("subject")))
+        if len(candidates) < 2 or not any(value in known_aliases for value in candidates):
+            return False
+        if any(value in excluded_aliases for value in candidates):
+            return True
+        return any(
+            value not in known_aliases
+            and value not in {
+                normalize_member_alias(item)
+                for item in _NON_PERSON_MEMORY_SUBJECTS | _COMMON_WORDS
+            }
+            for value in candidates
+        )
+
+    @staticmethod
     def _is_person_memory_query(query: str) -> bool:
         if query.lstrip().startswith(_SUBJECTLESS_MEMORY_QUERY_PREFIXES):
+            return False
+        if _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query):
             return False
         for pattern in (
             _PERSON_MEMORY_SUBJECT_PATTERN,
@@ -515,9 +1276,6 @@ class MemoryQueryResolver:
         recent: tuple[RecentMemoryMessage, ...],
         quoted_message: RecentMemoryMessage | None,
     ) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None:
-        if not _FOLLOW_UP_PATTERN.search(query):
-            return None
-
         if quoted_message is not None and not quoted_message.blocked and quoted_message.content.strip():
             quoted_source_id = self._source_id(quoted_message)
             if bool(getattr(quoted_message, "is_bot", False)) and quoted_message.reply_to_msg_id:
@@ -548,6 +1306,12 @@ class MemoryQueryResolver:
                 ((speaker_id,) if speaker_id else ()),
                 (quoted_source_id,),
             )
+
+        # An explicit QQ quote is itself a deterministic reference. Textual
+        # follow-up markers are only required when inferring a reference from
+        # the recent-message window without transport-level quote metadata.
+        if not _FOLLOW_UP_PATTERN.search(query):
+            return None
 
         matching_speakers = {
             message.speaker.strip()

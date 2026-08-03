@@ -752,6 +752,70 @@ def test_llm_client_propagates_non_retryable_http_errors() -> None:
         raise AssertionError("expected HTTPStatusError")
 
 
+def test_responses_retries_xbai_403_with_identical_native_payload() -> None:
+    request_bodies: list[bytes] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(request.content)
+        if attempts < 3:
+            return httpx.Response(403, request=request, json={"error": "gateway policy"})
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_403_retry", text="recovered"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.xbai.top/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    sleep_attempts: list[int] = []
+    client._sleep_before_retry = lambda *, attempt, max_attempts: sleep_attempts.append(attempt)
+
+    text = client.generate_text(
+        [
+            "System persona: native instruction marker",
+            "Target message: private input marker",
+        ]
+    )
+
+    assert text == "recovered"
+    assert attempts == 3
+    assert sleep_attempts == [1, 2]
+    assert request_bodies[0] == request_bodies[1] == request_bodies[2]
+    payload = json.loads(request_bodies[0])
+    assert payload["instructions"] == "System persona: native instruction marker"
+
+
+def test_responses_does_not_retry_403_from_other_hosts() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(403, request=request, json={"error": "forbidden"})
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.generate_text(["Target message: private input marker"])
+
+    assert attempts == 1
+
+
 def test_llm_client_raises_value_error_when_chat_payload_has_no_text() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request

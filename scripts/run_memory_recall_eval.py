@@ -12,7 +12,7 @@ from typing import Sequence
 
 from sqlalchemy import select, text
 
-from app.config import AppSettings
+from app.config import AppSettings, load_runtime_config
 from app.core.memory_backfill import (
     message_ledger_manifest_sha256,
     verify_message_ledger_manifest,
@@ -97,6 +97,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Content-free controlled-answer/index-visibility judgment JSON",
     )
     parser.add_argument(
+        "--quality-private-replay",
+        type=Path,
+        help="Private controlled replay artifact bound by the quality sidecar",
+    )
+    parser.add_argument(
+        "--quality-visibility-artifact",
+        type=Path,
+        help="Disposable-clone visibility artifact bound by the quality sidecar",
+    )
+    parser.add_argument(
         "--quality-template-output",
         type=Path,
         help="Write a retrieval-bound judgment template; missing judgments still fail",
@@ -143,11 +153,19 @@ def _run(argv: Sequence[str] | None = None) -> int:
         }
     )
     _validate_v3_runtime_settings(functional_settings)
+    runtime_config = load_runtime_config(functional_settings)
     prepared = _load_prepared_report(
         args.prepared_report,
         database=args.database,
     )
     prepared_generation = int(prepared["vector_generation"])
+    filter_manifest = _load_strict_json_object(args.manifest)
+    filter_watermarks = group_watermarks_from_manifest(filter_manifest)
+    metadata = load_message_metadata(args.database)
+    candidate_filter = _snapshot_candidate_filter(
+        metadata=metadata,
+        snapshot_watermarks=filter_watermarks,
+    )
     engine = build_engine(args.database)
     try:
         llm_client = build_llm_client(settings=functional_settings, engine=engine)
@@ -157,6 +175,7 @@ def _run(argv: Sequence[str] | None = None) -> int:
             llm_client=llm_client,
             bot_display_name=str(functional_settings.bot_qq),
             raw_message_embedding_generation_override=prepared_generation,
+            evaluation_candidate_filter=candidate_filter,
         )
         _validate_local_vector_runtime(runtime, warm=True)
         manifest = _validate_v3_rollout_state(
@@ -176,7 +195,6 @@ def _run(argv: Sequence[str] | None = None) -> int:
             snapshot_manifest_sha256=snapshot_manifest_sha256,
             snapshot_watermarks=group_watermarks,
         )
-        metadata = load_message_metadata(args.database)
         try:
             validate_v3_dataset_sources(
                 cases,
@@ -195,6 +213,11 @@ def _run(argv: Sequence[str] | None = None) -> int:
             for case in cases
         )
         observations: list[V3Observation] = []
+        answer_prompt_sha256_by_case: list[str] = []
+        # Delayed import avoids the quality replay module's intentional import of
+        # this evaluator while still using the exact production replay prompt.
+        from scripts.run_memory_v3_quality_replay import build_answer_prompt
+
         vector_succeeded = False
         for case_index, request in enumerate(requests):
             started = perf_counter()
@@ -204,19 +227,32 @@ def _run(argv: Sequence[str] | None = None) -> int:
                 trace,
                 previously_succeeded=vector_succeeded,
             )
-            observations.append(
-                build_v3_observation(
-                    case_index=case_index,
-                    case=cases[case_index],
-                    trace=trace,
-                    requester_uin=str(request.current_user_id),
-                    metadata=metadata,
-                    snapshot_watermark=group_watermarks[cases[case_index].group_id],
-                    history_packet_tokens=_history_packet_tokens(
-                        trace.result.packed_context
-                    ),
-                    retrieval_latency_ms=latency_ms,
-                )
+            observation = build_v3_observation(
+                case_index=case_index,
+                case=cases[case_index],
+                trace=trace,
+                requester_uin=str(request.current_user_id),
+                metadata=metadata,
+                snapshot_watermark=group_watermarks[cases[case_index].group_id],
+                history_packet_tokens=_history_packet_tokens(
+                    trace.result.packed_context
+                ),
+                retrieval_latency_ms=latency_ms,
+            )
+            observations.append(observation)
+            answer_prompt = build_answer_prompt(
+                case=cases[case_index],
+                trace=trace,
+                runtime_config=runtime_config,
+            )
+            answer_prompt_sha256_by_case.append(
+                hashlib.sha256(
+                    json.dumps(
+                        answer_prompt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
             )
 
         _validate_local_vector_runtime(runtime, warm=False)
@@ -232,6 +268,7 @@ def _run(argv: Sequence[str] | None = None) -> int:
             llm_client=llm_client,
             bot_display_name=str(benchmark_settings.bot_qq),
             raw_message_embedding_generation_override=prepared_generation,
+            evaluation_candidate_filter=candidate_filter,
         )
         _validate_local_vector_runtime(benchmark_runtime, warm=True)
         benchmark = _benchmark(
@@ -256,6 +293,10 @@ def _run(argv: Sequence[str] | None = None) -> int:
         input_failures: list[str] = []
         if args.quality_sidecar is None:
             input_failures.append("AC_QUALITY_SIDECAR_REQUIRED")
+        elif args.quality_private_replay is None:
+            input_failures.append("AC_QUALITY_PRIVATE_REPLAY_REQUIRED")
+        elif args.quality_visibility_artifact is None:
+            input_failures.append("AC_QUALITY_VISIBILITY_ARTIFACT_REQUIRED")
         else:
             try:
                 quality = load_v3_quality_sidecar(
@@ -264,6 +305,14 @@ def _run(argv: Sequence[str] | None = None) -> int:
                     snapshot_manifest_sha256=snapshot_manifest_sha256,
                     retrieval_fingerprint=retrieval_fingerprint,
                     case_count=len(cases),
+                    private_replay_path=args.quality_private_replay,
+                    visibility_artifact_path=args.quality_visibility_artifact,
+                    expected_vector_generation=prepared_generation,
+                    evaluation_cases=cases,
+                    expected_answer_prompt_sha256_by_case={
+                        index: value
+                        for index, value in enumerate(answer_prompt_sha256_by_case)
+                    },
                 )
             except ValueError:
                 input_failures.append("AC_QUALITY_SIDECAR_INVALID")
@@ -307,15 +356,20 @@ def _run(argv: Sequence[str] | None = None) -> int:
             "status": "failed" if failures else "passed",
             "error_codes": list(failures),
         }
-        _write_jsonl(
-            args.results_output,
-            (
-                observation_as_safe_dict(observation)
-                for observation in observations
-            ),
-        )
-        _write_json(args.report_output, report)
+        result_rows = []
+        for observation, answer_prompt_sha256 in zip(
+            observations,
+            answer_prompt_sha256_by_case,
+            strict=True,
+        ):
+            row = observation_as_safe_dict(observation)
+            row["answer_prompt_sha256"] = answer_prompt_sha256
+            result_rows.append(row)
+        _write_jsonl(args.results_output, result_rows)
         _write_json(args.benchmark_output, benchmark)
+        report["results_sha256"] = _file_sha256(args.results_output)
+        report["benchmark_sha256"] = _file_sha256(args.benchmark_output)
+        _write_json(args.report_output, report)
         if failures:
             raise AcceptanceGateError(failures)
         print(
@@ -437,6 +491,41 @@ def _build_request(
         now=_utc(target.timestamp),
         current_user_id=int(target.user_id),
     )
+
+
+def _snapshot_candidate_filter(*, metadata, snapshot_watermarks):
+    """Exclude only live rows above the frozen evaluation watermark.
+
+    Missing, cross-group, and ineligible provenance deliberately remains in
+    the trace so the corresponding safety gates can still fail closed.
+    """
+
+    frozen_watermarks = {
+        int(group_id): int(watermark)
+        for group_id, watermark in snapshot_watermarks.items()
+    }
+
+    def filter_candidates(*, request, resolved_query, candidates):
+        del resolved_query
+        group_id = int(request.group_id)
+        watermark = frozen_watermarks[group_id]
+        retained = []
+        for candidate in candidates:
+            rows = tuple(
+                metadata.get(str(source_id))
+                for source_id in getattr(candidate, "source_msg_ids", ())
+            )
+            if any(
+                row is not None
+                and int(row.group_id) == group_id
+                and int(row.row_id) > watermark
+                for row in rows
+            ):
+                continue
+            retained.append(candidate)
+        return tuple(retained)
+
+    return filter_candidates
 
 
 def _benchmark(
@@ -576,6 +665,7 @@ def _v3_acceptance_failures(
         ("citation_subject_leak_count", "AC_CITATION_SUBJECT_LEAK"),
         ("citation_time_leak_count", "AC_CITATION_TIME_LEAK"),
         ("citation_ineligible_source_count", "AC_CITATION_INELIGIBLE_SOURCE"),
+        ("answer_protocol_failure_count", "AC_ANSWER_PROTOCOL"),
     )
     for metric_name, error_code in zero_gates:
         value = _finite_number(metrics.get(metric_name))

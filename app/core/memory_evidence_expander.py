@@ -58,16 +58,73 @@ class MemoryEvidenceExpander:
     ) -> tuple[EvidenceSegment, ...]:
         if mode not in self._radii:
             raise ValueError(f"unknown expansion mode: {mode}")
+        selected_candidates = tuple(candidates[: self._limits[mode]])
+        raw_sources = self._load_raw_sources(
+            group_id=group_id,
+            candidates=selected_candidates,
+        )
         segments: list[EvidenceSegment] = []
-        for candidate in candidates[: self._limits[mode]]:
-            segment = self._expand_candidate(
-                group_id=group_id,
-                candidate=candidate,
-                radius=self._radii[mode],
-            )
+        for candidate in selected_candidates:
+            if candidate.episode_id is None:
+                segment = self._expand_loaded_source_document(
+                    candidate=candidate,
+                    loaded_by_id=raw_sources,
+                )
+            else:
+                segment = self._expand_candidate(
+                    group_id=group_id,
+                    candidate=candidate,
+                    radius=self._radii[mode],
+                )
             if segment is not None:
                 segments.append(segment)
         return tuple(segments)
+
+    def _load_raw_sources(
+        self,
+        *,
+        group_id: int,
+        candidates: Sequence[FusedRetrievalCandidate],
+    ) -> dict[str, EvidenceMessage]:
+        raw_candidates = tuple(
+            candidate for candidate in candidates if candidate.episode_id is None
+        )
+        if not raw_candidates:
+            return {}
+        for candidate in raw_candidates:
+            if int(candidate.group_id) != int(group_id):
+                raise MemoryScopeViolation(
+                    f"candidate scope mismatch document_id={candidate.document_id}"
+                )
+        if self._source_loader is None:
+            raise MemoryScopeViolation(
+                f"candidate has no episode document_id={raw_candidates[0].document_id}"
+            )
+
+        source_msg_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for candidate in raw_candidates
+                for source_id in candidate.source_msg_ids
+            )
+        )
+        loaded = tuple(
+            self._source_loader(
+                group_id=group_id,
+                source_msg_ids=source_msg_ids,
+            )
+        )
+        loaded_by_id = {row.source_msg_id: row for row in loaded}
+        if (
+            len(loaded_by_id) != len(loaded)
+            or any(
+                row.group_id is None or int(row.group_id) != int(group_id)
+                for row in loaded
+            )
+            or any(source_id not in loaded_by_id for source_id in source_msg_ids)
+        ):
+            raise MemoryScopeViolation("unverified batched raw provenance")
+        return loaded_by_id
 
     def _expand_candidate(
         self,
@@ -188,10 +245,41 @@ class MemoryEvidenceExpander:
             raise MemoryScopeViolation(
                 f"unverified raw provenance document_id={candidate.document_id}"
             )
-        blocked_output_present = any(row.blocked for row in loaded)
+        return self._expand_loaded_source_document(
+            candidate=candidate,
+            loaded_by_id=by_id,
+        )
+
+    def _expand_loaded_source_document(
+        self,
+        *,
+        candidate: FusedRetrievalCandidate,
+        loaded_by_id: dict[str, EvidenceMessage],
+    ) -> EvidenceSegment | None:
+        hit_ids = tuple(
+            source_id
+            for source_id in candidate.source_msg_ids
+            if not loaded_by_id[source_id].blocked
+        )
+        if not hit_ids:
+            return None
+        selected_ids = set(hit_ids)
+        selected_ids.update(
+            row.source_msg_id
+            for row in loaded_by_id.values()
+            if row.reply_to_msg_id in hit_ids
+        )
+
+        blocked_output_present = any(
+            loaded_by_id[source_id].blocked for source_id in selected_ids
+        )
         selected = tuple(
             sorted(
-                (by_id[source_id] for source_id in candidate.source_msg_ids if not by_id[source_id].blocked),
+                (
+                    loaded_by_id[source_id]
+                    for source_id in selected_ids
+                    if not loaded_by_id[source_id].blocked
+                ),
                 key=lambda row: (row.sent_at, row.source_msg_id),
             )
         )
@@ -201,7 +289,7 @@ class MemoryEvidenceExpander:
             episode_id=f"raw:{candidate.document_id}",
             fused_score=candidate.fused_score,
             messages=selected,
-            hit_source_msg_ids=tuple(row.source_msg_id for row in selected),
+            hit_source_msg_ids=hit_ids,
             document_id=str(candidate.document_id),
             pinned=bool(
                 {"exact_quote", "reply_graph"}.intersection(candidate.routes)

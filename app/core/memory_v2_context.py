@@ -54,6 +54,7 @@ FactLoader = Callable[..., Sequence[MemoryFact]]
 SummaryLoader = Callable[..., Sequence[MemorySummary]]
 SourceScopeValidator = Callable[[int, tuple[str, ...]], bool]
 MemberLoader = Callable[[int], Sequence[GroupMemberIdentity]]
+CandidateFilter = Callable[..., Sequence[object]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,8 @@ class MemoryV2ContextProvider:
         fact_loader: FactLoader | None = None,
         summary_loader: SummaryLoader | None = None,
         member_loader: MemberLoader | None = None,
+        candidate_filter: CandidateFilter | None = None,
+        max_direct_replies_per_source: int = 2,
         excluded_member_ids: set[int] | frozenset[int] = frozenset(),
         historical_no_hit_omit_recent: bool = False,
         observability_route: str = "",
@@ -105,6 +108,10 @@ class MemoryV2ContextProvider:
         self._fact_loader = fact_loader or (lambda **_: ())
         self._summary_loader = summary_loader or (lambda **_: ())
         self._member_loader = member_loader
+        self._candidate_filter = candidate_filter
+        if max_direct_replies_per_source < 0:
+            raise ValueError("direct reply limit cannot be negative")
+        self._max_direct_replies_per_source = max_direct_replies_per_source
         self._excluded_member_ids = frozenset(int(item) for item in excluded_member_ids)
         self._historical_no_hit_omit_recent = bool(historical_no_hit_omit_recent)
         self._observability_route = str(observability_route).strip()
@@ -142,6 +149,14 @@ class MemoryV2ContextProvider:
             if bool(getattr(retrieval_result, "all_channels_failed", False))
             else tuple(getattr(retrieval_result, "candidates"))
         )
+        if self._candidate_filter is not None:
+            candidates = tuple(
+                self._candidate_filter(
+                    request=request,
+                    resolved_query=resolved,
+                    candidates=candidates,
+                )
+            )
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         mode = "detail" if resolved.needs_detail else "normal"
         expansion_started = perf_counter()
@@ -319,14 +334,15 @@ class MemoryV2ContextProvider:
             ),
         )
 
-    @staticmethod
     def _eligible_segments(
+        self,
         segments: Sequence[EvidenceSegment],
         resolved: ResolvedMemoryQuery,
     ) -> tuple[EvidenceSegment, ...]:
         """Revalidate every expanded raw source against the resolved plan."""
 
         validated: list[EvidenceSegment] = []
+        direct_reply_counts: dict[str, int] = {}
         for segment in segments:
             allowed_messages = tuple(
                 message for message in segment.messages if eligible(message, resolved)
@@ -340,6 +356,22 @@ class MemoryV2ContextProvider:
                 for source_id in segment.hit_source_msg_ids
             ):
                 continue
+            if not allowed_messages:
+                continue
+            hit_ids = frozenset(segment.hit_source_msg_ids)
+            if segment.episode_id.startswith("raw:"):
+                allowed_messages = tuple(
+                    message
+                    for message in allowed_messages
+                    if (
+                        message.source_msg_id in hit_ids
+                        or message.reply_to_msg_id not in hit_ids
+                        or self._consume_direct_reply_quota(
+                            message.reply_to_msg_id,
+                            direct_reply_counts,
+                        )
+                    )
+                )
             if not allowed_messages:
                 continue
             validated.append(
@@ -359,6 +391,19 @@ class MemoryV2ContextProvider:
                 )
             )
         return tuple(validated)
+
+    def _consume_direct_reply_quota(
+        self,
+        parent_id: str | None,
+        counts: dict[str, int],
+    ) -> bool:
+        if not parent_id or self._max_direct_replies_per_source <= 0:
+            return False
+        count = counts.get(parent_id, 0)
+        if count >= self._max_direct_replies_per_source:
+            return False
+        counts[parent_id] = count + 1
+        return True
 
     @staticmethod
     def _pin_required_segments(

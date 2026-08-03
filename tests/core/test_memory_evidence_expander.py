@@ -155,3 +155,79 @@ def test_raw_message_document_loads_exact_provenance_without_episode() -> None:
 
     assert segment.episode_id == "raw:3"
     assert tuple(message.source_msg_id for message in segment.messages) == ("raw-hit",)
+
+
+def test_raw_message_documents_batch_source_loading_and_preserve_candidate_order() -> None:
+    calls: list[tuple[int, tuple[str, ...]]] = []
+
+    def load_sources(*, group_id: int, source_msg_ids: tuple[str, ...]):
+        calls.append((group_id, source_msg_ids))
+        return tuple(
+            item(source_id, index, group_id=group_id)
+            for index, source_id in enumerate(reversed(source_msg_ids))
+        )
+
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=load_sources,
+        normal_segment_limit=4,
+    )
+    first = replace(
+        candidate(("first-b", "first-a"), episode_id=None),
+        document_id=30,
+        document_kind="raw_message_v3",
+    )
+    second = replace(
+        candidate(("second",), episode_id=None),
+        document_id=31,
+        document_kind="raw_message_v3",
+    )
+
+    segments = expander.expand(
+        group_id=100,
+        candidates=(first, second),
+        mode="normal",
+    )
+
+    assert calls == [(100, ("first-b", "first-a", "second"))]
+    assert tuple(segment.document_id for segment in segments) == ("30", "31")
+    assert tuple(message.source_msg_id for message in segments[0].messages) == (
+        "first-a",
+        "first-b",
+    )
+    assert tuple(message.source_msg_id for message in segments[1].messages) == (
+        "second",
+    )
+
+
+def test_raw_message_document_loads_direct_replies_for_later_eligibility_filtering() -> None:
+    rows = (
+        item("hit", 0),
+        item("reply-1", 1, reply_to="hit"),
+        item("reply-2", 2, reply_to="hit"),
+        item("reply-3", 3, reply_to="hit"),
+        item("unrelated", 4, reply_to="other"),
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("hit",), episode_id=None),
+        document_kind="raw_message_v3",
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == (
+        "hit",
+        "reply-1",
+        "reply-2",
+        "reply-3",
+    )
+    assert segment.hit_source_msg_ids == ("hit",)
+    assert segment.atomic_source_groups == ()

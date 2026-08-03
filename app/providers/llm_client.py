@@ -35,6 +35,7 @@ INSTRUCTION_PREFIXES = (
     "Reply style:",
 )
 PROXY_CHAT_IMAGE_STRING_HOSTS = {"api.codexzh.com"}
+TRANSIENT_RESPONSES_403_HOSTS = {"api.xbai.top"}
 USE_CLIENT_DEFAULT_TIMEOUT = object()
 
 
@@ -343,6 +344,22 @@ class LlmClient:
 
     def _is_retryable_status_code(self, status_code: int) -> bool:
         return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+    def _is_retryable_responses_status_code(self, status_code: int) -> bool:
+        if self._is_retryable_status_code(status_code):
+            return True
+        return status_code == 403 and self._base_host in TRANSIENT_RESPONSES_403_HOSTS
+
+    def _responses_payload_text_sizes(self, payload: dict[str, Any]) -> tuple[int, int]:
+        instructions_chars = len(str(payload.get("instructions") or ""))
+        input_chars = 0
+        for item in payload.get("input") or ():
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content") or ():
+                if isinstance(content, dict) and content.get("type") == "input_text":
+                    input_chars += len(str(content.get("text") or ""))
+        return instructions_chars, input_chars
 
     def _sleep_before_retry(self, *, attempt: int, max_attempts: int) -> None:
         if attempt >= max_attempts:
@@ -1081,10 +1098,20 @@ class LlmClient:
                 continue
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
-                if not self._is_retryable_status_code(status_code):
+                if not self._is_retryable_responses_status_code(status_code):
                     raise
                 last_error = exc
-                logger.warning("responses_status_retry attempt=%s status=%s", attempt, status_code)
+                instructions_chars, input_chars = self._responses_payload_text_sizes(responses_payload)
+                logger.warning(
+                    "responses_status_retry attempt=%s max_attempts=%s status=%s "
+                    "instructions_chars=%s input_chars=%s model=%s endpoint=/responses",
+                    attempt,
+                    self.REQUEST_MAX_ATTEMPTS,
+                    status_code,
+                    instructions_chars,
+                    input_chars,
+                    model,
+                )
                 self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
                 continue
 

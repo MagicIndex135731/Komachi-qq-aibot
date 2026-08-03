@@ -186,6 +186,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_detail_context_budget_tokens == 64000
     assert settings.memory_recent_context_budget_tokens == 10000
     assert settings.memory_history_context_budget_tokens == 24000
+    assert settings.memory_context_budget_chars == 12000
     assert settings.memory_max_evidence_messages == 150
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30

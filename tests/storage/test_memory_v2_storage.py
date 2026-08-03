@@ -33,6 +33,8 @@ from app.storage.repositories import (
     RetrievalIndexStateRepository,
     UserRepository,
     MessageRepository,
+    _initial_vector_fetch_limit,
+    _next_vector_fetch_limit,
 )
 
 
@@ -349,6 +351,18 @@ def test_raw_message_v3_mention_filter_requires_real_onebot_at_segment(
         )
         assert expected is not None
         assert [hit.document_id for hit in hits] == [expected.id]
+
+        temporal_hits = documents.search_group_documents_temporal_hits(
+            group_id=10001,
+            start_at=None,
+            end_at=None,
+            limit=10,
+            document_kinds=("raw_message_v3",),
+            mentioned_user_ids=("30001",),
+            allow_unbounded=True,
+            sample_time_coverage=False,
+        )
+        assert [hit.document_id for hit in temporal_hits] == [expected.id]
 
 
 def test_raw_message_v3_unbounded_temporal_coverage_samples_full_history(
@@ -2356,6 +2370,22 @@ def test_raw_v3_vector_search_expands_until_scoped_hit_or_generation_exhaustion(
             document_kinds=("raw_message_v3",),
             speaker_ids=("20001",),
         ) == []
+
+
+def test_raw_v3_vector_search_expansion_respects_sqlite_vec_knn_cap() -> None:
+    assert _initial_vector_fetch_limit(
+        requested=600,
+        available=17_704,
+        has_post_filters=False,
+    ) == 600
+    assert _initial_vector_fetch_limit(
+        requested=600,
+        available=17_704,
+        has_post_filters=True,
+    ) == 4096
+    assert _next_vector_fetch_limit(2400, requested=150, available=17_704) == 4096
+    assert _next_vector_fetch_limit(4096, requested=150, available=17_704) == 4096
+    assert _next_vector_fetch_limit(2400, requested=150, available=3000) == 3000
 
 
 def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generations(

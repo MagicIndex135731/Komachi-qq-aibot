@@ -41,6 +41,12 @@ def _write_activation_gate(
     dataset_path.write_text('{"frozen":true}\n', encoding="utf-8")
     dataset_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
     fingerprint = "b" * 64
+    private_path = path.with_suffix(".quality-private.json")
+    private_path.write_text('{"private":true}', encoding="utf-8")
+    private_sha256 = hashlib.sha256(private_path.read_bytes()).hexdigest()
+    visibility_path = path.with_suffix(".quality-visibility.json")
+    visibility_path.write_text('{"visibility":true}', encoding="utf-8")
+    visibility_sha256 = hashlib.sha256(visibility_path.read_bytes()).hexdigest()
     quality_path = path.with_suffix(".quality.json")
     quality_path.write_text(
         json.dumps(
@@ -48,11 +54,17 @@ def _write_activation_gate(
                 "dataset_sha256": dataset_sha256,
                 "snapshot_manifest_sha256": prepared_report["manifest_sha256"],
                 "retrieval_fingerprint_sha256": fingerprint,
+                "private_replay_sha256": private_sha256,
+                "visibility_artifact_sha256": visibility_sha256,
             },
             sort_keys=True,
         ),
         encoding="utf-8",
     )
+    results_path = path.with_suffix(".results.jsonl")
+    results_path.write_text('{"placeholder":true}\n', encoding="utf-8")
+    benchmark_path = path.with_suffix(".benchmark.json")
+    benchmark_path.write_text('{"placeholder":true}', encoding="utf-8")
     zero_metrics = {
         name: 0
         for name in (
@@ -76,6 +88,7 @@ def _write_activation_gate(
             "citation_subject_leak_count",
             "citation_time_leak_count",
             "citation_ineligible_source_count",
+            "answer_protocol_failure_count",
         )
     }
     metrics = {
@@ -106,6 +119,10 @@ def _write_activation_gate(
                 "quality_sidecar_sha256": hashlib.sha256(
                     quality_path.read_bytes()
                 ).hexdigest(),
+                "results_sha256": hashlib.sha256(results_path.read_bytes()).hexdigest(),
+                "benchmark_sha256": hashlib.sha256(
+                    benchmark_path.read_bytes()
+                ).hexdigest(),
                 "metrics": metrics,
                 "acceptance": {
                     "status": status,
@@ -123,6 +140,14 @@ def _activation_artifact_args(gate_path) -> list[str]:
         str(gate_path.with_suffix(".dataset.jsonl")),
         "--quality-sidecar",
         str(gate_path.with_suffix(".quality.json")),
+        "--quality-private-replay",
+        str(gate_path.with_suffix(".quality-private.json")),
+        "--quality-visibility-artifact",
+        str(gate_path.with_suffix(".quality-visibility.json")),
+        "--results",
+        str(gate_path.with_suffix(".results.jsonl")),
+        "--benchmark-report",
+        str(gate_path.with_suffix(".benchmark.json")),
     ]
 
 
@@ -145,6 +170,18 @@ def test_activation_gate_binds_dataset_quality_and_retrieval_fingerprint(
         quality_sidecar_sha256=hashlib.sha256(
             quality_path.read_bytes()
         ).hexdigest(),
+        quality_private_replay_sha256=hashlib.sha256(
+            gate_path.with_suffix(".quality-private.json").read_bytes()
+        ).hexdigest(),
+        quality_visibility_artifact_sha256=hashlib.sha256(
+            gate_path.with_suffix(".quality-visibility.json").read_bytes()
+        ).hexdigest(),
+        results_sha256=hashlib.sha256(
+            gate_path.with_suffix(".results.jsonl").read_bytes()
+        ).hexdigest(),
+        benchmark_sha256=hashlib.sha256(
+            gate_path.with_suffix(".benchmark.json").read_bytes()
+        ).hexdigest(),
         quality_sidecar=quality,
     )
 
@@ -159,6 +196,18 @@ def test_activation_gate_binds_dataset_quality_and_retrieval_fingerprint(
             ).hexdigest(),
             quality_sidecar_sha256=hashlib.sha256(
                 quality_path.read_bytes()
+            ).hexdigest(),
+            quality_private_replay_sha256=hashlib.sha256(
+                gate_path.with_suffix(".quality-private.json").read_bytes()
+            ).hexdigest(),
+            quality_visibility_artifact_sha256=hashlib.sha256(
+                gate_path.with_suffix(".quality-visibility.json").read_bytes()
+            ).hexdigest(),
+            results_sha256=hashlib.sha256(
+                gate_path.with_suffix(".results.jsonl").read_bytes()
+            ).hexdigest(),
+            benchmark_sha256=hashlib.sha256(
+                gate_path.with_suffix(".benchmark.json").read_bytes()
             ).hexdigest(),
             quality_sidecar=quality,
         )
@@ -199,6 +248,18 @@ def test_activation_gate_rejects_non_finite_or_non_numeric_metrics(
             quality_sidecar_sha256=hashlib.sha256(
                 quality_path.read_bytes()
             ).hexdigest(),
+            quality_private_replay_sha256=hashlib.sha256(
+                gate_path.with_suffix(".quality-private.json").read_bytes()
+            ).hexdigest(),
+            quality_visibility_artifact_sha256=hashlib.sha256(
+                gate_path.with_suffix(".quality-visibility.json").read_bytes()
+            ).hexdigest(),
+            results_sha256=hashlib.sha256(
+                gate_path.with_suffix(".results.jsonl").read_bytes()
+            ).hexdigest(),
+            benchmark_sha256=hashlib.sha256(
+                gate_path.with_suffix(".benchmark.json").read_bytes()
+            ).hexdigest(),
             quality_sidecar=quality,
         )
 
@@ -209,6 +270,147 @@ def test_activation_gate_json_loader_rejects_nan(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="non-standard JSON constant"):
         backfill_v3._load_strict_json(path)
+
+
+def test_activation_benchmark_enforces_full_sampling_contract(tmp_path) -> None:
+    path = tmp_path / "benchmark.json"
+    benchmark = {
+        "warmup_runs": 20,
+        "measured_runs": 320,
+        "mean_latency_ms": 100.0,
+        "p50_latency_ms": 90.0,
+        "p95_latency_ms": 140.0,
+        "rewrite_enabled": False,
+        "rerank_enabled": False,
+        "network_enabled": False,
+        "vector_success_verified": True,
+    }
+    path.write_text(json.dumps(benchmark), encoding="utf-8")
+    assert backfill_v3._load_activation_benchmark(path, case_count=64) == benchmark
+
+    for field, value in (("warmup_runs", 19), ("measured_runs", 319)):
+        invalid = {**benchmark, field: value}
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="insufficient"):
+            backfill_v3._load_activation_benchmark(path, case_count=64)
+
+
+def test_activation_reparses_full_quality_artifacts(tmp_path, monkeypatch) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "group_id": index + 1,
+                    "query": "query",
+                    "recent_context_message_ids": ["recent"],
+                    "expected_evidence_message_ids": [],
+                    "category": "abstention",
+                }
+            )
+            + "\n"
+            for index in range(64)
+        ),
+        encoding="utf-8",
+    )
+    quality_path = tmp_path / "quality.json"
+    private_path = tmp_path / "quality-private.json"
+    visibility_path = tmp_path / "quality-visibility.json"
+    results_path = tmp_path / "results.jsonl"
+    benchmark_path = tmp_path / "benchmark.json"
+    database_path = tmp_path / "bot.db"
+    for artifact in (
+        quality_path,
+        private_path,
+        visibility_path,
+        results_path,
+        benchmark_path,
+        database_path,
+    ):
+        artifact.write_text("{}", encoding="utf-8")
+    captured: dict[str, object] = {}
+    observations = (object(),)
+    quality = object()
+
+    def validate(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return quality
+
+    monkeypatch.setattr(backfill_v3, "load_v3_quality_sidecar", validate)
+    monkeypatch.setattr(backfill_v3, "validate_v3_dataset_contract", lambda _cases: {})
+    monkeypatch.setattr(
+        backfill_v3,
+        "_load_activation_results",
+        lambda *_args, **_kwargs: (observations, ("c" * 64,)),
+    )
+    monkeypatch.setattr(
+        backfill_v3,
+        "retrieval_fingerprint_sha256",
+        lambda _observations: "b" * 64,
+    )
+    monkeypatch.setattr(backfill_v3, "load_message_metadata", lambda _path: {})
+    monkeypatch.setattr(
+        backfill_v3,
+        "evaluate_v3",
+        lambda **_kwargs: {"metrics": {}, "memory_path": "raw_message_v3"},
+    )
+    monkeypatch.setattr(backfill_v3, "audit_v3_quality_sources", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        backfill_v3,
+        "_load_activation_benchmark",
+        lambda _path, **_kwargs: {},
+    )
+    monkeypatch.setattr(backfill_v3, "_v3_acceptance_failures", lambda **_kwargs: ())
+    args = SimpleNamespace(
+        database=database_path,
+        dataset=dataset_path,
+        quality_sidecar=quality_path,
+        quality_private_replay=private_path,
+        quality_visibility_artifact=visibility_path,
+        results=results_path,
+        benchmark_report=benchmark_path,
+    )
+    gate = {
+        "case_count": 64,
+        "retrieval_fingerprint_sha256": "b" * 64,
+        "metrics": {},
+        "memory_path": "raw_message_v3",
+        "vector_generation": 2,
+        "quality_sidecar_sha256": hashlib.sha256(quality_path.read_bytes()).hexdigest(),
+        "acceptance": {"status": "passed", "error_codes": []},
+        "results_sha256": hashlib.sha256(results_path.read_bytes()).hexdigest(),
+        "benchmark_sha256": hashlib.sha256(benchmark_path.read_bytes()).hexdigest(),
+    }
+    backfill_v3._validate_activation_quality_artifacts(
+        args,
+        gate=gate,
+        manifest_sha256="a" * 64,
+        generation=2,
+    )
+
+    gate["metrics"] = {"answer_accuracy": 1.0}
+    with pytest.raises(ValueError, match="metrics"):
+        backfill_v3._validate_activation_quality_artifacts(
+            args,
+            gate=gate,
+            manifest_sha256="a" * 64,
+            generation=2,
+        )
+
+    evaluation_cases = captured.pop("evaluation_cases")
+    assert len(evaluation_cases) == 64
+    assert captured == {
+        "path": quality_path,
+        "dataset_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        "snapshot_manifest_sha256": "a" * 64,
+        "retrieval_fingerprint": "b" * 64,
+        "case_count": 64,
+        "private_replay_path": private_path,
+        "visibility_artifact_path": visibility_path,
+        "expected_vector_generation": 2,
+        "expected_answer_prompt_sha256_by_case": {0: "c" * 64},
+    }
 
 
 def test_fts_only_raw_backfill_is_manifest_bounded_and_idempotent(tmp_path) -> None:
@@ -414,12 +616,13 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         return real_verify(*args, **kwargs)
 
     def activate(*args, **kwargs):
-        assert verification_count == 2
+        assert verification_count in {2, 3, 4}
         assert callable(kwargs["pre_activation_check"])
         return real_activate(*args, **kwargs)
 
     monkeypatch.setattr(backfill_v3, "verify_message_ledger_manifest", verify)
     monkeypatch.setattr(backfill_v3, "activate_retrieval_vector_generation", activate)
+    monkeypatch.setattr(backfill_v3, "_validate_activation_quality_artifacts", lambda *_args, **_kwargs: None)
     prepared_output = tmp_path / "prepared-report.json"
 
     assert (
@@ -480,6 +683,104 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         passed_gate,
         prepared_report=prepared_report,
     )
+    real_snapshot_live_high_watermarks = backfill_v3._snapshot_live_high_watermarks
+    fail_post_activation_once = True
+
+    def snapshot_live_high_watermarks(*args, **kwargs):
+        nonlocal fail_post_activation_once
+        if fail_post_activation_once:
+            with build_engine(database).connect() as connection:
+                active = int(
+                    connection.execute(
+                        text(
+                            "SELECT generation FROM retrieval_index_state "
+                            "WHERE channel = 'vector' AND is_active = 1"
+                        )
+                    ).scalar_one()
+                )
+            if active == int(prepared_report["vector_generation"]):
+                fail_post_activation_once = False
+                raise RuntimeError("injected post-activation failure")
+        return real_snapshot_live_high_watermarks(*args, **kwargs)
+
+    monkeypatch.setattr(
+        backfill_v3,
+        "_snapshot_live_high_watermarks",
+        snapshot_live_high_watermarks,
+    )
+    with pytest.raises(RuntimeError, match="legacy generation was restored"):
+        main(
+            [
+                "--phase",
+                "activate",
+                "--database",
+                str(database),
+                "--manifest",
+                str(backup.manifest_path),
+                "--prepared-report",
+                str(prepared_output),
+                "--gate-report",
+                str(passed_gate),
+                *_activation_artifact_args(passed_gate),
+                "--batch-size",
+                "1",
+            ]
+        )
+    with build_engine(database).connect() as connection:
+        restored_generation = int(
+            connection.execute(
+                text(
+                    "SELECT generation FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND is_active = 1"
+                )
+            ).scalar_one()
+        )
+    assert restored_generation == active_generation
+    monkeypatch.setattr(
+        backfill_v3,
+        "_snapshot_live_high_watermarks",
+        real_snapshot_live_high_watermarks,
+    )
+    real_emit_report = backfill_v3._emit_report
+    fail_emit_once = True
+
+    def emit_report(*args, **kwargs):
+        nonlocal fail_emit_once
+        if fail_emit_once:
+            fail_emit_once = False
+            raise OSError("injected activation report failure")
+        return real_emit_report(*args, **kwargs)
+
+    monkeypatch.setattr(backfill_v3, "_emit_report", emit_report)
+    with pytest.raises(RuntimeError, match="legacy generation was restored"):
+        main(
+            [
+                "--phase",
+                "activate",
+                "--database",
+                str(database),
+                "--manifest",
+                str(backup.manifest_path),
+                "--prepared-report",
+                str(prepared_output),
+                "--gate-report",
+                str(passed_gate),
+                *_activation_artifact_args(passed_gate),
+                "--batch-size",
+                "1",
+            ]
+        )
+    with build_engine(database).connect() as connection:
+        restored_after_emit_failure = int(
+            connection.execute(
+                text(
+                    "SELECT generation FROM retrieval_index_state "
+                    "WHERE channel = 'vector' AND is_active = 1"
+                )
+            ).scalar_one()
+        )
+    assert restored_after_emit_failure == active_generation
+    monkeypatch.setattr(backfill_v3, "_emit_report", real_emit_report)
     assert (
         main(
             [
@@ -500,7 +801,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         )
         == 0
     )
-    assert verification_count == 3
+    assert verification_count == 5
 
     engine = build_engine(database)
     with engine.connect() as connection:
@@ -682,6 +983,7 @@ def test_vector_backfill_catches_live_messages_around_activation_and_resumes(
         return activated
 
     monkeypatch.setattr(backfill_v3, "activate_retrieval_vector_generation", activate)
+    monkeypatch.setattr(backfill_v3, "_validate_activation_quality_artifacts", lambda *_args, **_kwargs: None)
     prepared_output = tmp_path / "prepared-report.json"
     assert (
         main(

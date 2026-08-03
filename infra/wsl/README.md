@@ -66,6 +66,8 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 
 ## 群聊记忆编排 V2 发布清单
 
+> Memory V3 是通过发布门禁后启用的生产历史查询路径；仓库模板仍安全默认关闭。本节保留为 legacy V2 兼容与底层 generation 资料；新发布应直接使用下方的 Memory V3 流程。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
+
 `.env.example` 的 `MEMORY_*` 示例保持
 `MEMORY_ORCHESTRATION_V2_ENABLED=true` 和
 `MEMORY_ORCHESTRATION_SHADOW_MODE=true`。The required rollout order is:
@@ -182,6 +184,21 @@ non-active generation. Its passing report is bound to the manifest, dataset,
 retrieval fingerprint, exact quality-sidecar digest, and `vector_generation`:
 
 ```bash
+python -m scripts.run_memory_v3_quality_replay \
+  --database /workspace/data/bot.db \
+  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
+  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
+  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
+  --review /workspace/data/backups/memory-v3-review.json \
+  --quality-output /workspace/data/backups/memory-v3-quality.json \
+  --private-replay-output /workspace/data/backups/memory-v3-quality-private.json \
+  --visibility-output /workspace/data/backups/memory-v3-quality-visibility.json \
+  --visibility-samples 20
+```
+
+After that controlled replay completes, run the final evaluator:
+
+```bash
 python -m scripts.run_memory_recall_eval \
   --database /workspace/data/bot.db \
   --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
@@ -189,10 +206,12 @@ python -m scripts.run_memory_recall_eval \
   --dataset /workspace/data/backups/memory-v3-cases.jsonl \
   --review /workspace/data/backups/memory-v3-review.json \
   --quality-sidecar /workspace/data/backups/memory-v3-quality.json \
+  --quality-private-replay /workspace/data/backups/memory-v3-quality-private.json \
+  --quality-visibility-artifact /workspace/data/backups/memory-v3-quality-visibility.json \
   --results-output /workspace/data/backups/memory-v3-results.jsonl \
   --report-output /workspace/data/backups/memory-v3-gate.json \
   --benchmark-output /workspace/data/backups/memory-v3-benchmark.json \
-  --warmup 20 --benchmark-runs 250
+  --warmup 20 --benchmark-runs 320
 ```
 
 Activation requires both the original prepared report and a passing gate
@@ -212,6 +231,10 @@ python -m scripts.backfill_memory_v3_raw \
   --gate-report /workspace/data/backups/memory-v3-gate.json \
   --dataset /workspace/data/backups/memory-v3-cases.jsonl \
   --quality-sidecar /workspace/data/backups/memory-v3-quality.json \
+  --quality-private-replay /workspace/data/backups/memory-v3-quality-private.json \
+  --quality-visibility-artifact /workspace/data/backups/memory-v3-quality-visibility.json \
+  --results /workspace/data/backups/memory-v3-results.jsonl \
+  --benchmark-report /workspace/data/backups/memory-v3-benchmark.json \
   --output /workspace/data/backups/memory-v3-activated.json
 ```
 

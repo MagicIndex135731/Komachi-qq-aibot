@@ -37,6 +37,29 @@ def test_deterministic_follow_up_uses_quoted_message_without_rewrite() -> None:
     assert result.rewrite_used is False
 
 
+def test_explicit_quote_does_not_require_a_textual_follow_up_marker() -> None:
+    resolver = MemoryQueryResolver()
+    quoted = Recent(
+        "explicit-quote",
+        "member",
+        "source evidence",
+        datetime(2026, 7, 22, 23, 55),
+        user_id=10001,
+    )
+
+    result = resolver.resolve(
+        "please verify the source evidence",
+        recent_messages=(quoted,),
+        quoted_message=quoted,
+        now=NOW,
+    )
+
+    assert result.retrieval_query == quoted.content
+    assert result.reference_msg_ids == ("explicit-quote",)
+    assert result.subject_ids is None
+    assert result.rewrite_used is False
+
+
 def test_named_follow_up_binds_unique_recent_entity() -> None:
     resolver = MemoryQueryResolver()
     recent = (
@@ -90,6 +113,1003 @@ def test_direct_nickname_question_binds_unique_group_member_without_rewriting_qu
     assert result.entities == ("加菲猫",)
     assert result.speaker_ids == ("10001",)
     assert result.subject_ids == ("10001",)
+
+
+def test_dated_history_binds_unique_member_despite_common_word_alias_collision() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="昨天", group_card=""),
+    )
+
+    result = resolver.resolve(
+        "阿渣昨天的劲爆发言",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.entities == ("阿渣",)
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+    assert result.time_range == TimeRange(
+        start=datetime(2026, 7, 21, 16, 0, tzinfo=UTC),
+        end=datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+    )
+    assert result.answer_mode == "dated_history"
+
+
+def test_relative_day_alias_with_member_joiner_still_fails_closed() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="昨天"),
+    )
+
+    result = resolver.resolve(
+        "昨天和阿渣都说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣昨天说了哪些话？",
+        "阿渣昨天有哪些发言？",
+        "阿渣昨天有什么内容？",
+    ),
+)
+def test_plural_dated_speech_query_uses_summary_coverage_instead_of_top_one(
+    query: str,
+) -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+    assert result.answer_mode == "summary"
+    assert result.coverage_mode == "time_buckets"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣 和 昨天说了什么？",
+        "阿渣和@昨天说了什么？",
+    ),
+)
+def test_spaced_or_at_relative_day_member_joiner_still_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="昨天"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_excluded_alias_cannot_redirect_dated_query_to_relative_day_member() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="昨天"),
+    )
+
+    result = resolver.resolve(
+        "阿渣昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={10001},
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_bare_relative_day_alias_does_not_hijack_temporal_or_unknown_person_query() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10003, nickname="昨天"),)
+
+    temporal = resolver.resolve(
+        "昨天发生了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    unknown_person = resolver.resolve(
+        "陌生猫昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert temporal.speaker_ids == ()
+    assert temporal.subject_ids is None
+    assert temporal.answer_mode == "summary"
+    assert temporal.time_range is not None
+    assert unknown_person.speaker_ids == ()
+    assert unknown_person.subject_ids == ()
+
+
+def test_explicit_member_qq_binds_and_conflicting_alias_fails_closed() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    explicit = resolver.resolve(
+        "@10002 昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    conflicting = resolver.resolve(
+        "@10002 阿渣昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert explicit.speaker_ids == ("10002",)
+    assert explicit.subject_ids == ("10002",)
+    assert conflicting.speaker_ids == ()
+    assert conflicting.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("query", "excluded"),
+    (
+        ("@99999 昨天说了什么？", frozenset()),
+        ("@10001 昨天说了什么？", frozenset({10001})),
+        ("@10002 @99999 昨天说了什么？", frozenset()),
+        ("@10002 @10001 昨天说了什么？", frozenset({10001})),
+    ),
+)
+def test_unknown_or_excluded_explicit_qq_fails_closed(
+    query: str,
+    excluded: frozenset[int],
+) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+        GroupMemberIdentity(user_id=10003, nickname="昨天"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids=excluded,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_unknown_text_mention_fails_closed_and_bare_group_qq_binds() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+        GroupMemberIdentity(user_id=10003, nickname="昨天"),
+    )
+
+    unknown = resolver.resolve(
+        "@陌生猫昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    bare_qq = resolver.resolve(
+        "10002昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert unknown.speaker_ids == ()
+    assert unknown.subject_ids == ()
+    assert bare_qq.speaker_ids == ("10002",)
+    assert bare_qq.subject_ids == ("10002",)
+
+
+@pytest.mark.parametrize(
+    ("query", "excluded"),
+    (
+        ("10002和99999昨天说了什么？", frozenset()),
+        ("10002和10001昨天说了什么？", frozenset({10001})),
+    ),
+)
+def test_known_bare_qq_joined_with_unknown_or_excluded_qq_fails_closed(
+    query: str,
+    excluded: frozenset[int],
+) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids=excluded,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣和陌生猫昨天说了什么？",
+        "@加菲猫和陌生猫昨天说了什么？",
+    ),
+)
+def test_known_alias_joined_with_unknown_alias_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣还有陌生猫昨天说了什么？",
+        "阿渣以及陌生猫昨天说了什么？",
+        "10002还有99999昨天说了什么？",
+        "10002以及99999昨天说了什么？",
+    ),
+)
+def test_multichar_joiner_with_unknown_member_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+def test_joined_relative_days_remain_a_subjectless_temporal_query() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="昨天"),
+        GroupMemberIdentity(user_id=10002, nickname="今天"),
+    )
+
+    result = resolver.resolve(
+        "昨天和今天发生了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids is None
+    assert result.time_range is not None
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣昨天的消息",
+        "@10001 昨天的消息",
+    ),
+)
+def test_strong_member_reference_wins_over_common_word_alias(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="消息"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣和加菲猫昨天说了什么？",
+        "@阿渣和@加菲猫昨天说了什么？",
+    ),
+)
+def test_joined_excluded_alias_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={10002},
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣再加上陌生猫昨天都说了什么？",
+        "阿渣并且陌生猫昨天都说了什么？",
+        "10001并且99999昨天都说了什么？",
+    ),
+)
+def test_additional_joiner_with_unknown_member_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣外加陌生猫昨天都说了什么？",
+        "10001外加99999昨天都说了什么？",
+    ),
+)
+def test_unenumerated_join_phrase_with_unknown_member_fails_closed(query: str) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣外加陌生猫发生了什么？",
+        "阿渣外加陌生猫怎么了？",
+        "说说阿渣外加陌生猫昨天的事",
+        "@10001 阿渣和加菲猫昨天都说了什么？",
+        "QQ号10001 阿渣加菲猫昨天都说了什么？",
+        "@10001 阿渣外加陌生猫昨天都说了什么？",
+    ),
+)
+def test_unknown_conjunction_shape_fails_closed_without_predicate_enumeration(
+    query: str,
+) -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣2026-07-21说了什么？",
+        "阿渣7月21日说了什么？",
+        "阿渣上周说了什么？",
+    ),
+)
+def test_strong_member_alias_allows_trailing_explicit_date(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+    assert result.time_range is not None
+
+
+def test_same_member_nickname_and_card_in_query_are_one_identity() -> None:
+    result = MemoryQueryResolver().resolve(
+        "阿渣（A-Zha）昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(
+                user_id=10001,
+                nickname="阿渣",
+                group_card="A-Zha",
+            ),
+        ),
+    )
+
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣昨天外加陌生猫都说了什么？",
+        "阿渣昨天外加加菲猫都说了什么？",
+        "阿渣2026-07-21外加陌生猫都说了什么？",
+        "@10001 阿渣昨天外加陌生猫都说了什么？",
+        "阿渣也和陌生猫昨天都说了什么？",
+        "阿渣为什么和陌生猫昨天都说了什么？",
+    ),
+)
+def test_safe_prefix_is_consumed_before_checking_for_second_member(query: str) -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize("query", ("阿渣7/21说了什么？", "阿渣7-21说了什么？"))
+def test_strong_member_alias_allows_short_trailing_date(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.time_range is not None
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "请问阿渣昨天的劲爆发言",
+        "关于阿渣昨天的劲爆发言",
+        "帮我看看阿渣昨天的劲爆发言",
+    ),
+)
+def test_polite_intro_keeps_prefix_alias_strong(query: str) -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="发言"),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣的朋友加菲猫昨天说了什么？",
+        "阿渣说加菲猫昨天做了什么？",
+        "我想问阿渣外加陌生猫昨天都说了什么？",
+        "能不能说说阿渣外加陌生猫昨天的事",
+    ),
+)
+def test_complete_second_alias_or_unknown_suffix_fails_closed(query: str) -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣刚刚说了什么？",
+        "阿渣之前说了什么？",
+        "阿渣曾说过什么？",
+    ),
+)
+def test_common_single_member_time_adverbs_remain_bound(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣的朋友陌生猫昨天说了什么？",
+        "阿渣说陌生猫昨天做了什么？",
+        "阿渣提到陌生猫昨天的事",
+        "我想问阿渣的朋友陌生猫昨天说了什么？",
+    ),
+)
+def test_unknown_relation_or_quote_target_fails_closed(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
+        ),
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣在群里说了什么？",
+        "阿渣最近在群里说了什么？",
+        "阿渣刚才说了什么？",
+        "阿渣上次说了什么？",
+    ),
+)
+def test_common_group_preposition_and_time_adverb_remain_bound(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣的室友陌生猫昨天说了什么？",
+        "阿渣的好友陌生猫昨天说了什么？",
+    ),
+)
+def test_unenumerated_relation_target_fails_closed(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣说动画昨天上映了吗？",
+        "阿渣提到项目昨天上线了吗？",
+        "阿渣聊到游戏昨天更新了吗？",
+    ),
+)
+def test_quote_verb_with_known_topic_remains_single_member(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+def test_cross_group_alias_is_detected_but_never_bound() -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=20001, nickname="动画", in_scope=False),
+    )
+
+    relation = MemoryQueryResolver().resolve(
+        "阿渣的室友动画昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    direct = MemoryQueryResolver().resolve(
+        "动画昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert relation.subject_ids == ()
+    assert direct.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("query", "members"),
+    (
+        (
+            "王小明昨天说了什么？",
+            (
+                GroupMemberIdentity(user_id=10001, nickname="小明"),
+                GroupMemberIdentity(user_id=20001, nickname="王小明", in_scope=False),
+            ),
+        ),
+        (
+            "小明王小明昨天说了什么？",
+            (
+                GroupMemberIdentity(user_id=10001, nickname="小明"),
+                GroupMemberIdentity(user_id=10001, nickname="王小明", in_scope=False),
+            ),
+        ),
+    ),
+)
+def test_cross_group_superstring_alias_never_binds_shorter_target_alias(
+    query: str,
+    members: tuple[GroupMemberIdentity, ...],
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_exact_target_alias_wins_over_same_named_cross_group_alias() -> None:
+    result = MemoryQueryResolver().resolve(
+        "小明昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="小明"),
+            GroupMemberIdentity(user_id=20001, nickname="小明", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我想问王小明昨天说了什么？",
+        "能不能说说王小明昨天的事",
+    ),
+)
+def test_polite_prefix_cannot_bypass_cross_group_superstring_shadow(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="小明"),
+            GroupMemberIdentity(user_id=20001, nickname="王小明", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_shadow_check_covers_every_matching_alias_of_resolved_member() -> None:
+    result = MemoryQueryResolver().resolve(
+        "我想问王小明A-Zha昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="小明", group_card="A-Zha"),
+            GroupMemberIdentity(user_id=20001, nickname="王小明", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我想问加菲猫，阿渣昨天说了什么？",
+        "能不能说说加菲猫阿渣昨天的事",
+    ),
+)
+def test_non_overlapping_restricted_alias_before_target_fails_closed(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=20001, nickname="加菲猫", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_excluded_superstring_alias_shadows_shorter_allowed_alias() -> None:
+    result = MemoryQueryResolver().resolve(
+        "王小明昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="小明"),
+            GroupMemberIdentity(user_id=10002, nickname="王小明"),
+        ),
+        excluded_member_ids={10002},
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_text_mention_uses_longest_alias_before_scope_conflict_check() -> None:
+    result = MemoryQueryResolver().resolve(
+        "@王小明 昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="王小明"),
+            GroupMemberIdentity(user_id=20001, nickname="王小", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+def test_text_mention_exact_target_alias_wins_over_same_named_external_alias() -> None:
+    result = MemoryQueryResolver().resolve(
+        "@小明昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="小明"),
+            GroupMemberIdentity(user_id=20001, nickname="小明", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "阿渣的室友消息昨天说了什么？",
+        "阿渣的好友服务昨天说了什么？",
+        "阿渣的老师大家昨天说了什么？",
+    ),
+)
+def test_possessive_relation_rejects_common_or_topic_words(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_long_possessive_relation_target_fails_closed() -> None:
+    result = MemoryQueryResolver().resolve(
+        "阿渣的室友这是一个超过旧长度限制的陌生人物名字昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_cross_group_common_word_alias_overrides_topic_word_exception() -> None:
+    result = MemoryQueryResolver().resolve(
+        "阿渣说消息昨天发了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=20001, nickname="消息", in_scope=False),
+        ),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_text_mention_binds_target_when_same_qq_also_has_external_snapshots() -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", in_scope=False),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", in_scope=False),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "@阿渣 昨天说了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+@pytest.mark.parametrize(
+    ("query", "members", "expected_subject"),
+    (
+        (
+            "加菲猫最喜欢什么动画？",
+            (
+                GroupMemberIdentity(user_id=10001, nickname="加菲猫"),
+                GroupMemberIdentity(user_id=10002, nickname="动画"),
+            ),
+            ("10001",),
+        ),
+        (
+            "@10001 加菲猫最喜欢什么动画？",
+            (
+                GroupMemberIdentity(user_id=10001, nickname="加菲猫"),
+                GroupMemberIdentity(user_id=10002, nickname="动画"),
+            ),
+            ("10001",),
+        ),
+        (
+            "阿渣昨天的劲爆发言",
+            (
+                GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+                GroupMemberIdentity(user_id=10002, nickname="发言"),
+            ),
+            ("10001",),
+        ),
+        (
+            "结果昨天说了什么？",
+            (GroupMemberIdentity(user_id=10003, nickname="结果"),),
+            ("10003",),
+        ),
+    ),
+)
+def test_prefix_alias_is_strong_without_common_word_enumeration(
+    query: str,
+    members: tuple[GroupMemberIdentity, ...],
+    expected_subject: tuple[str, ...],
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == expected_subject
+    assert result.subject_ids == expected_subject
+
+
+def test_joined_relative_days_ignore_unrelated_predicate_alias() -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="昨天"),
+        GroupMemberIdentity(user_id=10002, nickname="今天"),
+        GroupMemberIdentity(user_id=10003, nickname="发生"),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "昨天和今天发生了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids is None
+
+
+def test_excluded_bot_text_mention_does_not_bind_a_person() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="Mira"),
+        GroupMemberIdentity(user_id=10003, nickname="昨天"),
+    )
+
+    result = resolver.resolve(
+        "@Mira 昨天发生了什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={10001},
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids is None
+    assert result.time_range is not None
 
 
 def test_direct_nickname_question_fails_closed_for_duplicate_aliases() -> None:

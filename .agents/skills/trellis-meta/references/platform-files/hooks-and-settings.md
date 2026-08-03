@@ -15,8 +15,8 @@ settings/config files usually register:
 For Codex, `codex.dispatch_mode: global-policy` is the default. It keeps task
 state/context injection active while leaving sub-agent dispatch, model choice,
 reasoning effort, and parallelism to higher-priority Codex/user instructions.
-The legacy `inline` and `sub-agent` values remain available as explicit
-project overrides.
+Use `auto` to opt into native Trellis sub-agent dispatch, `inline` to force
+main-session implementation, or the legacy `sub-agent` alias for `auto`.
 
 Common files:
 
@@ -35,7 +35,7 @@ Common files:
 | Pi Agent | `.pi/settings.json`, `.pi/extensions/trellis/` |
 | Trae IDE | `.trae/hooks.json` |
 
-Reasonix and ZCode are pull-based platforms that do not use hooks or settings files; their agent files contain prelude instructions to read context after startup.
+Reasonix is a pull-based platform whose agent files contain prelude instructions to read context after startup. ZCode uses `.zcode/config.json` with shared hooks, including PreToolUse for sub-agent prompt injection. Kimi Code is likewise pull-based and has no project-level settings/hooks file Trellis writes (hooks live only in the user-level `~/.kimi-code/config.toml`), so its agent prompts ship as skills with the same prelude.
 
 Whether these files exist in a project depends on which `trellis init --<platform>` flags the user ran.
 

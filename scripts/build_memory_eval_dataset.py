@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Sequence
 
@@ -14,6 +15,7 @@ from app.core.memory_backfill import (
     verify_message_ledger_manifest,
 )
 from app.core.memory_backfill_runner import group_watermarks_from_manifest
+from app.core.memory_query_resolver import MemoryQueryResolver
 
 try:
     from .evaluate_memory_recall import validate_real_dataset, load_evaluation_cases
@@ -55,7 +57,50 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--review-output", required=True, type=Path)
+    parser.add_argument("--paraphrase-overrides", required=True, type=Path)
     return parser
+
+
+def _load_paraphrase_overrides(
+    path: Path,
+    *,
+    snapshot_manifest_sha256: str,
+) -> dict[str, str]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant is forbidden: {value}")
+
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=reject_constant,
+    )
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("paraphrase overrides schema_version must be 1")
+    if payload.get("snapshot_manifest_sha256") != snapshot_manifest_sha256:
+        raise ValueError("paraphrase overrides snapshot manifest mismatch")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ValueError("paraphrase overrides items must be a list")
+    overrides: dict[str, str] = {}
+    queries: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"paraphrase override {index} must be an object")
+        source_id = item.get("source_message_id")
+        query = item.get("query")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError(f"paraphrase override {index} has invalid source ID")
+        if not isinstance(query, str) or len(query.strip()) < 8:
+            raise ValueError(f"paraphrase override {index} has invalid query")
+        if item.get("semantic_equivalence_approved") is not True:
+            raise ValueError(f"paraphrase override {index} lacks semantic approval")
+        normalized_query = " ".join(query.split()).casefold()
+        if source_id in overrides or normalized_query in queries:
+            raise ValueError("paraphrase overrides contain duplicate source or query")
+        overrides[source_id] = query.strip()
+        queries.add(normalized_query)
+    if len(overrides) < CATEGORY_COUNTS["paraphrase"]:
+        raise ValueError("paraphrase overrides contain fewer than 10 approved items")
+    return overrides
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -72,7 +117,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.database,
         group_watermarks=group_watermarks_from_manifest(manifest),
     )
-    cases, review = build_cases(rows, distractor_rows=snapshot_rows)
+    paraphrase_overrides = _load_paraphrase_overrides(
+        args.paraphrase_overrides,
+        snapshot_manifest_sha256=manifest_sha256,
+    )
+    cases, review = build_cases(
+        rows,
+        distractor_rows=snapshot_rows,
+        paraphrase_overrides=paraphrase_overrides,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
         for case in cases:
@@ -213,6 +266,7 @@ def build_cases(
     rows: list[dict[str, Any]],
     *,
     distractor_rows: list[dict[str, Any]] | None = None,
+    paraphrase_overrides: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict]:
     by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     by_platform_id = {row["platform_msg_id"]: row for row in rows}
@@ -239,13 +293,46 @@ def build_cases(
     def following(row: dict[str, Any], *, width: int = 6) -> list[str]:
         group_rows = by_group[row["group_id"]]
         index = positions[(row["group_id"], row["platform_msg_id"])]
-        values = [
+        later_rows = group_rows[index + 1 :]
+        target_index = next(
+            (
+                offset
+                for offset, item in enumerate(later_rows[width - 1 :], width - 1)
+                if not item.get("reply_to_msg_id")
+            ),
+            next(
+                (
+                    offset
+                    for offset, item in enumerate(later_rows)
+                    if not item.get("reply_to_msg_id")
+                ),
+                None,
+            ),
+        )
+        if target_index is None:
+            raise ValueError("evaluation evidence has no later non-reply context")
+        return [
             item["platform_msg_id"]
-            for item in group_rows[index + 1 : index + 1 + width]
+            for item in later_rows[max(0, target_index - width + 1) : target_index + 1]
         ]
-        if not values:
-            raise ValueError("evaluation evidence has no later context")
-        return values
+
+    resolver = MemoryQueryResolver()
+
+    def has_general_unbound_plan(query: str, recent_ids: list[str]) -> bool:
+        target = by_platform_id[recent_ids[-1]]
+        plan = resolver.resolve(
+            query,
+            recent_messages=(),
+            now=_parse_timestamp(target["timestamp"]),
+            group_id=int(target["group_id"]),
+            requester_id=str(target["user_id"]),
+        )
+        return (
+            plan.subject_ids is None
+            and plan.time_range is None
+            and plan.answer_mode == "general_history"
+            and plan.coverage_strategy == "relevance"
+        )
 
     def add(
         *,
@@ -314,19 +401,58 @@ def build_cases(
         seen_candidate_texts.add(normalized_text)
         candidates.append(row)
     cursor = 0
-    for category in ("exact", "paraphrase"):
-        for _ in range(CATEGORY_COUNTS[category]):
+    rejected_exact: set[str] = set()
+    reserved_paraphrase_sources = set(paraphrase_overrides or ())
+    for _ in range(CATEGORY_COUNTS["exact"]):
+        while True:
+            row, cursor = _next_unused(
+                candidates,
+                chosen | rejected_exact | reserved_paraphrase_sources,
+                cursor,
+            )
+            recent_ids = following(row)
+            query = f"查找历史原话：“{_excerpt(row['plain_text'])}”"
+            if has_general_unbound_plan(query, recent_ids):
+                break
+            rejected_exact.add(row["platform_msg_id"])
+        excerpt = _excerpt(row["plain_text"])
+        add(
+            category="exact",
+            row=row,
+            query=query,
+            expected=[row["platform_msg_id"]],
+            recent_ids=recent_ids,
+        )
+
+    if paraphrase_overrides is None:
+        for _ in range(CATEGORY_COUNTS["paraphrase"]):
             row, cursor = _next_unused(candidates, chosen, cursor)
             excerpt = _excerpt(row["plain_text"])
-            query = (
-                f"查找历史原话：“{excerpt}”"
-                if category == "exact"
-                else f"查找历史中表达过这个意思的消息：{_paraphrase(excerpt)}"
-            )
             add(
-                category=category,
+                category="paraphrase",
                 row=row,
-                query=query,
+                query=f"查找历史中表达过这个意思的消息：{_paraphrase(excerpt)}",
+                expected=[row["platform_msg_id"]],
+                recent_ids=following(row),
+            )
+    else:
+        curated_rows = [
+            row
+            for row in candidates
+            if row["platform_msg_id"] in paraphrase_overrides
+            and row["platform_msg_id"] not in chosen
+            and has_general_unbound_plan(
+                paraphrase_overrides[row["platform_msg_id"]],
+                following(row),
+            )
+        ]
+        if len(curated_rows) < CATEGORY_COUNTS["paraphrase"]:
+            raise ValueError("not enough eligible curated paraphrase sources")
+        for row in curated_rows[: CATEGORY_COUNTS["paraphrase"]]:
+            add(
+                category="paraphrase",
+                row=row,
+                query=paraphrase_overrides[row["platform_msg_id"]],
                 expected=[row["platform_msg_id"]],
                 recent_ids=following(row),
             )
@@ -337,22 +463,58 @@ def build_cases(
         if row["reply_to_msg_id"] in by_platform_id
         and by_platform_id[row["reply_to_msg_id"]]["group_id"] == row["group_id"]
     ]
-    for row in reply_rows[: CATEGORY_COUNTS["vague_reference"]]:
+    complete_reply_rows = [
+        row
+        for row in (distractor_rows if distractor_rows is not None else rows)
+        if row.get("reply_to_msg_id")
+        and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
+    ]
+    replies_by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in complete_reply_rows:
+        replies_by_parent[str(row["reply_to_msg_id"])].append(row)
+    unique_direct_reply_ids = {
+        children[0]["platform_msg_id"]
+        for children in replies_by_parent.values()
+        if len(children) == 1
+    }
+    single_reply_rows = [
+        row for row in reply_rows if row["platform_msg_id"] in unique_direct_reply_ids
+    ]
+    for row in single_reply_rows[: CATEGORY_COUNTS["vague_reference"]]:
         quoted = by_platform_id[row["reply_to_msg_id"]]
         add(
             category="vague_reference",
             row=row,
-            query="引用的那件事后来呢？请接着讲。",
+            query="这条引用消息在群里的直接回复是什么？",
             expected=[row["platform_msg_id"]],
             recent_ids=following(row),
             quoted_context_message_id=quoted["platform_msg_id"],
         )
     if sum(case["category"] == "vague_reference" for case in cases) < 10:
-        raise ValueError("not enough scoped reply chains for vague-reference cases")
+        raise ValueError("not enough single-reply chains for vague-reference cases")
 
-    for _ in range(CATEGORY_COUNTS["temporal"]):
-        row, cursor = _next_unused(candidates, chosen, cursor)
-        day = str(row["timestamp"])[:10]
+    rejected_summary_days: set[str] = set()
+    for temporal_index in range(CATEGORY_COUNTS["temporal"]):
+        while True:
+            row, cursor = _next_unused(
+                candidates,
+                chosen | rejected_summary_days,
+                cursor,
+            )
+            temporal_recent_ids = following(row)
+            if temporal_index != 0 or _day_has_two_halfday_buckets(
+                row,
+                rows=rows,
+                excluded_message_ids=set(temporal_recent_ids),
+            ):
+                break
+            rejected_summary_days.add(row["platform_msg_id"])
+        day = (
+            _parse_timestamp(row["timestamp"])
+            .astimezone(_SHANGHAI)
+            .date()
+            .isoformat()
+        )
         start = f"{day}T00:00:00"
         end = f"{day}T23:59:59.999999"
         add(
@@ -360,33 +522,52 @@ def build_cases(
             row=row,
             query=f"{day} 群里围绕“{_excerpt(row['plain_text'], 24)}”说过什么？",
             expected=[row["platform_msg_id"]],
-            recent_ids=following(row),
+            recent_ids=temporal_recent_ids,
             time_range={"start_at": start, "end_at": end},
         )
 
     reply_pairs = [
         (by_platform_id[row["reply_to_msg_id"]], row)
         for row in reply_rows
-        if row["platform_msg_id"] not in chosen
+        if row["platform_msg_id"] in unique_direct_reply_ids
+        and row["platform_msg_id"] not in chosen
         and row["reply_to_msg_id"] not in chosen
         and positions[(row["group_id"], row["platform_msg_id"])]
         < len(by_group[row["group_id"]]) - 6
     ]
-    for first, second in reply_pairs[: CATEGORY_COUNTS["multi_hop"]]:
+    selected_multi_hop = 0
+    for first, second in reply_pairs:
+        recent_ids = following(second)
+        query = (
+            f"“{_excerpt(first['plain_text'], 18)}”这条消息和它的直接回复"
+            "分别说了什么？"
+        )
+        if not has_general_unbound_plan(query, recent_ids):
+            continue
         add(
             category="multi_hop",
             row=second,
-            query=(
-                f"把“{_excerpt(first['plain_text'], 18)}”和"
-                f"“{_excerpt(second['plain_text'], 18)}”两段信息合起来说明。"
-            ),
+            query=query,
             expected=[first["platform_msg_id"], second["platform_msg_id"]],
-            recent_ids=following(second),
+            recent_ids=recent_ids,
         )
+        selected_multi_hop += 1
+        if selected_multi_hop >= CATEGORY_COUNTS["multi_hop"]:
+            break
 
     by_group_user: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         by_group_user[(row["group_id"], row["user_id"])].append(row)
+    complete_by_group_user: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in (distractor_rows if distractor_rows is not None else rows):
+        if row["delivery_state"] in _INELIGIBLE_DELIVERY_STATES:
+            continue
+        complete_by_group_user[(row["group_id"], row["user_id"])].append(row)
+    complete_adjacent_pairs = {
+        (first["platform_msg_id"], second["platform_msg_id"])
+        for values in complete_by_group_user.values()
+        for first, second in zip(values, values[1:])
+    }
     update_pairs = []
     for values in by_group_user.values():
         for first, second in zip(values, values[1:]):
@@ -400,6 +581,10 @@ def build_cases(
                 and not second["platform_msg_id"].startswith("bot-reply-")
                 and first["platform_msg_id"] not in chosen
                 and second["platform_msg_id"] not in chosen
+                and (
+                    first["platform_msg_id"],
+                    second["platform_msg_id"],
+                ) in complete_adjacent_pairs
                 and _is_related_update(first, second)
             ):
                 update_pairs.append((first, second))
@@ -429,12 +614,18 @@ def build_cases(
             row=row,
             query=f"群里有人讨论过不存在的代号 ZX-{nonce} 吗？",
             expected=[],
+            recent_ids=following(row),
         )
 
     _attach_v3_contracts(
         cases,
         source_rows=distractor_rows if distractor_rows is not None else rows,
     )
+    evidence_rows = distractor_rows if distractor_rows is not None else rows
+    evidence_by_platform_id = {
+        row["platform_msg_id"]: row
+        for row in evidence_rows
+    }
     if len(cases) != 64:
         raise RuntimeError("evaluation builder did not create exactly 64 cases")
     gate_tag_counts: dict[str, int] = defaultdict(int)
@@ -450,12 +641,32 @@ def build_cases(
             for source_id in case["expected_evidence_message_ids"]
         ),
         "all_expected_ids_group_scoped": all(
-            row["scope_verified"] for row in review_rows
+            evidence_by_platform_id[source_id]["group_id"] == case["group_id"]
+            for case in cases
+            for source_id in case["expected_evidence_message_ids"]
         ),
         "evaluation_schema_version": 3,
         "gate_tag_counts": dict(sorted(gate_tag_counts.items())),
         "forbidden_source_count": len(forbidden_ids),
-        "case_evidence": review_rows,
+        "case_evidence": [
+            {
+                "case_index": index,
+                "category": case["category"],
+                "group_id": case["group_id"],
+                "expected_ids": list(case["expected_evidence_message_ids"]),
+                "source_sha256": hashlib.sha256(
+                    "\n".join(
+                        evidence_by_platform_id[source_id]["plain_text"]
+                        for source_id in case["expected_evidence_message_ids"]
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "scope_verified": all(
+                    evidence_by_platform_id[source_id]["group_id"] == case["group_id"]
+                    for source_id in case["expected_evidence_message_ids"]
+                ),
+            }
+            for index, case in enumerate(cases)
+        ],
     }
 
 
@@ -515,6 +726,7 @@ def _attach_v3_contracts(
             if row["platform_msg_id"] != exact_source_id
             and int(row["group_id"]) == int(exact_source["group_id"])
             and int(row["user_id"]) == int(exact_source["user_id"])
+            and not row.get("reply_to_msg_id")
             and _parse_timestamp(row["timestamp"])
             > _parse_timestamp(exact_source["timestamp"])
             and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
@@ -539,7 +751,12 @@ def _attach_v3_contracts(
     first_abstention = next(
         case for case in cases if case["category"] == "abstention"
     )
-    first_abstention["query"] = "他们最近有没有@我？"
+    abstention_nonce = re.search(r"ZX-[0-9a-f]+", first_abstention["query"])
+    if abstention_nonce is None:
+        raise ValueError("mention abstention case has no frozen nonce")
+    first_abstention["query"] = (
+        f"关于不存在的代号 {abstention_nonce.group(0)}，他们最近有没有@我？"
+    )
     first_abstention["expected_answer_mode"] = "mention"
     first_abstention["allowed_subject_user_ids"] = [
         first_abstention["requester_uin"]
@@ -554,10 +771,52 @@ def _attach_v3_contracts(
         .date()
         .isoformat()
     )
-    first_temporal["query"] = f"总结{local_day}的聊天"
+    first_temporal["query"] = (
+        f"总结{local_day}上半天和下半天各一条有内容的聊天记录"
+    )
     first_temporal["expected_answer_mode"] = "summary"
     first_temporal["expected_coverage_strategy"] = "time_buckets"
     first_temporal["minimum_time_bucket_count"] = 2
+    temporal_range = first_temporal["time_range"]
+    if temporal_range is None:
+        raise ValueError("summary time-bucket case has no frozen range")
+    temporal_start, temporal_end = (
+        _parse_timestamp(value) for value in temporal_range.values()
+    )
+    temporal_expected = [
+        row
+        for row in source_rows
+        if int(row["group_id"]) == int(first_temporal["group_id"])
+        and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
+        and 12 <= len(str(row["plain_text"]).strip()) <= 400
+        and row["platform_msg_id"]
+        not in set(first_temporal["recent_context_message_ids"])
+        and temporal_start <= _parse_timestamp(row["timestamp"]) < temporal_end
+    ]
+    midpoint = temporal_start + (temporal_end - temporal_start) / 2
+    early_row = max(
+        (
+            row
+            for row in temporal_expected
+            if _parse_timestamp(row["timestamp"]) < midpoint
+        ),
+        key=lambda row: len(str(row["plain_text"]).strip()),
+        default=None,
+    )
+    late_row = max(
+        (
+            row
+            for row in temporal_expected
+            if _parse_timestamp(row["timestamp"]) >= midpoint
+        ),
+        key=lambda row: len(str(row["plain_text"]).strip()),
+        default=None,
+    )
+    early = early_row["platform_msg_id"] if early_row is not None else None
+    late = late_row["platform_msg_id"] if late_row is not None else None
+    if early is None or late is None:
+        raise ValueError("summary time-bucket case lacks two real time buckets")
+    first_temporal["expected_evidence_message_ids"] = [early, late]
     first_temporal["gate_tags"].extend(
         ("time_range", "time_bucket", "cross_group", "blocked_reserved")
     )
@@ -630,6 +889,29 @@ def _shanghai_day_range(timestamp: str) -> dict[str, str]:
         "start_at": start_at.isoformat(),
         "end_at": end_at.isoformat(),
     }
+
+
+def _day_has_two_halfday_buckets(
+    anchor: dict[str, Any],
+    *,
+    rows: Sequence[dict[str, Any]],
+    excluded_message_ids: set[str] | frozenset[str] = frozenset(),
+) -> bool:
+    time_range = _shanghai_day_range(anchor["timestamp"])
+    start_at, end_at = (_parse_timestamp(value) for value in time_range.values())
+    midpoint = start_at + (end_at - start_at) / 2
+    matching = [
+        _parse_timestamp(row["timestamp"])
+        for row in rows
+        if int(row["group_id"]) == int(anchor["group_id"])
+        and row["platform_msg_id"] not in excluded_message_ids
+        and row["delivery_state"] not in _INELIGIBLE_DELIVERY_STATES
+        and 12 <= len(str(row["plain_text"]).strip()) <= 400
+        and start_at <= _parse_timestamp(row["timestamp"]) < end_at
+    ]
+    return any(value < midpoint for value in matching) and any(
+        value >= midpoint for value in matching
+    )
 
 
 def _parse_timestamp(value: object) -> datetime:

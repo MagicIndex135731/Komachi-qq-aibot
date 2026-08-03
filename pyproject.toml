@@ -34,6 +34,7 @@ norecursedirs = [
   ".venv",
   "__pycache__",
   ".pytest_cache",
+  ".pytest-*",
   ".pytest_tmp",
   ".worktrees",
   ".tmp*",

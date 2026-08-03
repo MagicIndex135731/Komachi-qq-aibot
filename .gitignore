@@ -2,6 +2,7 @@
 .venv-wsl/
 __pycache__/
 .pytest_cache/
+.pytest-*/
 *.pyc
 *.egg-info/
 data/bot.db

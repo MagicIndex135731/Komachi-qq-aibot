@@ -49,6 +49,89 @@ def test_vector_only_candidate_survives_without_any_lexical_candidate() -> None:
     assert result.candidates[0].routes == ("vector",)
 
 
+def test_vector_cutoff_interleaves_only_the_near_boundary_slice() -> None:
+    rows = tuple(candidate(index) for index in range(1, 21))
+    retriever = HybridMemoryRetriever(
+        channels={"vector": lambda **_: rows},
+        candidate_limit=20,
+        final_limit=10,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert [item.document_id for item in result.candidates] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+    ]
+    assert len({item.document_id for item in result.candidates}) == 10
+
+
+def test_vector_cutoff_stabilization_is_not_used_for_time_bucket_coverage() -> None:
+    rows = tuple(candidate(index) for index in range(1, 21))
+    retriever = HybridMemoryRetriever(
+        channels={"vector": lambda **_: rows},
+        candidate_limit=20,
+        final_limit=10,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(coverage_mode="time_buckets"),
+    )
+
+    assert len(result.candidates) == 10
+    assert [item.document_id for item in result.candidates] != [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+    ]
+
+
+def test_vector_cutoff_keeps_true_top_k_when_boundary_scores_are_not_tied() -> None:
+    rows = tuple(candidate(index, score=1.0 - index / 100.0) for index in range(1, 21))
+    retriever = HybridMemoryRetriever(
+        channels={"vector": lambda **_: rows},
+        candidate_limit=20,
+        final_limit=10,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert [item.document_id for item in result.candidates] == list(range(1, 11))
+
+
+def test_vector_cutoff_never_promotes_scores_outside_the_boundary_tie_group() -> None:
+    scores = [2.3 - index / 10.0 for index in range(14)] + [0.9, 0.9, 0.2, 0.1, 0.0, -0.1]
+    rows = tuple(
+        candidate(index, score=score)
+        for index, score in enumerate(scores, start=1)
+    )
+    retriever = HybridMemoryRetriever(
+        channels={"vector": lambda **_: rows},
+        candidate_limit=20,
+        final_limit=16,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert {item.document_id for item in result.candidates} == set(range(1, 17))
+
+
 def test_weighted_rrf_pins_exact_reference_above_multi_route_semantic_hit() -> None:
     retriever = HybridMemoryRetriever(
         channels={
@@ -81,6 +164,168 @@ def test_exact_only_reference_is_pinned_above_stronger_multi_route_candidate() -
     result = retriever.retrieve(group_id=100, resolved_query=object())
 
     assert [item.document_id for item in result.candidates[:2]] == [3, 9]
+
+
+def test_explicit_reference_runs_only_deterministic_provenance_channels() -> None:
+    called: list[str] = []
+
+    def channel(name: str, result: list[RetrievalCandidate]):
+        def run(**_):
+            called.append(name)
+            return result
+
+        return run
+
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": channel("bm25", [candidate(9)]),
+            "vector": channel("vector", [candidate(9)]),
+            "temporal": channel("temporal", [candidate(9)]),
+            "entity": channel("entity", [candidate(9)]),
+            "exact_quote": channel("exact_quote", [candidate(3)]),
+            "reply_graph": channel("reply_graph", [candidate(4)]),
+        }
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(reference_msg_ids=("quoted",)),
+    )
+
+    assert set(called) == {"exact_quote", "reply_graph"}
+    assert result.attempted_channels == ("exact_quote", "reply_graph")
+    assert {item.document_id for item in result.candidates} == {3, 4}
+
+
+def test_mention_plan_runs_only_temporal_channel() -> None:
+    called: list[str] = []
+
+    def channel(name: str):
+        def run(**_):
+            called.append(name)
+            return [candidate(4)]
+
+        return run
+
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": channel("bm25"),
+            "vector": channel("vector"),
+            "entity": channel("entity"),
+            "temporal": channel("temporal"),
+        }
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            reference_msg_ids=(),
+            answer_mode="mention",
+            retrieval_mode="hybrid",
+        ),
+    )
+
+    assert called == ["temporal"]
+    assert result.attempted_channels == ("temporal",)
+    assert [item.document_id for item in result.candidates] == [4]
+
+
+def test_temporal_history_combines_scoped_relevance_and_window_coverage() -> None:
+    called: list[str] = []
+
+    def channel(name: str):
+        def run(**_):
+            called.append(name)
+            return [candidate(4)]
+
+        return run
+
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": channel("bm25"),
+            "vector": channel("vector"),
+            "entity": channel("entity"),
+            "temporal": channel("temporal"),
+            "reply_graph": channel("reply_graph"),
+        }
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            reference_msg_ids=(),
+            answer_mode="exact",
+            retrieval_mode="temporal",
+        ),
+    )
+
+    assert set(called) == {"bm25", "vector", "entity", "temporal"}
+    assert result.attempted_channels == ("bm25", "vector", "entity", "temporal")
+    assert [item.document_id for item in result.candidates] == [4]
+
+
+def test_temporal_relevance_window_is_bounded_to_sixty_candidates() -> None:
+    rows = tuple(
+        candidate(
+            index,
+            at=datetime(2026, 7, 1, tzinfo=UTC) + timedelta(minutes=index),
+        )
+        for index in range(1, 101)
+    )
+    retriever = HybridMemoryRetriever(
+        channels={"temporal": lambda **_: rows},
+        candidate_limit=100,
+        final_limit=150,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            reference_msg_ids=(),
+            answer_mode="exact",
+            retrieval_mode="temporal",
+            coverage_mode="relevance",
+        ),
+    )
+
+    assert len(result.candidates) == 60
+
+
+def test_temporal_mention_keeps_configured_limit_but_buckets_are_bounded() -> None:
+    rows = tuple(
+        candidate(
+            index,
+            at=datetime(2026, 7, 1, tzinfo=UTC) + timedelta(minutes=index),
+        )
+        for index in range(1, 101)
+    )
+    retriever = HybridMemoryRetriever(
+        channels={"temporal": lambda **_: rows},
+        candidate_limit=100,
+        final_limit=80,
+    )
+
+    mention = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            reference_msg_ids=(),
+            answer_mode="mention",
+            retrieval_mode="temporal",
+            coverage_mode="relevance",
+        ),
+    )
+    buckets = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            reference_msg_ids=(),
+            answer_mode="exact",
+            retrieval_mode="temporal",
+            coverage_mode="time_buckets",
+        ),
+    )
+
+    assert len(mention.candidates) == 80
+    assert len(buckets.candidates) == 60
 
 
 def test_channels_run_in_parallel_with_independent_callables() -> None:
@@ -222,3 +467,92 @@ def test_time_bucket_coverage_resists_busy_recent_interval() -> None:
     }
     assert len(result.candidates) == 12
     assert len(represented_months) >= 9
+
+
+def test_temporal_route_pins_relevance_before_chronological_coverage() -> None:
+    ordered = [
+        candidate(
+            index,
+            at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=index),
+        )
+        for index in range(1, 101)
+    ]
+    relevant = ordered[-1]
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": lambda **_: [relevant],
+            "temporal": lambda **_: ordered,
+        },
+        candidate_limit=100,
+        final_limit=60,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            retrieval_mode="temporal",
+            answer_mode="summary",
+            coverage_mode="chronological",
+        ),
+    )
+
+    assert len(result.candidates) == 60
+    assert result.candidates[0].document_id == relevant.document_id
+    assert [item.document_id for item in result.candidates[-12:]] == list(range(48, 60))
+
+
+def test_dated_history_uses_a_small_relevance_first_shortlist() -> None:
+    ordered = [
+        candidate(
+            index,
+            at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=index),
+        )
+        for index in range(1, 101)
+    ]
+    relevant = ordered[-1]
+    retriever = HybridMemoryRetriever(
+        channels={"bm25": lambda **_: [relevant], "temporal": lambda **_: ordered},
+        candidate_limit=100,
+        final_limit=150,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            retrieval_mode="temporal",
+            answer_mode="dated_history",
+            coverage_mode="chronological",
+        ),
+    )
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].document_id == relevant.document_id
+
+
+def test_temporal_relevance_pins_leave_room_for_every_time_bucket() -> None:
+    ordered = [
+        candidate(
+            index,
+            at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(days=index * 4),
+        )
+        for index in range(1, 101)
+    ]
+    relevance_order = list(reversed(ordered))
+    retriever = HybridMemoryRetriever(
+        channels={"bm25": lambda **_: relevance_order},
+        candidate_limit=100,
+        final_limit=60,
+    )
+
+    result = retriever.retrieve(
+        group_id=100,
+        resolved_query=SimpleNamespace(
+            retrieval_mode="temporal",
+            answer_mode="answer",
+            coverage_mode="time_buckets",
+        ),
+    )
+
+    assert len(result.candidates) == 60
+    assert result.candidates[0].document_id == 100
+    assert len({(item.start_at.year, item.start_at.month) for item in result.candidates}) >= 9

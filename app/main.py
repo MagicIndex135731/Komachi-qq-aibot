@@ -498,6 +498,7 @@ def build_memory_runtime(
     llm_client,
     bot_display_name: str,
     raw_message_embedding_generation_override: int | None = None,
+    evaluation_candidate_filter: Callable[..., tuple[object, ...]] | None = None,
 ) -> MemoryRuntimeComposition:
     legacy = LegacyMemoryContext(
         engine=engine,
@@ -574,7 +575,9 @@ def build_memory_runtime(
             settings.memory_fts_candidate_limit,
             settings.memory_vector_candidate_limit,
             (
-                settings.memory_max_evidence_messages * 4
+                # Keep one packet of overfetch headroom for fusion and frozen
+                # snapshot filtering without making every channel rank 600 rows.
+                settings.memory_max_evidence_messages * 2
                 if settings.memory_raw_v3_enabled
                 else 1
             ),
@@ -605,6 +608,9 @@ def build_memory_runtime(
                 bot_display_name=bot_display_name,
             )
 
+    direct_reply_limit = 2
+    direct_reply_scan_limit = 32
+
     def load_sources(*, group_id: int, source_msg_ids: tuple[str, ...]):
         with session_scope(engine) as session:
             messages = MessageRepository(session)
@@ -612,12 +618,19 @@ def build_memory_runtime(
                 group_id=group_id,
                 platform_msg_ids=list(source_msg_ids),
             )
+            direct_replies = messages.list_direct_group_replies(
+                group_id=group_id,
+                parent_platform_msg_ids=list(source_msg_ids),
+                scan_limit_per_parent=direct_reply_scan_limit,
+            )
+            loaded_by_id = dict(rows_by_id)
+            for row in direct_replies:
+                loaded_by_id.setdefault(str(row.platform_msg_id), row)
             rows = tuple(
-                rows_by_id[source_id]
-                for source_id in source_msg_ids
-                if source_id in rows_by_id
-                and not messages.is_reserved_outbound(rows_by_id[source_id])
-                and not messages.is_delivery_uncertain_outbound(rows_by_id[source_id])
+                row
+                for row in loaded_by_id.values()
+                if not messages.is_reserved_outbound(row)
+                and not messages.is_delivery_uncertain_outbound(row)
             )
             users_by_id = UserRepository(session).get_users_by_ids(
                 [int(row.user_id) for row in rows]
@@ -692,24 +705,15 @@ def build_memory_runtime(
 
     def load_members(group_id: int) -> tuple[GroupMemberIdentity, ...]:
         with session_scope(engine) as session:
-            rows = session.execute(
-                select(
-                    Message.user_id,
-                    func.json_extract(Message.raw_json, "$.sender.nickname"),
-                    func.json_extract(Message.raw_json, "$.sender.card"),
-                )
-                .where(Message.group_id == int(group_id))
-                .distinct()
+            rows = MessageRepository(session).list_recent_group_member_messages(
+                group_id=None,
+                limit=None,
             )
-            return tuple(
-                GroupMemberIdentity(
-                    user_id=int(user_id),
-                    nickname=str(nickname or "").strip(),
-                    group_card=str(group_card or "").strip(),
-                )
-                for user_id, nickname, group_card in rows
-                if str(nickname or "").strip() or str(group_card or "").strip()
+            members = group_member_identities_from_messages(
+                rows,
+                target_group_id=int(group_id),
             )
+        return members
 
     def validate_source_scope(group_id: int, source_msg_ids: tuple[str, ...]) -> bool:
         with session_scope(engine) as session:
@@ -739,6 +743,7 @@ def build_memory_runtime(
         detail_budget=settings.memory_detail_context_budget_tokens,
         recent_budget=settings.memory_recent_context_budget_tokens,
         history_budget=settings.memory_history_context_budget_tokens,
+        context_char_budget=settings.memory_context_budget_chars,
         max_recent_messages=settings.context_recent_limit,
         max_history_messages=settings.memory_max_evidence_messages,
     )
@@ -751,6 +756,8 @@ def build_memory_runtime(
         fact_loader=load_facts,
         summary_loader=load_summaries,
         member_loader=load_members,
+        candidate_filter=evaluation_candidate_filter,
+        max_direct_replies_per_source=direct_reply_limit,
         excluded_member_ids={settings.bot_qq},
         historical_no_hit_omit_recent=settings.memory_raw_v3_enabled,
         observability_route=(

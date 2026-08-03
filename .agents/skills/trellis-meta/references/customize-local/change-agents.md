@@ -42,8 +42,9 @@ Use the actual paths in the user project as authoritative.
 Codex defaults to `codex.dispatch_mode: global-policy`. In this mode Trellis
 does not select whether to dispatch an agent, which model to use, reasoning
 effort, agent count, or parallelism. Those decisions come from higher-priority
-Codex/user instructions. Use `inline` or `sub-agent` only when a project wants
-Trellis to force a legacy execution path.
+Codex/user instructions. Set `auto` to opt into native Trellis sub-agent
+dispatch, `inline` to keep implementation in the main session, or use the
+legacy `sub-agent` alias for `auto`.
 
 ## Modification Principles
 
