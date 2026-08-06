@@ -156,7 +156,9 @@ _ASSESSMENT_PATTERN = re.compile(
     r"|(?:对|给)[^，。？?！!\n]{1,16}?(?:什么看法|啥看法|什么印象|看法如何|印象如何)"
 )
 _FOLLOW_UP_PRONOUN_PATTERN = re.compile(r"他|她|那位|这个人|那家伙|这位")
-_RELATION_PLACEHOLDERS = frozenset({"谁", "什么人", "哪个人", "哪位"})
+_PERSON_SHAPE_SUFFIX_PATTERN = re.compile(
+    r"(?:人|猫|哥|姐|老师|同学|君|酱|娃|叔|婶|妈|爸|兄|弟|妹|生|总|董|员)$"
+)
 _SUMMARY_PATTERN = re.compile(
     r"总结|概括|汇总|发生了什么|"
     r"(?:今天|昨天|前天|本周|这周|上周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?).*?"
@@ -370,6 +372,35 @@ class MemoryQueryResolver:
                 coverage_mode=coverage_mode,
             ), aliases=(direct_member.matched_alias,))
         if direct_reference.status == "ambiguous":
+            if (
+                self._rewrite_provider is not None
+                and needs_history
+                and self._looks_like_member_or_history_query(original)
+            ):
+                rewritten = self._try_rewrite(original, recent, current_time)
+                if rewritten is not None:
+                    constrained = self._constrain_rewritten_subject(
+                        rewritten,
+                        group_members=group_members,
+                        original=original,
+                        recent=recent,
+                    )
+                    if constrained is not None:
+                        return replace(
+                            constrained,
+                            needs_history=True,
+                            needs_detail=needs_detail,
+                            time_range=time_range or constrained.time_range,
+                            retrieval_mode=(
+                                "temporal"
+                                if time_range is not None
+                                else constrained.retrieval_mode
+                            ),
+                            group_id=normalized_group_id,
+                            requester_id=normalized_requester_id,
+                            answer_mode=answer_mode,
+                            coverage_mode=coverage_mode,
+                        )
             return ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
@@ -826,6 +857,7 @@ class MemoryQueryResolver:
         )
 
     @staticmethod
+    @staticmethod
     def _has_unsafe_member_suffix(
         query: str,
         *,
@@ -834,250 +866,26 @@ class MemoryQueryResolver:
         has_time_range: bool,
         exclude_user_ids: set[int] | frozenset[int],
     ) -> bool:
-        normalized = normalize_member_alias(query)
-        normalized_alias = normalize_member_alias(member.matched_alias)
-        if not normalized_alias:
-            return False
-        start = normalized.find(normalized_alias)
-        if start < 0:
-            return False
-        remainder = normalized[start + len(normalized_alias) :]
-        same_member_aliases = sorted(
-            {
-                normalize_member_alias(alias)
-                for identity in group_members
-                if identity.in_scope and int(identity.user_id) == int(member.user_id)
-                for alias in (identity.group_card, identity.nickname)
-                if normalize_member_alias(alias)
-                and normalize_member_alias(alias) != normalized_alias
-            },
-            key=len,
-            reverse=True,
-        )
-        stripped_same_alias = True
-        while stripped_same_alias:
-            stripped_same_alias = False
-            for alias in same_member_aliases:
-                if remainder.startswith(alias):
-                    remainder = remainder[len(alias) :]
-                    stripped_same_alias = True
-                    break
-        if not remainder:
-            return False
+        """Reject only on evidence, never on an unknown continuation.
 
-        possessive_intent = re.match(
-            r"^的(?:计划|决定|打算|想法|安排|近况|状态|工作|生活|喜好|偏好|"
-            r"印象|评价|看法|兴趣|风格)[^，。？?！!\n]{0,12}$",
-            remainder,
+        Default is single-subject (allow). Ambiguity requires either the alias
+        embedded inside another member's longer alias, or a second known member /
+        person pronoun after a joiner.
+        """
+        del has_time_range
+        if MemoryQueryResolver._has_restricted_alias_shadow(
+            query,
+            member=member,
+            group_members=group_members,
+            exclude_user_ids=exclude_user_ids,
+        ):
+            return True
+        return MemoryQueryResolver._has_unknown_joined_member(
+            query,
+            group_members,
+            exclude_user_ids=exclude_user_ids,
         )
-        if possessive_intent is not None:
-            return False
 
-        assessment_topic = re.fullmatch(
-            r"^对(?P<topic>.+?)(?:的)?(?:评价|点评|看法|印象)$",
-            remainder,
-        )
-        if assessment_topic is not None:
-            normalized_topic = normalize_member_alias(
-                assessment_topic.group("topic")
-            )
-            if normalized_topic.endswith(_TOPIC_CATEGORY_SUFFIXES):
-                return False
-            other_member_aliases = {
-                normalize_member_alias(alias)
-                for identity in group_members
-                if int(identity.user_id) != int(member.user_id)
-                for alias in (identity.group_card, identity.nickname)
-                if len(normalize_member_alias(alias)) >= 2
-            }
-            return any(
-                alias in normalized_topic for alias in other_member_aliases
-            )
-
-        relation_target = re.match(
-            r"^(?:的(?P<relation>[\u4e00-\u9fff]{1,4})|说|提到|聊到|问到)"
-            r"(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{2,}?)"
-            r"(?=最近|刚刚|刚才|之前|上次|昨天|今天|前天|上周|"
-            r"说|做|发|提|聊|的事|[？?]|$)",
-            remainder,
-        )
-        if relation_target is not None:
-            subject = normalize_member_alias(relation_target.group("subject"))
-            known_aliases = {
-                normalize_member_alias(alias)
-                for identity in group_members
-                for alias in (identity.group_card, identity.nickname)
-                if normalize_member_alias(alias)
-            }
-            restricted_aliases = {
-                normalize_member_alias(alias)
-                for identity in group_members
-                if not identity.in_scope
-                or int(identity.user_id) in exclude_user_ids
-                for alias in (identity.group_card, identity.nickname)
-                if normalize_member_alias(alias)
-            }
-            relation_slot = relation_target.group("relation") is not None
-            person_shaped = bool(
-                re.search(r"(?:人|猫|哥|姐|老师|同学|君|酱)$", subject)
-                or re.match(r"(?:小|老)[\u4e00-\u9fffA-Za-z0-9_-]{1,5}$", subject)
-            )
-            if relation_slot:
-                return True
-            if subject in restricted_aliases:
-                return True
-            if (subject in known_aliases or person_shaped) and subject not in {
-                normalize_member_alias(value)
-                for value in _NON_PERSON_MEMORY_SUBJECTS | _COMMON_WORDS
-            }:
-                return True
-
-        other_aliases = {
-            normalize_member_alias(alias)
-            for identity in group_members
-            if not identity.in_scope or int(identity.user_id) != int(member.user_id)
-            for alias in (identity.group_card, identity.nickname)
-            if len(normalize_member_alias(alias)) >= 2
-            and (
-                not identity.in_scope
-                or int(identity.user_id) in exclude_user_ids
-                or normalize_member_alias(alias)
-                not in {
-                    normalize_member_alias(value)
-                    for value in _COMMON_WORDS
-                }
-            )
-        }
-        member_follow_markers = (
-            "最近",
-            "昨天",
-            "今天",
-            "前天",
-            "以前",
-            "曾经",
-            "过去",
-            "当时",
-            "上周",
-            "说",
-            "发",
-            "提",
-            "聊",
-            "做",
-            "表现",
-            "最喜欢",
-            "喜欢",
-        )
-        for alias in other_aliases:
-            offset = remainder.find(alias)
-            if offset < 0:
-                continue
-            following = remainder[offset + len(alias) :]
-            if following.startswith(member_follow_markers):
-                return True
-
-        time_prefix = re.compile(
-            r"^(?:"
-            r"\d{8}|"
-            r"\d{4}年?\d{1,2}月\d{1,2}日?|"
-            r"\d{1,2}月\d{1,2}日|"
-            r"上周|本周|这周|下周|上个月|本月|这个月|"
-            r"最近|刚刚|刚才|之前|上次|昨天|今天|前天|以前|曾经|曾|过去|当时"
-            r")"
-        )
-        consumable_prefixes = (
-            "在这个群里",
-            "在这个群",
-            "在群里",
-            "在群中",
-            "和谁",
-            "也",
-            "还",
-            "都",
-            "到底",
-            "究竟",
-            "为什么",
-        )
-        while remainder:
-            time_match = time_prefix.match(remainder)
-            if time_match is not None:
-                remainder = remainder[time_match.end() :]
-                continue
-            if has_time_range:
-                compact_date = re.match(r"^\d{3,4}", remainder)
-                if compact_date is not None:
-                    remainder = remainder[compact_date.end() :]
-                    continue
-            consumed = next(
-                (value for value in consumable_prefixes if remainder.startswith(value)),
-                None,
-            )
-            if consumed is None:
-                break
-            remainder = remainder[len(consumed) :]
-        if not remainder:
-            return False
-        terminal_continuations = (
-            "的",
-            "说",
-            "发",
-            "提",
-            "聊",
-            "最",
-            "喜欢",
-            "讨厌",
-            "不喜欢",
-            "怎么了",
-            "发生",
-            "表现",
-            "做",
-            "有没有",
-            "是否",
-            "是谁",
-            "有",
-            "如何",
-            "为什么",
-            "哪",
-            "在",
-            "决定",
-            "打算",
-            "计划",
-            "是什么关系",
-            "是什么样的人",
-            "是什么人",
-            "是哪里人",
-            "是哪个",
-            "是哪支",
-            "是做什么的",
-            "做什么的",
-            "做了什么",
-            "在做什么",
-            "在干嘛",
-            "忙什么",
-            "支持",
-            "看好",
-            "觉得",
-            "感觉",
-            "认为",
-            "以为",
-            "看来",
-            "听起来",
-            "看起来",
-            "咋看",
-            "啥看法",
-            "怎么看",
-            "对",
-            "给",
-            "评价",
-            "点评",
-            "印象",
-            "看法",
-        )
-        # Fail closed for every unknown continuation. This deliberately uses
-        # an allow-list of single-subject grammar rather than trying to
-        # enumerate all possible conjunctions between two people.
-        return not remainder.startswith(terminal_continuations)
-
-    @staticmethod
     def _classify_explicit_member_ids(
         query: str,
         group_members: Sequence[GroupMemberIdentity],
@@ -1284,59 +1092,190 @@ class MemoryQueryResolver:
         return has_weak_alias and has_strong_alias
 
     @staticmethod
+    @staticmethod
+    @staticmethod
+    @staticmethod
     def _has_unknown_joined_member(
         query: str,
         group_members: Sequence[GroupMemberIdentity],
         *,
         exclude_user_ids: set[int] | frozenset[int],
     ) -> bool:
-        if _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query):
-            return False
-        parts = re.split(rf"\s*{_MEMBER_JOINER_PATTERN}\s*", query)
-        if len(parts) < 2:
-            return False
-        known_aliases = {
-            normalize_member_alias(alias)
-            for member in group_members
-            for alias in (member.group_card, member.nickname, str(member.user_id))
-            if normalize_member_alias(alias)
-        }
-        excluded_aliases = {
-            normalize_member_alias(alias)
-            for member in group_members
-            if int(member.user_id) in exclude_user_ids or not member.in_scope
-            for alias in (member.group_card, member.nickname, str(member.user_id))
-            if normalize_member_alias(alias)
-        }
-        candidates: list[str] = []
-        for part in parts:
-            match = re.match(
-                r"\s*@?\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
-                r"(?=今天|昨天|前天|最近|以前|曾经|过去|当时|"
-                r"说过|说了|发过|发言|提到|聊过|最喜欢|喜欢什么|"
-                r"讨厌什么|不喜欢什么|都|[？?]|$)",
-                part,
-            )
-            if match is not None:
-                candidates.append(normalize_member_alias(match.group("subject")))
-        if len(candidates) < 2 or not any(value in known_aliases for value in candidates):
-            return False
-        if any(value in excluded_aliases for value in candidates):
-            return True
-        if any(
-            value == placeholder or value.startswith(placeholder)
-            for value in candidates
-            for placeholder in _RELATION_PLACEHOLDERS
-        ):
-            return False
-        return any(
-            value not in known_aliases
-            and value not in {
-                normalize_member_alias(item)
-                for item in _NON_PERSON_MEMORY_SUBJECTS | _COMMON_WORDS
-            }
-            for value in candidates
+        """Evidence-based second-person detection; no continuation whitelist.
+
+        Rejects only when the question demonstrably involves a second person:
+        a joiner followed by another member/pronoun/person-shaped token, a
+        possessive relation noun, a speech target that is person-shaped, or two
+        distinct member aliases used as people (media-topic uses such as
+        "八仙动画" do not count).
+        """
+        all_aliases = sorted(
+            {
+                normalize_member_alias(alias)
+                for member in group_members
+                for alias in (member.group_card, member.nickname, str(member.user_id))
+                if normalize_member_alias(alias)
+            },
+            key=len,
+            reverse=True,
         )
+        excluded_aliases = sorted(
+            {
+                normalize_member_alias(alias)
+                for member in group_members
+                if int(member.user_id) in exclude_user_ids or not member.in_scope
+                for alias in (member.group_card, member.nickname, str(member.user_id))
+                if normalize_member_alias(alias)
+            },
+            key=len,
+            reverse=True,
+        )
+        common_aliases = {
+            normalize_member_alias(value) for value in _COMMON_WORDS
+        }
+        common_aliases.update(
+            normalize_member_alias(value)
+            for value in (
+                "发言",
+                "动画",
+                "电影",
+                "漫画",
+                "游戏",
+                "小说",
+                "综艺",
+                "节目",
+                "项目",
+                "内容",
+                "消息",
+                "事情",
+                "话题",
+                "服务",
+                "结果",
+                "大家",
+            )
+        )
+        person_pronouns = (
+            "他们",
+            "她们",
+            "别人",
+            "对方",
+            "那位",
+            "那家伙",
+            "这位",
+            "他",
+            "她",
+        )
+        relation_placeholders = ("谁", "什么人", "哪个人", "哪位", "什么")
+
+        def is_person_shaped(value: str) -> bool:
+            if not value:
+                return False
+            if re.fullmatch(r"\d{5,12}", value):
+                return True
+            if not re.fullmatch(r"[\u4e00-\u9fff]{2,6}", value):
+                return False
+            return bool(
+                _PERSON_SHAPE_SUFFIX_PATTERN.search(value)
+                or re.match(r"^(?:小|老)[\u4e00-\u9fff]{1,5}$", value)
+            )
+
+        def looks_like_placeholder(value: str) -> bool:
+            normalized = normalize_member_alias(value)
+            return any(
+                normalized == placeholder or normalized.startswith(placeholder)
+                for placeholder in relation_placeholders
+            )
+
+        # 1) joiner followed by a second person.
+        parts = re.split(
+            r"\s*(?:和|与|跟|以及|还有|或|、|外加|再加上|并且|又和|也和|也与|也跟|再)\s*",
+            query,
+        )
+        if len(parts) >= 2:
+            for part in parts[1:]:
+                stripped = re.sub(r"^[\s@]+", "", part)
+                if not stripped or looks_like_placeholder(stripped):
+                    continue
+                normalized = normalize_member_alias(stripped)
+                if any(normalized.startswith(alias) for alias in all_aliases):
+                    return True
+                if any(normalized.startswith(alias) for alias in excluded_aliases):
+                    return True
+                if stripped.startswith(person_pronouns):
+                    return True
+                head = re.match(r"(?:[\u4e00-\u9fff]{2,6}?(?=昨天|今天|前天|最近|以前|曾经|过去|当时|说|发|提|聊|做|发生|怎么|都|也|了|[，。？?！!\s]|$)|\d{5,12})", stripped)
+                if head is not None and is_person_shaped(head.group()):
+                    return True
+
+        # 2) possessive relation noun followed by a person/statement target.
+        if re.search(
+            r"的(?:朋友|同学|室友|老师|兄弟|姐妹|同事|邻居|家人|对象|好友|"
+            r"猫主人|原主人|学长|学姐|师傅|老板|客户|女友|男友|老婆|老公)"
+            r"[^，。？?！!\n]{0,24}"
+            r"(?:说|发|提|聊|消息|发言|昨天|今天|最近|之前|做|发生|都|"
+            r"[，。？?！!\s]|$)",
+            query,
+        ):
+            return True
+
+        # 3) speech/mention target that is another member or person-shaped.
+        known_or_pronoun = "|".join(re.escape(alias) for alias in all_aliases)
+        if known_or_pronoun:
+            speech = re.search(
+                r"(?:说|提到|问到|提起)(?P<target>(?:" + known_or_pronoun + r")"
+                r"|他|她|他们|她们|[\u4e00-\u9fff]{2,6}?(?=昨天|今天|前天|最近|以前|说|发|提|聊|做|发生|都|[，。？?！!\s]|$)|\d{5,12})",
+                query,
+            )
+            if speech is not None:
+                target = speech.group("target")
+                if (
+                    not looks_like_placeholder(target)
+                    and not any(
+                        normalize_member_alias(target) == alias
+                        and normalize_member_alias(alias) in common_aliases
+                        for alias in all_aliases
+                    )
+                ):
+                    if (
+                        any(
+                            normalize_member_alias(target).startswith(alias)
+                            for alias in all_aliases
+                        )
+                        or target.startswith(person_pronouns)
+                        or is_person_shaped(target)
+                    ):
+                        return True
+
+        # 4) two distinct member aliases used as people (not media topics).
+        normalized_query = normalize_member_alias(query)
+        present_by_id: dict[int, set[str]] = {}
+        for member in group_members:
+            if not member.in_scope or int(member.user_id) in exclude_user_ids:
+                continue
+            user_id = int(member.user_id)
+            for alias in dict.fromkeys((member.group_card, member.nickname)):
+                normalized_alias = normalize_member_alias(alias)
+                if (
+                    not normalized_alias
+                    or normalized_alias in common_aliases
+                    or normalized_alias not in normalized_query
+                ):
+                    continue
+                person_use = False
+                for match in re.finditer(re.escape(normalized_alias), normalized_query):
+                    following = normalized_query[match.end() :]
+                    if any(
+                        following.startswith(normalize_member_alias(suffix))
+                        for suffix in _TOPIC_CATEGORY_SUFFIXES
+                    ):
+                        continue
+                    person_use = True
+                    break
+                if person_use:
+                    present_by_id.setdefault(user_id, set()).add(normalized_alias)
+        if len(present_by_id) >= 2:
+            return True
+        return False
 
     @staticmethod
     def _looks_like_member_or_history_query(query: str) -> bool:

@@ -1759,6 +1759,73 @@ def test_current_plan_decision_relationship_phrasings_bind_member() -> None:
         assert result.subject_ids == ("200000002",), query_text
 
 
+def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="张三", group_card=""),
+    )
+
+    multi = resolver.resolve(
+        "阿渣和张三聊过什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert multi.subject_ids == ()
+
+    with_other = resolver.resolve(
+        "阿渣和别人谁更厉害？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert with_other.subject_ids == ()
+
+    relation_placeholder = resolver.resolve(
+        "阿渣和谁是什么关系？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert relation_placeholder.subject_ids == ("10001",)
+
+    classmate = resolver.resolve(
+        "阿渣的同学说过什么？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert classmate.subject_ids == ()
+
+    same_name_topic = resolver.resolve(
+        "阿渣这部动画怎么样？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert same_name_topic.subject_ids == ("10001",)
+
+
+def test_two_member_assessment_can_resolve_via_rewrite() -> None:
+    def rewrite(_query, _recent, _timeout) -> str:
+        return '{"resolved_query":"加菲猫 评价","speaker_ids":["10001"]}'
+
+    resolver = MemoryQueryResolver(rewrite_provider=rewrite)
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", group_card=""),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫", group_card=""),
+    )
+    result = resolver.resolve(
+        "阿渣评价加菲猫怎么样？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+    assert result.rewrite_used is True
+    assert result.subject_ids == ("10001",)
+
+
 def test_rewrite_fallback_normalizes_unbound_opinion_query() -> None:
     def rewrite(_query, _recent, _timeout) -> str:
         return '{"resolved_query":"八仙 评价 阿渣"}'
