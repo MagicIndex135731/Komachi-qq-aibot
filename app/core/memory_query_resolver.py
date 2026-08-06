@@ -156,6 +156,7 @@ _ASSESSMENT_PATTERN = re.compile(
     r"|(?:对|给)[^，。？?！!\n]{1,16}?(?:什么看法|啥看法|什么印象|看法如何|印象如何)"
 )
 _FOLLOW_UP_PRONOUN_PATTERN = re.compile(r"他|她|那位|这个人|那家伙|这位")
+_RELATION_PLACEHOLDERS = frozenset({"谁", "什么人", "哪个人", "哪位"})
 _SUMMARY_PATTERN = re.compile(
     r"总结|概括|汇总|发生了什么|"
     r"(?:今天|昨天|前天|本周|这周|上周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?).*?"
@@ -864,6 +865,14 @@ class MemoryQueryResolver:
         if not remainder:
             return False
 
+        possessive_intent = re.match(
+            r"^的(?:计划|决定|打算|想法|安排|近况|状态|工作|生活|喜好|偏好|"
+            r"印象|评价|看法|兴趣|风格)[^，。？?！!\n]{0,12}$",
+            remainder,
+        )
+        if possessive_intent is not None:
+            return False
+
         assessment_topic = re.fullmatch(
             r"^对(?P<topic>.+?)(?:的)?(?:评价|点评|看法|印象)$",
             remainder,
@@ -980,6 +989,7 @@ class MemoryQueryResolver:
             "在这个群",
             "在群里",
             "在群中",
+            "和谁",
             "也",
             "还",
             "都",
@@ -1027,6 +1037,24 @@ class MemoryQueryResolver:
             "如何",
             "为什么",
             "哪",
+            "在",
+            "决定",
+            "打算",
+            "计划",
+            "是什么关系",
+            "是什么样的人",
+            "是什么人",
+            "是哪里人",
+            "是哪个",
+            "是哪支",
+            "是做什么的",
+            "做什么的",
+            "做了什么",
+            "在做什么",
+            "在干嘛",
+            "忙什么",
+            "支持",
+            "看好",
             "觉得",
             "感觉",
             "认为",
@@ -1295,6 +1323,12 @@ class MemoryQueryResolver:
             return False
         if any(value in excluded_aliases for value in candidates):
             return True
+        if any(
+            value == placeholder or value.startswith(placeholder)
+            for value in candidates
+            for placeholder in _RELATION_PLACEHOLDERS
+        ):
+            return False
         return any(
             value not in known_aliases
             and value not in {

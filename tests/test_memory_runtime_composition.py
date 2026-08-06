@@ -1304,3 +1304,123 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
 
     assert packed.facts == ()
     assert packed.summaries == ()
+
+
+def test_member_fact_supplement_prefers_query_relevant_facts(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(
+        update={
+            "memory_raw_v3_enabled": True,
+            "memory_layered_memory_enabled": True,
+        }
+    )
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="A-Zha",
+            group_card="阿渣",
+        )
+        UserRepository(session).upsert_user(
+            user_id=99,
+            nickname="Questioner",
+            group_card="提问者",
+        )
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="unrelated-fact-src",
+            group_id=10001,
+            user_id=20001,
+            timestamp=observed_at,
+            plain_text="我在给 agent 做前后端。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="anime-fact-src",
+            group_id=10001,
+            user_id=20001,
+            timestamp=observed_at + timedelta(minutes=1),
+            plain_text="我一直在看海贼王。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        query = messages.add_group_message(
+            platform_msg_id="anime-query",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at + timedelta(minutes=2),
+            plain_text="阿渣喜欢什么动画？",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        memories = MemoryRepository(session)
+        memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="profile",
+            content="阿渣在给 agent 做前后端",
+            importance=5,
+            confidence=0.95,
+            source_msg_id="unrelated-fact-src",
+            valid_from=observed_at,
+        )
+        memories.add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            content="阿渣一直在看海贼王动画",
+            importance=2,
+            confidence=0.8,
+            source_msg_id="anime-fact-src",
+            valid_from=observed_at,
+        )
+        session.flush()
+        documents = RetrievalDocumentRepository(session)
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=int(row.id),
+            )
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+    packed = trace.result.packed_context
+    texts = [fact.text for fact in packed.facts]
+    assert any("海贼王" in text for text in texts)
+    assert any("前后端" in text for text in texts)
+    assert texts.index(next(t for t in texts if "海贼王" in t)) < texts.index(
+        next(t for t in texts if "前后端" in t)
+    )

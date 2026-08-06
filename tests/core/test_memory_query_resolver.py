@@ -1730,6 +1730,35 @@ def test_opinion_phrasing_binds_member_deterministically() -> None:
         assert result.needs_history is True, query_text
 
 
+def test_current_plan_decision_relationship_phrasings_bind_member() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=200000002, nickname="A-Zha", group_card="阿渣"),
+    )
+    for query_text in (
+        "阿渣最近在做什么？",
+        "阿渣在干嘛？",
+        "阿渣决定了什么？",
+        "阿渣打算做什么？",
+        "阿渣的计划是什么？",
+        "阿渣和谁是什么关系？",
+        "阿渣是什么样的人？",
+        "阿渣是哪里人？",
+        "阿渣是做什么的？",
+        "阿渣支持哪个足球队？",
+        "阿渣支持哪支球队？",
+        "阿渣是哪个足球队粉丝？",
+        "阿渣看好哪支球队？",
+    ):
+        result = resolver.resolve(
+            query_text,
+            recent_messages=(),
+            now=NOW,
+            group_members=members,
+        )
+        assert result.subject_ids == ("200000002",), query_text
+
+
 def test_rewrite_fallback_normalizes_unbound_opinion_query() -> None:
     def rewrite(_query, _recent, _timeout) -> str:
         return '{"resolved_query":"八仙 评价 阿渣"}'

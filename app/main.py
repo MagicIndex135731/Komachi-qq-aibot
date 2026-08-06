@@ -32,6 +32,12 @@ from app.core.memory_background_service import (
     SqlAlchemyMemoryBackgroundStore,
 )
 from app.core.memory_compaction_service import MemoryCompactionService
+from app.core.memory_fact_ranking import (
+    filter_member_query_features,
+    matching_member_fact_ids,
+    memory_query_features,
+    rank_member_facts,
+)
 from app.core.memory_context_packer import (
     EvidenceMessage,
     MemoryContextPacker,
@@ -671,18 +677,49 @@ def build_memory_runtime(
                 )
             )
             subject_ids = resolved_query.subject_ids
+            boosted_fact_ids: set[int] = set()
             if subject_ids:
                 seen_ids = {row.id for row in rows}
+                query_features = memory_query_features(
+                    query=str(resolved_query.retrieval_query),
+                    entities=resolved_query.entities,
+                    topic_terms=resolved_query.topic_terms,
+                )
+                member_aliases: list[str] = []
+                for member in UserRepository(session).get_users_by_ids(
+                    [int(subject_id) for subject_id in subject_ids]
+                ).values():
+                    member_aliases.extend(
+                        str(value)
+                        for value in (member.nickname, member.group_card)
+                        if str(value or "").strip()
+                    )
+                query_features = filter_member_query_features(
+                    query_features,
+                    aliases=member_aliases,
+                )
                 for subject_id in subject_ids:
-                    for row in memories.list_group_memories_for_subject(
+                    candidates = memories.list_group_memories_for_subject(
                         scope_id=str(group_id),
                         subject_id=subject_id,
+                        limit=max(
+                            24,
+                            settings.memory_final_episode_limit,
+                        ),
+                    )
+                    for row in rank_member_facts(
+                        candidates,
+                        query_features=query_features,
                         limit=settings.memory_final_episode_limit,
                     ):
                         if row.id in seen_ids:
                             continue
                         rows.append(row)
                         seen_ids.add(row.id)
+                boosted_fact_ids = matching_member_fact_ids(
+                    rows,
+                    query_features=query_features,
+                )
             return tuple(
                 MemoryFact(
                     text=str(row.content),
@@ -694,7 +731,8 @@ def build_memory_runtime(
                             ]
                         )
                     ),
-                    score=float(row.confidence or 0.0),
+                    score=float(row.confidence or 0.0)
+                    + (1.0 if row.id in boosted_fact_ids else 0.0),
                     valid_until=row.valid_until,
                     group_id=group_id,
                 )
