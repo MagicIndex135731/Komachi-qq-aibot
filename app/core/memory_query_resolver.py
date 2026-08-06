@@ -149,7 +149,13 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:评价|点评|分析|总结|概括|说说|怎么看)\s*(?:一下)?我|"
     r"(?:我|我的)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么|过去|以前|历史)"
 )
-_ASSESSMENT_PATTERN = re.compile(r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)")
+_ASSESSMENT_PATTERN = re.compile(
+    r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
+    r"|(?:觉得|感觉|认为|以为|看来|听起来|看起来|咋看|啥看法)"
+    r".{0,16}?(?:怎么样|如何|咋样|怎样|评价|印象|看法)"
+    r"|(?:对|给)[^，。？?！!\n]{1,16}?(?:什么看法|啥看法|什么印象|看法如何|印象如何)"
+)
+_FOLLOW_UP_PRONOUN_PATTERN = re.compile(r"他|她|那位|这个人|那家伙|这位")
 _SUMMARY_PATTERN = re.compile(
     r"总结|概括|汇总|发生了什么|"
     r"(?:今天|昨天|前天|本周|这周|上周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?).*?"
@@ -222,6 +228,12 @@ _PERSON_SPEECH_SUBJECT_PATTERN = re.compile(
 _PERSON_ASSESSMENT_SUBJECT_PATTERN = re.compile(
     r"^\s*(?:如何|怎么)?(?:评价|点评|分析|看待)\s*"
     r"(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:这个人|的|[？?]|$)"
+)
+_PERSON_OPINION_SUBJECT_PATTERN = re.compile(
+    r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
+    r"(?:觉得|感觉|认为|以为|看来|听起来|看起来|咋看|啥看法)\s*"
+    r"(?P<topic>[\u4e00-\u9fffA-Za-z0-9]{1,16}?)"
+    r"(?:怎么样|如何|咋样|怎样|什么看法|啥看法|什么印象|印象如何|如何评价)"
 )
 _FIRST_PERSON_HISTORY_PATTERN = re.compile(
     r"^\s*(?:我|我的)(?:最近|昨天|今天|以前|曾经|过去|历史|当时)?.*"
@@ -435,6 +447,36 @@ class MemoryQueryResolver:
                 return self._with_topic_query(plan, aliases=entities)
             return plan
 
+        if (
+            self._rewrite_provider is not None
+            and needs_history
+            and self._looks_like_member_or_history_query(original)
+        ):
+            rewritten = self._try_rewrite(original, recent, current_time)
+            if rewritten is not None:
+                constrained = self._constrain_rewritten_subject(
+                    rewritten,
+                    group_members=group_members,
+                    original=original,
+                    recent=recent,
+                )
+                if constrained is not None:
+                    return replace(
+                        constrained,
+                        needs_history=True,
+                        needs_detail=needs_detail,
+                        time_range=time_range or constrained.time_range,
+                        retrieval_mode=(
+                            "temporal"
+                            if time_range is not None
+                            else constrained.retrieval_mode
+                        ),
+                        group_id=normalized_group_id,
+                        requester_id=normalized_requester_id,
+                        answer_mode=answer_mode,
+                        coverage_mode=coverage_mode,
+                    )
+
         if self._is_person_memory_query(original):
             return ResolvedMemoryQuery(
                 original_query=original,
@@ -450,25 +492,6 @@ class MemoryQueryResolver:
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             )
-
-        if self._rewrite_provider is not None and _FOLLOW_UP_PATTERN.search(original):
-            rewritten = self._try_rewrite(original, recent, current_time)
-            if rewritten is not None:
-                return replace(
-                    rewritten,
-                    needs_history=True,
-                    needs_detail=needs_detail,
-                    time_range=time_range or rewritten.time_range,
-                    retrieval_mode=(
-                        "temporal"
-                        if time_range is not None
-                        else rewritten.retrieval_mode
-                    ),
-                    group_id=normalized_group_id,
-                    requester_id=normalized_requester_id,
-                    answer_mode=answer_mode,
-                    coverage_mode=coverage_mode,
-                )
 
         return ResolvedMemoryQuery(
             original,
@@ -1004,6 +1027,22 @@ class MemoryQueryResolver:
             "如何",
             "为什么",
             "哪",
+            "觉得",
+            "感觉",
+            "认为",
+            "以为",
+            "看来",
+            "听起来",
+            "看起来",
+            "咋看",
+            "啥看法",
+            "怎么看",
+            "对",
+            "给",
+            "评价",
+            "点评",
+            "印象",
+            "看法",
         )
         # Fail closed for every unknown continuation. This deliberately uses
         # an allow-list of single-subject grammar rather than trying to
@@ -1266,6 +1305,66 @@ class MemoryQueryResolver:
         )
 
     @staticmethod
+    def _looks_like_member_or_history_query(query: str) -> bool:
+        return bool(
+            _HISTORY_PATTERN.search(query)
+            or _FOLLOW_UP_PATTERN.search(query)
+            or _ASSESSMENT_PATTERN.search(query)
+            or MemoryQueryResolver._is_person_memory_query(query)
+        )
+
+    def _constrain_rewritten_subject(
+        self,
+        rewritten: ResolvedMemoryQuery,
+        *,
+        group_members: Sequence[GroupMemberIdentity],
+        original: str,
+        recent: tuple[RecentMemoryMessage, ...],
+    ) -> ResolvedMemoryQuery | None:
+        """Keep rewrite subject strictly inside the group and the question.
+
+        A rewrite may never invent a personal subject. It must either mention
+        the member by alias/QQ in the question or resolve a follow-up pronoun
+        to a recent speaker in this group; otherwise the subject is rejected.
+        """
+        subject_ids = rewritten.subject_ids
+        if not subject_ids:
+            return rewritten
+        allowed_ids: set[str] = set()
+        aliases_by_id: dict[str, set[str]] = {}
+        for member in group_members:
+            if not member.in_scope:
+                continue
+            user_id = str(member.user_id)
+            allowed_ids.add(user_id)
+            aliases_by_id.setdefault(user_id, set()).update(
+                normalize_member_alias(alias)
+                for alias in (member.nickname, member.group_card)
+                if normalize_member_alias(alias)
+            )
+        if allowed_ids and not set(subject_ids) <= allowed_ids:
+            return None
+        normalized_original = normalize_member_alias(original)
+        for subject_id in subject_ids:
+            if str(subject_id) in original:
+                continue
+            aliases = aliases_by_id.get(str(subject_id), ())
+            if any(alias and alias in normalized_original for alias in aliases):
+                continue
+            if _FOLLOW_UP_PRONOUN_PATTERN.search(original):
+                recent_ids = [
+                    str(message.user_id)
+                    for message in reversed(recent)
+                    if not message.blocked
+                    and message.user_id is not None
+                    and not isinstance(message.user_id, bool)
+                ]
+                if str(subject_id) in recent_ids:
+                    continue
+            return None
+        return rewritten
+
+    @staticmethod
     def _is_person_memory_query(query: str) -> bool:
         if query.lstrip().startswith(_SUBJECTLESS_MEMORY_QUERY_PREFIXES):
             return False
@@ -1276,6 +1375,7 @@ class MemoryQueryResolver:
             _REMEMBER_PERSON_PATTERN,
             _PERSON_SPEECH_SUBJECT_PATTERN,
             _PERSON_ASSESSMENT_SUBJECT_PATTERN,
+            _PERSON_OPINION_SUBJECT_PATTERN,
         ):
             match = pattern.search(query)
             if match is not None and match.group("subject") not in _NON_PERSON_MEMORY_SUBJECTS:

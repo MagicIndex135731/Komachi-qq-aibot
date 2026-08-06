@@ -191,6 +191,7 @@ class PreparedGroupReply:
     proactive_turn: bool = False
     force_web_search: bool = False
     allow_web_search: bool = False
+    use_memory_tools: bool = False
     memory_tool_executor: object | None = None
 
 
@@ -1389,6 +1390,10 @@ class InboundRouter:
                     timeout_seconds=self.runtime.settings.memory_memory_tool_timeout_seconds,
                     max_results=self.runtime.settings.memory_memory_tool_max_results,
                 )
+            mentions_member = (
+                memory_tool_executor is not None
+                and self._query_mentions_member(event.plain_text, users_by_id)
+            )
             memory_result = self.memory_orchestrator.build_context(
                 GroupMemoryContextRequest(
                     group_id=event.group_id,
@@ -1738,8 +1743,32 @@ class InboundRouter:
                 proactive_turn=proactive_turn,
                 force_web_search=forced_search_request and self.web_search_client is None,
                 allow_web_search=builtin_web_search_eligible,
+                use_memory_tools=(
+                    memory_tool_executor is not None
+                    and (
+                        addressed_turn
+                        or use_full_history
+                        or bool(relevant_history_lines)
+                        or packed_memory_context is not None
+                        or mentions_member
+                    )
+                ),
                 memory_tool_executor=memory_tool_executor,
             )
+
+    @staticmethod
+    def _query_mentions_member(query: str, users_by_id) -> bool:
+        member_labels = {
+            str(value).strip()
+            for user in users_by_id.values()
+            for value in (
+                user.nickname,
+                user.group_card,
+                str(user.user_id),
+            )
+            if str(value).strip()
+        }
+        return any(label and label in query for label in member_labels)
 
     def _reserve_outbound_reply(self, event, reply_text: str) -> bool:
         with session_scope(self.engine) as session:
@@ -1997,7 +2026,11 @@ class InboundRouter:
             generation_kwargs["allow_web_search"] = prepared_reply.allow_web_search
         if force_web_search:
             generation_kwargs["force_web_search"] = True
-        if prepared_reply.memory_tool_executor is not None and not prepared_reply.target_images:
+        if (
+            prepared_reply.use_memory_tools
+            and prepared_reply.memory_tool_executor is not None
+            and not prepared_reply.target_images
+        ):
             raw_reply = self.llm_client.generate_text_with_tools(
                 prepared_reply.prompt_lines,
                 tools=memory_tool_schemas(),

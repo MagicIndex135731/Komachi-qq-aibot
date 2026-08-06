@@ -50,6 +50,15 @@ PARAPHRASE_VARIANTS = (
     "20001喜欢喝什么？",
 )
 
+OPINION_VARIANTS = (
+    "阿渣觉得八仙怎么样？",
+    "阿渣感觉八仙如何？",
+    "阿渣认为八仙咋样？",
+    "阿渣怎么看八仙？",
+    "阿渣对八仙什么看法？",
+    "阿渣如何评价八仙？",
+)
+
 
 @pytest.fixture
 def seeded(sqlite_engine) -> dict:
@@ -79,7 +88,9 @@ def seeded(sqlite_engine) -> dict:
             mentioned_bot=False,
         )
         query_ids: dict[str, int] = {}
-        for index, variant in enumerate(PARAPHRASE_VARIANTS):
+        for index, variant in enumerate(
+            (*PARAPHRASE_VARIANTS, *OPINION_VARIANTS)
+        ):
             row = messages.add_group_message(
                 platform_msg_id=f"para-query-{index}",
                 group_id=100,
@@ -190,6 +201,34 @@ def test_paraphrase_matrix_recalls_same_source_for_all_variants(
     assert len(bound_sources) >= 2
     assert ambiguous_count >= 1
     assert all(sources == bound_sources[0] for sources in bound_sources)
+
+
+def test_opinion_variants_bind_member_and_recall_same_source(
+    sqlite_engine,
+    tmp_path,
+    seeded,
+) -> None:
+    runtime = build_memory_runtime(
+        settings=_settings(tmp_path),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    for variant in OPINION_VARIANTS:
+        trace = runtime.v2_provider.evaluate(
+            runtime.build_request(
+                group_id=100,
+                message_id=seeded["query_ids"][variant],
+            )
+        )
+        assert trace.resolved_query.subject_ids == ("20001",), variant
+        fact_sources = {
+            source_id
+            for fact in trace.result.packed_context.facts
+            if "阿渣喜欢喝冰美式" in fact.text
+            for source_id in fact.source_msg_ids
+        }
+        assert fact_sources == {seeded["fact_source"]}, variant
 
 
 def test_paraphrase_variant_cross_group_fails_closed(

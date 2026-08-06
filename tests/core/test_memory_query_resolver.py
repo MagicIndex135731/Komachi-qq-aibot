@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import time
 
 import pytest
 
-from app.core.memory_query_resolver import MemoryQueryResolver, TimeRange
+from app.core.memory_query_resolver import MemoryQueryResolver, ResolvedMemoryQuery, TimeRange
 from app.core.member_identity import GroupMemberIdentity
 
 
@@ -1701,6 +1701,107 @@ def test_invalid_or_conflicting_scope_identity_is_rejected() -> None:
         resolver.resolve(
             "历史",
             recent_messages=(),
-            requester_id=10001,
-            requester_uin=10002,
+        requester_id=10001,
+        requester_uin=10002,
         )
+
+
+def test_opinion_phrasing_binds_member_deterministically() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=200000002, nickname="A-Zha", group_card="阿渣"),
+    )
+    for query_text in (
+        "阿渣觉得八仙怎么样？",
+        "阿渣感觉八仙如何？",
+        "阿渣认为八仙咋样？",
+        "阿渣怎么看八仙？",
+        "阿渣对八仙什么看法？",
+        "阿渣对八仙的印象如何？",
+    ):
+        result = resolver.resolve(
+            query_text,
+            recent_messages=(),
+            now=NOW,
+            group_members=members,
+        )
+        assert result.subject_ids == ("200000002",), query_text
+        assert result.answer_mode == "assessment", query_text
+        assert result.needs_history is True, query_text
+
+
+def test_rewrite_fallback_normalizes_unbound_opinion_query() -> None:
+    def rewrite(_query, _recent, _timeout) -> str:
+        return '{"resolved_query":"八仙 评价 阿渣"}'
+
+    resolver = MemoryQueryResolver(rewrite_provider=rewrite)
+    result = resolver.resolve(
+        "阿渣觉得八仙怎么样？",
+        recent_messages=(),
+        now=NOW,
+    )
+    assert result.rewrite_used is True
+    assert result.retrieval_query == "八仙 评价 阿渣"
+    assert result.subject_ids is None
+
+
+def test_rewrite_subject_must_be_group_member_and_mentioned() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+    base = ResolvedMemoryQuery(
+        original_query="阿渣觉得八仙怎么样？",
+        retrieval_query="八仙 评价 阿渣",
+        speaker_ids=("10001",),
+        subject_ids=("10001",),
+    )
+    kept = resolver._constrain_rewritten_subject(
+        base,
+        group_members=members,
+        original="阿渣觉得八仙怎么样？",
+        recent=(),
+    )
+    assert kept is not None
+    assert kept.subject_ids == ("10001",)
+
+    unknown = replace(base, speaker_ids=("99999",), subject_ids=("99999",))
+    assert (
+        resolver._constrain_rewritten_subject(
+            unknown,
+            group_members=members,
+            original="阿渣觉得八仙怎么样？",
+            recent=(),
+        )
+        is None
+    )
+
+    unmentioned = replace(base, speaker_ids=(), subject_ids=("10001",))
+    assert (
+        resolver._constrain_rewritten_subject(
+            unmentioned,
+            group_members=members,
+            original="八仙怎么样？",
+            recent=(),
+        )
+        is None
+    )
+
+    recent = (
+        Recent(
+            "1",
+            "阿渣",
+            "我喜欢八仙",
+            datetime(2026, 7, 22, 23, 50),
+            user_id=10001,
+        ),
+    )
+    pronoun = replace(base, speaker_ids=("10001",), subject_ids=("10001",))
+    kept_pronoun = resolver._constrain_rewritten_subject(
+        pronoun,
+        group_members=members,
+        original="他对八仙什么看法？",
+        recent=recent,
+    )
+    assert kept_pronoun is not None
+    assert kept_pronoun.subject_ids == ("10001",)

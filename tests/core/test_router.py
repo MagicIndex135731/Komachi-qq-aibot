@@ -4372,6 +4372,7 @@ def test_generate_group_reply_text_uses_memory_tools_when_executor_present(
     reply = PreparedGroupReply(
         should_reply=True,
         prompt_lines=["Group policy: keep safe.", "Target message: Alice: 阿渣喜欢什么"],
+        use_memory_tools=True,
         memory_tool_executor=executor,
     )
     text = router._generate_group_reply_text(
@@ -4405,3 +4406,17 @@ def test_generate_group_reply_text_uses_plain_path_without_executor(
     assert text == "plain reply"
     assert llm.tool_calls == []
     assert llm.plain_calls == 1
+
+
+def test_query_mentions_member_detects_nickname_card_and_id() -> None:
+    from types import SimpleNamespace
+
+    router = object.__new__(InboundRouter)
+    users = {
+        10001: SimpleNamespace(nickname="A-Zha", group_card="阿渣", user_id=10001),
+        10002: SimpleNamespace(nickname="Bob", group_card="", user_id=10002),
+    }
+    assert router._query_mentions_member("阿渣觉得八仙怎么样？", users) is True
+    assert router._query_mentions_member("Bob 怎么说？", users) is True
+    assert router._query_mentions_member("10002 咋看？", users) is True
+    assert router._query_mentions_member("八仙怎么样？", users) is False
