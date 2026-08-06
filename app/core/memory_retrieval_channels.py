@@ -37,6 +37,7 @@ class ScopedMemoryRetrievalChannels:
         vector_generation: int | None = None,
         raw_message_v3_only: bool = False,
         legacy_v2_only: bool = False,
+        layered_memory_enabled: bool = False,
         excluded_speaker_ids: Sequence[int | str] = (),
     ) -> None:
         if session_factory is None:
@@ -55,6 +56,7 @@ class ScopedMemoryRetrievalChannels:
         )
         self._raw_message_v3_only = bool(raw_message_v3_only)
         self._legacy_v2_only = bool(legacy_v2_only)
+        self._layered_memory_enabled = bool(layered_memory_enabled)
         self._excluded_speaker_ids = tuple(
             dict.fromkeys(
                 str(value).strip()
@@ -74,7 +76,7 @@ class ScopedMemoryRetrievalChannels:
             "reply_graph": self.reply_graph,
             "exact_quote": self.exact_quote,
         }
-        if not self._raw_message_v3_only:
+        if not self._raw_message_v3_only or self._layered_memory_enabled:
             channels["fact"] = self.fact
         return channels
 
@@ -153,7 +155,7 @@ class ScopedMemoryRetrievalChannels:
                 generation=self._vector_generation,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
-                **self._hard_filters(resolved_query),
+                **self._vector_hard_filters(resolved_query),
             )
             return self._adapt(group_id=group_id, hits=hits)
 
@@ -397,10 +399,25 @@ class ScopedMemoryRetrievalChannels:
 
     def _document_kinds(self) -> tuple[str, ...] | None:
         if self._raw_message_v3_only:
+            if self._layered_memory_enabled:
+                return ("raw_message_v3", "episode_summary", "memory")
             return ("raw_message_v3",)
         if self._legacy_v2_only:
             return ("episode", "episode_summary", "memory")
         return None
+
+    def _vector_hard_filters(self, resolved_query: Any) -> dict[str, object]:
+        """Vector documents stay raw-only when layered memory is enabled.
+
+        Episode/summary/memory documents carry no embeddings in the raw_v3
+        pipeline. Restricting the vector channel to ``raw_message_v3`` keeps
+        generation lookup on the exact raw family instead of silently
+        searching an unrelated legacy generation.
+        """
+        hard_filters = self._hard_filters(resolved_query)
+        if self._raw_message_v3_only:
+            hard_filters["document_kinds"] = ("raw_message_v3",)
+        return hard_filters
 
     @staticmethod
     def _time_bound(resolved_query: Any, name: str):
@@ -431,6 +448,7 @@ def build_memory_retrieval_channels(
     vector_generation: int | None = None,
     raw_message_v3_only: bool = False,
     legacy_v2_only: bool = False,
+    layered_memory_enabled: bool = False,
     excluded_speaker_ids: Sequence[int | str] = (),
 ) -> Mapping[str, RetrievalChannel]:
     return ScopedMemoryRetrievalChannels(
@@ -440,5 +458,6 @@ def build_memory_retrieval_channels(
         vector_generation=vector_generation,
         raw_message_v3_only=raw_message_v3_only,
         legacy_v2_only=legacy_v2_only,
+        layered_memory_enabled=layered_memory_enabled,
         excluded_speaker_ids=excluded_speaker_ids,
     ).as_mapping()

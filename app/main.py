@@ -185,7 +185,7 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
     fallback_model = (settings.llm_fallback_model or "").strip()
     if fallback_model == chat_model:
         fallback_model = ""
-    responses_model = chat_model if settings.llm_text_endpoint == "responses" else ""
+    responses_model = chat_model
     tool_event_log = settings.log_dir / "responses-tool-events.jsonl"
 
     def record_tool_event(event: dict) -> None:
@@ -200,11 +200,11 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         fallback_model=fallback_model,
         vision_model=(settings.llm_vision_model or "").strip(),
         responses_model=responses_model,
+        responses_only=True,
         image_responses_model=chat_model,
-        compat_model=chat_model,
-        builtin_web_search=settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses",
+        builtin_web_search=settings.llm_builtin_web_search,
         web_search_context_size=settings.llm_builtin_web_search_context_size,
-        reasoning_effort=settings.llm_reasoning_effort if settings.llm_text_endpoint == "responses" else "",
+        reasoning_effort=settings.llm_reasoning_effort,
         max_output_tokens=settings.llm_max_output_tokens,
         usage_recorder=build_usage_recorder(engine),
         tool_event_recorder=record_tool_event,
@@ -570,6 +570,7 @@ def build_memory_runtime(
             ),
             raw_message_v3_only=settings.memory_raw_v3_enabled,
             legacy_v2_only=not settings.memory_raw_v3_enabled,
+            layered_memory_enabled=settings.memory_layered_memory_enabled,
             excluded_speaker_ids=(settings.bot_qq,),
         ),
         candidate_limit=max(
@@ -653,16 +654,32 @@ def build_memory_runtime(
             )
 
     def load_facts(*, group_id: int, resolved_query):
-        if settings.memory_raw_v3_enabled:
+        if settings.memory_raw_v3_enabled and not settings.memory_layered_memory_enabled:
             return ()
         with session_scope(engine) as session:
-            rows = MemoryRepository(session).search_group_memories_fts(
-                scope_id=str(group_id),
-                query=str(resolved_query.retrieval_query),
-                limit=settings.memory_final_episode_limit,
-                as_of=datetime.now().astimezone(),
-                subject_ids=resolved_query.subject_ids,
+            memories = MemoryRepository(session)
+            rows = list(
+                memories.search_group_memories_fts(
+                    scope_id=str(group_id),
+                    query=str(resolved_query.retrieval_query),
+                    limit=settings.memory_final_episode_limit,
+                    as_of=datetime.now().astimezone(),
+                    subject_ids=resolved_query.subject_ids,
+                )
             )
+            subject_ids = resolved_query.subject_ids
+            if subject_ids:
+                seen_ids = {row.id for row in rows}
+                for subject_id in subject_ids:
+                    for row in memories.list_group_memories_for_subject(
+                        scope_id=str(group_id),
+                        subject_id=subject_id,
+                        limit=settings.memory_final_episode_limit,
+                    ):
+                        if row.id in seen_ids:
+                            continue
+                        rows.append(row)
+                        seen_ids.add(row.id)
             return tuple(
                 MemoryFact(
                     text=str(row.content),
@@ -683,12 +700,26 @@ def build_memory_runtime(
             )
 
     def load_summaries(*, group_id: int, resolved_query):
-        if settings.memory_raw_v3_enabled or not resolved_query.needs_history:
+        if (
+            (
+                settings.memory_raw_v3_enabled
+                and not settings.memory_layered_memory_enabled
+            )
+            or not resolved_query.needs_history
+        ):
             return ()
         with session_scope(engine) as session:
+            summary_kwargs = {}
+            if settings.memory_raw_v3_enabled:
+                summary_kwargs["summary_levels"] = (
+                    "episode",
+                    "semantic_window",
+                    "semantic_daily",
+                )
             rows = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
                 limit=settings.context_summary_limit,
+                **summary_kwargs,
             )
             return tuple(
                 MemorySummary(
@@ -892,7 +923,7 @@ def build_memory_runtime(
     logging.info(
         "memory_runtime route=%s raw_enabled=%s embedding_provider=%s "
         "embedding_model=%s embedding_device=%s embedding_generation=%s "
-        "adaptive_enabled=%s",
+        "adaptive_enabled=%s layered_enabled=%s tools_enabled=%s",
         "raw_v3" if settings.memory_raw_v3_enabled else "legacy_v2",
         settings.memory_raw_v3_enabled,
         identity.provider,
@@ -904,6 +935,8 @@ def build_memory_runtime(
             else legacy_embedding_generation
         ),
         settings.memory_adaptive_context_enabled,
+        settings.memory_layered_memory_enabled,
+        settings.memory_memory_tools_enabled,
     )
     return MemoryRuntimeComposition(
         memory_orchestrator=orchestrator,

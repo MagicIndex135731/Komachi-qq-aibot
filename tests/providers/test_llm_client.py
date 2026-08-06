@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.providers.llm_client import LlmClient
+from app.providers.llm_client import LlmClient, LlmFunctionCall
 from app.core.message_content import ImageAttachment
 
 
@@ -63,6 +63,232 @@ def _responses_image_stream_body(*, response_id: str, image_b64: str) -> str:
         f'data: {json.dumps({"type": "response.output_item.done", "item": item})}\n\n'
         f'data: {json.dumps({"type": "response.completed", "response": completed_response})}\n\n'
     )
+
+
+def _responses_tool_stream_body(
+    *,
+    response_id: str,
+    text: str | None,
+    function_calls: list[dict],
+) -> str:
+    completed_response = {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": function_calls,
+    }
+    body = (
+        f'data: {json.dumps({"type": "response.created", "response": {"id": response_id}})}\n\n'
+    )
+    if text:
+        body += (
+            f'data: {json.dumps({"type": "response.output_text.delta", "delta": text})}\n\n'
+            f'data: {json.dumps({"type": "response.output_text.done", "text": text})}\n\n'
+        )
+    body += f'data: {json.dumps({"type": "response.completed", "response": completed_response})}\n\n'
+    return body
+
+
+MEMORY_TOOLS = [
+    {
+        "type": "function",
+        "name": "memory_search",
+        "description": "Search group memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    }
+]
+
+
+def test_responses_sse_extracts_function_calls() -> None:
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+    )
+    body = _responses_tool_stream_body(
+        response_id="r1",
+        text="partial",
+        function_calls=[
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "memory_search",
+                "arguments": '{"query":"冰美式"}',
+            }
+        ],
+    )
+    result = client._extract_responses_result_from_sse(body, model="gpt-5.4")
+    assert result.text == "partial"
+    assert result.function_calls == (
+        LlmFunctionCall(
+            name="memory_search",
+            arguments='{"query":"冰美式"}',
+            call_id="call_1",
+        ),
+    )
+
+
+def test_generate_text_with_tools_executes_and_returns_final_text() -> None:
+    payloads = []
+    executed = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        payloads.append(payload)
+        assert payload["tools"] == MEMORY_TOOLS
+        assert payload["tool_choice"] == "auto"
+        if len(payloads) == 1:
+            return httpx.Response(
+                200,
+                text=_responses_tool_stream_body(
+                    response_id="r1",
+                    text=None,
+                    function_calls=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "memory_search",
+                            "arguments": '{"query":"冰美式"}',
+                        }
+                    ],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            text=_responses_stream_body(
+                response_id="r2",
+                text="找到了：冰美式",
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    def executor(name, arguments):
+        executed.append((name, arguments))
+        return "阿渣喜欢喝冰美式"
+
+    text = client.generate_text_with_tools(
+        ["Target message: 阿渣喜欢喝什么？"],
+        tools=MEMORY_TOOLS,
+        tool_executor=executor,
+        max_tool_rounds=2,
+    )
+
+    assert text == "找到了：冰美式"
+    assert executed == [("memory_search", {"query": "冰美式"})]
+    second_input = payloads[1]["input"]
+    assert any(item.get("type") == "function_call" for item in second_input)
+    output_items = [
+        item for item in second_input if item.get("type") == "function_call_output"
+    ]
+    assert output_items == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "阿渣喜欢喝冰美式",
+        }
+    ]
+
+
+def test_generate_text_with_tools_handles_tool_exception_and_round_cap() -> None:
+    payloads = []
+    executed = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        if len(payloads) <= 2:
+                return httpx.Response(
+                    200,
+                    text=_responses_tool_stream_body(
+                        response_id=f"r{len(payloads)}",
+                        text="partial",
+                    function_calls=[
+                        {
+                            "type": "function_call",
+                            "call_id": f"call_{len(payloads)}",
+                            "name": "memory_search",
+                            "arguments": "not-json",
+                            }
+                        ],
+                    ),
+                    headers={"content-type": "text/event-stream"},
+                )
+        raise AssertionError("must stop after max rounds")
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    def executor(name, arguments):
+        executed.append((name, arguments))
+        return "ok"
+
+    text = client.generate_text_with_tools(
+        ["Target message: x"],
+        tools=MEMORY_TOOLS,
+        tool_executor=executor,
+        max_tool_rounds=1,
+    )
+
+    assert text == "partial"
+    assert executed == []  # malformed arguments never reach the executor
+    output_items = [
+        item
+        for item in payloads[1]["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert output_items[0]["output"] == '{"error":"invalid_arguments"}'
+
+
+def test_generate_text_with_tools_degrades_to_plain_when_responses_disabled() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "plain fallback",
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    text = client.generate_text_with_tools(
+        ["Target message: x"],
+        tools=MEMORY_TOOLS,
+        tool_executor=lambda _name, _args: "ok",
+    )
+    assert text == "plain fallback"
+    assert captured["payload"]["model"] == "gpt-5.4"
 
 
 def test_llm_client_posts_to_chat_completions_endpoint_with_bearer_auth() -> None:
@@ -1195,6 +1421,68 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert recorded[0].output_tokens == 45
 
 
+def test_responses_model_fallback_uses_terra_on_responses_endpoint() -> None:
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        payload = json.loads(request.content.decode("utf-8"))
+        assert request.url.path == "/v1/responses"
+        if payload["model"] == "gpt-5.6-luna":
+            return httpx.Response(503, request=request, json={"error": "unavailable"})
+        assert payload["model"] == "gpt-5.6-terra"
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_terra", text="terra reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        fallback_model="gpt-5.6-terra",
+        responses_model="gpt-5.6-luna",
+        responses_only=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **_: None
+
+    assert client.generate_text(["System persona: Be concise.", "Target message: hi"]) == "terra reply"
+    assert len(captured_requests) == client.REQUEST_MAX_ATTEMPTS + 1
+    assert [request.url.path for request in captured_requests] == ["/v1/responses"] * len(captured_requests)
+    assert [json.loads(request.content.decode("utf-8"))["model"] for request in captured_requests] == [
+        "gpt-5.6-luna"
+    ] * client.REQUEST_MAX_ATTEMPTS + ["gpt-5.6-terra"]
+
+
+def test_responses_only_never_falls_back_to_chat_completions() -> None:
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        assert request.url.path == "/v1/responses"
+        return httpx.Response(503, request=request, json={"error": "unavailable"})
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        fallback_model="gpt-5.6-terra",
+        responses_model="gpt-5.6-luna",
+        responses_only=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **_: None
+
+    with pytest.raises(ValueError, match="responses request failed after retries"):
+        client.generate_text(["Target message: hi"])
+
+    assert len(captured_requests) == client.REQUEST_MAX_ATTEMPTS * 2
+    assert {request.url.path for request in captured_requests} == {"/v1/responses"}
+
+
 def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     captured = {}
     recorded = []
@@ -2131,14 +2419,14 @@ def test_llm_client_generate_image_omits_compression_for_png() -> None:
     }
 
 
-def test_llm_client_default_http_client_disables_environment_proxy() -> None:
+def test_llm_client_default_http_client_honors_proxy_environment() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
         model="gpt-5.4",
     )
 
-    assert client.http_client.trust_env is False
+    assert client.http_client.trust_env is True
 
 
 def test_llm_client_falls_back_to_url_image_response_format_when_b64_json_is_rejected() -> None:

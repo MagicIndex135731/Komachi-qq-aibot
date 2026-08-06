@@ -36,6 +36,7 @@ norecursedirs = [
   ".pytest_cache",
   ".pytest-*",
   ".pytest_tmp",
+  ".codex_tmp*",
   ".worktrees",
   ".tmp*",
   ".tmp_pytest",

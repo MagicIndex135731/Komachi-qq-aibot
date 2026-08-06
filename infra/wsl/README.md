@@ -273,3 +273,25 @@ python -m scripts.backfill_memory_v3_raw \
   --prepared-report /workspace/data/backups/memory-v3-prepared.json \
   --output /workspace/data/backups/memory-v3-rollback.json
 ```
+
+### Layered memory and memory tools
+
+`MEMORY_LAYERED_MEMORY_ENABLED=true` adds episode summaries, structured
+`memory_items`, and user profile facts to the V3 evidence packet while keeping
+the vector channel raw-message-only. `MEMORY_MEMORY_TOOLS_ENABLED=true`
+exposes `memory_search` / `memory_read` / `memory_write` to the model through
+Responses function calling; writes are source-bound to the current group and
+conversation. Both switches default to `false` and are enabled explicitly in
+the deployed `.env`.
+
+To fill summaries and facts for history that predates episode derivation, run
+the bounded, resumable backfill (inside the `xiaomachi` container or against a
+backup copy):
+
+```bash
+python -m scripts.backfill_structured_memory plan --database /workspace/data/bot.db
+python -m scripts.backfill_structured_memory run \
+  --database /workspace/data/bot.db --run-key layered-20260806 --finalize
+python -m scripts.backfill_structured_memory status \
+  --database /workspace/data/bot.db --run-key layered-20260806
+```

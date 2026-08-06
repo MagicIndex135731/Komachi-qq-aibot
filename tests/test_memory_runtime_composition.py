@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from app.storage.repositories import (
     MemoryRepository,
     MessageRepository,
     RetrievalDocumentRepository,
+    SummaryRepository,
     UserRepository,
 )
 
@@ -1037,3 +1039,268 @@ def test_shadow_evaluator_records_rewrite_flag_from_real_v2_trace(
     )
 
     assert evaluation.rewrite_used is True
+
+
+def test_layered_raw_v3_restores_fact_channel_and_logs_runtime_flags(
+    sqlite_engine,
+    tmp_path,
+    caplog,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(
+        update={
+            "memory_raw_v3_enabled": True,
+            "memory_layered_memory_enabled": True,
+        }
+    )
+    with caplog.at_level(logging.INFO):
+        runtime = build_memory_runtime(
+            settings=settings,
+            engine=sqlite_engine,
+            llm_client=_NoopLlmClient(),
+            bot_display_name="bot",
+        )
+
+    assert "fact" in runtime.v2_provider._retriever.channels
+    assert runtime.v2_provider._retriever.channels["fact"] is not None
+    assert any(
+        "layered_enabled=True" in record.message
+        and "tools_enabled=False" in record.message
+        and "raw_enabled=True" in record.message
+        for record in caplog.records
+    )
+
+
+def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(
+        update={
+            "memory_raw_v3_enabled": True,
+            "memory_layered_memory_enabled": True,
+        }
+    )
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=42,
+            nickname="A-Zha",
+            group_card="阿渣",
+        )
+        UserRepository(session).upsert_user(
+            user_id=99,
+            nickname="Questioner",
+            group_card="提问者",
+        )
+        messages = MessageRepository(session)
+        fact_source = messages.add_group_message(
+            platform_msg_id="layered-fact-source",
+            group_id=10001,
+            user_id=42,
+            timestamp=observed_at,
+            plain_text="我最喜欢喝冰美式。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        query = messages.add_group_message(
+            platform_msg_id="layered-query",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at + timedelta(minutes=1),
+            plain_text="阿渣以前说过喜欢喝什么？",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        memory = MemoryRepository(session).add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="preference",
+            content="阿渣喜欢喝冰美式",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="layered-fact-source",
+            valid_from=observed_at,
+        )
+        SummaryRepository(session).upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="episode",
+            summary_key="episode:1:test",
+            start_at=observed_at,
+            end_at=observed_at + timedelta(hours=1),
+            content="阿渣饮品偏好：冰美式",
+            source_count=1,
+            source_start_msg_id="layered-fact-source",
+            source_end_msg_id="layered-fact-source",
+        )
+        session.flush()
+        documents = RetrievalDocumentRepository(session)
+        documents.upsert_document(
+            scope_type="group",
+            scope_id="10001",
+            group_id=10001,
+            episode_id=None,
+            document_kind="memory",
+            source_table="memory_items",
+            source_id=str(memory.id),
+            start_at=observed_at,
+            end_at=observed_at,
+            content="阿渣喜欢喝冰美式",
+            metadata_json={"subject_id": "42", "kind": "preference"},
+            content_hash="hash-layered-memory",
+            source_message_ids=[int(fact_source.id)],
+        )
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=int(row.id),
+                embedding_generation=None,
+            )
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+    packed = trace.result.packed_context
+
+    assert any(
+        "阿渣喜欢喝冰美式" in fact.text
+        and "layered-fact-source" in fact.source_msg_ids
+        for fact in packed.facts
+    )
+    assert any(
+        "阿渣饮品偏好" in summary.text
+        and "layered-fact-source" in summary.source_msg_ids
+        for summary in packed.summaries
+    )
+    assert "layered-fact-source" in trace.result.selected_source_msg_ids
+
+
+def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(update={"memory_raw_v3_enabled": True})
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=42,
+            nickname="A-Zha",
+            group_card="阿渣",
+        )
+        UserRepository(session).upsert_user(
+            user_id=99,
+            nickname="Questioner",
+            group_card="提问者",
+        )
+        messages = MessageRepository(session)
+        fact_source = messages.add_group_message(
+            platform_msg_id="non-layered-fact-source",
+            group_id=10001,
+            user_id=42,
+            timestamp=observed_at,
+            plain_text="我最喜欢喝冰美式。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        query = messages.add_group_message(
+            platform_msg_id="non-layered-query",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at + timedelta(minutes=1),
+            plain_text="阿渣以前说过喜欢喝什么？",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        MemoryRepository(session).add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="preference",
+            content="阿渣喜欢喝冰美式",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="non-layered-fact-source",
+            valid_from=observed_at,
+        )
+        SummaryRepository(session).upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="episode",
+            summary_key="episode:2:test",
+            start_at=observed_at,
+            end_at=observed_at + timedelta(hours=1),
+            content="阿渣饮品偏好：冰美式",
+            source_count=1,
+            source_start_msg_id="non-layered-fact-source",
+            source_end_msg_id="non-layered-fact-source",
+        )
+        session.flush()
+        documents = RetrievalDocumentRepository(session)
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(
+                group_id=10001,
+                message_id=int(row.id),
+                embedding_generation=None,
+            )
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+    packed = trace.result.packed_context
+
+    assert packed.facts == ()
+    assert packed.summaries == ()

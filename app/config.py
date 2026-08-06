@@ -148,6 +148,31 @@ class AppSettings(BaseSettings):
         gt=0,
         alias="MEMORY_ADAPTIVE_MAX_HISTORY_MESSAGES",
     )
+    memory_layered_memory_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_LAYERED_MEMORY_ENABLED",
+    )
+    memory_memory_tools_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_MEMORY_TOOLS_ENABLED",
+    )
+    memory_memory_tool_max_rounds: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        alias="MEMORY_MEMORY_TOOL_MAX_ROUNDS",
+    )
+    memory_memory_tool_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        alias="MEMORY_MEMORY_TOOL_MAX_RESULTS",
+    )
+    memory_memory_tool_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        alias="MEMORY_MEMORY_TOOL_TIMEOUT_SECONDS",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",

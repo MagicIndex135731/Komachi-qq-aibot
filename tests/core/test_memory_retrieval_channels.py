@@ -27,6 +27,7 @@ from app.storage.repositories import (
     MemoryRepository,
     MessageRepository,
     RetrievalDocumentRepository,
+    SummaryRepository,
     UserRepository,
 )
 
@@ -1209,3 +1210,301 @@ def test_temporal_entity_fact_exact_and_reply_channels_use_scoped_provenance(
     assert reply_ids == {reply_document_id}
     for channel_ids in (temporal_ids, entity_ids, fact_ids, exact_ids, reply_ids):
         assert channel_ids
+
+
+def test_layered_raw_v3_enables_fact_channel_and_expands_document_kinds(
+    monkeypatch,
+) -> None:
+    seen: list[tuple[str, object]] = []
+
+    class RecordingRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        def search_group_documents_fts_hits(self, *, query: str, document_kinds, **_):
+            seen.append(("fts", document_kinds))
+            return ()
+
+        def search_group_documents_vector_hits(self, *, document_kinds, **_):
+            seen.append(("vector", document_kinds))
+            return ()
+
+        def search_group_documents_temporal_hits(self, *, document_kinds, **_):
+            seen.append(("temporal", document_kinds))
+            return ()
+
+        def search_group_documents_entity_hits(self, *, document_kinds, **_):
+            seen.append(("entity", document_kinds))
+            return ()
+
+        def search_group_fact_hits(self, *, document_kinds, **_):
+            seen.append(("fact", document_kinds))
+            return ()
+
+    monkeypatch.setattr(
+        "app.core.memory_retrieval_channels.RetrievalDocumentRepository",
+        RecordingRepository,
+    )
+    embedding = _FakeEmbeddingProvider()
+    channels = build_memory_retrieval_channels(
+        session_factory=lambda: nullcontext(object()),
+        embedding_provider=embedding,
+        raw_message_v3_only=True,
+        layered_memory_enabled=True,
+    )
+    assert "fact" in channels
+    resolved = ResolvedMemoryQuery(
+        original_query="阿渣喜欢什么动画",
+        retrieval_query="动画",
+        topic_query="动画",
+        topic_terms=("动画",),
+        topic_extraction="deterministic",
+        subject_ids=("20001",),
+        time_range=TimeRange(
+            datetime(2026, 7, 23, tzinfo=UTC),
+            datetime(2026, 7, 24, tzinfo=UTC),
+        ),
+        needs_history=True,
+    )
+    channels["bm25"](group_id=100, resolved_query=resolved, limit=5)
+    channels["vector"](group_id=100, resolved_query=resolved, limit=5)
+    channels["temporal"](group_id=100, resolved_query=resolved, limit=5)
+    channels["entity"](group_id=100, resolved_query=resolved, limit=5)
+    channels["fact"](group_id=100, resolved_query=resolved, limit=5)
+
+    layered_kinds = ("raw_message_v3", "episode_summary", "memory")
+    assert ("fts", layered_kinds) in seen
+    assert ("vector", ("raw_message_v3",)) in seen
+    assert ("temporal", layered_kinds) in seen
+    assert ("entity", layered_kinds) in seen
+    assert ("fact", layered_kinds) in seen
+
+
+def test_layered_off_raw_v3_keeps_existing_raw_only_behavior(monkeypatch) -> None:
+    seen: list[tuple[str, object]] = []
+
+    class RecordingRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        def search_group_documents_fts_hits(self, *, query: str, document_kinds, **_):
+            seen.append(("fts", document_kinds))
+            return ()
+
+    monkeypatch.setattr(
+        "app.core.memory_retrieval_channels.RetrievalDocumentRepository",
+        RecordingRepository,
+    )
+    channels = build_memory_retrieval_channels(
+        session_factory=lambda: nullcontext(object()),
+        raw_message_v3_only=True,
+        layered_memory_enabled=False,
+    )
+    assert "fact" not in channels
+    channels["bm25"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="阿渣喜欢什么动画",
+            retrieval_query="动画",
+            topic_query="动画",
+            topic_terms=("动画",),
+            topic_extraction="deterministic",
+        ),
+        limit=5,
+    )
+    assert seen and all(kinds == ("raw_message_v3",) for _, kinds in seen)
+
+
+def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        documents = RetrievalDocumentRepository(session)
+        for group_id in (100, 200):
+            groups.upsert_group(
+                group_id=group_id,
+                group_name=f"group-{group_id}",
+                enabled=True,
+                speak_enabled=True,
+            )
+        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=20002, nickname="Other", group_card="其他人")
+
+        def seed_message(
+            *,
+            group_id: int,
+            user_id: int,
+            platform_msg_id: str,
+            content: str,
+        ):
+            return messages.add_group_message(
+                platform_msg_id=platform_msg_id,
+                group_id=group_id,
+                user_id=user_id,
+                timestamp=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+                plain_text=content,
+                raw_json={"sender": {"nickname": f"user-{user_id}", "card": ""}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+        source_100 = seed_message(
+            group_id=100,
+            user_id=20001,
+            platform_msg_id="layered-source-100",
+            content="阿渣喜欢喝冰美式",
+        )
+        cross_source_200 = seed_message(
+            group_id=200,
+            user_id=20001,
+            platform_msg_id="layered-cross-200",
+            content="阿渣喜欢喝冰美式",
+        )
+        session.flush()
+        for row in (source_100, cross_source_200):
+            documents.project_raw_message_v3(
+                group_id=int(row.group_id),
+                message_id=int(row.id),
+            )
+
+        memories = MemoryRepository(session)
+        memory_100 = memories.add_memory(
+            scope_type="group",
+            scope_id="100",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            content="阿渣喜欢喝冰美式",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="layered-source-100",
+            valid_from=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+        )
+        session.flush()
+        memory_200 = memories.add_memory(
+            scope_type="group",
+            scope_id="200",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            content="阿渣喜欢喝冰美式",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="layered-cross-200",
+            valid_from=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+        )
+        session.flush()
+        documents.upsert_document(
+            scope_type="group",
+            scope_id="100",
+            group_id=100,
+            episode_id=None,
+            document_kind="memory",
+            source_table="memory_items",
+            source_id=str(memory_100.id),
+            start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            content="阿渣喜欢喝冰美式",
+            metadata_json={"subject_id": "20001", "kind": "preference"},
+            content_hash="hash-memory-100",
+            source_message_ids=[int(source_100.id)],
+        )
+        documents.upsert_document(
+            scope_type="group",
+            scope_id="200",
+            group_id=200,
+            episode_id=None,
+            document_kind="memory",
+            source_table="memory_items",
+            source_id=str(memory_200.id),
+            start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            content="阿渣喜欢喝冰美式",
+            metadata_json={"subject_id": "20001", "kind": "preference"},
+            content_hash="hash-memory-200",
+            source_message_ids=[int(cross_source_200.id)],
+        )
+        summary = SummaryRepository(session).upsert_summary(
+            scope_type="group",
+            scope_id="100",
+            summary_level="episode",
+            summary_key="episode:1:test",
+            start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
+            content="阿渣动画偏好总结",
+            source_count=1,
+            source_start_msg_id="layered-source-100",
+            source_end_msg_id="layered-source-100",
+        )
+        session.flush()
+        documents.upsert_document(
+            scope_type="group",
+            scope_id="100",
+            group_id=100,
+            episode_id=None,
+            document_kind="episode_summary",
+            source_table="summaries",
+            source_id=str(summary.id),
+            start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
+            content="阿渣动画偏好总结",
+            metadata_json={"episode_id": 1},
+            content_hash="hash-summary-100",
+            source_message_ids=[int(source_100.id)],
+        )
+
+    channels = build_memory_retrieval_channels(
+        sqlite_engine,
+        raw_message_v3_only=True,
+        layered_memory_enabled=True,
+    )
+    resolved = ResolvedMemoryQuery(
+        original_query="阿渣喜欢什么",
+        retrieval_query="阿渣",
+        topic_query="阿渣",
+        topic_terms=("阿渣",),
+        topic_extraction="deterministic",
+        subject_ids=None,
+        needs_history=True,
+    )
+    hits = channels["bm25"](group_id=100, resolved_query=resolved, limit=20)
+    hit_kinds = {hit.document_kind for hit in hits}
+    assert "memory" in hit_kinds
+    assert "episode_summary" in hit_kinds
+    assert "raw_message_v3" in hit_kinds
+    assert all(hit.group_id == 100 for hit in hits)
+    assert "layered-cross-200" not in {
+        source_id for hit in hits for source_id in hit.source_msg_ids
+    }
+
+    ambiguous = ResolvedMemoryQuery(
+        original_query="谁喜欢什么",
+        retrieval_query="喜欢",
+        topic_query="喜欢",
+        topic_terms=("喜欢",),
+        topic_extraction="deterministic",
+        subject_ids=(),
+        needs_history=True,
+    )
+    ambiguous_hits = channels["bm25"](group_id=100, resolved_query=ambiguous, limit=20)
+    assert all(hit.document_kind != "memory" for hit in ambiguous_hits)
+
+    bound = ResolvedMemoryQuery(
+        original_query="阿渣喜欢什么",
+        retrieval_query="阿渣",
+        topic_query="阿渣",
+        topic_terms=("阿渣",),
+        topic_extraction="deterministic",
+        subject_ids=("20001",),
+        needs_history=True,
+    )
+    bound_hits = channels["bm25"](group_id=100, resolved_query=bound, limit=20)
+    memory_hits = [hit for hit in bound_hits if hit.document_kind == "memory"]
+    assert memory_hits
+    assert all(
+        source_id == "layered-source-100"
+        for hit in memory_hits
+        for source_id in hit.source_msg_ids
+    )

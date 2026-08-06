@@ -13,7 +13,7 @@ from app.core.message_content import ImageAttachment
 from app.core.memory_context_packer import PackedMemoryContext
 from app.core.memory_orchestrator import MemoryContextResult, MemoryOrchestrator
 import app.core.router as router_module
-from app.core.router import InboundRouter
+from app.core.router import InboundRouter, PreparedGroupReply
 from app.core.reply_policy import ReplyDecision
 from app.core.search_policy import AddressDecision
 from app.storage.db import session_scope
@@ -4288,3 +4288,120 @@ async def test_router_marks_out_of_order_timestamp_as_late_arrival(
 
     assert service.enqueued[0]["late_arrival"] is False
     assert service.enqueued[1]["late_arrival"] is True
+
+
+def test_router_historical_ingest_does_not_trigger_late_arrival_resegmentation(
+    sqlite_engine,
+) -> None:
+    class BackgroundAwareCompaction:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def enqueue_episode_allocation(self, **kwargs):
+            self.enqueued.append(kwargs)
+
+        async def wake(self) -> None:
+            return None
+
+    service = BackgroundAwareCompaction()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_compaction_service=service,
+    )
+    newer = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="history-newer",
+        plain_text="newer",
+        timestamp=datetime(2026, 5, 9, 12, 30, tzinfo=UTC),
+    )
+    historical = make_event(
+        group_id=10001,
+        mentioned_bot=False,
+        message_id="history-late",
+        plain_text="historical",
+        timestamp=datetime(2026, 5, 9, 12, 10, tzinfo=UTC),
+    )
+
+    assert router.ingest_live_group_message(newer) is True
+    assert router.ingest_historical_group_message(historical) is True
+
+    assert service.enqueued[0]["late_arrival"] is False
+    assert service.enqueued[1]["late_arrival"] is False
+
+
+class _ToolAwareLlm:
+    def __init__(self) -> None:
+        self.plain_calls = 0
+        self.tool_calls: list[tuple[int, int]] = []
+
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, **kwargs) -> str:
+        del prompt_lines, conversation_key, kwargs
+        self.plain_calls += 1
+        return "plain reply"
+
+    def generate_text_with_tools(
+        self,
+        prompt_lines: list[str],
+        *,
+        tools,
+        tool_executor,
+        conversation_key=None,
+        max_tool_rounds=2,
+        **kwargs,
+    ) -> str:
+        del conversation_key, kwargs
+        self.tool_calls.append((max_tool_rounds, len(tools)))
+        return tool_executor("memory_search", {"query": "x"})
+
+
+def test_generate_group_reply_text_uses_memory_tools_when_executor_present(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    llm = _ToolAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 阿渣喜欢什么"],
+        memory_tool_executor=executor,
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "tooled reply"
+    assert llm.tool_calls == [(2, 3)]
+    assert llm.plain_calls == 0
+
+
+def test_generate_group_reply_text_uses_plain_path_without_executor(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    llm = _ToolAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: hi"],
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "plain reply"
+    assert llm.tool_calls == []
+    assert llm.plain_calls == 1

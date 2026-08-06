@@ -50,10 +50,18 @@ class LlmUsage:
 
 
 @dataclass(slots=True)
+class LlmFunctionCall:
+    name: str
+    arguments: str
+    call_id: str
+
+
+@dataclass(slots=True)
 class ResponsesStreamResult:
     text: str | None
     response_id: str | None
     usage: LlmUsage | None
+    function_calls: tuple[LlmFunctionCall, ...] = ()
 
 
 @dataclass(slots=True)
@@ -79,6 +87,7 @@ class LlmClient:
         fallback_model: str | None = None,
         vision_model: str | None = None,
         responses_model: str | None = None,
+        responses_only: bool = False,
         image_responses_model: str | None = None,
         compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
@@ -97,6 +106,7 @@ class LlmClient:
         self.fallback_model = (fallback_model or "").strip()
         self.vision_model = (vision_model or "").strip()
         self.responses_model = (responses_model or "").strip()
+        self.responses_only = bool(responses_only)
         self.image_responses_model = (image_responses_model or "").strip()
         self.compat_model = (compat_model or model).strip() or model
         self.image_generations_endpoint = self._normalize_endpoint(
@@ -111,7 +121,7 @@ class LlmClient:
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.max_output_tokens = max(1, int(max_output_tokens))
-        self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=False)
+        self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=True)
         self.usage_recorder = usage_recorder
         self.tool_event_recorder = tool_event_recorder
         self._conversation_response_ids: dict[str, str] = {}
@@ -182,6 +192,8 @@ class LlmClient:
         force_web_search: bool = False,
         allow_web_search: bool | None = None,
         max_output_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        extra_input_items: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
             {
@@ -198,15 +210,17 @@ class LlmClient:
                     "image_url": data_url,
                 }
             )
+        user_item: dict[str, Any] = {
+            "role": "user",
+            "content": content,
+        }
+        input_items: list[dict[str, Any]] = [user_item]
+        if extra_input_items:
+            input_items.extend(extra_input_items)
         payload: dict[str, Any] = {
             "model": model,
             "stream": True,
-            "input": [
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
+            "input": input_items,
         }
         if instructions:
             payload["instructions"] = "\n\n".join(instructions)
@@ -216,7 +230,10 @@ class LlmClient:
             payload["reasoning"] = {"effort": self.reasoning_effort}
         if max_output_tokens is not None:
             payload["max_output_tokens"] = max_output_tokens
-        if self.builtin_web_search and (allow_web_search is not False or force_web_search):
+        if tools is not None:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        elif self.builtin_web_search and (allow_web_search is not False or force_web_search):
             payload["tools"] = [
                 {
                     "type": "web_search",
@@ -724,6 +741,27 @@ class LlmClient:
         fallback_done_text: str | None = None
         response_id: str | None = None
         usage_payload: dict[str, Any] | None = None
+        function_calls: list[LlmFunctionCall] = []
+        seen_call_ids: set[str] = set()
+
+        def append_function_call(item: dict[str, Any]) -> None:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                return
+            call_id = str(item.get("call_id") or "")
+            name = str(item.get("name") or "").strip()
+            if not call_id or not name or call_id in seen_call_ids:
+                return
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False) if arguments is not None else ""
+            seen_call_ids.add(call_id)
+            function_calls.append(
+                LlmFunctionCall(
+                    name=name,
+                    arguments=arguments,
+                    call_id=call_id,
+                )
+            )
 
         for raw_line in response_text.splitlines():
             line = raw_line.strip()
@@ -765,10 +803,29 @@ class LlmClient:
                 usage = response.get("usage")
                 if isinstance(usage, dict):
                     usage_payload = usage
+                for output_item in response.get("output", []):
+                    if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+                        append_function_call(output_item)
+            if payload_type == "response.output_item.done" and isinstance(payload.get("item"), dict):
+                append_function_call(payload.get("item"))
+            if payload_type == "response.function_call_arguments.done":
+                append_function_call(
+                    {
+                        "type": "function_call",
+                        "call_id": payload.get("item_id") or payload.get("call_id"),
+                        "name": payload.get("name"),
+                        "arguments": payload.get("arguments"),
+                    }
+                )
 
         extracted_text = "".join(pieces) if pieces else fallback_done_text
         usage = self._extract_responses_usage({"usage": usage_payload}, model=model) if usage_payload else None
-        return ResponsesStreamResult(text=extracted_text, response_id=response_id, usage=usage)
+        return ResponsesStreamResult(
+            text=extracted_text,
+            response_id=response_id,
+            usage=usage,
+            function_calls=tuple(function_calls),
+        )
 
     def _extract_responses_image_artifacts(self, payload: Any) -> list[ImageArtifact]:
         artifacts: list[ImageArtifact] = []
@@ -957,6 +1014,12 @@ class LlmClient:
         return self.fallback_model or self.model
 
     def _distinct_chat_fallback_model(self, *, primary_model: str) -> str:
+        fallback_model = (self.fallback_model or "").strip()
+        if not fallback_model or fallback_model == primary_model:
+            return ""
+        return fallback_model
+
+    def _distinct_responses_fallback_model(self, *, primary_model: str) -> str:
         fallback_model = (self.fallback_model or "").strip()
         if not fallback_model or fallback_model == primary_model:
             return ""
@@ -1490,6 +1553,195 @@ class LlmClient:
             return text
         raise ValueError("model response did not include output text")
 
+    def generate_text_with_tools(
+        self,
+        prompt_lines: list[str],
+        *,
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], str],
+        conversation_key: str | None = None,
+        max_tool_rounds: int = 2,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """Run a bounded Responses function-calling loop and return final text.
+
+        Each round appends the assistant ``function_call`` items and their
+        ``function_call_output`` results to the input history. Tool failures,
+        malformed arguments, and round exhaustion degrade to the last model
+        text instead of blocking the reply path.
+        """
+        if not self._responses_enabled():
+            return self.generate_text(
+                prompt_lines,
+                conversation_key=conversation_key,
+                allow_web_search=False,
+            )
+        instructions, input_lines = self._split_prompt_lines(prompt_lines)
+        effective_rounds = max(1, int(max_tool_rounds))
+        output_tokens = (
+            self.max_output_tokens if max_output_tokens is None else max(1, int(max_output_tokens))
+        )
+
+        def request_with_tools(*, model: str) -> ResponsesStreamResult:
+            return self._request_responses_stream_result(
+                responses_payload=self._build_responses_payload(
+                    model=model,
+                    instructions=instructions,
+                    input_lines=input_lines,
+                    images=None,
+                    previous_response_id=None,
+                    force_web_search=False,
+                    allow_web_search=False,
+                    max_output_tokens=output_tokens,
+                    tools=tools,
+                    extra_input_items=extra_input_items,
+                ),
+                model=model,
+            )
+
+        extra_input_items: list[dict[str, Any]] = []
+        for round_index in range(effective_rounds + 1):
+            try:
+                responses_result = request_with_tools(model=self.responses_model)
+            except ValueError as exc:
+                fallback_model = self._distinct_responses_fallback_model(
+                    primary_model=self.responses_model
+                )
+                if fallback_model:
+                    logger.warning(
+                        "responses_tools_model_fallback primary_model=%s fallback_model=%s reason=%s",
+                        self.responses_model,
+                        fallback_model,
+                        type(exc.__cause__ or exc).__name__,
+                    )
+                    try:
+                        responses_result = request_with_tools(model=fallback_model)
+                    except ValueError:
+                        if self.responses_only:
+                            raise
+                    else:
+                        self._remember_response_id(
+                            conversation_key=conversation_key,
+                            response_id=responses_result.response_id,
+                        )
+                        self._record_usage(responses_result.usage)
+                        if not responses_result.function_calls and responses_result.text is not None:
+                            return responses_result.text
+                        extra_input_items.extend(
+                            self._function_call_input_items(
+                                responses_result.function_calls,
+                                tool_executor,
+                            )
+                        )
+                        continue
+                if self.responses_only:
+                    raise
+                logger.warning(
+                    "responses_tools_fallback_to_compat reason=%s",
+                    type(exc.__cause__ or exc).__name__,
+                )
+                return self.generate_text(
+                    prompt_lines,
+                    conversation_key=conversation_key,
+                    allow_web_search=False,
+                )
+            else:
+                self._remember_response_id(
+                    conversation_key=conversation_key,
+                    response_id=responses_result.response_id,
+                )
+                self._record_usage(responses_result.usage)
+
+            if not responses_result.function_calls:
+                if responses_result.text is not None:
+                    return responses_result.text
+                raise ValueError("model response did not include output text")
+
+            if round_index >= effective_rounds:
+                if responses_result.text is not None:
+                    return responses_result.text
+                raise ValueError("model response did not include output text after tool rounds")
+
+            extra_input_items.extend(
+                self._function_call_input_items(
+                    responses_result.function_calls,
+                    tool_executor,
+                )
+            )
+
+        raise ValueError("model response did not finish after tool rounds")
+
+    def _function_call_input_items(
+        self,
+        function_calls: tuple[LlmFunctionCall, ...],
+        tool_executor: Callable[[str, dict[str, Any]], str],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for call in function_calls:
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+            )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": self._execute_tool_call(call, tool_executor),
+                }
+            )
+        return items
+
+    def _execute_tool_call(
+        self,
+        call: LlmFunctionCall,
+        tool_executor: Callable[[str, dict[str, Any]], str],
+    ) -> str:
+        started = time.monotonic()
+        arguments: dict[str, Any]
+        try:
+            parsed = json.loads(call.arguments or "{}")
+            arguments = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            arguments = {}
+            output = '{"error":"invalid_arguments"}'
+        else:
+            try:
+                output = str(tool_executor(call.name, arguments))
+            except Exception:
+                logger.exception(
+                    "memory_tool_execution_failed tool=%s call_id=%s",
+                    call.name,
+                    call.call_id,
+                )
+                output = '{"error":"tool_execution_failed"}'
+        logger.info(
+            "memory_tool_call tool=%s call_id=%s status=%s latency_ms=%.1f args=%s",
+            call.name,
+            call.call_id,
+            "ok" if not output.startswith('{"error"') else "error",
+            (time.monotonic() - started) * 1000,
+            self._truncate_log_value(call.arguments),
+        )
+        if self.tool_event_recorder is not None:
+            try:
+                self.tool_event_recorder(
+                    {
+                        "response_id": "",
+                        "event": "memory_function_call",
+                        "item_id": call.call_id,
+                        "status": "ok" if not output.startswith('{"error"') else "error",
+                        "query": self._truncate_log_value(call.arguments),
+                        "tool": call.name,
+                    }
+                )
+            except Exception:
+                logger.exception("memory_tool_event_record_failed")
+        return output
+
     def generate_text(
         self,
         prompt_lines: list[str],
@@ -1519,6 +1771,45 @@ class LlmClient:
                     model=responses_model,
                 )
             except ValueError as exc:
+                fallback_model = "" if images and self.vision_model else self._distinct_responses_fallback_model(
+                    primary_model=responses_model
+                )
+                if fallback_model:
+                    logger.warning(
+                        "responses_model_fallback primary_model=%s fallback_model=%s reason=%s",
+                        responses_model,
+                        fallback_model,
+                        type(exc.__cause__ or exc).__name__,
+                    )
+                    fallback_payload = self._build_responses_payload(
+                        model=fallback_model,
+                        instructions=instructions,
+                        input_lines=input_lines,
+                        images=images,
+                        previous_response_id=self._responses_previous_response_id(conversation_key=conversation_key),
+                        force_web_search=force_web_search,
+                        allow_web_search=allow_web_search,
+                        max_output_tokens=self.max_output_tokens,
+                    )
+                    try:
+                        responses_result = self._request_responses_stream_result(
+                            responses_payload=fallback_payload,
+                            model=fallback_model,
+                        )
+                    except ValueError:
+                        if self.responses_only:
+                            raise
+                    else:
+                        self._remember_response_id(
+                            conversation_key=conversation_key,
+                            response_id=responses_result.response_id,
+                        )
+                        self._record_usage(responses_result.usage)
+                        if responses_result.text is not None:
+                            return responses_result.text
+                        raise ValueError("model response did not include output text")
+                if self.responses_only:
+                    raise
                 logger.warning(
                     "responses_fallback_to_compat reason=%s",
                     type(exc.__cause__ or exc).__name__,
@@ -1532,6 +1823,9 @@ class LlmClient:
                 if responses_result.text is not None:
                     return responses_result.text
                 raise ValueError("model response did not include output text")
+
+        if self.responses_only:
+            raise ValueError("responses-only text generation requires a configured responses model")
 
         return self._generate_text_without_responses(
             instructions=instructions,

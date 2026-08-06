@@ -119,8 +119,8 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
 
     assert captured["dev_control_service"] is None
     assert captured["memory_orchestrator"] is built_memory_orchestrator
-    assert captured["llm_kwargs"]["responses_model"] == ""
-    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_only"] is True
     assert memory_lifecycle_events == ["start", "stop"]
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
@@ -187,8 +187,8 @@ async def test_private_main_disables_local_worker(monkeypatch, tmp_path) -> None
     assert captured["enable_local_worker"] is False
     assert captured["web_search_client"] is search_client
     assert captured["reminder_scheduler"]["reminders"] == ["reminder"]
-    assert captured["llm_kwargs"]["responses_model"] == ""
-    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_only"] is True
     assert reminder_events == ["start", "stop"]
     assert len(FakeGateway.instances) == 1
     assert FakeGateway.instances[0].reconnect_forever is True
@@ -306,7 +306,7 @@ async def test_dev_worker_main_enables_local_worker(monkeypatch, tmp_path) -> No
 
     await dev_worker_main.run()
 
-    assert captured["llm_kwargs"]["responses_model"] == ""
-    assert captured["llm_kwargs"]["compat_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
+    assert captured["llm_kwargs"]["responses_only"] is True
     assert captured["enable_local_worker"] is True
     assert captured["assistant_name"] == "比企谷小町"

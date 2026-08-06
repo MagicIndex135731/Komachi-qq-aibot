@@ -23,6 +23,8 @@ data/memory_eval/
 data/models/
 data/backups/
 data/napcat/
+data/pytest-temp-*/
+data/tmp/
 .codex_tmp*/
 .tmp*/
 .pytest_tmp/

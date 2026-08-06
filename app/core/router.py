@@ -45,6 +45,8 @@ from app.core.memory_engine import (
     parse_personal_claim,
 )
 from app.core.memory_compaction import canonical_key
+from app.core.memory_tool_executor import MemoryToolExecutor
+from app.core.memory_tools import memory_tool_schemas
 from app.core.member_identity import (
     group_member_identities_from_messages,
     resolve_group_member_reference,
@@ -189,6 +191,7 @@ class PreparedGroupReply:
     proactive_turn: bool = False
     force_web_search: bool = False
     allow_web_search: bool = False
+    memory_tool_executor: object | None = None
 
 
 @dataclass(slots=True)
@@ -445,6 +448,7 @@ class InboundRouter:
             group_id=event.group_id,
             platform_msg_id=event.platform_msg_id,
             timestamp=event.timestamp,
+            allow_late_arrival=False,
         )
         self._archive_inbound_message(event)
         self._ingest_bbot_listener_cache(event)
@@ -1351,10 +1355,40 @@ class InboundRouter:
                 - self.runtime.settings.llm_context_safety_margin_tokens
                 - (
                     self.runtime.settings.llm_tool_context_reserve_tokens
-                    if self.runtime.settings.llm_builtin_web_search
+                    if (
+                        self.runtime.settings.llm_builtin_web_search
+                        or self.runtime.settings.memory_memory_tools_enabled
+                    )
                     else 0
                 ),
             )
+            memory_tool_executor = None
+            if self.runtime.settings.memory_memory_tools_enabled:
+                member_names: dict[str, int] = {}
+                for message in recent_messages:
+                    sender = (
+                        message.raw_json.get("sender", {})
+                        if isinstance(message.raw_json, dict)
+                        else {}
+                    )
+                    for label in (sender.get("nickname"), sender.get("card")):
+                        if isinstance(label, str) and label.strip():
+                            member_names.setdefault(label.strip(), int(message.user_id))
+                    member_names.setdefault(str(message.user_id), int(message.user_id))
+                member_names.setdefault(str(event.user_id), int(event.user_id))
+                member_names.setdefault(str(self.runtime.settings.bot_qq), int(self.runtime.settings.bot_qq))
+                memory_tool_executor = MemoryToolExecutor(
+                    engine=self.engine,
+                    group_id=event.group_id,
+                    current_user_id=event.user_id,
+                    now=self._normalize_timestamp(event.timestamp),
+                    recent_source_msg_ids=(
+                        message.platform_msg_id for message in recent_messages
+                    ),
+                    member_names=member_names,
+                    timeout_seconds=self.runtime.settings.memory_memory_tool_timeout_seconds,
+                    max_results=self.runtime.settings.memory_memory_tool_max_results,
+                )
             memory_result = self.memory_orchestrator.build_context(
                 GroupMemoryContextRequest(
                     group_id=event.group_id,
@@ -1586,7 +1620,10 @@ class InboundRouter:
             if full_history_lines:
                 tool_context_reserve = (
                     self.runtime.settings.llm_tool_context_reserve_tokens
-                    if self.runtime.settings.llm_builtin_web_search
+                    if (
+                        self.runtime.settings.llm_builtin_web_search
+                        or self.runtime.settings.memory_memory_tools_enabled
+                    )
                     else 0
                 )
                 max_input_tokens = max(
@@ -1701,6 +1738,7 @@ class InboundRouter:
                 proactive_turn=proactive_turn,
                 force_web_search=forced_search_request and self.web_search_client is None,
                 allow_web_search=builtin_web_search_eligible,
+                memory_tool_executor=memory_tool_executor,
             )
 
     def _reserve_outbound_reply(self, event, reply_text: str) -> bool:
@@ -1901,6 +1939,7 @@ class InboundRouter:
         group_id: int,
         platform_msg_id: str,
         timestamp: datetime,
+        allow_late_arrival: bool = True,
     ) -> None:
         service = self.memory_compaction_service
         enqueue_episode = getattr(service, "enqueue_episode_allocation", None)
@@ -1916,10 +1955,14 @@ class InboundRouter:
                 if message is None or int(message.group_id or 0) != int(group_id):
                     return
                 message_id = int(message.id)
-                late_arrival = messages.is_late_group_message(
-                    group_id=int(group_id),
-                    message_id=message_id,
-                    timestamp=message.timestamp,
+                late_arrival = (
+                    messages.is_late_group_message(
+                        group_id=int(group_id),
+                        message_id=message_id,
+                        timestamp=message.timestamp,
+                    )
+                    if allow_late_arrival
+                    else False
                 )
             normalized_timestamp = self._normalize_timestamp(timestamp)
             if callable(enqueue_raw):
@@ -1954,7 +1997,15 @@ class InboundRouter:
             generation_kwargs["allow_web_search"] = prepared_reply.allow_web_search
         if force_web_search:
             generation_kwargs["force_web_search"] = True
-        if prepared_reply.target_images:
+        if prepared_reply.memory_tool_executor is not None and not prepared_reply.target_images:
+            raw_reply = self.llm_client.generate_text_with_tools(
+                prepared_reply.prompt_lines,
+                tools=memory_tool_schemas(),
+                tool_executor=prepared_reply.memory_tool_executor.execute,
+                conversation_key=conversation_key,
+                max_tool_rounds=self.runtime.settings.memory_memory_tool_max_rounds,
+            )
+        elif prepared_reply.target_images:
             raw_reply = self.llm_client.generate_text(
                 prepared_reply.prompt_lines,
                 images=prepared_reply.target_images,

@@ -197,6 +197,11 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_history_protected_min_messages == 1
     assert settings.memory_adaptive_max_recent_messages == 120
     assert settings.memory_adaptive_max_history_messages == 300
+    assert settings.memory_layered_memory_enabled is False
+    assert settings.memory_memory_tools_enabled is False
+    assert settings.memory_memory_tool_max_rounds == 2
+    assert settings.memory_memory_tool_max_results == 5
+    assert settings.memory_memory_tool_timeout_seconds == 2.0
     assert settings.memory_max_evidence_messages == 150
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30

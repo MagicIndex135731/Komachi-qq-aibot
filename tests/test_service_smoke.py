@@ -248,7 +248,7 @@ def test_build_llm_client_preserves_primary_model_and_exposes_distinct_fallback(
     assert captured["fallback_model"] == "gpt-4o-mini"
     assert captured["vision_model"] == "gpt-4o"
     assert captured["image_responses_model"] == "gpt-5.4-mini"
-    assert captured["compat_model"] == "gpt-5.4-mini"
+    assert captured["responses_only"] is True
 
 
 def test_build_llm_client_enables_responses_when_text_endpoint_requests_it(monkeypatch) -> None:
@@ -267,7 +267,7 @@ def test_build_llm_client_enables_responses_when_text_endpoint_requests_it(monke
     assert captured["model"] == "gpt-5.4-mini"
     assert captured["fallback_model"] == "gpt-4o-mini"
     assert captured["responses_model"] == "gpt-5.4-mini"
-    assert captured["compat_model"] == "gpt-5.4-mini"
+    assert captured["responses_only"] is True
 
 
 def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> None:
@@ -371,8 +371,8 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     assert len(sync_calls) == 1
     assert llm_kwargs[0]["model"] == "gpt-5.4"
     assert llm_kwargs[0]["fallback_model"] == ""
-    assert llm_kwargs[0]["responses_model"] == ""
-    assert llm_kwargs[0]["compat_model"] == "gpt-5.4"
+    assert llm_kwargs[0]["responses_model"] == "gpt-5.4"
+    assert llm_kwargs[0]["responses_only"] is True
     assert llm_kwargs[1]["model"] == "gpt-image-2"
     assert llm_kwargs[1]["responses_model"] == ""
     assert llm_kwargs[1]["image_responses_model"] == ""
