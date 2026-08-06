@@ -82,94 +82,98 @@ async def _handle_group_recall_payload(payload: dict, *, engine) -> bool:
 async def run() -> None:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
-    engine = build_engine(settings.sqlite_path)
-    create_all(engine)
-    sync_history_archives(engine, runtime)
-
-    gateway = NapCatGateway(
-        ws_url=settings.napcat_ws_url,
-        reconnect_forever=True,
-    )
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "group.heartbeat.json")
-    sender = Sender(gateway)
-    llm_client = build_llm_client(settings=settings, engine=engine)
-    group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
-    web_search_client = build_web_search_client(settings)
-    group_image_service = build_group_image_service(
-        settings=settings,
-        llm_client=group_image_llm_client,
-        sender=sender,
-        web_search_client=web_search_client,
-    )
-    memory_runtime = build_memory_runtime(
-        settings=settings,
-        engine=engine,
-        llm_client=llm_client,
-        bot_display_name=str(runtime.persona.get("name", settings.bot_qq)),
-    )
-    memory_compaction_service = memory_runtime.memory_compaction_service
-    persistent_group_engine = engine if hasattr(engine, "connect") else None
-    if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
-        group_image_service.engine = persistent_group_engine
-    if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
-        await group_image_service.start()
-    if memory_compaction_service is not None:
-        await memory_compaction_service.start()
-    router = InboundRouter(
-        engine=engine,
-        runtime=runtime,
-        sender=sender,
-        llm_client=llm_client,
-        reply_policy=ReplyPolicy(),
-        context_builder=ContextBuilder(),
-        admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
-        web_search_client=web_search_client,
-        dev_control_service=None,
-        group_image_service=group_image_service,
-        memory_compaction_service=memory_compaction_service,
-        memory_orchestrator=memory_runtime.memory_orchestrator,
-    )
-
-    async def handle_payload(payload: dict) -> None:
-        if await _handle_group_recall_payload(payload, engine=engine):
-            return
-        if payload.get("post_type") != "message":
-            return
-        if payload.get("message_type") != "group":
-            return
-
-        group_id = int(payload["group_id"])
-        if group_id == 10001:
-            logging.info(
-                "group_payload_received group_id=%s msg_id=%s user_id=%s",
-                group_id,
-                payload.get("message_id"),
-                payload.get("user_id"),
-            )
-        if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):
-            return
-
-        event = parse_group_message_event(
-            payload,
-            bot_qq=settings.bot_qq,
-            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
-        )
-        await router.handle_group_message(event)
-
-    async def backfill_group_history_on_connect() -> None:
-        await backfill_recent_group_history(
-            router=router,
-            gateway=gateway,
-            bot_qq=settings.bot_qq,
-            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
-        )
-
-    logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
+    await heartbeat.start()
+    engine = None
+    group_image_service = None
+    memory_compaction_service = None
     try:
-        await heartbeat.start()
+        engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
+        await asyncio.to_thread(create_all, engine)
+        await asyncio.to_thread(sync_history_archives, engine, runtime)
+
+        gateway = NapCatGateway(
+            ws_url=settings.napcat_ws_url,
+            reconnect_forever=True,
+        )
+        sender = Sender(gateway)
+        llm_client = build_llm_client(settings=settings, engine=engine)
+        group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
+        web_search_client = build_web_search_client(settings)
+        group_image_service = build_group_image_service(
+            settings=settings,
+            llm_client=group_image_llm_client,
+            sender=sender,
+            web_search_client=web_search_client,
+        )
+        memory_runtime = await asyncio.to_thread(
+            build_memory_runtime,
+            settings=settings,
+            engine=engine,
+            llm_client=llm_client,
+            bot_display_name=str(runtime.persona.get("name", settings.bot_qq)),
+        )
+        memory_compaction_service = memory_runtime.memory_compaction_service
+        persistent_group_engine = engine if hasattr(engine, "connect") else None
+        if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
+            group_image_service.engine = persistent_group_engine
+        if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
+            await group_image_service.start()
+        if memory_compaction_service is not None:
+            await memory_compaction_service.start()
+        router = InboundRouter(
+            engine=engine,
+            runtime=runtime,
+            sender=sender,
+            llm_client=llm_client,
+            reply_policy=ReplyPolicy(),
+            context_builder=ContextBuilder(),
+            admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
+            web_search_client=web_search_client,
+            dev_control_service=None,
+            group_image_service=group_image_service,
+            memory_compaction_service=memory_compaction_service,
+            memory_orchestrator=memory_runtime.memory_orchestrator,
+        )
+
+        async def handle_payload(payload: dict) -> None:
+            if await _handle_group_recall_payload(payload, engine=engine):
+                return
+            if payload.get("post_type") != "message":
+                return
+            if payload.get("message_type") != "group":
+                return
+
+            group_id = int(payload["group_id"])
+            if group_id == 10001:
+                logging.info(
+                    "group_payload_received group_id=%s msg_id=%s user_id=%s",
+                    group_id,
+                    payload.get("message_id"),
+                    payload.get("user_id"),
+                )
+            if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):
+                return
+
+            event = parse_group_message_event(
+                payload,
+                bot_qq=settings.bot_qq,
+                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+            )
+            await router.handle_group_message(event)
+
+        async def backfill_group_history_on_connect() -> None:
+            await backfill_recent_group_history(
+                router=router,
+                gateway=gateway,
+                bot_qq=settings.bot_qq,
+                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+            )
+
+        logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
-        if hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
+        if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
         if memory_compaction_service is not None:
             await memory_compaction_service.stop()

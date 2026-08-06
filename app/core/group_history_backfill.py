@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -113,7 +114,7 @@ async def _backfill_group_history(
         except Exception:
             logger.exception("group_history_backfill_parse_failed group_id=%s message_id=%s", group_id, message_id)
             continue
-        if router.ingest_historical_group_message(event):
+        if await asyncio.to_thread(router.ingest_historical_group_message, event):
             persisted_count += 1
     return persisted_count
 

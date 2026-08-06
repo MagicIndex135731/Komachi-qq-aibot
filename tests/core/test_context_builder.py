@@ -89,6 +89,26 @@ def test_render_persona_includes_mesugaki_speech_habits() -> None:
     assert "Mild flirting and playful innuendo" in text
 
 
+def test_render_persona_keeps_a_required_default_style_contract() -> None:
+    persona = {
+        "name": "Mira",
+        "identity": "AI persona",
+        "core_traits": ["sharp-tongued"],
+        "speaking_style": {"tone": "distinctly mesugaki"},
+        "self_concept": "Keep a recognizable persona for ordinary factual answers.",
+        "speech_habits": [
+            "Default style is not optional: retain at least one recognizable persona cue in ordinary replies.",
+            "Answer the fact first, then add a context-fitting playful sting.",
+        ],
+    }
+
+    text = render_persona(persona)
+
+    assert "distinctly mesugaki" in text
+    assert "Default style is not optional" in text
+    assert "Answer the fact first" in text
+
+
 def test_render_safety_lines_only_includes_enabled_rules() -> None:
     safety = {
         "must_disclose_ai_identity": True,
