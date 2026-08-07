@@ -38,15 +38,62 @@ TIME_SENSITIVE_HINTS = (
 )
 
 EXPLICIT_SEARCH_HINTS = (
-    "查一个",
-    "查一查",
-    "搜一个",
-    "搜一搜",
-    "搜索",
-    "联网",
-    "上网",
     "帮我查",
     "帮我搜",
+    "帮我搜索",
+    "给我查",
+    "给我搜",
+    "给我搜索",
+    "麻烦查",
+    "麻烦搜",
+    "麻烦搜索",
+    "联网搜索",
+    "联网查",
+    "联网搜",
+    "上网搜索",
+    "上网查",
+    "上网搜",
+    "搜索一下",
+    "搜索一个",
+    "搜索看看",
+    "搜索下",
+    "搜一下",
+    "搜一个",
+    "搜一搜",
+    "搜搜",
+    "查一下",
+    "查一个",
+    "查一查",
+    "查查",
+    "联网",
+    "上网",
+)
+
+SEARCH_NARRATIVE_REFERENCE_HINTS = (
+    "搜遍了",
+    "搜了一遍",
+    "搜过",
+    "搜完了",
+    "搜完",
+    "搜了一圈",
+    "搜了一下",
+    "搜索过",
+    "搜索了",
+    "搜索遍了",
+    "搜索了一遍",
+    "搜索完",
+    "搜索了一下",
+    "查过了",
+    "查过",
+    "查询过",
+    "查了一下",
+    "查了",
+)
+
+EXPLICIT_SEARCH_IMPERATIVE_PATTERN = re.compile(
+    r"(?:帮我|给我|请|麻烦|麻烦你|拜托).{0,4}(?:联网|上网|搜索|搜|查)"
+    r"|(?:联网|上网)(?:搜索|搜|查|一下|一个|看看|找找|下)?"
+    r"|(?:搜索|搜|查)(?:一下|一查|一搜|一个|看看|找找|下)"
 )
 
 QUERY_REWRITE_REPLACEMENTS = (
@@ -313,9 +360,11 @@ def is_explicit_search_request(text: str) -> bool:
     normalized = text.strip()
     if is_search_verification_query(normalized):
         return False
+    if any(hint in normalized for hint in SEARCH_NARRATIVE_REFERENCE_HINTS):
+        return False
     if any(hint in normalized for hint in EXPLICIT_SEARCH_HINTS):
         return True
-    return bool(re.search(r"(联网|上网|搜索|查|搜).{0,8}(一个|一查|一搜)?", normalized))
+    return bool(EXPLICIT_SEARCH_IMPERATIVE_PATTERN.search(normalized))
 
 
 def is_search_verification_query(text: str) -> bool:

@@ -107,6 +107,25 @@ def test_explicit_search_request_matches_search_language_only() -> None:
     assert is_explicit_search_request("\u4f60\u771f\u7684\u4e0a\u7f51\u641c\u4e86\u5417") is False
 
 
+def test_explicit_search_rejects_bare_characters_and_narrative_references() -> None:
+    assert is_explicit_search_request("搜遍了各种论坛也没找到") is False
+    assert is_explicit_search_request("我搜了一下攻略") is False
+    assert is_explicit_search_request("之前搜索过这个问题") is False
+    assert is_explicit_search_request("你查了记录吗") is False
+    assert is_explicit_search_request("搜索引擎推荐") is False
+    assert is_explicit_search_request("他只是在群里搜了搜") is False
+
+
+def test_explicit_search_accepts_imperative_and_network_keywords() -> None:
+    assert is_explicit_search_request("帮我搜一下台风路径") is True
+    assert is_explicit_search_request("联网搜索最新台风") is True
+    assert is_explicit_search_request("搜一下白海豚") is True
+    assert is_explicit_search_request("查一查这部电影") is True
+    assert is_explicit_search_request("帮我联网搜一下aqua") is True
+    assert is_explicit_search_request("联网") is True
+    assert is_explicit_search_request("上网") is True
+
+
 def test_search_verification_query_matches_meta_followup_without_triggering_new_search() -> None:
     assert is_search_verification_query("\u4f60\u771f\u7684\u4e0a\u7f51\u641c\u4e86\u5417") is True
     assert is_search_verification_query("\u4f60\u521a\u521a\u67e5\u4e86\u5417") is True
