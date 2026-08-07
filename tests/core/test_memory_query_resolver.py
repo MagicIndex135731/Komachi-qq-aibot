@@ -2218,3 +2218,30 @@ def test_semantic_rewrite_keeps_member_subject_for_member_question() -> None:
     assert result.subject_ids == ("10001",)
     assert result.answer_mode == "current_fact"
     assert result.preferred_fact_kinds == ("current",)
+
+
+def test_semantic_rewrite_accepts_string_time_range_marker() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "最近在看 动画",
+                "answer_mode": "current_fact",
+                "subject_role": "requester",
+                "fact_kinds": ["current"],
+                "time_range": "recent",
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "我最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        requester_id=900000101,
+    )
+
+    assert result.rewrite_used is True
+    assert result.answer_mode == "current_fact"
+    assert result.retrieval_query == "最近在看 动画"
+    assert result.time_range is None

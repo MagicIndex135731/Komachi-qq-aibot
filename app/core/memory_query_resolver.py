@@ -1926,9 +1926,12 @@ class MemoryQueryResolver:
         confidence = payload.get("confidence", 0.5)
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
             return None
-        time_range = MemoryQueryResolver._parse_rewrite_time_range(payload.get("time_range"), now)
-        if payload.get("time_range") is not None and time_range is None:
-            return None
+        time_range_value = payload.get("time_range")
+        time_range = (
+            MemoryQueryResolver._parse_rewrite_time_range(time_range_value, now)
+            if isinstance(time_range_value, dict)
+            else None
+        )
         answer_mode_value = payload.get("answer_mode")
         answer_mode = (
             str(answer_mode_value).strip()
