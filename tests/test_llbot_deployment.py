@@ -49,7 +49,7 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
     assert "../../:/workspace" not in xiaomachi["volumes"]
     assert "xiaomachi_data:/workspace/data" in xiaomachi["volumes"]
-    assert xiaomachi["devices"] == ["nvidia.com/gpu=all"]
+    assert "devices" not in xiaomachi
     assert "devices" not in llbot
     assert all("/mnt/" not in volume for volume in xiaomachi["volumes"])
     assert "./runtime/pip-cache:/root/.cache/pip" not in xiaomachi["volumes"]
@@ -155,7 +155,9 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
     assert 'launcher="open_napcat_webui.ps1"' in script
     assert 'service_name="llbot"' in script
     assert 'service_name="napcat"' in script
-    assert 'docker compose -f "${compose_file}" build xiaomachi' in script
+    assert 'docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi' in script
+    assert 'gpu_flag="-f docker-compose.gpu.yml"' in script
+    assert "ENABLE_GPU" in script
     assert 'migrate_xiaomachi_data_volume.sh' in script
     assert "cleanup_failed_start" in script
     assert "pkill -f xiaomachi-wsl-keepalive" in script
@@ -163,6 +165,7 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
     assert "startup is already in progress" in script
     assert 'up -d "${service_name}"' in script
     assert 'up -d --no-deps xiaomachi' in script
+    assert 'docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi' in script
     assert script.index('compose_file="docker-compose.llbot.yml"') < script.index(
         'compose_file="docker-compose.yml"'
     )

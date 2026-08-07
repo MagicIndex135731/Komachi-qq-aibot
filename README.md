@@ -112,7 +112,14 @@
 - `MEMORY_QUERY_REWRITE_ENABLED=true`：确定性绑定失败时做一次受约束改写，不改宽时间范围、
   不虚构成员。
 - `MEMORY_EMBEDDING_DEVICE=cuda`：生产使用 CUDA 推理，Docker 通过 CDI 只把 GPU 分配给
-  `xiaomachi`。
+  `xiaomachi`。模板默认 `auto`：有 NVIDIA GPU 自动用 CUDA，没有则自动回退 CPU，
+  无 CUDA 机器可直接部署运行。
+
+无 NVIDIA 环境部署：保持 `.env` 中 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`、
+`MEMORY_EMBEDDING_LOCAL_FILES_ONLY=false`（首次运行需联网下载嵌入模型）即可；
+不需要安装 NVIDIA Container Toolkit，也不需要改动 Compose。有 NVIDIA 的机器设
+`ENABLE_GPU=1` 启用 `docker-compose.gpu.yml`，并把
+`MEMORY_EMBEDDING_DEVICE=cuda`、模型缓存后 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`。
 
 维护命令（均在容器内执行，先备份）：
 
@@ -163,16 +170,20 @@ Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENA
 
 ```bash
 cd "/mnt/d/qq群ai小人/infra/wsl"
-docker compose -f docker-compose.llbot.yml build xiaomachi
+# 无 NVIDIA 机器（默认）
 docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
+# 有 NVIDIA 机器（ENABLE_GPU=1）
+docker compose -f docker-compose.llbot.yml -f docker-compose.gpu.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
 **不得重建或重启 `xiaomachi-llbot`**，也不得删除其登录态。
-`MEMORY_ORCHESTRATION_V2_ENABLED` 只是 V2 兼容开关，不是 V3 回滚开关；
+V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，但它只是 V2 兼容开关，
+不是 V3 回滚开关；
 若向量通道异常，设置 `MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS。
-生产镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`，
-`MEMORY_EMBEDDING_DEVICE=cuda`，Docker 通过 `nvidia.com/gpu=all` CDI 只给
-`xiaomachi` 分配 GPU；模型缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`
+生产镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`；`ENABLE_GPU=1` 时通过
+`docker-compose.gpu.yml` 挂载 `nvidia.com/gpu=all` CDI 给 `xiaomachi`，
+`MEMORY_EMBEDDING_DEVICE=cuda` 仅在启用 GPU 的生产使用；无 GPU 机器保持
+`auto` 自动回退 CPU。模型缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`
 可离线启动。V2 为已退役兼容路径，旧迁移与评测命令不再需要。
 
 ## 运行结构

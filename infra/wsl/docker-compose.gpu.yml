@@ -1,0 +1,4 @@
+services:
+  xiaomachi:
+    devices:
+      - "nvidia.com/gpu=all"

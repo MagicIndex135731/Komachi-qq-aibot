@@ -26,7 +26,7 @@ def test_repair_memory_correction_is_idempotent_and_preserves_evidence(sqlite_en
         )
         users = UserRepository(session)
         users.upsert_user(user_id=200000001, nickname="Reporter", group_card="")
-        users.upsert_user(user_id=200000002, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=200000002, nickname="A-Zha", group_card="小明")
         messages = MessageRepository(session)
         target_seed = messages.add_group_message(
             platform_msg_id="target-seed",
@@ -34,7 +34,7 @@ def test_repair_memory_correction_is_idempotent_and_preserves_evidence(sqlite_en
             user_id=200000002,
             timestamp=corrected_at - timedelta(days=2),
             plain_text="普通群聊。",
-            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "小明"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -55,7 +55,7 @@ def test_repair_memory_correction_is_idempotent_and_preserves_evidence(sqlite_en
             group_id=100000001,
             user_id=200000001,
             timestamp=corrected_at,
-            plain_text="你记错了，是阿渣喜欢坐床上看动画。",
+            plain_text="你记错了，是小明喜欢坐床上看动画。",
             raw_json={},
             msg_type="text",
             reply_to_msg_id=None,
@@ -140,7 +140,7 @@ def test_repair_memory_correction_is_idempotent_and_preserves_evidence(sqlite_en
     kwargs = {
         "group_id": 100000001,
         "subject_id": 200000002,
-        "subject_alias": "阿渣",
+        "subject_alias": "小明",
         "predicate": "likes",
         "object_text": "坐床上看动画",
         "supporting_source_ids": ("900000001", "900000002"),
@@ -182,9 +182,9 @@ def test_repair_memory_correction_is_idempotent_and_preserves_evidence(sqlite_en
     assert episode_document.embedding_status == "ready"
     assert message_count == 3
     assert source_rows == {
-        "target-seed": ("普通群聊。", {"sender": {"nickname": "A-Zha", "card": "阿渣"}}),
+        "target-seed": ("普通群聊。", {"sender": {"nickname": "A-Zha", "card": "小明"}}),
         "900000001": ("小明最喜欢坐床上看动画片。", {}),
-        "900000002": ("你记错了，是阿渣喜欢坐床上看动画。", {}),
+        "900000002": ("你记错了，是小明喜欢坐床上看动画。", {}),
     }
 
     with pytest.raises(ValueError, match="does not support the requested fact"):

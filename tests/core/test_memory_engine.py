@@ -157,7 +157,7 @@ def test_parse_personal_claim_distinguishes_sender_and_named_subject() -> None:
     assert first_person.object_text == "坐床上看动画"
     assert named is not None
     assert named.subject_mode == "alias"
-    assert named.subject_alias == "阿渣"
+    assert named.subject_alias == "小明"
     assert named.object_text == "坐床上看动画片"
 
 

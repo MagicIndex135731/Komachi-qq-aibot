@@ -39,6 +39,11 @@ else
   launcher="open_napcat_webui.ps1"
 fi
 
+gpu_flag=""
+if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' .env; then
+  gpu_flag="-f docker-compose.gpu.yml"
+fi
+
 startup_complete=false
 
 cleanup_failed_start() {
@@ -94,7 +99,7 @@ docker volume inspect xiaomachi-llbot-data >/dev/null 2>&1 || docker volume crea
 bash "${SCRIPT_DIR}/migrate_runtime_to_linux_volumes.sh"
 # This is a cache check on normal starts. Dependency installation only runs when
 # the Dockerfile or requirements file changed, or when the local image is absent.
-docker compose -f "${compose_file}" build xiaomachi
+docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi
 bash "${SCRIPT_DIR}/migrate_xiaomachi_data_volume.sh" "${compose_file}"
 if [[ "${platform}" == "llbot" ]]; then
   docker run --rm \
@@ -109,6 +114,6 @@ fi
 # The bot reconnects to OneBot on its own while the QQ platform finishes login.
 docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
-docker compose -f "${compose_file}" up -d --no-deps xiaomachi
+docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
 bash "${SCRIPT_DIR}/status.sh"
 startup_complete=true

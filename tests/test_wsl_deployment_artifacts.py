@@ -158,12 +158,14 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     )
 
     compose_up = start_script.index('docker compose -f "${compose_file}" up -d "${service_name}"')
-    image_build = start_script.index('docker compose -f "${compose_file}" build xiaomachi')
+    image_build = start_script.index('docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi')
     conditional_open = start_script.index("\nopen_login_page\n")
-    bot_up = start_script.index('docker compose -f "${compose_file}" up -d --no-deps xiaomachi')
+    bot_up = start_script.index('docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi')
     status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"')
     assert image_build < compose_up < conditional_open < bot_up < status_probe
-    assert 'docker compose -f "${compose_file}" up -d --no-deps xiaomachi' in start_script
+    assert 'docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi' in start_script
+    assert 'gpu_flag="-f docker-compose.gpu.yml"' in start_script
+    assert "ENABLE_GPU" in start_script
     assert "webui_port=6099" in start_script
     assert "webui_port=3080" in start_script
     assert "wslpath -w" in start_script
@@ -202,10 +204,12 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
     required_settings = [
         "CONTEXT_RECENT_LIMIT=60",
         "MEMORY_ORCHESTRATION_V2_ENABLED=true",
-        "MEMORY_ORCHESTRATION_SHADOW_MODE=true",
+        "MEMORY_ORCHESTRATION_SHADOW_MODE=false",
         "MEMORY_EMBEDDING_PROVIDER=local",
-        "MEMORY_RAW_V3_ENABLED=false",
+        "MEMORY_RAW_V3_ENABLED=true",
         "MEMORY_EMBEDDING_DEVICE=auto",
+        "MEMORY_EMBEDDING_LOCAL_FILES_ONLY=false",
+        "ENABLE_GPU=0",
         "MEMORY_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5",
         "MEMORY_EMBEDDING_DIMENSIONS=512",
         "MEMORY_EMBEDDING_CACHE_DIR=/workspace/data/models",
@@ -217,7 +221,11 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         "MEMORY_EPISODE_MAX_TOKENS=8000",
         "MEMORY_CHUNK_MAX_TOKENS=1800",
         "MEMORY_CHUNK_OVERLAP_MESSAGES=5",
-        "MEMORY_QUERY_REWRITE_ENABLED=false",
+        "MEMORY_QUERY_REWRITE_ENABLED=true",
+        "MEMORY_LAYERED_MEMORY_ENABLED=true",
+        "MEMORY_MEMORY_TOOLS_ENABLED=true",
+        "MEMORY_FACT_SEMANTIC_RANKING_ENABLED=true",
+        "MEMORY_ADAPTIVE_CONTEXT_ENABLED=true",
         "MEMORY_QUERY_REWRITE_TIMEOUT_SECONDS=3",
         "MEMORY_QUERY_REWRITE_MAX_OUTPUT_TOKENS=256",
         "MEMORY_LLM_RERANK_ENABLED=false",
@@ -235,20 +243,17 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         assert setting in env_example
 
     for documentation in (root_readme, wsl_readme):
-        assert "shadow -> backfill -> evaluate -> active" in documentation
-        assert "/workspace/data/models" in documentation
-        assert "MEMORY_ORCHESTRATION_V2_ENABLED=false" in documentation
         assert "MEMORY_ORCHESTRATION_V2_ENABLED=true" in documentation
         assert "MEMORY_EMBEDDING_PROVIDER=disabled" in documentation
         assert "MEMORY_EMBEDDING_DEVICE=auto" in documentation
         assert "nvidia.com/gpu=all" in documentation
-        assert "docker compose -f docker-compose.llbot.yml build xiaomachi" in documentation
-        assert (
-            "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi"
-            in documentation
-        )
+        assert "docker-compose.gpu.yml" in documentation
+        assert "ENABLE_GPU" in documentation
+        assert "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi" in documentation
         assert "xiaomachi-llbot" in documentation
-        assert "must not restart xiaomachi-llbot" in documentation
+    assert "/workspace/data/models" in wsl_readme
+    assert "must not restart xiaomachi-llbot" in wsl_readme
+    assert "MEMORY_ORCHESTRATION_V2_ENABLED" in root_readme
 
 
 def test_gitignore_excludes_wsl_runtime_state() -> None:
@@ -349,12 +354,17 @@ def test_xiaomachi_image_requirements_match_pyproject() -> None:
     assert "fastembed>=0.6.0,<0.7.0" in actual
 
 
-def test_xiaomachi_compose_requests_only_the_nvidia_cdi_device_for_the_bot() -> None:
+def test_xiaomachi_compose_keeps_gpu_device_in_optional_override() -> None:
     for name in ("docker-compose.yml", "docker-compose.llbot.yml"):
         compose = yaml.safe_load((REPO_ROOT / "infra/wsl" / name).read_text(encoding="utf-8"))
-        assert compose["services"]["xiaomachi"]["devices"] == ["nvidia.com/gpu=all"]
+        assert "devices" not in compose["services"]["xiaomachi"]
         platform_service = "llbot" if "llbot" in compose["services"] else "napcat"
         assert "devices" not in compose["services"][platform_service]
+    gpu = yaml.safe_load(
+        (REPO_ROOT / "infra/wsl/docker-compose.gpu.yml").read_text(encoding="utf-8")
+    )
+    assert gpu["services"]["xiaomachi"]["devices"] == ["nvidia.com/gpu=all"]
+    assert "name" not in gpu
 
 
 def test_status_script_uses_on_demand_probes_before_logs() -> None:

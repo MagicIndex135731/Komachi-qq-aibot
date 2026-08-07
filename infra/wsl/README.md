@@ -76,7 +76,10 @@ Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V
 
 ```bash
 docker compose -f docker-compose.llbot.yml build xiaomachi
+# 无 NVIDIA 机器（ENABLE_GPU=0，默认）：
 docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
+# 有 NVIDIA 机器（ENABLE_GPU=1）：
+docker compose -f docker-compose.llbot.yml -f docker-compose.gpu.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
 操作前后记录 `xiaomachi-llbot` 的 container ID 与 `StartedAt`；
@@ -86,13 +89,17 @@ LLBot 登录态。
 
 ### CUDA 向量加速
 
-`xiaomachi` 镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`，Compose 只向 bot 服务挂载
-`nvidia.com/gpu=all` CDI 设备。设置 `MEMORY_EMBEDDING_DEVICE=auto` 后优先使用 NVIDIA
-GPU，并在 CUDA 推理异常时回退 CPU；LLBot 不申请 GPU。主机需安装 NVIDIA Container
-Toolkit，并确保 `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 已生成设备规范。
+`xiaomachi` 镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`。GPU 设备是可选的：
+基础 Compose 不再挂载 GPU，`ENABLE_GPU=1` 时才通过 `docker-compose.gpu.yml`
+向 bot 服务挂载 `nvidia.com/gpu=all` CDI 设备；无 NVIDIA 机器无需任何改动即可运行
+（嵌入 `MEMORY_EMBEDDING_DEVICE=auto` 自动回退 CPU）。
+设置 `MEMORY_EMBEDDING_DEVICE=auto` 后优先使用 NVIDIA GPU，并在 CUDA 推理异常时
+回退 CPU；LLBot 不申请 GPU。主机需安装 NVIDIA Container Toolkit，并确保
+`nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 已生成设备规范。
 可用 `docker run --rm --device nvidia.com/gpu=all ...` 验证透传。
 确认模型已经缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`，可保证离线重启不会
-等待模型站点超时。
+等待模型站点超时（首次部署请保持 `false` 以便联网下载模型）。嵌入模型缓存位于持久卷
+`/workspace/data/models`，镜像重建不会丢失。
 
 ### 按群记忆策略与日常维护（Memory V3）
 
