@@ -294,6 +294,13 @@ def _parse_fact(
         or (allowed_subjects is not None and subject_id not in allowed_subjects)
     ):
         return None
+    if kind in {"preference", "taboo", "profile"} and (
+        len(object_text) < 2 or len(content) < 6
+    ):
+        # Quality gate: preference/profile fragments such as "likes 你" or
+        # "玩调式的" lack a meaningful object and must not be persisted as
+        # long-term profile evidence.
+        return None
 
     cleaned_sources: list[str] = []
     for source in sources_raw:

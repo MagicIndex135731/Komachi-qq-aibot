@@ -179,6 +179,16 @@ class AppSettings(BaseSettings):
         le=30,
         alias="MEMORY_MEMBER_FACT_SUPPLEMENT_LIMIT",
     )
+    memory_fact_semantic_ranking_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_FACT_SEMANTIC_RANKING_ENABLED",
+    )
+    memory_fact_semantic_candidates: int = Field(
+        default=60,
+        ge=1,
+        le=200,
+        alias="MEMORY_FACT_SEMANTIC_CANDIDATES",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",

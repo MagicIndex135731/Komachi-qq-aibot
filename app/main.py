@@ -38,6 +38,7 @@ from app.core.memory_fact_ranking import (
     memory_query_features,
     rank_member_facts,
 )
+from app.core.memory_fact_semantics import SemanticFactRanker
 from app.core.memory_context_packer import (
     EvidenceMessage,
     MemoryContextPacker,
@@ -527,6 +528,7 @@ def build_memory_runtime(
         api_key=settings.memory_embedding_api_key,
         timeout_seconds=settings.memory_embedding_timeout_seconds,
     )
+    semantic_fact_ranker = SemanticFactRanker(embedding_provider)
     legacy_embedding_generation = None
     raw_message_embedding_generation = None
     if settings.memory_orchestration_v2_enabled and embedding_provider.available:
@@ -679,6 +681,7 @@ def build_memory_runtime(
             subject_ids = resolved_query.subject_ids
             boosted_fact_ids: set[int] = set()
             preferred_fact_ids: set[int] = set()
+            semantic_scores_by_id: dict[int, float] = {}
             if subject_ids:
                 seen_ids = {row.id for row in rows}
                 query_features = memory_query_features(
@@ -711,11 +714,25 @@ def build_memory_runtime(
                             settings.memory_member_fact_supplement_limit,
                         ),
                     )
+                    semantic_scores: dict[int, float] = {}
+                    if (
+                        settings.memory_fact_semantic_ranking_enabled
+                        and resolved_query.answer_mode in {"current_fact", "assessment"}
+                    ):
+                        semantic_candidates = candidates[
+                            : settings.memory_fact_semantic_candidates
+                        ]
+                        semantic_scores = semantic_fact_ranker.score(
+                            str(resolved_query.retrieval_query),
+                            semantic_candidates,
+                        )
+                        semantic_scores_by_id.update(semantic_scores)
                     for row in rank_member_facts(
                         candidates,
                         query_features=query_features,
                         limit=settings.memory_member_fact_supplement_limit,
                         preferred_kinds=preferred_kinds,
+                        semantic_scores=semantic_scores,
                     ):
                         if row.id in seen_ids:
                             continue
@@ -744,7 +761,8 @@ def build_memory_runtime(
                     ),
                     score=float(row.confidence or 0.0)
                     + (1.0 if row.id in boosted_fact_ids else 0.0)
-                    + (0.5 if row.id in preferred_fact_ids else 0.0),
+                    + (0.5 if row.id in preferred_fact_ids else 0.0)
+                    + (0.8 * semantic_scores_by_id.get(row.id, 0.0)),
                     valid_until=row.valid_until,
                     group_id=group_id,
                 )

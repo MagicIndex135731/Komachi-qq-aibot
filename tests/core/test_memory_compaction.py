@@ -11,8 +11,13 @@ from app.core.memory_compaction import (
 )
 
 
-def _fact(*, source_ids: list[str] | None = None, content: str = "Alice likes hotpot.") -> dict:
-    return {
+def _fact(
+    *,
+    source_ids: list[str] | None = None,
+    content: str = "Alice likes hotpot.",
+    **overrides,
+) -> dict:
+    payload = {
         "kind": "preference",
         "subject_id": "Alice",
         "predicate": "likes",
@@ -24,6 +29,8 @@ def _fact(*, source_ids: list[str] | None = None, content: str = "Alice likes ho
         "valid_until": None,
         "ignored_by_parser": "do not persist",
     }
+    payload.update(overrides)
+    return payload
 
 
 def test_parser_filters_fields_and_deduplicates_source_backed_facts() -> None:
@@ -52,6 +59,38 @@ def test_parser_filters_fields_and_deduplicates_source_backed_facts() -> None:
         "source_msg_ids": ("m-1", "m-2"),
         "valid_until": None,
     }
+
+
+def test_parser_quality_gate_rejects_preference_fragments() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "digest",
+            "facts": [
+                _fact(
+                    source_ids=["m-1"],
+                    predicate="likes",
+                    object_text="你",
+                    content="阿渣 likes 你",
+                ),
+                _fact(
+                    source_ids=["m-2"],
+                    object_text="冰美式",
+                    content="阿渣喜欢喝冰美式",
+                ),
+                _fact(
+                    source_ids=["m-3"],
+                    kind="taboo",
+                    predicate="dislikes",
+                    object_text="北京",
+                    content="阿渣不喜欢北京",
+                ),
+            ],
+        },
+        allowed_source_msg_ids={"m-1", "m-2", "m-3"},
+    )
+
+    assert result.rejected_fact_count == 1
+    assert [fact.object_text for fact in result.facts] == ["冰美式", "北京"]
 
 
 def test_parser_discards_hallucinated_source_ids_and_uses_summary_fallback() -> None:

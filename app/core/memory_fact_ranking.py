@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
@@ -79,6 +79,7 @@ def rank_member_facts(
     query_features: Sequence[str],
     limit: int,
     preferred_kinds: Sequence[str] = (),
+    semantic_scores: Mapping[int, float] | None = None,
 ) -> list[RankableMemoryFact]:
     """Rank member facts by query relevance, then importance/confidence.
 
@@ -96,7 +97,11 @@ def rank_member_facts(
     preferred = frozenset(
         str(kind).strip() for kind in preferred_kinds if str(kind).strip()
     )
-    scored: list[tuple[bool, bool, float, float, int, RankableMemoryFact]] = []
+    normalized_semantic = {
+        int(fact_id): max(0.0, min(1.0, float(score)))
+        for fact_id, score in (semantic_scores or {}).items()
+    }
+    scored: list[tuple[bool, bool, float, float, float, int, RankableMemoryFact]] = []
     for fact in facts:
         haystack = " ".join(
             str(value)
@@ -105,10 +110,12 @@ def rank_member_facts(
         )
         matched = any(feature in haystack for feature in normalized_features)
         kind = str(getattr(fact, "memory_kind", "") or "").strip()
+        semantic = normalized_semantic.get(int(fact.id or 0), 0.0)
         scored.append(
             (
                 kind in preferred,
                 matched,
+                semantic,
                 float(fact.importance or 1),
                 float(fact.confidence or 0.0),
                 int(fact.id or 0),
@@ -116,10 +123,17 @@ def rank_member_facts(
             )
         )
     scored.sort(
-        key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
+        key=lambda item: (
+            item[0],
+            item[2],
+            item[1],
+            item[3],
+            item[4],
+            item[5],
+        ),
         reverse=True,
     )
-    return [item[5] for item in scored[: int(limit)]]
+    return [item[6] for item in scored[: int(limit)]]
 
 
 def matching_member_fact_ids(
