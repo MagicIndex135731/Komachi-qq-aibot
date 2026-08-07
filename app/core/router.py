@@ -88,6 +88,12 @@ from app.storage.repositories import (
 logger = logging.getLogger(__name__)
 
 
+_QUOTED_PRONOUN_PATTERN = re.compile(r"他|她|那位|这位|这个人|那家伙")
+_QUOTED_REFERENT_ASK_PATTERN = re.compile(
+    r"谁|什么|什么意思|在说谁|说的是谁|指谁|是谁|说什么|在说什么|指的谁"
+)
+
+
 QQ_BLOCKED_REPLY_NOTICE = "刚刚的回复可能包含敏感信息，被 QQ 拦截了，无法发送。"
 QQ_BLOCKED_CONTEXT_NOTE = (
     "[系统投递状态：以上回复未在 QQ 群中送达；连续发送后仍被 QQ 拦截，可能包含敏感信息。"
@@ -591,6 +597,28 @@ class InboundRouter:
             fallback=str(quoted_raw_payload.get("user_id", "quoted-user")) if isinstance(quoted_raw_payload, dict) else "quoted-user",
         )
         return f"{label}: {quoted_text}"
+
+    def _quoted_pronoun_referent_note(
+        self,
+        *,
+        query_text: str,
+        quoted_raw_payload: dict | None,
+    ) -> str | None:
+        if not isinstance(quoted_raw_payload, dict):
+            return None
+        if not self._flatten_raw_message_text(quoted_raw_payload):
+            return None
+        if not _QUOTED_PRONOUN_PATTERN.search(query_text):
+            return None
+        if not _QUOTED_REFERENT_ASK_PATTERN.search(query_text):
+            return None
+        return (
+            "Note: “他/她” in this question refers to the sender of the quoted "
+            "message above. Use the recent chat to determine who or what that "
+            "sender is talking about and quote the original lines. If the "
+            "quoted text explicitly names another person, follow the quoted "
+            "text; if no clear referent exists, say the evidence is insufficient."
+        )
 
     def _is_reply_to_bot(self, *, event, messages: MessageRepository, quoted_raw_payload: dict | None) -> bool:
         if event.reply_to_msg_id is None:
@@ -1597,6 +1625,12 @@ class InboundRouter:
             )
             if quoted_message_line is not None:
                 prompt_target_text = f"{prompt_target_text}\nQuoted message: {quoted_message_line}"
+                pronoun_referent_note = self._quoted_pronoun_referent_note(
+                    query_text=event.plain_text,
+                    quoted_raw_payload=quoted_raw_payload,
+                )
+                if pronoun_referent_note is not None:
+                    prompt_target_text = f"{prompt_target_text}\n{pronoun_referent_note}"
             prompt_lines = self.context_builder.build(
                 persona_text=render_persona(self.runtime.persona),
                 safety_rules=render_safety_lines(self.runtime.safety),

@@ -390,6 +390,114 @@ class FakeImageSearchClient:
         return []
 
 
+class FakeGetMsgGateway:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    async def call_api(self, action: str, params: dict) -> dict:
+        del params
+        assert action == "get_msg"
+        return {"status": "ok", "data": self.payload}
+
+
+def test_quoted_pronoun_referent_note_trigger_matrix(sqlite_engine) -> None:
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+    )
+    quoted = {
+        "message": [{"type": "text", "data": {"text": "形式主义大国"}}],
+        "sender": {"nickname": "X", "card": "Y"},
+        "user_id": 81921,
+    }
+    note = router._quoted_pronoun_referent_note(
+        query_text="他在说谁",
+        quoted_raw_payload=quoted,
+    )
+    assert note is not None
+    assert "sender of the quoted message" in note
+
+    for query_text in ("这是什么意思", "今天天气怎么样", "她在哪里", "他在干嘛"):
+        assert (
+            router._quoted_pronoun_referent_note(
+                query_text=query_text,
+                quoted_raw_payload=quoted,
+            )
+            is None
+        ), query_text
+    assert (
+        router._quoted_pronoun_referent_note(
+            query_text="他在说谁",
+            quoted_raw_payload=None,
+        )
+        is None
+    )
+    assert (
+        router._quoted_pronoun_referent_note(
+            query_text="他在说谁",
+            quoted_raw_payload={},
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_appends_pronoun_referent_note_for_quoted_question(
+    sqlite_engine,
+) -> None:
+    observed_at = datetime(2026, 8, 7, 7, 20, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        users = UserRepository(session)
+        users.upsert_user(user_id=81921, nickname="X", group_card="Y")
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        MessageRepository(session).add_group_message(
+            platform_msg_id="quote-1",
+            group_id=10001,
+            user_id=81921,
+            timestamp=observed_at,
+            plain_text="形式主义大国",
+            raw_json={"sender": {"nickname": "X", "card": "Y"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+    sender = FakeSender()
+    sender.gateway = FakeGetMsgGateway(
+        {
+            "message": [{"type": "text", "data": {"text": "形式主义大国"}}],
+            "sender": {"nickname": "X", "card": "Y"},
+            "user_id": 81921,
+        }
+    )
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="ask-1",
+            plain_text="他在说谁",
+            user_id=20001,
+            reply_to_msg_id="quote-1",
+        )
+    )
+    assert llm.calls
+    prompt_text = "\n".join(llm.calls[0])
+    assert "Quoted message: Y（QQ昵称：X）: 形式主义大国" in prompt_text
+    assert "sender of the quoted message" in prompt_text
+
+
 def make_raw_payload(
     *,
     message_id: str,
