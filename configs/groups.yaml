@@ -5,6 +5,8 @@ default_group_behavior:
   proactive_reply: true
   proactive_interval_seconds: "180-480"
   image_generation: true
+  memory_enabled: false
+  recent_context_limit: 100
 
 groups:
   "100000001":
@@ -15,6 +17,8 @@ groups:
     proactive_interval_seconds: "180-480"
     image_generation: true
     long_context_history: false
+    memory_enabled: true
+    recent_context_limit: null
 
   "100000002":
     enabled: true
@@ -23,3 +27,5 @@ groups:
     proactive_reply: false
     proactive_interval_seconds: "180-480"
     image_generation: false
+    memory_enabled: false
+    recent_context_limit: 100

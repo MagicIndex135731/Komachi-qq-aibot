@@ -484,6 +484,7 @@ class SqlAlchemyMemoryBackgroundStore:
         raw_message_projection_enabled: bool | None = None,
         raw_message_embedding_enabled: bool = False,
         raw_message_embedding_generation: int | None = None,
+        memory_enabled_group_ids: frozenset[int] | None = None,
     ) -> None:
         self.engine = engine
         self.batch_size = max(1, int(batch_size))
@@ -515,8 +516,18 @@ class SqlAlchemyMemoryBackgroundStore:
             if raw_message_projection_enabled is None
             else bool(raw_message_projection_enabled)
         )
+        self._memory_enabled_group_ids = (
+            None
+            if memory_enabled_group_ids is None
+            else frozenset(int(value) for value in memory_enabled_group_ids)
+        )
         self.segmentation_generation: str | None = None
         self.compaction_generation: str | None = None
+
+    def _memory_group_enabled(self, group_id: int) -> bool:
+        if self._memory_enabled_group_ids is None:
+            return True
+        return int(group_id) in self._memory_enabled_group_ids
 
     def configure_generations(
         self,
@@ -536,7 +547,9 @@ class SqlAlchemyMemoryBackgroundStore:
         backfill_run_id: int | None,
         watermark_message_id: int | None,
         now: datetime,
-    ) -> BackgroundJob:
+    ) -> BackgroundJob | None:
+        if not self._memory_group_enabled(group_id):
+            return None
         payload = {
             "group_id": int(group_id),
             "latest_message_id": int(latest_message_id),
@@ -567,7 +580,9 @@ class SqlAlchemyMemoryBackgroundStore:
         compaction_generation: str,
         backfill_run_id: int | None,
         now: datetime,
-    ) -> BackgroundJob:
+    ) -> BackgroundJob | None:
+        if not self._memory_group_enabled(group_id):
+            return None
         payload = {
             "group_id": int(group_id),
             "episode_id": int(episode_id),
@@ -590,7 +605,9 @@ class SqlAlchemyMemoryBackgroundStore:
         *,
         request: ShadowJobRequest,
         now: datetime,
-    ) -> BackgroundJob:
+    ) -> BackgroundJob | None:
+        if not self._memory_group_enabled(request.group_id):
+            return None
         payload = {
             "group_id": int(request.group_id),
             "message_id": int(request.message_id),
@@ -679,6 +696,8 @@ class SqlAlchemyMemoryBackgroundStore:
         """Persist an ID-only request; projection content is reloaded by worker."""
         if not self.raw_message_projection_enabled:
             return None
+        if not self._memory_group_enabled(group_id):
+            return None
         resolved_group_id = int(group_id)
         resolved_message_id = int(message_id)
         with session_scope(self.engine) as session:
@@ -743,6 +762,8 @@ class SqlAlchemyMemoryBackgroundStore:
             )
             jobs = JobRepository(session)
             for group_id, message_id in gaps:
+                if not self._memory_group_enabled(group_id):
+                    continue
                 jobs.enqueue_coalescing_job(
                     job_type=self.raw_message_projection_job_type,
                     job_key=(
@@ -802,7 +823,24 @@ class SqlAlchemyMemoryBackgroundStore:
                     include_derived_generations=include_derived_generations,
                 )
                 if row is not None:
-                    return _background_job(row)
+                    job = _background_job(row)
+                    if not self._memory_group_enabled(job.group_id):
+                        try:
+                            jobs.complete_coalescing_job(
+                                job_id=job.id,
+                                worker_id=worker_id,
+                                claimed_generation=job.claimed_generation,
+                                now=now,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "memory_disabled_group_job_retire_failed "
+                                "group_id=%s job_id=%s",
+                                job.group_id,
+                                job.id,
+                            )
+                        continue
+                    return job
         return None
 
     def complete_job(
@@ -1466,6 +1504,7 @@ class MemoryBackgroundService:
         poll_interval_seconds: float = 1.0,
         reconciliation_interval_seconds: float = 30.0,
         reconciliation_batch_size: int = 500,
+        memory_enabled_group_ids: frozenset[int] | None = None,
     ) -> None:
         self.store = store
         self.deriver = deriver
@@ -1493,6 +1532,11 @@ class MemoryBackgroundService:
             1,
             int(reconciliation_batch_size),
         )
+        self._memory_enabled_group_ids = (
+            None
+            if memory_enabled_group_ids is None
+            else frozenset(int(value) for value in memory_enabled_group_ids)
+        )
         configure_generations = getattr(store, "configure_generations", None)
         if callable(configure_generations):
             configure_generations(
@@ -1503,6 +1547,11 @@ class MemoryBackgroundService:
         self._wake_event = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
         self._next_reconciliation_at: datetime | None = None
+
+    def _memory_group_enabled(self, group_id: int) -> bool:
+        if self._memory_enabled_group_ids is None:
+            return True
+        return int(group_id) in self._memory_enabled_group_ids
 
     @property
     def worker_task(self) -> asyncio.Task[None] | None:
@@ -1544,8 +1593,10 @@ class MemoryBackgroundService:
         now: datetime | None = None,
         backfill_run_id: int | None = None,
         watermark_message_id: int | None = None,
-    ) -> BackgroundJob:
+    ) -> BackgroundJob | None:
         """Persist/rearm one stable allocator job without reading history."""
+        if not self._memory_group_enabled(group_id):
+            return None
         queued = self.store.enqueue_allocator(
             group_id=int(group_id),
             latest_message_id=int(message_id),
@@ -1565,6 +1616,8 @@ class MemoryBackgroundService:
         now: datetime | None = None,
     ) -> BackgroundJob | None:
         """Persist an ID-only projection request for retryable worker execution."""
+        if not self._memory_group_enabled(group_id):
+            return None
         queued = self.store.enqueue_raw_message_projection(
             group_id=int(group_id),
             message_id=int(message_id),
@@ -1587,6 +1640,8 @@ class MemoryBackgroundService:
         The store performs the membership/document invalidation transaction.
         The replay itself remains a normal generation-aware allocator job.
         """
+        if not self._memory_group_enabled(group_id):
+            return None
         resolved_now = _utc(now or datetime.now(UTC))
         plan = self.store.prepare_late_arrival_resegment(
             group_id=int(group_id),
@@ -1623,10 +1678,12 @@ class MemoryBackgroundService:
     def enqueue_shadow(
         self,
         request: ShadowJobRequest,
-        *,
+        *, 
         now: datetime | None = None,
     ) -> BackgroundJob | None:
         if self.shadow_evaluator is None:
+            return None
+        if not self._memory_group_enabled(request.group_id):
             return None
         queued = self.store.enqueue_shadow(
             request=request,

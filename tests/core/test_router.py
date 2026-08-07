@@ -498,6 +498,59 @@ async def test_router_appends_pronoun_referent_note_for_quoted_question(
     assert "sender of the quoted message" in prompt_text
 
 
+@pytest.mark.asyncio
+async def test_memory_disabled_group_uses_recent_only_context(sqlite_engine) -> None:
+    observed_at = datetime(2026, 8, 7, 7, 20, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="plain",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        messages = MessageRepository(session)
+        for index in range(20):
+            messages.add_group_message(
+                platform_msg_id=f"plain-{index}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=observed_at + timedelta(seconds=index),
+                plain_text=f"消息{index}",
+                raw_json={"sender": {"nickname": "Alice", "card": ""}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    router.runtime.group_policy["groups"]["10001"]["memory_enabled"] = False
+    router.runtime.group_policy["groups"]["10001"]["recent_context_limit"] = 100
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="plain-ask",
+            plain_text="最近聊了什么",
+            user_id=20001,
+        )
+    )
+
+    assert llm.calls
+    prompt_text = "\n".join(llm.calls[0])
+    assert "Packed memory context" not in prompt_text
+    assert "消息19" in prompt_text
+
+
 def make_raw_payload(
     *,
     message_id: str,

@@ -19,6 +19,7 @@ from app.main import (
     build_memory_runtime,
     build_web_search_client,
     create_runtime_banner,
+    should_enable_memory_in_group,
     should_ingest_group_message,
     sync_history_archives,
 )
@@ -112,6 +113,14 @@ async def run() -> None:
             engine=engine,
             llm_client=llm_client,
             bot_display_name=str(runtime.persona.get("name", settings.bot_qq)),
+            memory_enabled_group_ids=frozenset(
+                int(group_id)
+                for group_id in runtime.group_policy.get("groups", {})
+                if should_enable_memory_in_group(
+                    group_id=int(group_id),
+                    group_policy=runtime.group_policy,
+                )
+            ),
         )
         memory_compaction_service = memory_runtime.memory_compaction_service
         persistent_group_engine = engine if hasattr(engine, "connect") else None

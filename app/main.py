@@ -121,6 +121,11 @@ def should_archive_group_history(*, group_id: int, group_policy: dict[str, Any])
     return bool(entry.get("enabled", False) and entry.get("speak", False) and entry.get("archive", False))
 
 
+def should_enable_memory_in_group(*, group_id: int, group_policy: dict[str, Any]) -> bool:
+    entry = _group_policy_entry(group_id=group_id, group_policy=group_policy)
+    return bool(entry.get("memory_enabled", False))
+
+
 def sync_history_archives(engine, runtime) -> dict[int, int]:
     allowed_group_ids = {
         int(group_id)
@@ -510,6 +515,7 @@ def build_memory_runtime(
     bot_display_name: str,
     raw_message_embedding_generation_override: int | None = None,
     evaluation_candidate_filter: Callable[..., tuple[object, ...]] | None = None,
+    memory_enabled_group_ids: frozenset[int] | None = None,
 ) -> MemoryRuntimeComposition:
     legacy = LegacyMemoryContext(
         engine=engine,
@@ -932,6 +938,7 @@ def build_memory_runtime(
                 embedding_generation=legacy_embedding_generation,
                 raw_message_embedding_enabled=settings.memory_raw_v3_enabled,
                 raw_message_embedding_generation=raw_message_embedding_generation,
+                memory_enabled_group_ids=memory_enabled_group_ids,
             ),
             deriver=CompactionEpisodeDeriver(
                 llm_client=llm_client,
@@ -948,6 +955,7 @@ def build_memory_runtime(
             bot_user_id=settings.bot_qq,
             embedder=embedding_provider,
             shadow_evaluator=shadow_evaluator,
+            memory_enabled_group_ids=memory_enabled_group_ids,
         )
 
     def enqueue_shadow_sync(request: ShadowJobRequest) -> None:
@@ -1069,6 +1077,14 @@ async def run() -> None:
             engine=engine,
             llm_client=llm_client,
             bot_display_name=str(runtime.persona.get("name", settings.bot_qq)),
+            memory_enabled_group_ids=frozenset(
+                int(group_id)
+                for group_id in runtime.group_policy.get("groups", {})
+                if should_enable_memory_in_group(
+                    group_id=int(group_id),
+                    group_policy=runtime.group_policy,
+                )
+            ),
         )
         memory_compaction_service = memory_runtime.memory_compaction_service
         persistent_group_engine = engine if hasattr(engine, "connect") else None

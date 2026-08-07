@@ -284,18 +284,22 @@ class InboundRouter:
                     "enabled": False,
                     "archive": False,
                     "speak": False,
+                "proactive_reply": True,
+                "proactive_interval_seconds": "180-480",
+                "memory_enabled": False,
+                "recent_context_limit": 100,
+            },
+            "groups": {
+                "10001": {
+                    "enabled": True,
+                    "archive": True,
+                    "speak": True,
                     "proactive_reply": True,
                     "proactive_interval_seconds": "180-480",
-                },
-                "groups": {
-                    "10001": {
-                        "enabled": True,
-                        "archive": True,
-                        "speak": True,
-                        "proactive_reply": True,
-                        "proactive_interval_seconds": "180-480",
-                    }
-                },
+                    "memory_enabled": True,
+                    "recent_context_limit": 120,
+                }
+            },
             },
             safety={
                 "must_disclose_ai_identity": True,
@@ -432,6 +436,24 @@ class InboundRouter:
         defaults = self.runtime.group_policy.get("default_group_behavior", {})
         configured = self.runtime.group_policy.get("groups", {}).get(str(group_id), {})
         return bool(configured.get(key, defaults.get(key, default)))
+
+    def _group_policy_int(self, *, group_id: int, key: str, default: int) -> int:
+        defaults = self.runtime.group_policy.get("default_group_behavior", {})
+        configured = self.runtime.group_policy.get("groups", {}).get(str(group_id), {})
+        value = configured.get(key, defaults.get(key, default))
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _group_memory_enabled(self, *, group_id: int) -> bool:
+        return self._group_policy_bool(
+            group_id=group_id,
+            key="memory_enabled",
+            default=False,
+        )
 
     def _normalize_timestamp(self, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -1177,9 +1199,19 @@ class InboundRouter:
                 groups=groups,
                 group_id=event.group_id,
             )
+            memory_enabled = self._group_memory_enabled(group_id=event.group_id)
+            recent_context_limit = (
+                self.runtime.settings.memory_recent_snapshot_limit
+                if memory_enabled
+                else self._group_policy_int(
+                    group_id=event.group_id,
+                    key="recent_context_limit",
+                    default=100,
+                )
+            )
             recent_messages = messages.list_recent_group_messages(
                 group_id=event.group_id,
-                limit=self.runtime.settings.memory_recent_snapshot_limit,
+                limit=recent_context_limit,
             )
             use_full_history = self._group_policy_bool(
                 group_id=event.group_id,
@@ -1392,7 +1424,7 @@ class InboundRouter:
                 ),
             )
             memory_tool_executor = None
-            if self.runtime.settings.memory_memory_tools_enabled:
+            if memory_enabled and self.runtime.settings.memory_memory_tools_enabled:
                 member_names: dict[str, int] = {}
                 for message in recent_messages:
                     sender = (
@@ -1422,19 +1454,21 @@ class InboundRouter:
                 memory_tool_executor is not None
                 and self._query_mentions_member(event.plain_text, users_by_id)
             )
-            memory_result = self.memory_orchestrator.build_context(
-                GroupMemoryContextRequest(
-                    group_id=event.group_id,
-                    query=event.plain_text,
-                    recent_messages=recent_memory_messages,
-                    quoted_message=quoted_memory_message,
-                    target_message_id=event.platform_msg_id,
-                    available_input=available_memory_input,
-                    now=self._normalize_timestamp(event.timestamp),
-                    current_user_id=event.user_id,
-                    use_full_history=use_full_history,
-                )
+            memory_request = GroupMemoryContextRequest(
+                group_id=event.group_id,
+                query=event.plain_text,
+                recent_messages=recent_memory_messages,
+                quoted_message=quoted_memory_message,
+                target_message_id=event.platform_msg_id,
+                available_input=available_memory_input,
+                now=self._normalize_timestamp(event.timestamp),
+                current_user_id=event.user_id,
+                use_full_history=use_full_history,
             )
+            if memory_enabled:
+                memory_result = self.memory_orchestrator.build_context(memory_request)
+            else:
+                memory_result = self.memory_orchestrator.recent_provider(memory_request)
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
             prompt_recent_lines = memory_context.recent_messages
             full_history_lines = memory_context.full_history_messages
@@ -2004,6 +2038,8 @@ class InboundRouter:
         timestamp: datetime,
         allow_late_arrival: bool = True,
     ) -> None:
+        if not self._group_memory_enabled(group_id=group_id):
+            return
         service = self.memory_compaction_service
         enqueue_episode = getattr(service, "enqueue_episode_allocation", None)
         enqueue_raw = getattr(service, "enqueue_raw_message_index", None)

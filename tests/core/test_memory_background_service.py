@@ -2164,3 +2164,75 @@ def test_allocator_requeries_after_cached_episode_is_superseded(
             group_id=10001,
         )
         assert [row.platform_msg_id for row in current_rows] == ["m-1", "m-2"]
+
+
+def test_store_enqueue_gates_memory_disabled_groups(sqlite_engine) -> None:
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        memory_enabled_group_ids=frozenset({100}),
+    )
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    queued = store.enqueue_allocator(
+        group_id=100,
+        latest_message_id=1,
+        segmentation_generation="segment-v2",
+        backfill_run_id=None,
+        watermark_message_id=None,
+        now=now,
+    )
+    assert queued is not None
+    assert (
+        store.enqueue_allocator(
+            group_id=200,
+            latest_message_id=1,
+            segmentation_generation="segment-v2",
+            backfill_run_id=None,
+            watermark_message_id=None,
+            now=now,
+        )
+        is None
+    )
+    assert (
+        store.enqueue_raw_message_projection(
+            group_id=200,
+            message_id=1,
+            now=now,
+        )
+        is None
+    )
+    projected = store.enqueue_raw_message_projection(
+        group_id=100,
+        message_id=1,
+        now=now,
+    )
+    assert projected is not None
+
+
+def test_store_claim_retires_memory_disabled_group_jobs(sqlite_engine) -> None:
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        memory_enabled_group_ids=frozenset({100}),
+    )
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        JobRepository(session).enqueue_coalescing_job(
+            job_type="raw_message_project",
+            job_key="raw-message:200:9:project:v3",
+            payload_json={"group_id": 200, "message_id": 9},
+            run_at=now,
+            target_generation="raw-message-v3",
+            max_attempts=3,
+        )
+    claimed = store.claim_next_job(worker_id="w", now=now, lease_seconds=60)
+    assert claimed is None
+    with session_scope(sqlite_engine) as session:
+        count = session.execute(
+            text(
+                "SELECT COUNT(*) FROM jobs WHERE "
+                "json_extract(payload_json, '$.group_id')=200 "
+                "AND status IN ('queued','running')"
+            )
+        ).scalar_one()
+        assert int(count) == 0
