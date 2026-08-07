@@ -649,6 +649,34 @@ async def test_router_replies_to_direct_mention_in_allowlisted_group(sqlite_engi
 
 
 @pytest.mark.asyncio
+async def test_handle_persisted_group_message_replies_without_reingesting(
+    sqlite_engine,
+) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    event = make_event(
+        group_id=10001,
+        mentioned_bot=True,
+        message_id="persisted-1",
+    )
+    assert router.ingest_live_group_message(event) is True
+
+    await router._handle_persisted_group_message(event)
+
+    assert [outbound.text for outbound in sender.sent] == ["I am here."]
+    with session_scope(sqlite_engine) as session:
+        rows = session.execute(
+            select(Message).where(Message.platform_msg_id == "persisted-1")
+        ).scalars().all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_router_forwards_supported_bbot_command_in_target_group(sqlite_engine) -> None:
     sender = FakeSender()
     llm = FakeLlm()

@@ -748,8 +748,14 @@ class SqlAlchemyMemoryBackgroundStore:
         with session_scope(self.engine) as session:
             documents = RetrievalDocumentRepository(session)
             resolved_limit = max(1, int(limit))
+            group_ids = (
+                tuple(self._memory_enabled_group_ids)
+                if self._memory_enabled_group_ids is not None
+                else None
+            )
             revoked = documents.revoke_unsafe_raw_message_v3_projections(
                 limit=resolved_limit,
+                group_ids=group_ids,
             )
             remaining = max(0, resolved_limit - revoked)
             gaps = (
@@ -757,6 +763,7 @@ class SqlAlchemyMemoryBackgroundStore:
                     projection_job_type=self.raw_message_projection_job_type,
                     embedding_generation=generation,
                     limit=remaining,
+                    group_ids=group_ids,
                 )
                 if remaining
                 else []
@@ -1503,7 +1510,7 @@ class MemoryBackgroundService:
         shadow_evaluator: ShadowEvaluator | None = None,
         lease_seconds: int = 60,
         poll_interval_seconds: float = 1.0,
-        reconciliation_interval_seconds: float = 30.0,
+        reconciliation_interval_seconds: float = 300.0,
         reconciliation_batch_size: int = 500,
         memory_enabled_group_ids: frozenset[int] | None = None,
     ) -> None:
@@ -1547,6 +1554,7 @@ class MemoryBackgroundService:
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
+        self._startup_reconciliation_task: asyncio.Task[None] | None = None
         self._next_reconciliation_at: datetime | None = None
 
     def _memory_group_enabled(self, group_id: int) -> bool:
@@ -1698,14 +1706,22 @@ class MemoryBackgroundService:
             return
         self._stop_event.clear()
         self._wake_event.clear()
+        now = datetime.now(UTC)
         await asyncio.to_thread(
             self.store.recover_stale_jobs,
-            now=datetime.now(UTC),
+            now=now,
         )
-        await asyncio.to_thread(
-            self._reconcile_raw_message_projections,
-            datetime.now(UTC),
-            True,
+        # 启动不阻塞在首次全量对账上：放到后台执行，让机器尽快开始收消息；
+        # 工作循环按 reconciliation_interval_seconds 再执行周期对账。
+        self._next_reconciliation_at = now + timedelta(
+            seconds=self.reconciliation_interval_seconds
+        )
+        self._startup_reconciliation_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._reconcile_raw_message_projections,
+                datetime.now(UTC),
+                True,
+            )
         )
         self._worker_task = asyncio.create_task(
             self._worker_loop(),

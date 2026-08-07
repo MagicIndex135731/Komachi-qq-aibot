@@ -2132,6 +2132,14 @@ class InboundRouter:
         persisted = self.ingest_live_group_message(event)
         if not persisted:
             return
+        await self._handle_persisted_group_message(event)
+
+    async def _handle_persisted_group_message(self, event) -> None:
+        """Reply pipeline for a message that is already persisted in the ledger.
+
+        Used by the live path after ingest and by startup replay for messages
+        that arrived while the bot was starting (backfilled as history).
+        """
         if self.memory_compaction_service is not None:
             await self.memory_compaction_service.wake()
         if self._should_hold_group_image_for_followup(event):

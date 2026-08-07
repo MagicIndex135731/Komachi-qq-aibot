@@ -2846,6 +2846,7 @@ class RetrievalDocumentRepository:
         projection_job_type: str,
         embedding_generation: int | None,
         limit: int,
+        group_ids: Sequence[int] | None = None,
     ) -> list[tuple[int, int]]:
         """Return eligible ledger rows lacking a projection or live repair job."""
         projection_filters = [
@@ -2900,15 +2901,18 @@ class RetrievalDocumentRepository:
             func.json_extract(Message.raw_json, "$.delivery_state"),
             "",
         )
+        filters = [
+            Message.group_id.is_not(None),
+            func.trim(func.coalesce(Message.plain_text, "")) != "",
+            ~delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
+            ~matching_projection,
+            ~live_or_terminal_failure_job,
+        ]
+        if group_ids:
+            filters.append(Message.group_id.in_(tuple(int(value) for value in group_ids)))
         rows = self.session.execute(
             select(Message.group_id, Message.id)
-            .where(
-                Message.group_id.is_not(None),
-                func.trim(func.coalesce(Message.plain_text, "")) != "",
-                ~delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
-                ~matching_projection,
-                ~live_or_terminal_failure_job,
-            )
+            .where(*filters)
             .order_by(Message.id.asc())
             .limit(max(1, int(limit)))
         )
@@ -2922,12 +2926,28 @@ class RetrievalDocumentRepository:
         self,
         *,
         limit: int,
+        group_ids: Sequence[int] | None = None,
     ) -> int:
         """Deactivate projections whose canonical source became ineligible."""
         delivery_state = func.coalesce(
             func.json_extract(Message.raw_json, "$.delivery_state"),
             "",
         )
+        filters = [
+            RetrievalDocument.document_kind == "raw_message_v3",
+            RetrievalDocument.source_table == "messages",
+            RetrievalDocument.status == "active",
+            or_(
+                func.trim(func.coalesce(Message.plain_text, "")) == "",
+                delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
+            ),
+        ]
+        if group_ids:
+            filters.append(
+                RetrievalDocument.group_id.in_(
+                    tuple(int(value) for value in group_ids)
+                )
+            )
         documents = list(
             self.session.scalars(
                 select(RetrievalDocument)
@@ -2950,15 +2970,7 @@ class RetrievalDocumentRepository:
                         == RetrievalDocumentMessage.group_id
                     ),
                 )
-                .where(
-                    RetrievalDocument.document_kind == "raw_message_v3",
-                    RetrievalDocument.source_table == "messages",
-                    RetrievalDocument.status == "active",
-                    or_(
-                        func.trim(func.coalesce(Message.plain_text, "")) == "",
-                        delivery_state.in_(_INELIGIBLE_DELIVERY_STATES),
-                    ),
-                )
+                .where(*filters)
                 .distinct()
                 .order_by(RetrievalDocument.id.asc())
                 .limit(max(1, int(limit)))

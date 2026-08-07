@@ -114,6 +114,16 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
         ),
     )
     monkeypatch.setattr(group_main, "InboundRouter", lambda **kwargs: captured.update(kwargs) or object())
+    monkeypatch.setattr(group_main, "_max_message_id", lambda _engine: 0)
+
+    async def _noop_replay(**kwargs) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        group_main,
+        "_replay_startup_window_mentions",
+        _noop_replay,
+    )
 
     await group_main.run()
 

@@ -2215,6 +2215,55 @@ def test_background_service_module_imports_json_for_vector_serialization() -> No
     assert module.json.dumps([0.1, 0.2], separators=(",", ":")) == "[0.1,0.2]"
 
 
+def test_reconcile_raw_message_projections_skips_disabled_groups(
+    sqlite_engine,
+) -> None:
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        for group_id in (100, 200):
+            GroupRepository(session).upsert_group(
+                group_id=group_id,
+                group_name=f"g{group_id}",
+                enabled=True,
+                speak_enabled=True,
+            )
+        UserRepository(session).upsert_user(
+            user_id=1,
+            nickname="a",
+            group_card="a",
+        )
+        messages = MessageRepository(session)
+        for group_id in (100, 200):
+            messages.add_group_message(
+                platform_msg_id=f"m-{group_id}",
+                group_id=group_id,
+                user_id=1,
+                timestamp=now,
+                plain_text="hello",
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_projection_enabled=True,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=1,
+        memory_enabled_group_ids=frozenset({100}),
+    )
+    repaired = store.reconcile_raw_message_projections(now=now, limit=500)
+    assert repaired == 1
+    with session_scope(sqlite_engine) as session:
+        group_ids = session.execute(
+            text(
+                "SELECT json_extract(payload_json, '$.group_id') FROM jobs "
+                "WHERE job_type='raw_message_project'"
+            )
+        ).scalars().all()
+        assert sorted(int(value) for value in group_ids) == [100]
+
+
 def test_store_claim_retires_memory_disabled_group_jobs(sqlite_engine) -> None:
     store = SqlAlchemyMemoryBackgroundStore(
         sqlite_engine,

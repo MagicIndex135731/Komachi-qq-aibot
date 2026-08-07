@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
+
+from sqlalchemy import bindparam, text
 
 from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_group_message_event
@@ -26,6 +29,119 @@ from app.main import (
 from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all, session_scope
 from app.storage.repositories import MessageRepository, RetrievalDocumentRepository
+
+
+def _max_message_id(engine) -> int:
+    with session_scope(engine) as session:
+        row = session.execute(
+            text("SELECT COALESCE(MAX(id), 0) FROM messages")
+        ).scalar_one()
+        return int(row)
+
+
+def _startup_window_mention_rows(
+    engine,
+    *,
+    watermark_message_id: int,
+    enabled_group_ids: tuple[int, ...],
+    bot_qq: int,
+    limit: int = 5,
+):
+    """Return @小町 messages persisted by startup backfill but never replied."""
+    if not enabled_group_ids:
+        return []
+    with session_scope(engine) as session:
+        return session.execute(
+            text(
+                "SELECT id, group_id, user_id, platform_msg_id, raw_json, "
+                "plain_text, reply_to_msg_id, timestamp FROM messages "
+                "WHERE id > :wm AND mentioned_bot = 1 AND user_id != :bot "
+                "AND group_id IN :groups ORDER BY id LIMIT :limit"
+            ).bindparams(bindparam("groups", expanding=True)),
+            {
+                "wm": int(watermark_message_id),
+                "bot": int(bot_qq),
+                "groups": tuple(enabled_group_ids),
+                "limit": max(1, int(limit)),
+            },
+        ).all()
+
+
+async def _replay_startup_window_mentions(
+    *,
+    engine,
+    router: InboundRouter,
+    settings: AppSettings,
+    runtime,
+    watermark_message_id: int,
+) -> None:
+    """补处理启动窗口内被回填为历史、但实际是 @小町 的提问。"""
+    enabled_group_ids = tuple(
+        int(group_id)
+        for group_id in runtime.group_policy.get("groups", {})
+        if should_ingest_group_message(
+            group_id=int(group_id),
+            group_policy=runtime.group_policy,
+        )
+    )
+    rows = _startup_window_mention_rows(
+        engine,
+        watermark_message_id=watermark_message_id,
+        enabled_group_ids=enabled_group_ids,
+        bot_qq=settings.bot_qq,
+    )
+    bot_name = str(runtime.persona.get("name", settings.bot_qq))
+    for row in rows:
+        raw_json = row.raw_json if isinstance(row.raw_json, dict) else {}
+        message_segments: list[dict] = []
+        raw_message = raw_json.get("message")
+        if isinstance(raw_message, list) and raw_message:
+            message_segments = list(raw_message)
+        else:
+            if row.reply_to_msg_id:
+                message_segments.append(
+                    {"type": "reply", "data": {"id": row.reply_to_msg_id}}
+                )
+            if row.plain_text:
+                message_segments.append(
+                    {"type": "text", "data": {"text": row.plain_text}}
+                )
+        if not any(
+            isinstance(segment, dict) and segment.get("type") == "at"
+            for segment in message_segments
+        ):
+            message_segments.append(
+                {"type": "at", "data": {"qq": str(settings.bot_qq)}}
+            )
+        payload = {
+            "post_type": "message",
+            "message_id": row.platform_msg_id,
+            "group_id": row.group_id,
+            "user_id": row.user_id,
+            "sender": raw_json.get("sender")
+            or {"nickname": str(row.user_id), "card": ""},
+            "time": int(datetime.fromisoformat(str(row.timestamp)).timestamp()),
+            "message": message_segments,
+        }
+        event = parse_group_message_event(
+            payload,
+            bot_qq=settings.bot_qq,
+            bot_name=bot_name,
+        )
+        logging.info(
+            "startup_window_replay group_id=%s msg_id=%s",
+            event.group_id,
+            event.platform_msg_id,
+        )
+        try:
+            await router._handle_persisted_group_message(event)
+        except Exception:
+            logging.exception(
+                "startup_window_replay_failed group_id=%s msg_id=%s",
+                event.group_id,
+                event.platform_msg_id,
+            )
+        await asyncio.sleep(0.5)
 
 
 def _revoke_group_message_projection(
@@ -172,11 +288,19 @@ async def run() -> None:
             await router.handle_group_message(event)
 
         async def backfill_group_history_on_connect() -> None:
+            watermark_message_id = _max_message_id(engine)
             await backfill_recent_group_history(
                 router=router,
                 gateway=gateway,
                 bot_qq=settings.bot_qq,
                 bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+            )
+            await _replay_startup_window_mentions(
+                engine=engine,
+                router=router,
+                settings=settings,
+                runtime=runtime,
+                watermark_message_id=watermark_message_id,
             )
 
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
