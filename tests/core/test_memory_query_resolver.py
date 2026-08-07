@@ -2245,3 +2245,28 @@ def test_semantic_rewrite_accepts_string_time_range_marker() -> None:
     assert result.answer_mode == "current_fact"
     assert result.retrieval_query == "最近在看 动画"
     assert result.time_range is None
+
+
+def test_semantic_rewrite_model_denial_clears_deterministic_time_range() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "今天天气",
+                "answer_mode": "general",
+                "subject_role": "none",
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "今天天气怎么样",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is True
+    assert result.subject_ids in (None, ())
+    assert result.time_range is None
+    assert result.needs_history is False

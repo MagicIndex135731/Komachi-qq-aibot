@@ -1825,25 +1825,20 @@ class MemoryQueryResolver:
         *,
         member_bound: bool = False,
     ) -> bool:
-        """True when the question needs model understanding to be resolved.
+        """True when the question may benefit from model understanding.
 
-        The lexical gate is deliberately broad (any question word on a
-        member/first-person/history-shaped question); the model decides the
-        actual intent instead of a verb whitelist.
+        Any real question (containing a question word) gets the model channel
+        first; deterministic rules remain a fallback only. ``member_bound`` is
+        kept for already-resolved member references so they also get intent
+        understanding without paying for subject resolution twice.
         """
         text = str(query or "").strip()
         if len(text) < 4:
             return False
-        if not re.search(
+        return bool(re.search(
             r"什么|啥|吗|呢|哪|怎么|如何|多少|几|谁|怎么样|咋样|是不是|有没有",
             text,
-        ):
-            return False
-        return bool(
-            MemoryQueryResolver._is_first_person_subject(text)
-            or MemoryQueryResolver._looks_like_member_or_history_query(text)
-            or member_bound
-        )
+        )) or member_bound
 
     def _apply_semantic_understanding(
         self,
@@ -1890,7 +1885,19 @@ class MemoryQueryResolver:
             or _HISTORY_PATTERN.search(original)
             or merged.answer_mode in history_modes
         )
-        return replace(merged, needs_history=needs_history, rewrite_used=True)
+        merged = replace(merged, needs_history=needs_history, rewrite_used=True)
+        if (
+            rewritten.subject_role == "none"
+            and not rewritten.preferred_fact_kinds
+            and rewritten.time_range is None
+            and rewritten.answer_mode
+            not in {"dated_history", "summary", "assessment", "mention", "exact"}
+        ):
+            # The model says this question is not about member/history memory:
+            # drop the deterministic time range so weather/trivia/chitchat are
+            # not searched as "today's history".
+            merged = replace(merged, time_range=None, needs_history=False)
+        return merged
 
     def _parse_rewrite_response(
         self,
