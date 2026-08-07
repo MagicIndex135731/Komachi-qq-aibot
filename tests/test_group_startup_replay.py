@@ -18,7 +18,7 @@ def _seed(sqlite_engine) -> None:
     now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     with session_scope(sqlite_engine) as session:
         GroupRepository(session).upsert_group(
-            group_id=900000001,
+            group_id=100000001,
             group_name="g",
             enabled=True,
             speak_enabled=True,
@@ -36,7 +36,7 @@ def _seed(sqlite_engine) -> None:
         messages = MessageRepository(session)
         messages.add_group_message(
             platform_msg_id="before-1",
-            group_id=900000001,
+            group_id=100000001,
             user_id=20001,
             timestamp=now,
             plain_text="旧的",
@@ -47,7 +47,7 @@ def _seed(sqlite_engine) -> None:
         )
         messages.add_group_message(
             platform_msg_id="window-1",
-            group_id=900000001,
+            group_id=100000001,
             user_id=20001,
             timestamp=now + __import__("datetime").timedelta(minutes=1),
             plain_text="启动窗口 @提问",
@@ -58,7 +58,7 @@ def _seed(sqlite_engine) -> None:
         )
         messages.add_group_message(
             platform_msg_id="window-2",
-            group_id=900000001,
+            group_id=100000001,
             user_id=20001,
             timestamp=now + __import__("datetime").timedelta(minutes=2),
             plain_text="没 @ 的",
@@ -69,7 +69,7 @@ def _seed(sqlite_engine) -> None:
         )
         messages.add_group_message(
             platform_msg_id="window-3",
-            group_id=900000001,
+            group_id=100000001,
             user_id=123456789,
             timestamp=now + __import__("datetime").timedelta(minutes=3),
             plain_text="机器人自己的",
@@ -116,7 +116,7 @@ def test_startup_window_mention_rows_filters(sqlite_engine) -> None:
     rows = group_main._startup_window_mention_rows(
         sqlite_engine,
         watermark_message_id=_watermark(sqlite_engine),
-        enabled_group_ids=(900000001,),
+        enabled_group_ids=(100000001,),
         bot_qq=123456789,
     )
     platform_ids = [row.platform_msg_id for row in rows]
@@ -145,7 +145,7 @@ def test_replay_startup_window_mentions_calls_router(sqlite_engine) -> None:
     runtime = SimpleNamespace(
         group_policy={
             "groups": {
-                "900000001": {"enabled": True, "speak": True},
+                "100000001": {"enabled": True, "speak": True},
             }
         },
         persona={"name": "小町"},
@@ -163,7 +163,7 @@ def test_replay_startup_window_mentions_calls_router(sqlite_engine) -> None:
 
     assert len(router.calls) == 1
     group_id, platform_id, mentioned_bot, plain_text = router.calls[0]
-    assert group_id == 900000001
+    assert group_id == 100000001
     assert platform_id == "window-1"
     assert mentioned_bot is True
     assert plain_text == "启动窗口 @提问"
