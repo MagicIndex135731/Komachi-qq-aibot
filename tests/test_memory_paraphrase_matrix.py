@@ -74,6 +74,20 @@ CLAIM_VARIANTS = (
     ("我自称喜欢喝豆浆是哪条？", True),
 )
 
+NO_MEMORY_VARIANTS = (
+    "在吗",
+    "哈哈",
+    "真恶心",
+    "我服了",
+    "今天天气怎么样",
+    "1+1等于几",
+    "太阳从哪边升起",
+    "推荐个附近的餐厅",
+    "闭嘴",
+    "啊啊啊啊",
+    "你叫什么名字",
+)
+
 
 @pytest.fixture
 def seeded(sqlite_engine) -> dict:
@@ -394,3 +408,69 @@ def test_paraphrase_variant_cross_group_fails_closed(
         source_id != seeded["fact_source"]
         for source_id in trace.result.selected_source_msg_ids
     )
+
+
+def test_no_memory_variants_do_not_mislead_the_model(
+    sqlite_engine,
+    tmp_path,
+    seeded,
+) -> None:
+    """Non-memory messages must not steer the upstream model.
+
+    Chit-chat, mood words, weather, trivia, recommendations and commands may
+    still carry ordinary recent/history context, but they must not bind a
+    member subject and must not produce an evidence-backed grounding policy
+    that tells the model to answer from memory.
+    """
+    observed_at = datetime(2026, 7, 23, 13, 0, tzinfo=UTC)
+    message_ids: dict[str, int] = {}
+    with session_scope(sqlite_engine) as session:
+        messages = MessageRepository(session)
+        for index, variant in enumerate(NO_MEMORY_VARIANTS):
+            row = messages.add_group_message(
+                platform_msg_id=f"no-memory-{index}",
+                group_id=100,
+                user_id=99,
+                timestamp=observed_at + timedelta(minutes=index),
+                plain_text=variant,
+                raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+            session.flush()
+            message_ids[variant] = int(row.id)
+
+    runtime = build_memory_runtime(
+        settings=_settings(tmp_path),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    unbound_variants = {
+        "在吗",
+        "哈哈",
+        "真恶心",
+        "我服了",
+        "闭嘴",
+        "啊啊啊啊",
+    }
+    for variant in NO_MEMORY_VARIANTS:
+        trace = runtime.v2_provider.evaluate(
+            runtime.build_request(
+                group_id=100,
+                message_id=message_ids[variant],
+            )
+        )
+        packed = trace.result.packed_context
+        assert len(packed.facts) <= 12, (
+            f"{variant!r} packed too many facts: {len(packed.facts)}"
+        )
+        assert packed.grounding_policy != MEMORY_GROUNDING_WITH_EVIDENCE, (
+            f"{variant!r} got evidence-backed grounding"
+        )
+        if variant in unbound_variants:
+            subject_ids = trace.resolved_query.subject_ids
+            assert subject_ids in (None, ()), (
+                f"{variant!r} unexpectedly bound subject {subject_ids}"
+            )

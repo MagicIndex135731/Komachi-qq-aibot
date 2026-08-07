@@ -263,6 +263,12 @@ _TEMPORAL_FIRST_PERSON_HISTORY_PATTERN = re.compile(
     r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|"
     r"喜欢(?:看|听|玩|用|吃|喝|读|追)?什么|讨厌什么)"
 )
+_TEMPORAL_HISTORY_INTENT_PATTERN = re.compile(
+    r"说过|说了|发过|发了|聊过|聊了|讲过|提到|提及|"
+    r"说|发|聊|提|发生|干了|做了|看了|玩了|吃了|喝了|"
+    r"评价|讨论|记得|消息|什么|谁|哪|都|分别|"
+    r"之前|当时|那时|曾经|以前|那个|这个"
+)
 _FIRST_PERSON_CLAIM_QUOTE_PATTERN = re.compile(
     r"^\s*(?:我|我的).{0,32}?"
     r"(?:自称|说过|说的|发过|发的|提过|提到|讲过|表示过).{0,32}?"
@@ -1740,6 +1746,8 @@ class MemoryQueryResolver:
 
     @staticmethod
     def _parse_time_range(query: str, now: datetime) -> TimeRange | None:
+        if not _TEMPORAL_HISTORY_INTENT_PATTERN.search(query):
+            return None
         local_now = MemoryQueryResolver._as_shanghai_time(now)
         local_day = datetime(
             local_now.year,
