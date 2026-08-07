@@ -2084,6 +2084,54 @@ class MemoryBackgroundService:
                 episode.id,
                 job.target_generation,
             )
+            return
+        if (
+            derivation.facts
+            and self.embedder is not None
+            and bool(getattr(self.embedder, "available", False))
+        ):
+            try:
+                vectors = self.embedder.embed_documents(
+                    [fact.content for fact in derivation.facts]
+                ) or []
+                identity = getattr(self.embedder, "identity", None)
+                rows = []
+                with session_scope(self.store.engine) as session:
+                    memories = MemoryRepository(session)
+                    for fact, vector in zip(derivation.facts, vectors):
+                        if not vector:
+                            continue
+                        memory = memories.find_active_memory_by_content(
+                            scope_id=str(episode.group_id),
+                            subject_id=fact.subject_id,
+                            memory_kind=fact.kind,
+                            content=fact.content,
+                        )
+                        if memory is None:
+                            continue
+                        rows.append(
+                            {
+                                "memory_id": int(memory.id),
+                                "group_id": int(episode.group_id),
+                                "provider": str(getattr(identity, "provider", "") or ""),
+                                "model": str(getattr(identity, "model", "") or ""),
+                                "dimensions": int(
+                                    getattr(identity, "dimensions", 0) or 0
+                                ),
+                                "version": str(getattr(identity, "version", "") or ""),
+                                "vector_json": json.dumps(
+                                    [float(value) for value in vector],
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        )
+                    if rows:
+                        memories.upsert_memory_item_semantic_vectors(rows)
+            except Exception:
+                logger.exception(
+                    "memory_fact_vector_index_failed episode_id=%s",
+                    episode.id,
+                )
 
     def _build_windows(
         self,

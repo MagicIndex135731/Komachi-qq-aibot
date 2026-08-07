@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import math
 import threading
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 class FactEmbedder(Protocol):
@@ -39,8 +39,10 @@ class SemanticFactRanker:
         embedder: FactEmbedder,
         *,
         cache_size: int = 2048,
+        vector_loader: Callable[[Sequence[int]], Mapping[int, Sequence[float]]] | None = None,
     ) -> None:
         self._embedder = embedder
+        self._vector_loader = vector_loader
         self._cache: OrderedDict[int, list[float]] = OrderedDict()
         self._lock = threading.Lock()
         self._cache_size = max(1, int(cache_size))
@@ -63,8 +65,30 @@ class SemanticFactRanker:
         except Exception:
             return {}
 
+        persisted: dict[int, list[float]] = {}
+        if self._vector_loader is not None:
+            fact_ids = [
+                int(getattr(fact, "id", 0) or 0)
+                for fact in facts
+                if int(getattr(fact, "id", 0) or 0)
+            ]
+            try:
+                loaded = self._vector_loader(fact_ids) or {}
+            except Exception:
+                loaded = {}
+            persisted = {
+                int(fact_id): [float(value) for value in vector]
+                for fact_id, vector in loaded.items()
+                if vector
+            }
+
         with self._lock:
             cached: dict[int, list[float]] = {}
+            for fact_id, vector in persisted.items():
+                self._cache[fact_id] = vector
+                cached[fact_id] = vector
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
             missing: list[tuple[int, str]] = []
             for fact in facts:
                 fact_id = int(getattr(fact, "id", 0) or 0)

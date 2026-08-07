@@ -124,6 +124,27 @@ class MemoryItem(Base):
     superseded_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class MemoryItemSemanticVector(Base):
+    """Persistent precomputed semantic vectors for memory_items."""
+
+    __tablename__ = "memory_item_semantic_vectors"
+    __table_args__ = (
+        Index("ix_misv_group_memory", "group_id", "memory_id"),
+    )
+
+    memory_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(Integer)
+    provider: Mapped[str] = mapped_column(String(64), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    dimensions: Mapped[int] = mapped_column(Integer, default=0)
+    version: Mapped[str] = mapped_column(String(64), default="")
+    vector_json: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 

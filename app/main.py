@@ -528,7 +528,20 @@ def build_memory_runtime(
         api_key=settings.memory_embedding_api_key,
         timeout_seconds=settings.memory_embedding_timeout_seconds,
     )
-    semantic_fact_ranker = SemanticFactRanker(embedding_provider)
+    def load_memory_item_vectors(memory_ids):
+        with session_scope(engine) as session:
+            return MemoryRepository(session).load_memory_item_semantic_vectors(
+                tuple(memory_ids),
+                provider=embedding_provider.identity.provider,
+                model=embedding_provider.identity.model,
+                dimensions=embedding_provider.identity.dimensions,
+                version=embedding_provider.identity.version,
+            )
+
+    semantic_fact_ranker = SemanticFactRanker(
+        embedding_provider,
+        vector_loader=load_memory_item_vectors,
+    )
     legacy_embedding_generation = None
     raw_message_embedding_generation = None
     if settings.memory_orchestration_v2_enabled and embedding_provider.available:

@@ -22,6 +22,7 @@ from app.storage.models import (
     Job,
     MemoryBackfillRun,
     MemoryItem,
+    MemoryItemSemanticVector,
     Message,
     RetrievalDocument,
     RetrievalDocumentMessage,
@@ -1747,6 +1748,160 @@ class MemoryRepository:
             .limit(limit)
         )
         return list(self.session.scalars(stmt))
+
+    def find_active_memory_by_content(
+        self,
+        *,
+        scope_id: str,
+        subject_id: str,
+        memory_kind: str,
+        content: str,
+    ) -> MemoryItem | None:
+        return self.session.scalars(
+            select(MemoryItem)
+            .where(
+                MemoryItem.scope_type == "group",
+                MemoryItem.scope_id == scope_id,
+                MemoryItem.subject_id == subject_id,
+                MemoryItem.memory_kind == memory_kind,
+                MemoryItem.content == content,
+                MemoryItem.status == "active",
+            )
+            .order_by(MemoryItem.id.desc())
+            .limit(1)
+        ).first()
+
+    def upsert_memory_item_semantic_vectors(
+        self,
+        rows: Sequence[dict[str, Any]],
+    ) -> int:
+        now = _normalize_utc_sqlite_timestamp(datetime.now(UTC))
+        count = 0
+        for row in rows:
+            memory_id = int(row["memory_id"])
+            existing = self.session.get(MemoryItemSemanticVector, memory_id)
+            if existing is None:
+                existing = MemoryItemSemanticVector(
+                    memory_id=memory_id,
+                    group_id=int(row["group_id"]),
+                )
+                self.session.add(existing)
+            existing.group_id = int(row["group_id"])
+            existing.provider = str(row.get("provider") or "")
+            existing.model = str(row.get("model") or "")
+            existing.dimensions = int(row.get("dimensions") or 0)
+            existing.version = str(row.get("version") or "")
+            existing.vector_json = str(row.get("vector_json") or "")
+            existing.updated_at = now
+            count += 1
+        self.session.flush()
+        return count
+
+    def load_memory_item_semantic_vectors(
+        self,
+        memory_ids: Sequence[int],
+        *,
+        provider: str = "",
+        model: str = "",
+        dimensions: int = 0,
+        version: str = "",
+    ) -> dict[int, list[float]]:
+        normalized_ids = tuple(
+            dict.fromkeys(int(memory_id) for memory_id in memory_ids if memory_id)
+        )
+        if not normalized_ids:
+            return {}
+        rows = self.session.scalars(
+            select(MemoryItemSemanticVector).where(
+                MemoryItemSemanticVector.memory_id.in_(normalized_ids)
+            )
+        ).all()
+        result: dict[int, list[float]] = {}
+        for row in rows:
+            if provider and row.provider != provider:
+                continue
+            if model and row.model != model:
+                continue
+            if dimensions and row.dimensions != dimensions:
+                continue
+            if version and row.version != version:
+                continue
+            try:
+                vector = json.loads(row.vector_json or "[]")
+            except ValueError:
+                continue
+            if (
+                isinstance(vector, list)
+                and vector
+                and all(isinstance(value, (int, float)) for value in vector)
+            ):
+                result[int(row.memory_id)] = [float(value) for value in vector]
+        return result
+
+    def delete_memory_item_semantic_vectors(
+        self,
+        memory_ids: Sequence[int],
+    ) -> int:
+        normalized = [int(memory_id) for memory_id in memory_ids if memory_id]
+        if not normalized:
+            return 0
+        rows = self.session.scalars(
+            select(MemoryItemSemanticVector).where(
+                MemoryItemSemanticVector.memory_id.in_(normalized)
+            )
+        ).all()
+        for row in rows:
+            self.session.delete(row)
+        self.session.flush()
+        return len(rows)
+
+    def list_active_memory_items_for_indexing(
+        self,
+        *,
+        after_id: int = 0,
+        limit: int = 500,
+        scope_id: str | None = None,
+    ) -> list[MemoryItem]:
+        filters = [
+            MemoryItem.status == "active",
+            MemoryItem.id > int(after_id),
+        ]
+        if scope_id is not None:
+            filters.append(MemoryItem.scope_id == scope_id)
+        return list(
+            self.session.scalars(
+                select(MemoryItem)
+                .where(*filters)
+                .order_by(MemoryItem.id.asc())
+                .limit(max(1, int(limit)))
+            )
+        )
+
+    def deactivate_memory_items(
+        self,
+        memory_ids: Sequence[int],
+        *,
+        valid_until: datetime,
+    ) -> int:
+        normalized = [int(memory_id) for memory_id in memory_ids if memory_id]
+        if not normalized:
+            return 0
+        rows = self.session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.id.in_(normalized),
+                MemoryItem.status == "active",
+            )
+        ).all()
+        for row in rows:
+            row.status = "inactive"
+            row.valid_until = valid_until
+            row.expires_at = valid_until
+            _deactivate_memory_retrieval_documents(
+                self.session,
+                memory_id=int(row.id),
+            )
+        self.session.flush()
+        return len(rows)
 
     def _sync_memory_indexes(self, memory: MemoryItem) -> None:
         self._sync_fts(memory)
