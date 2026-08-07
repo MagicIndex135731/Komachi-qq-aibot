@@ -228,7 +228,7 @@ def test_observed_transport_exhausts_xbai_403_and_logs_only_safe_metadata(caplog
     assert attempts == client.REQUEST_MAX_ATTEMPTS
     log_text = caplog.text
     assert "status=403" in log_text
-    assert "attempt=5" in log_text
+    assert "attempt=3" in log_text
     assert "prompt_chars=" in log_text
     assert "instructions_chars=" in log_text
     assert "private instruction marker" not in log_text

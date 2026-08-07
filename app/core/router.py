@@ -2107,6 +2107,7 @@ class InboundRouter:
                 tool_executor=prepared_reply.memory_tool_executor.execute,
                 conversation_key=conversation_key,
                 max_tool_rounds=self.runtime.settings.memory_memory_tool_max_rounds,
+                **generation_kwargs,
             )
         elif prepared_reply.target_images:
             raw_reply = self.llm_client.generate_text(

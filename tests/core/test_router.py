@@ -4497,6 +4497,8 @@ class _ToolAwareLlm:
     def __init__(self) -> None:
         self.plain_calls = 0
         self.tool_calls: list[tuple[int, int]] = []
+        self.supports_selective_web_search = True
+        self.supports_forced_web_search = True
 
     def generate_text(self, prompt_lines: list[str], *, conversation_key=None, **kwargs) -> str:
         del prompt_lines, conversation_key, kwargs
@@ -4513,8 +4515,8 @@ class _ToolAwareLlm:
         max_tool_rounds=2,
         **kwargs,
     ) -> str:
-        del conversation_key, kwargs
-        self.tool_calls.append((max_tool_rounds, len(tools)))
+        del conversation_key
+        self.tool_calls.append((max_tool_rounds, len(tools), kwargs))
         return tool_executor("memory_search", {"query": "x"})
 
 
@@ -4541,8 +4543,39 @@ def test_generate_group_reply_text_uses_memory_tools_when_executor_present(
         prepared_reply=reply,
     )
     assert text == "tooled reply"
-    assert llm.tool_calls == [(2, 3)]
+    assert llm.tool_calls == [(2, 3, {"allow_web_search": False})]
     assert llm.plain_calls == 0
+
+
+def test_generate_group_reply_text_passes_web_search_flags_to_memory_tools(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    llm = _ToolAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Target message: Alice: 联网搜索最新台风"],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        force_web_search=True,
+        allow_web_search=True,
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "tooled reply"
+    assert llm.tool_calls[0][2] == {
+        "allow_web_search": True,
+        "force_web_search": True,
+    }
 
 
 def test_generate_group_reply_text_uses_plain_path_without_executor(

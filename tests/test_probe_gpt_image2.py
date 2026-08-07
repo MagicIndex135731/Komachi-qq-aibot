@@ -102,8 +102,8 @@ def test_probe_gpt_image_2_falls_back_to_v1_paths_and_classifies_connect_error()
         ("GET", "https://api.example.test/models"),
         ("GET", "https://api.example.test/v1/models"),
     ]
-    assert calls[2:7] == [("POST", "https://api.example.test/images/generations")] * 5
-    assert calls[7:12] == [("POST", "https://api.example.test/v1/images/generations")] * 5
+    assert calls[2:5] == [("POST", "https://api.example.test/images/generations")] * 3
+    assert calls[5:8] == [("POST", "https://api.example.test/v1/images/generations")] * 3
 
 
 def test_probe_gpt_image_2_does_not_append_v1_twice_when_base_url_already_has_v1() -> None:
@@ -135,7 +135,7 @@ def test_probe_gpt_image_2_does_not_append_v1_twice_when_base_url_already_has_v1
     assert result["generation_check"]["path"] == "/images/generations"
     assert result["generation_check"]["status"] == "connect_error"
     assert calls[0] == ("GET", "https://api.example.test/v1/models")
-    assert calls[1:] == [("POST", "https://api.example.test/v1/images/generations")] * 5
+    assert calls[1:] == [("POST", "https://api.example.test/v1/images/generations")] * 3
 
 
 def test_classify_probe_result_marks_winerror_10013_as_outbound_blocked() -> None:

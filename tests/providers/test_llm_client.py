@@ -1672,6 +1672,83 @@ def test_llm_client_can_force_builtin_web_search_tool_choice() -> None:
     assert captured["payload"]["tool_choice"] == {"type": "web_search"}
 
 
+def test_request_max_attempts_is_three() -> None:
+    assert LlmClient.REQUEST_MAX_ATTEMPTS == 3
+
+
+def test_llm_client_tools_payload_includes_web_search_when_allowed() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_tools_search_1", text="ok"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        web_search_context_size="high",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text_with_tools(
+        ["Target message: Alice: 查台风"],
+        tools=MEMORY_TOOLS,
+        tool_executor=lambda _name, _args: "tool result",
+        allow_web_search=True,
+    )
+
+    assert text == "ok"
+    tools = captured["payload"]["tools"]
+    assert tools[:-1] == MEMORY_TOOLS
+    assert tools[-1] == {"type": "web_search", "search_context_size": "high"}
+    assert captured["payload"]["tool_choice"] == "auto"
+
+
+def test_llm_client_tools_payload_forces_web_search_choice() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_tools_force_1", text="grounded"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text_with_tools(
+        ["Target message: Alice: 联网搜索最新台风"],
+        tools=MEMORY_TOOLS,
+        tool_executor=lambda _name, _args: "tool result",
+        allow_web_search=True,
+        force_web_search=True,
+    )
+
+    assert text == "grounded"
+    assert any(
+        tool.get("type") == "web_search"
+        for tool in captured["payload"]["tools"]
+    )
+    assert captured["payload"]["tool_choice"] == {"type": "web_search"}
+
+
 def test_llm_client_can_attach_reasoning_effort_to_responses() -> None:
     captured = {}
 

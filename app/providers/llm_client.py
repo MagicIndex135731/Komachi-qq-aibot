@@ -73,7 +73,7 @@ class ResponsesImageResult:
 
 class LlmClient:
     ANTHROPIC_MAX_TOKENS = 1024
-    REQUEST_MAX_ATTEMPTS = 5
+    REQUEST_MAX_ATTEMPTS = 3
     IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
     supports_forced_web_search = True
     supports_selective_web_search = True
@@ -231,8 +231,20 @@ class LlmClient:
         if max_output_tokens is not None:
             payload["max_output_tokens"] = max_output_tokens
         if tools is not None:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            resolved_tools = list(tools)
+            if self.builtin_web_search and (
+                allow_web_search is not False or force_web_search
+            ):
+                resolved_tools.append(
+                    {
+                        "type": "web_search",
+                        "search_context_size": self.web_search_context_size,
+                    }
+                )
+            payload["tools"] = resolved_tools
+            payload["tool_choice"] = (
+                {"type": "web_search"} if force_web_search else "auto"
+            )
         elif self.builtin_web_search and (allow_web_search is not False or force_web_search):
             payload["tools"] = [
                 {
@@ -1562,6 +1574,8 @@ class LlmClient:
         conversation_key: str | None = None,
         max_tool_rounds: int = 2,
         max_output_tokens: int | None = None,
+        force_web_search: bool = False,
+        allow_web_search: bool | None = None,
     ) -> str:
         """Run a bounded Responses function-calling loop and return final text.
 
@@ -1574,7 +1588,8 @@ class LlmClient:
             return self.generate_text(
                 prompt_lines,
                 conversation_key=conversation_key,
-                allow_web_search=False,
+                force_web_search=force_web_search,
+                allow_web_search=allow_web_search,
             )
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
         effective_rounds = max(1, int(max_tool_rounds))
@@ -1590,8 +1605,8 @@ class LlmClient:
                     input_lines=input_lines,
                     images=None,
                     previous_response_id=None,
-                    force_web_search=False,
-                    allow_web_search=False,
+                    force_web_search=force_web_search,
+                    allow_web_search=allow_web_search,
                     max_output_tokens=output_tokens,
                     tools=tools,
                     extra_input_items=extra_input_items,
@@ -1643,7 +1658,8 @@ class LlmClient:
                 return self.generate_text(
                     prompt_lines,
                     conversation_key=conversation_key,
-                    allow_web_search=False,
+                    force_web_search=force_web_search,
+                    allow_web_search=allow_web_search,
                 )
             else:
                 self._remember_response_id(
