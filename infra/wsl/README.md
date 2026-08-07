@@ -64,25 +64,13 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 
 `runtime/pip-cache` 可以重建，但保留它能显著缩短容器重建时间。
 
-## 群聊记忆编排 V2 发布清单
+## Memory V3 发布与回滚
 
-> Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V3_ENABLED=true`，
-> 运行时日志 `route=raw_v3`）；`.env.example` 已按生产模板全部开启，代码默认值保持
-> 安全关闭。生产部署在 `.env` 中显式打开，需先完成发布门禁（备份、回填、评测、激活）。
-> 本节保留为 legacy V2 兼容与底层 generation
-> 资料；新发布应直接使用下方的 Memory V3 流程。V3 运行仍要求
-> `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
-
-`.env.example` 的 `MEMORY_*` 示例保持
-`MEMORY_ORCHESTRATION_V2_ENABLED=true` 和
-`MEMORY_ORCHESTRATION_SHADOW_MODE=true`。The required rollout order is:
-**shadow -> backfill -> evaluate -> active**。本地 FastEmbed 缓存使用既有持久卷的
-`/workspace/data/models`；模型初始化或向量服务失败时只保留 FTS/V1，不能阻塞回复或直接启用 V2。
-
-发布前使用 SQLite backup API 创建并验证 `integrity_check=ok` 的备份，随后完成幂等回填，
-记录 run ID、每群 watermark、episode/document/embedding 覆盖率和失败/待处理 job。仅当回填
-边界内 mandatory jobs 已清空且 V1/V2 评测通过，才将
-`MEMORY_ORCHESTRATION_SHADOW_MODE=false` 用于 active 灰度。
+Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V3_ENABLED=true`，
+运行时日志 `route=raw_v3`）；`.env.example` 已按生产模板全部开启，代码默认值保持
+安全关闭。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，但该开关只是 V2
+兼容开关，不是 V3 回滚开关。发布前使用 SQLite backup API 创建并验证
+`integrity_check=ok` 的备份，再按下方 V3 流程完成准备、评测、激活。
 
 部署只构建和重建 `xiaomachi` service（容器名 `xiaomachi-bot`）：
 
@@ -91,27 +79,10 @@ docker compose -f docker-compose.llbot.yml build xiaomachi
 docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
-Before and after this operation, record the `xiaomachi-llbot` container ID and
-`StartedAt`; **must not restart xiaomachi-llbot**. V2 的即时行为回滚为
-`MEMORY_ORCHESTRATION_V2_ENABLED=false`；仅向量回滚为
-`MEMORY_EMBEDDING_PROVIDER=disabled`，保留 FTS。普通回滚不恢复数据库，也不得删除
+操作前后记录 `xiaomachi-llbot` 的 container ID 与 `StartedAt`；
+**must not restart xiaomachi-llbot**。向量通道异常时回滚为
+`MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS；普通回滚不恢复数据库，也不得删除
 LLBot 登录态。
-
-### Memory V2 数据操作
-
-所有命令都在新镜像或仓库根目录执行，目标只能是 bot 数据卷中的
-`/workspace/data/bot.db`。先运行 `scripts/backup_memory_v2.py` 创建在线备份和逐群水位账本，
-再运行 `scripts/backfill_memory_v2.py`；回填报告必须显示 mandatory jobs 全部终态、无
-orphan、无 blocked 派生物、无 embedding failure。随后用
-`scripts/build_memory_eval_dataset.py` 生成 gitignored 的 64 题真实数据集。逐题核验
-evidence 后，将 hash 绑定的 review sidecar 标记为 approved，再以
-`scripts/run_memory_recall_eval.py --review PATH --backfill-run-key ID
---warmup 20 --benchmark-runs 250
---enforce-real-dataset` 完成 V1/V2 指标与本地检索 p95。完整参数示例见仓库根
-`README.md`。
-
-只有上述检查通过后才把 shadow 切换为 active；任何阶段均不得重建
-`xiaomachi-llbot`，也不得读取、打印或覆盖 `.env` 全文。
 
 ### CUDA 向量加速
 

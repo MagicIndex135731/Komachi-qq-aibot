@@ -4,17 +4,42 @@
 
 完整的系统架构、消息工作流、商用 API、QQ/OneBot 服务和 Memory V3 原理见 [小町工程设计与运行原理](docs/ARCHITECTURE.md)。
 
-## 功能亮点
+## 核心优势
 
-- **人格化群聊**：小町人格、@/主动回复、群策略、安全规则与 QQ 拦截降级，普通群聊与开发控制台共用一套运行时。
-- **Memory V3 分层记忆**：最近消息、episode 摘要、结构化事实、用户画像、群公共上下文分层编排；模型可调用原生记忆工具
-  `memory_search` / `memory_read` / `memory_write` 主动取上下文，而不是依赖单一 RAG 召回碰运气。
-- **语义排序 + 持久向量**：本地 bge-small-zh 在 CUDA 上运行，事实向量预计算并持久化，冷启动零重算、排序稳定。
-- **问法鲁棒性**：首人称（我喜欢/我喜欢看/我想看）、自称原话（我什么时候说过/哪条）、评价（觉得/怎么看/如何评价）、
-  引用消息代词（他/她=被引用消息发送人）、成员昵称 vs QQ 号等问法族统一处理，口语与错字变体可命中。
-- **按群记忆策略**：默认群只使用最近 100 条消息作为上下文；完整分层记忆仅在明确开启的群生效（真实群号由本地的 `configs/groups.local.yaml` 配置，不提交仓库）。
-- **数据治理**：每条事实绑定真实消息 source、可纠正/撤回；历史噪音清理、向量回填、按群数据清理脚本均幂等且先备份。
-- **可观测与安全**：`memory_runtime`/指标/心跳日志，跨群隔离 fail-closed，敏感投递自动降级不泄露。
+### 一个真正“记得住”的群聊 AI
+
+- **Memory V3 分层记忆**：最近消息、episode 摘要、结构化事实、用户画像、群公共上下文
+  分层编排。不是“把聊天记录塞进向量库再碰运气”，而是让模型带着工具主动找上下文。
+- **原生记忆工具**：`memory_search` / `memory_read` / `memory_write`——模型可以按需检索
+  原文、读取某成员画像、写入有出处的记忆；写入必须绑定当前群、当前会话的真实消息，
+  全量审计。
+- **每条记忆都有出处**：事实、画像、摘要全部绑定真实消息 source，可纠正、可撤回、
+  可追溯；跨群内容严格隔离，答不出就明确说证据不足，绝不编造。
+
+### 问什么都能接住
+
+- **问法族统一处理**：首人称（我喜欢/我喜欢看/我想看）、自称原话（我什么时候说过/哪条）、
+  评价（觉得/怎么看/如何评价）、引用消息代词（他/她=被引用消息发送人）、成员昵称 vs
+  QQ 号等，口语、错字、倒装变体都能命中同一份事实。
+- **意图类型 + 语义 + 字面 + 时效的综合排序**：按问题意图优先命中正确类型的事实
+  （喜欢、讨厌、梗、关系、计划、决定、近况、画像），语义相似度兜底，重要性/置信度/
+  时效决胜。
+- **持久向量 + CUDA**：事实向量预计算并持久化，冷启动零重算、排序稳定；本地模型在
+  GPU 上推理，不依赖外部付费 reranker。
+
+### 按群定制，隐私可控
+
+- 默认群只使用最近 100 条消息作为上下文，不生成、不检索、不保存任何记忆；
+  完整分层记忆只在显式开启的群生效。
+- 真实群号等部署配置放在 gitignore 的本地覆盖文件中，公开仓库只保留占位符。
+
+### 安全、可靠、可运维
+
+- QQ 投递被拦截时自动降级，不泄露敏感细节；联网检索工具事件留痕可核验。
+- 心跳、指标、`memory_runtime` 日志、LLBot 登录态保护：发布只重建 `xiaomachi`，
+  绝不重启 LLBot。
+- 备份、向量回填、噪音清理、按群数据清理全部幂等且先备份，原始消息永不删除。
+- WSL2 + Docker 一键部署，GPU 只分配给 bot 容器；开发与运维命令齐全。
 
 ## 日常操作
 
@@ -47,9 +72,9 @@
    QQ_PLATFORM=llbot
    LLM_BASE_URL=
    LLM_API_KEY=
-   LLM_MODEL=gpt-5.6-terra
+   LLM_MODEL=gpt-5.6-luna
    LLM_TEXT_ENDPOINT=responses
-   LLM_REASONING_EFFORT=medium
+   LLM_REASONING_EFFORT=high
    LLM_BUILTIN_WEB_SEARCH=true
    LLM_BUILTIN_WEB_SEARCH_CONTEXT_SIZE=high
    ```
@@ -126,33 +151,15 @@ cd "/mnt/d/qq群ai小人/infra/wsl"
 docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
-### 群聊记忆编排 V2 灰度与回滚
+### 记忆系统（Memory V3）发布与回滚
 
-> Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENABLED=true`，
-> 分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。
-> `.env.example` 已按生产模板全部开启；代码默认值保持安全关闭，避免未配置环境误启用。
-> 生产部署在 `.env` 中显式打开，需先完成发布门禁（备份、回填、评测、激活）。以下 V2 内容用于理解兼容路径和底层
-> generation；新的生产发布、评测与回滚以 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 为准。V3 运行仍要求
-> `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
+Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENABLED=true`，
+分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。
+`.env.example` 已按生产模板全部开启；代码默认值保持安全关闭，避免未配置环境误启用。
+完整的 V3 准备、评测、激活与回滚流程见
+[Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback)。
 
-`infra/wsl/.env.example` 给出了全部 `MEMORY_*` 配置的无秘密示例。初始值保持
-`MEMORY_ORCHESTRATION_V2_ENABLED=true` 与
-`MEMORY_ORCHESTRATION_SHADOW_MODE=true`：V1 继续生成真实提示词，V2 仅异步记录
-安全的 IDs、计数、分数、token、耗时和错误类别，不能增加群聊回复延迟。
-
-The required rollout order is: **shadow -> backfill -> evaluate -> active**.
-FastEmbed 模型缓存位于持久数据卷中的 `/workspace/data/models`；镜像构建期安装依赖，
-运行期不会重新安装。模型或 provider 不可用时，保持 shadow/V1 或只走 FTS，不能直接
-启用 V2。
-
-启用前，先从在线 SQLite 数据库通过 backup API 生成并验证备份（`integrity_check=ok`），
-再运行可恢复的回填并记录 backfill run、每群 snapshot watermark、episode/文档/embedding
-覆盖率以及 pending/running/failed job 数。使用 `data/memory_eval/` 中不纳入 Git 的人工确认
-JSONL 对比 V1/V2；只有冻结 run 内 mandatory jobs 全部清空、embedding ready 且评测达标后，
-才把 `MEMORY_ORCHESTRATION_SHADOW_MODE=false`，进入 active V2 阶段。
-
-发布前后记录 `xiaomachi-llbot` 的 container ID 与 `StartedAt`。发布只允许重建
-`xiaomachi` service（容器名 `xiaomachi-bot`）：
+发布只允许重建 `xiaomachi` service（容器名 `xiaomachi-bot`）：
 
 ```bash
 cd "/mnt/d/qq群ai小人/infra/wsl"
@@ -160,58 +167,13 @@ docker compose -f docker-compose.llbot.yml build xiaomachi
 docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
 ```
 
-**must not restart xiaomachi-llbot**：不得重建或重启 LLBot，也不得删除其登录态。若 V2
-出现故障，立即设置 `MEMORY_ORCHESTRATION_V2_ENABLED=false` 回到 V1；若仅向量通道有问题，
-设置 `MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS。正常回滚不恢复数据库；只有确认数据
-损坏并获得单独授权时，才可从已验证 backup 恢复。
-
-### 群聊记忆 V2 迁移与评测
-
-> 本节保留用于 legacy V2 数据维护，不是 Memory V3 的发布入口。
-
-迁移必须严格按“在线备份 → 水位内回填 → 真实数据集评测 → 启用 V2”执行。以下命令只针对
-`xiaomachi-bot` 的数据库；不要把 LLBot 数据卷或 `.env` 作为参数。
-
-```bash
-python scripts/backup_memory_v2.py \
-  --database /workspace/data/bot.db \
-  --backup-dir /workspace/data/backups \
-  --tag pre-memory-v2-YYYYMMDDTHHMMSSZ
-
-python scripts/backfill_memory_v2.py \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-pre-memory-v2-YYYYMMDDTHHMMSSZ.manifest.json \
-  --run-key pre-memory-v2-YYYYMMDDTHHMMSSZ \
-  --output /workspace/data/memory_eval/backfill-report.json
-
-python scripts/build_memory_eval_dataset.py \
-  --database /workspace/data/backups/bot-pre-memory-v2-YYYYMMDDTHHMMSSZ.db \
-  --manifest /workspace/data/backups/bot-pre-memory-v2-YYYYMMDDTHHMMSSZ.manifest.json \
-  --paraphrase-overrides /workspace/data/memory_eval/paraphrase-overrides.json \
-  --output /workspace/data/memory_eval/cases.jsonl \
-  --review-output /workspace/data/memory_eval/cases-review.json
-
-python scripts/run_memory_recall_eval.py \
-  --database /workspace/data/bot.db \
-  --dataset /workspace/data/memory_eval/cases.jsonl \
-  --review /workspace/data/memory_eval/cases-review.json \
-  --backfill-run-key pre-memory-v2-YYYYMMDDTHHMMSSZ \
-  --results-output /workspace/data/memory_eval/results.jsonl \
-  --report-output /workspace/data/memory_eval/report.json \
-  --benchmark-output /workspace/data/memory_eval/benchmark.json \
-  --warmup 20 --benchmark-runs 250 --enforce-real-dataset
-```
-
-生产镜像使用 CUDA 12.8、cuDNN 和 `fastembed-gpu`。`MEMORY_EMBEDDING_DEVICE=auto`
-会优先使用 `CUDAExecutionProvider`，CUDA 初始化或推理失败时回退 CPU；Docker 通过
-`nvidia.com/gpu=all` CDI 设备把 GPU 仅分配给 `xiaomachi`，不会分配给 LLBot。
-WSL 主机需安装 NVIDIA Container Toolkit 并生成 `/etc/cdi/nvidia.yaml`。
-模型首次下载完成后可设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`，让后续启动严格
-使用持久化缓存，不再依赖 Hugging Face 网络。
-
-回填命令会验证备份账本，固定逐群 snapshot watermark，并要求 mandatory jobs
-`queued/running/failed=0`、无 orphan、无 blocked 派生物和无 embedding failure 才标记完成。
-评测数据及报告位于 gitignored 的 `data/memory_eval/`；不要提交真实聊天内容。
+**不得重建或重启 `xiaomachi-llbot`**，也不得删除其登录态。
+`MEMORY_ORCHESTRATION_V2_ENABLED` 只是 V2 兼容开关，不是 V3 回滚开关；
+若向量通道异常，设置 `MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS。
+生产镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`，
+`MEMORY_EMBEDDING_DEVICE=cuda`，Docker 通过 `nvidia.com/gpu=all` CDI 只给
+`xiaomachi` 分配 GPU；模型缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`
+可离线启动。V2 为已退役兼容路径，旧迁移与评测命令不再需要。
 
 ## 运行结构
 
