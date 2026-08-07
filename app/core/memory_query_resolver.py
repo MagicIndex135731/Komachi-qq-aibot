@@ -147,7 +147,9 @@ _HISTORY_PATTERN = re.compile(
 _DETAIL_PATTERN = re.compile(r"详细|经过|后来|最后|怎么处理")
 _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:评价|点评|分析|总结|概括|说说|怎么看)\s*(?:一下)?我|"
-    r"(?:我|我的)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么|过去|以前|历史)"
+    r"(?:我|我的)(?:平时|一般|通常)?"
+    r"(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
+    r"(?:我|我的)(?:讨厌什么|不喜欢什么|过去|以前|历史)"
 )
 _ASSESSMENT_PATTERN = re.compile(
     r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
@@ -174,7 +176,10 @@ _MENTION_PATTERN = re.compile(
 _REQUESTER_MENTION_PATTERN = re.compile(
     r"(?:谁|哪些人|有人|他们|她们|大家|群里).*(?:叫|提到|说到|@)\s*我"
 )
-_CURRENT_FACT_PATTERN = re.compile(r"最喜欢|喜欢什么|讨厌什么|不喜欢什么|还记得|记得")
+_CURRENT_FACT_PATTERN = re.compile(
+    r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
+    r"讨厌什么|不喜欢什么|还记得|记得"
+)
 _TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
 _TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
 _TOPIC_CATEGORY_SUFFIXES = (
@@ -195,7 +200,8 @@ _ASSESSMENT_SCAFFOLD_PATTERN = re.compile(
     r"(?:评价|点评|分析|看待)(?:一下)?|怎么看"
 )
 _CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
-    r"最喜欢什么|喜欢什么|讨厌什么|不喜欢什么|还记得|记得"
+    r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
+    r"讨厌什么|不喜欢什么|还记得|记得"
 )
 _HISTORY_SCAFFOLD_PATTERN = re.compile(
     r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
@@ -219,7 +225,9 @@ _SUBJECTLESS_RELATIVE_EVENT_PATTERN = re.compile(
     r"^\s*(?:今天|昨天|前天).*(?:发生了什么|群里发生|都发生)"
 )
 _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
-    r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:最喜欢|喜欢什么|讨厌什么|不喜欢什么)"
+    r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
+    r"(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
+    r"讨厌什么|不喜欢什么"
 )
 _REMEMBER_PERSON_PATTERN = re.compile(
     r"^\s*(?:还)?记得\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:吗|么|的|曾经|以前|喜欢|讨厌|[？?]|$)"
@@ -240,11 +248,13 @@ _PERSON_OPINION_SUBJECT_PATTERN = re.compile(
 )
 _FIRST_PERSON_HISTORY_PATTERN = re.compile(
     r"^\s*(?:我|我的)(?:最近|昨天|今天|以前|曾经|过去|历史|当时)?.*"
-    r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|喜欢什么|讨厌什么)"
+    r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|"
+    r"喜欢(?:看|听|玩|用|吃|喝|读|追)?什么|讨厌什么)"
 )
 _TEMPORAL_FIRST_PERSON_HISTORY_PATTERN = re.compile(
     r"^\s*(?:最近|昨天|今天|前天|以前|曾经|过去|当时)\s*(?:我|我的).*"
-    r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|喜欢什么|讨厌什么)"
+    r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|"
+    r"喜欢(?:看|听|玩|用|吃|喝|读|追)?什么|讨厌什么)"
 )
 _NON_PERSON_MEMORY_SUBJECTS = frozenset(
     {

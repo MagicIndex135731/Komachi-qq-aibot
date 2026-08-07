@@ -1403,6 +1403,69 @@ def test_temporal_prefix_before_first_person_still_binds_requester() -> None:
     assert result.answer_mode == "dated_history"
 
 
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我喜欢看什么动画？",
+        "我爱看什么动画？",
+        "我想看什么动画？",
+        "我平时喜欢看什么动画？",
+        "我最喜欢看什么动画？",
+        "我喜欢听什么歌？",
+        "我喜欢玩什么游戏？",
+        "我喜欢吃什么？",
+        "我喜欢喝什么？",
+    ),
+)
+def test_first_person_verb_infix_variants_bind_requester(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+        requester_id=20001,
+    )
+
+    assert result.subject_ids == ("20001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+
+
+def test_first_person_verb_infix_without_requester_stays_unbound() -> None:
+    result = MemoryQueryResolver().resolve(
+        "我喜欢看什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids is None
+
+
+def test_unknown_person_verb_infix_memory_query_fails_closed() -> None:
+    result = MemoryQueryResolver().resolve(
+        "陌生猫喜欢看什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_member_verb_infix_memory_query_binds_member() -> None:
+    result = MemoryQueryResolver().resolve(
+        "阿渣喜欢看什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+    assert result.answer_mode == "current_fact"
+
+
 def test_bad_or_unsafe_rewrite_json_falls_back_to_original_question() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=lambda *_: '{"retrieval_query":"x","group_id":"forged"}'
