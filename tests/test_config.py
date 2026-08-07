@@ -202,6 +202,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_memory_tool_max_rounds == 2
     assert settings.memory_memory_tool_max_results == 5
     assert settings.memory_memory_tool_timeout_seconds == 2.0
+    assert settings.memory_member_fact_supplement_limit == 10
     assert settings.memory_max_evidence_messages == 150
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30

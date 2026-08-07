@@ -678,6 +678,7 @@ def build_memory_runtime(
             )
             subject_ids = resolved_query.subject_ids
             boosted_fact_ids: set[int] = set()
+            preferred_fact_ids: set[int] = set()
             if subject_ids:
                 seen_ids = {row.id for row in rows}
                 query_features = memory_query_features(
@@ -698,19 +699,23 @@ def build_memory_runtime(
                     query_features,
                     aliases=member_aliases,
                 )
+                preferred_kinds: tuple[str, ...] = ()
+                if resolved_query.answer_mode == "current_fact":
+                    preferred_kinds = ("preference", "taboo", "profile")
                 for subject_id in subject_ids:
                     candidates = memories.list_group_memories_for_subject(
                         scope_id=str(group_id),
                         subject_id=subject_id,
                         limit=max(
-                            24,
-                            settings.memory_final_episode_limit,
+                            200,
+                            settings.memory_member_fact_supplement_limit,
                         ),
                     )
                     for row in rank_member_facts(
                         candidates,
                         query_features=query_features,
-                        limit=settings.memory_final_episode_limit,
+                        limit=settings.memory_member_fact_supplement_limit,
+                        preferred_kinds=preferred_kinds,
                     ):
                         if row.id in seen_ids:
                             continue
@@ -720,6 +725,12 @@ def build_memory_runtime(
                     rows,
                     query_features=query_features,
                 )
+                if preferred_kinds:
+                    preferred_fact_ids = {
+                        row.id
+                        for row in rows
+                        if row.memory_kind in preferred_kinds
+                    }
             return tuple(
                 MemoryFact(
                     text=str(row.content),
@@ -732,7 +743,8 @@ def build_memory_runtime(
                         )
                     ),
                     score=float(row.confidence or 0.0)
-                    + (1.0 if row.id in boosted_fact_ids else 0.0),
+                    + (1.0 if row.id in boosted_fact_ids else 0.0)
+                    + (0.5 if row.id in preferred_fact_ids else 0.0),
                     valid_until=row.valid_until,
                     group_id=group_id,
                 )

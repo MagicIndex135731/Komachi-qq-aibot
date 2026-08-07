@@ -173,6 +173,12 @@ class AppSettings(BaseSettings):
         gt=0,
         alias="MEMORY_MEMORY_TOOL_TIMEOUT_SECONDS",
     )
+    memory_member_fact_supplement_limit: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        alias="MEMORY_MEMBER_FACT_SUPPLEMENT_LIMIT",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",

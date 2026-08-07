@@ -18,12 +18,14 @@ def _fact(
     confidence: float = 0.5,
     predicate: str = "",
     object_text: str = "",
+    memory_kind: str = "fact",
 ):
     return SimpleNamespace(
         id=fact_id,
         content=content,
         predicate=predicate,
         object_text=object_text,
+        memory_kind=memory_kind,
         importance=importance,
         confidence=confidence,
     )
@@ -84,3 +86,39 @@ def test_rank_member_facts_respects_limit_and_tie_break() -> None:
     )
     ranked = rank_member_facts(facts, query_features=("不存在",), limit=2)
     assert [fact.id for fact in ranked] == [1, 3]
+
+
+def test_rank_member_facts_prefers_kind_before_importance() -> None:
+    unrelated_current = _fact(
+        1,
+        "阿渣在做前后端",
+        importance=5,
+        confidence=0.9,
+        memory_kind="current",
+    )
+    unrelated_preference = _fact(
+        2,
+        "阿渣一直在看海贼王",
+        importance=2,
+        confidence=0.8,
+        memory_kind="preference",
+    )
+    matched_preference = _fact(
+        3,
+        "阿渣喜欢看动画",
+        importance=1,
+        confidence=0.7,
+        memory_kind="preference",
+    )
+    features = memory_query_features(
+        query="阿渣喜欢什么动画？",
+        topic_terms=("动画",),
+    )
+    features = filter_member_query_features(features, aliases=("阿渣",))
+    ranked = rank_member_facts(
+        (unrelated_current, unrelated_preference, matched_preference),
+        query_features=features,
+        limit=10,
+        preferred_kinds=("preference", "taboo", "profile"),
+    )
+    assert [fact.id for fact in ranked] == [3, 2, 1]

@@ -13,6 +13,7 @@ class RankableMemoryFact(Protocol):
     content: str
     predicate: str
     object_text: str
+    memory_kind: str
     importance: int
     confidence: float
     id: int
@@ -77,19 +78,25 @@ def rank_member_facts(
     *,
     query_features: Sequence[str],
     limit: int,
+    preferred_kinds: Sequence[str] = (),
 ) -> list[RankableMemoryFact]:
     """Rank member facts by query relevance, then importance/confidence.
 
     A fact matches when any query feature appears in its content, predicate or
-    object text. Matched facts always outrank unmatched ones; within each group
-    importance, confidence and id break ties deterministically.
+    object text. Facts whose kind is preferred (for example preference/taboo
+    when the question asks about likes) outrank non-preferred kinds; matched
+    facts outrank unmatched ones; importance, confidence and id break ties
+    deterministically.
     """
     if limit <= 0:
         return []
     normalized_features = tuple(
         dict.fromkeys(str(value) for value in query_features if str(value).strip())
     )
-    scored: list[tuple[bool, float, float, int, RankableMemoryFact]] = []
+    preferred = frozenset(
+        str(kind).strip() for kind in preferred_kinds if str(kind).strip()
+    )
+    scored: list[tuple[bool, bool, float, float, int, RankableMemoryFact]] = []
     for fact in facts:
         haystack = " ".join(
             str(value)
@@ -97,8 +104,10 @@ def rank_member_facts(
             if str(value or "").strip()
         )
         matched = any(feature in haystack for feature in normalized_features)
+        kind = str(getattr(fact, "memory_kind", "") or "").strip()
         scored.append(
             (
+                kind in preferred,
                 matched,
                 float(fact.importance or 1),
                 float(fact.confidence or 0.0),
@@ -106,8 +115,11 @@ def rank_member_facts(
                 fact,
             )
         )
-    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
-    return [item[4] for item in scored[: int(limit)]]
+    scored.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
+        reverse=True,
+    )
+    return [item[5] for item in scored[: int(limit)]]
 
 
 def matching_member_fact_ids(
