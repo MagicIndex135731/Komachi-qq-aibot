@@ -424,7 +424,7 @@ GitHub 保存的是可重建代码和无密钥配置，不是生产会话备份�
   长别名覆盖短别名不重复计人，避免英文作品名与成员短别名假歧义。
 - 事实排序按问法意图类型加权（running_joke/taboo/preference/relationship/plan/
   decision/current/event/profile），语义分数对所有绑定问法生效，时效决胜；
-  300 例真实历史压力回归 290/300（96.7%），跨群违规 0。
+  发布前以真实历史压力回归与离线问法矩阵作为门禁。
 - 数据治理：事实向量持久化（`memory_item_semantic_vectors`）与回填脚本、
   历史噪音清理脚本、按群数据清理脚本（`purge_group_memory.py`，原始消息保留）
   均幂等且先备份。

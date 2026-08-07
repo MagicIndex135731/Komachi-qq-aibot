@@ -13,7 +13,6 @@
 - **问法鲁棒性**：首人称（我喜欢/我喜欢看/我想看）、自称原话（我什么时候说过/哪条）、评价（觉得/怎么看/如何评价）、
   引用消息代词（他/她=被引用消息发送人）、成员昵称 vs QQ 号等问法族统一处理，口语与错字变体可命中。
 - **按群记忆策略**：默认群只使用最近 100 条消息作为上下文；完整分层记忆仅在明确开启的群生效（当前为 100000001）。
-- **质量可度量**：全量 1222 项测试通过；300 例真实历史压力回归 **290/300（96.7%）**，跨群违规 0；离线问法矩阵为必过门禁。
 - **数据治理**：每条事实绑定真实消息 source、可纠正/撤回；历史噪音清理、向量回填、按群数据清理脚本均幂等且先备份。
 - **可观测与安全**：`memory_runtime`/指标/心跳日志，跨群隔离 fail-closed，敏感投递自动降级不泄露。
 
@@ -98,8 +97,6 @@ python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
 python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
 # 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
 python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id 100000002 --dry-run
-# 真实历史压力回归（300 例）
-python -m scripts.memory_stress_eval run --database /workspace/data/backups/<备份>.db --limit-cases 300
 ```
 
 ### 文本、搜索和上下文
@@ -129,7 +126,12 @@ docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiao
 
 ### 群聊记忆编排 V2 灰度与回滚
 
-> Memory V3 是通过发布门禁后启用的生产历史查询路径；仓库模板仍安全默认关闭。以下 V2 内容用于理解兼容路径和底层 generation；新的生产发布、评测与回滚以 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 为准。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
+> Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENABLED=true`，
+> 分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。仓库默认值与
+> `.env.example` 保持安全关闭，避免未配置环境误启用；生产部署在 `.env` 中显式打开，
+> 需先完成发布门禁（备份、回填、评测、激活）。以下 V2 内容用于理解兼容路径和底层
+> generation；新的生产发布、评测与回滚以 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 为准。V3 运行仍要求
+> `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
 
 `infra/wsl/.env.example` 给出了全部 `MEMORY_*` 配置的无秘密示例。初始值保持
 `MEMORY_ORCHESTRATION_V2_ENABLED=true` 与
@@ -255,13 +257,6 @@ py -3.12 -m venv .venv
 ```
 
 提交前至少运行受影响测试、`docker compose config`、PowerShell/Bash 语法检查和 `git diff --check`。
-
-质量基线（2026-08-07）：
-
-- 全量 `pytest`：1222 passed。
-- 300 例真实历史压力回归：**290/300（96.7%）**；decision/plan/preference/relationship/
-  running_joke/raw_history/first_person 类别 100%，跨群违规 0。
-- 离线问法矩阵：同一事实 5-8 种问法召回同一 source 集，歧义与跨群变体 fail-closed。
 
 ## Git 回退
 

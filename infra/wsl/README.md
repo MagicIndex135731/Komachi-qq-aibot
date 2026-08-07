@@ -66,7 +66,11 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 
 ## 群聊记忆编排 V2 发布清单
 
-> Memory V3 是通过发布门禁后启用的生产历史查询路径；仓库模板仍安全默认关闭。本节保留为 legacy V2 兼容与底层 generation 资料；新发布应直接使用下方的 Memory V3 流程。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
+> Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V3_ENABLED=true`，
+> 运行时日志 `route=raw_v3`）；仓库默认值与 `.env.example` 保持安全关闭，需先完成发布
+> 门禁（备份、回填、评测、激活）再显式启用。本节保留为 legacy V2 兼容与底层 generation
+> 资料；新发布应直接使用下方的 Memory V3 流程。V3 运行仍要求
+> `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
 
 `.env.example` 的 `MEMORY_*` 示例保持
 `MEMORY_ORCHESTRATION_V2_ENABLED=true` 和
@@ -137,13 +141,9 @@ python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
 python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
 # 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
 python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id <GROUP_ID> --dry-run
-# 300 例真实历史压力回归
-python -m scripts.memory_stress_eval run --database /workspace/data/backups/<备份>.db --limit-cases 300
 ```
 
-质量基线（2026-08-07）：全量 pytest 1222 passed；300 例压力回归 290/300（96.7%），
-跨群违规 0；离线问法矩阵为必过门禁。发布只重建 `xiaomachi`，绝不重启
-`xiaomachi-llbot`。
+发布只重建 `xiaomachi`，绝不重启 `xiaomachi-llbot`。
 
 ## 验收
 
