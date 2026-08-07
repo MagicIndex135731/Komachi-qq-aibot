@@ -217,8 +217,9 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_episode_idle_minutes == 10
     assert settings.memory_episode_max_messages == 50
     assert settings.memory_episode_max_tokens == 8000
-    assert settings.memory_chunk_max_tokens == 1800
-    assert settings.memory_chunk_overlap_messages == 5
+    assert settings.memory_chunk_max_tokens == 2400
+    assert settings.memory_chunk_overlap_messages == 8
+    assert settings.memory_chunk_max_messages == 40
     assert settings.memory_query_rewrite_enabled is False
     assert settings.memory_query_rewrite_timeout_seconds == 3.0
     assert settings.memory_query_rewrite_max_output_tokens == 256

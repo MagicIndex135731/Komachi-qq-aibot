@@ -90,8 +90,9 @@ class AppSettings(BaseSettings):
     memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
     memory_episode_max_messages: int = Field(default=50, alias="MEMORY_EPISODE_MAX_MESSAGES")
     memory_episode_max_tokens: int = Field(default=8000, alias="MEMORY_EPISODE_MAX_TOKENS")
-    memory_chunk_max_tokens: int = Field(default=1800, alias="MEMORY_CHUNK_MAX_TOKENS")
-    memory_chunk_overlap_messages: int = Field(default=5, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
+    memory_chunk_max_tokens: int = Field(default=2400, alias="MEMORY_CHUNK_MAX_TOKENS")
+    memory_chunk_overlap_messages: int = Field(default=8, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
+    memory_chunk_max_messages: int = Field(default=40, ge=1, alias="MEMORY_CHUNK_MAX_MESSAGES")
     memory_query_rewrite_enabled: bool = Field(default=False, alias="MEMORY_QUERY_REWRITE_ENABLED")
     memory_query_rewrite_timeout_seconds: float = Field(default=3.0, alias="MEMORY_QUERY_REWRITE_TIMEOUT_SECONDS")
     memory_query_rewrite_max_output_tokens: int = Field(

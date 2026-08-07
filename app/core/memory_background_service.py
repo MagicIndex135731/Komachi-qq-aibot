@@ -1505,6 +1505,7 @@ class MemoryBackgroundService:
         max_tokens: int = 8000,
         chunk_max_tokens: int = 1800,
         chunk_overlap_messages: int = 5,
+        chunk_max_messages: int = 40,
         bot_user_id: int | None = None,
         embedder: DocumentEmbedder | None = None,
         shadow_evaluator: ShadowEvaluator | None = None,
@@ -1527,6 +1528,7 @@ class MemoryBackgroundService:
         self.max_tokens = max(1, int(max_tokens))
         self.chunk_max_tokens = max(1, int(chunk_max_tokens))
         self.chunk_overlap_messages = max(0, int(chunk_overlap_messages))
+        self.chunk_max_messages = max(1, int(chunk_max_messages))
         self.bot_user_id = int(bot_user_id) if bot_user_id is not None else None
         self.embedder = embedder
         self.shadow_evaluator = shadow_evaluator
@@ -2214,7 +2216,7 @@ class MemoryBackgroundService:
         segmented = build_overlap_windows(
             messages,
             min_messages=12,
-            max_messages=24,
+            max_messages=self.chunk_max_messages,
             max_tokens=self.chunk_max_tokens,
             overlap_messages=self.chunk_overlap_messages,
         )

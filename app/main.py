@@ -952,6 +952,7 @@ def build_memory_runtime(
             max_tokens=settings.memory_episode_max_tokens,
             chunk_max_tokens=settings.memory_chunk_max_tokens,
             chunk_overlap_messages=settings.memory_chunk_overlap_messages,
+            chunk_max_messages=settings.memory_chunk_max_messages,
             bot_user_id=settings.bot_qq,
             embedder=embedding_provider,
             shadow_evaluator=shadow_evaluator,

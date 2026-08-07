@@ -173,9 +173,9 @@ def build_overlap_windows(
     messages: Sequence[EpisodeMessageLike],
     *,
     min_messages: int = 12,
-    max_messages: int = 24,
-    max_tokens: int = 1800,
-    overlap_messages: int = 5,
+    max_messages: int = 40,
+    max_tokens: int = 2400,
+    overlap_messages: int = 8,
 ) -> list[EpisodeWindow]:
     """Split ordered episode messages into bounded overlapping evidence windows."""
     if not messages:

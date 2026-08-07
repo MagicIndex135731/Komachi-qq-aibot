@@ -164,6 +164,19 @@ def test_overlap_windows_stay_ordered_bounded_and_keep_about_five_message_overla
     assert all(window.token_count <= 1800 for window in windows)
 
 
+def test_overlap_windows_defaults_allow_forty_messages_and_eight_overlap() -> None:
+    messages = [_message(index) for index in range(1, 51)]
+    windows = build_overlap_windows(messages)
+
+    assert len(windows) == 2
+    assert len(windows[0].messages) == 40
+    assert len(windows[1].messages) == 18
+    assert [item.id for item in windows[0].messages[-8:]] == [
+        item.id for item in windows[1].messages[:8]
+    ]
+    assert all(window.token_count <= 2400 for window in windows)
+
+
 def test_overlap_windows_respect_token_limit_and_keep_reply_with_quoted_message() -> (
     None
 ):
