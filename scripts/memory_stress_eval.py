@@ -266,12 +266,19 @@ def _build_cases(
     *,
     limit_cases: int | None,
     excluded_user_ids: set[int] = frozenset(),
+    target_group_ids: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    group_ids = _group_ids(engine)
+    all_group_ids = _group_ids(engine)
+    resolved_target_group_ids = (
+        tuple(int(value) for value in target_group_ids)
+        if target_group_ids
+        else tuple(all_group_ids)
+    )
+    target_group_set = set(resolved_target_group_ids)
     in_scope_aliases_by_group: dict[int, set[str]] = {
         int(group_id): _runtime_in_scope_aliases(engine, int(group_id))
-        for group_id in group_ids
+        for group_id in resolved_target_group_ids
     }
     fact_rows = list(
         _iter_rows(
@@ -283,7 +290,11 @@ def _build_cases(
         )
     )
     for scope_id, subject_id, kind, content, predicate, object_text, source_id, source_ids in fact_rows:
-        if kind not in KIND_QUERY_TEMPLATES or int(subject_id) in excluded_user_ids:
+        if (
+            int(scope_id) not in target_group_set
+            or kind not in KIND_QUERY_TEMPLATES
+            or int(subject_id) in excluded_user_ids
+        ):
             continue
         alias = _member_alias(engine, int(subject_id))
         if (
@@ -329,7 +340,7 @@ def _build_cases(
                 }
             )
 
-    for group_id in group_ids:
+    for group_id in resolved_target_group_ids:
         for user_id in [
             value
             for value in _group_user_ids(engine, group_id)[:120]
@@ -362,7 +373,7 @@ def _build_cases(
                         }
                     )
 
-    for group_id in group_ids:
+    for group_id in resolved_target_group_ids:
         for user_id in [
             value
             for value in _group_user_ids(engine, group_id)[:80]
@@ -418,7 +429,10 @@ def _build_cases(
         )
     )
     for scope_id, subject_id, content, source_id, source_ids in first_person:
-        if int(subject_id) in excluded_user_ids:
+        if (
+            int(scope_id) not in target_group_set
+            or int(subject_id) in excluded_user_ids
+        ):
             continue
         alias = _member_alias(engine, int(subject_id))
         if (
@@ -557,11 +571,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--limit-cases", type=int, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--groups",
+        type=str,
+        required=True,
+        help="Comma-separated target group ids; other groups are ignored. "
+        "Explicitly pass the real group id(s) at evaluation time.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    target_group_ids = tuple(
+        int(item.strip())
+        for item in args.groups.split(",")
+        if item.strip()
+    )
+    if not target_group_ids:
+        raise SystemExit("--groups must contain at least one group id")
     settings = AppSettings().model_copy(
         update={
             "memory_query_rewrite_enabled": False,
@@ -588,6 +616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             engine,
             limit_cases=args.limit_cases,
             excluded_user_ids={int(settings.bot_qq)},
+            target_group_ids=target_group_ids,
         )
         if args.command == "plan":
             counts: dict[str, int] = {}
