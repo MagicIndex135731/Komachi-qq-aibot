@@ -12,7 +12,7 @@
 - **语义排序 + 持久向量**：本地 bge-small-zh 在 CUDA 上运行，事实向量预计算并持久化，冷启动零重算、排序稳定。
 - **问法鲁棒性**：首人称（我喜欢/我喜欢看/我想看）、自称原话（我什么时候说过/哪条）、评价（觉得/怎么看/如何评价）、
   引用消息代词（他/她=被引用消息发送人）、成员昵称 vs QQ 号等问法族统一处理，口语与错字变体可命中。
-- **按群记忆策略**：默认群只使用最近 100 条消息作为上下文；完整分层记忆仅在明确开启的群生效（当前为 100000001）。
+- **按群记忆策略**：默认群只使用最近 100 条消息作为上下文；完整分层记忆仅在明确开启的群生效（真实群号由本地的 `configs/groups.local.yaml` 配置，不提交仓库）。
 - **数据治理**：每条事实绑定真实消息 source、可纠正/撤回；历史噪音清理、向量回填、按群数据清理脚本均幂等且先备份。
 - **可观测与安全**：`memory_runtime`/指标/心跳日志，跨群隔离 fail-closed，敏感投递自动降级不泄露。
 
@@ -73,7 +73,9 @@
 群配置只有同时设置 `enabled: true` 和 `speak: true` 才允许小町在该群回复。
 记忆按群开关：`memory_enabled: false` 的群（默认）只使用最近
 `recent_context_limit`（默认 100）条消息作为上下文，不生成、不检索、不产生任何记忆数据；
-`memory_enabled: true` 的群启用完整分层记忆（当前生产为 100000001）。
+`memory_enabled: true` 的群启用完整分层记忆；真实群号在本地
+`configs/groups.local.yaml` 中配置（该文件不提交仓库），仓库中的
+`configs/groups.yaml` 仅保留占位群号。
 
 ### 记忆系统（Memory V3）
 
@@ -127,9 +129,9 @@ docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiao
 ### 群聊记忆编排 V2 灰度与回滚
 
 > Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENABLED=true`，
-> 分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。仓库默认值与
-> `.env.example` 保持安全关闭，避免未配置环境误启用；生产部署在 `.env` 中显式打开，
-> 需先完成发布门禁（备份、回填、评测、激活）。以下 V2 内容用于理解兼容路径和底层
+> 分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。
+> `.env.example` 已按生产模板全部开启；代码默认值保持安全关闭，避免未配置环境误启用。
+> 生产部署在 `.env` 中显式打开，需先完成发布门禁（备份、回填、评测、激活）。以下 V2 内容用于理解兼容路径和底层
 > generation；新的生产发布、评测与回滚以 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 为准。V3 运行仍要求
 > `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
 

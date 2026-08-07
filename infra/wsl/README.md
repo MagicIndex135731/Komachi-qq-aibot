@@ -67,8 +67,9 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 ## 群聊记忆编排 V2 发布清单
 
 > Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V3_ENABLED=true`，
-> 运行时日志 `route=raw_v3`）；仓库默认值与 `.env.example` 保持安全关闭，需先完成发布
-> 门禁（备份、回填、评测、激活）再显式启用。本节保留为 legacy V2 兼容与底层 generation
+> 运行时日志 `route=raw_v3`）；`.env.example` 已按生产模板全部开启，代码默认值保持
+> 安全关闭。生产部署在 `.env` 中显式打开，需先完成发布门禁（备份、回填、评测、激活）。
+> 本节保留为 legacy V2 兼容与底层 generation
 > 资料；新发布应直接使用下方的 Memory V3 流程。V3 运行仍要求
 > `MEMORY_ORCHESTRATION_V2_ENABLED=true`，不要把它作为 V3 回滚开关。
 
@@ -129,7 +130,7 @@ Toolkit，并确保 `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 已�
 - `memory_enabled: false`（默认）：该群**不使用任何记忆**，回复只取最近
   `recent_context_limit`（默认 100）条消息作为上下文；后台不生成、不检索、不入队。
 - `memory_enabled: true`：启用完整分层记忆（episode 摘要、结构化事实、用户画像、
-  记忆工具、语义排序）。当前生产仅 100000001 开启。
+  记忆工具、语义排序）。真实群号在 `configs/groups.local.yaml`（gitignored）中配置。
 
 日常维护命令（容器内，先备份）：
 
