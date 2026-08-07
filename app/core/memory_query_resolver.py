@@ -89,6 +89,8 @@ class ResolvedMemoryQuery:
     topic_terms: tuple[str, ...] = ()
     topic_extraction: TopicExtraction = "fallback"
     subject_aliases_removed: tuple[str, ...] = ()
+    subject_role: str = ""
+    preferred_fact_kinds: tuple[str, ...] = ()
 
     @property
     def resolved_query(self) -> str:
@@ -152,7 +154,9 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:评价|点评|分析|总结|概括|说说|怎么看)\s*(?:一下)?我|"
     r"(?:我|我的)(?:平时|一般|通常)?"
     r"(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"(?:我|我的)(?:讨厌什么|不喜欢什么|过去|以前|历史)"
+    r"(?:我|我的)(?:讨厌什么|不喜欢什么|过去|以前|历史)|"
+    r"^\s*(?:(?:最近|现在|目前)\s*)?(?:我|我的)(?:[^，。！？!?]{0,24}?)?"
+    r"(?:什么|啥|吗|呢|哪|怎么|如何|多少|几|是谁)"
 )
 _ASSESSMENT_PATTERN = re.compile(
     r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
@@ -291,6 +295,33 @@ _NON_PERSON_MEMORY_SUBJECTS = frozenset(
         "谁",
     }
 )
+
+_SEMANTIC_ANSWER_MODES = frozenset(
+    {
+        "exact",
+        "mention",
+        "dated_history",
+        "summary",
+        "assessment",
+        "current_fact",
+        "general_history",
+    }
+)
+_SEMANTIC_SUBJECT_ROLES = frozenset({"requester", "member", "group", "none"})
+_SEMANTIC_FACT_KINDS = frozenset(
+    {
+        "current",
+        "preference",
+        "taboo",
+        "profile",
+        "plan",
+        "decision",
+        "event",
+        "relationship",
+        "running_joke",
+        "fact",
+    }
+)
 _SUBJECTLESS_MEMORY_QUERY_PREFIXES = (
     "最喜欢什么",
     "喜欢什么",
@@ -378,7 +409,7 @@ class MemoryQueryResolver:
             if direct_member is None:
                 raise RuntimeError("resolved group member reference is missing its member")
             direct_subject_ids = (str(direct_member.user_id),)
-            return self._with_topic_query(ResolvedMemoryQuery(
+            plan = self._with_topic_query(ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
                 entities=(direct_member.matched_alias,),
@@ -394,6 +425,22 @@ class MemoryQueryResolver:
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             ), aliases=(direct_member.matched_alias,))
+            if (
+                self._rewrite_provider is not None
+                and self._should_attempt_semantic_resolution(
+                    original,
+                    member_bound=True,
+                )
+            ):
+                rewritten = self._try_rewrite(original, recent, current_time)
+                if rewritten is not None:
+                    return self._apply_semantic_understanding(
+                        plan,
+                        rewritten=rewritten,
+                        original=original,
+                        requester_id=normalized_requester_id,
+                    )
+            return plan
         if direct_reference.status == "ambiguous":
             if (
                 self._rewrite_provider is not None
@@ -444,7 +491,7 @@ class MemoryQueryResolver:
             or self._is_requester_mention_query(original)
         ):
             requester_subject = (normalized_requester_id,)
-            return self._with_topic_query(ResolvedMemoryQuery(
+            plan = self._with_topic_query(ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
                 speaker_ids=requester_subject,
@@ -459,6 +506,19 @@ class MemoryQueryResolver:
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             ), aliases=("我的", "我"))
+            if (
+                self._rewrite_provider is not None
+                and self._should_attempt_semantic_resolution(original)
+            ):
+                rewritten = self._try_rewrite(original, recent, current_time)
+                if rewritten is not None:
+                    return self._apply_semantic_understanding(
+                        plan,
+                        rewritten=rewritten,
+                        original=original,
+                        requester_id=normalized_requester_id,
+                    )
+            return plan
 
         if answer_mode == "mention":
             return ResolvedMemoryQuery(
@@ -504,8 +564,7 @@ class MemoryQueryResolver:
 
         if (
             self._rewrite_provider is not None
-            and needs_history
-            and self._looks_like_member_or_history_query(original)
+            and self._should_attempt_semantic_resolution(original)
         ):
             rewritten = self._try_rewrite(original, recent, current_time)
             if rewritten is not None:
@@ -516,19 +575,26 @@ class MemoryQueryResolver:
                     recent=recent,
                 )
                 if constrained is not None:
-                    return replace(
+                    constrained = replace(
                         constrained,
-                        needs_history=True,
-                        needs_detail=needs_detail,
                         time_range=time_range or constrained.time_range,
+                    )
+                    merged = self._apply_semantic_understanding(
+                        constrained,
+                        rewritten=rewritten,
+                        original=original,
+                        requester_id=normalized_requester_id,
+                    )
+                    return replace(
+                        merged,
+                        needs_detail=needs_detail,
                         retrieval_mode=(
                             "temporal"
                             if time_range is not None
-                            else constrained.retrieval_mode
+                            else merged.retrieval_mode
                         ),
                         group_id=normalized_group_id,
                         requester_id=normalized_requester_id,
-                        answer_mode=answer_mode,
                         coverage_mode=coverage_mode,
                     )
 
@@ -1745,6 +1811,79 @@ class MemoryQueryResolver:
             return None
         return self._parse_rewrite_response(original, response, now)
 
+    @staticmethod
+    def _should_attempt_semantic_resolution(
+        query: str,
+        *,
+        member_bound: bool = False,
+    ) -> bool:
+        """True when the question needs model understanding to be resolved.
+
+        The lexical gate is deliberately broad (any question word on a
+        member/first-person/history-shaped question); the model decides the
+        actual intent instead of a verb whitelist.
+        """
+        text = str(query or "").strip()
+        if len(text) < 4:
+            return False
+        if not re.search(
+            r"什么|啥|吗|呢|哪|怎么|如何|多少|几|谁|怎么样|咋样|是不是|有没有",
+            text,
+        ):
+            return False
+        return bool(
+            MemoryQueryResolver._is_first_person_subject(text)
+            or MemoryQueryResolver._looks_like_member_or_history_query(text)
+            or member_bound
+        )
+
+    def _apply_semantic_understanding(
+        self,
+        plan: ResolvedMemoryQuery,
+        *,
+        rewritten: ResolvedMemoryQuery,
+        original: str,
+        requester_id: str | None,
+    ) -> ResolvedMemoryQuery:
+        """Merge model understanding (intent, kinds, retrieval text) into a plan.
+
+        The subject stays rule-bound: ``requester`` only ever maps to the
+        caller-provided requester id, and member subjects keep their validated
+        speaker ids. The model supplies intent and retrieval text, not identity.
+        """
+        merged = plan
+        if rewritten.answer_mode in _SEMANTIC_ANSWER_MODES:
+            merged = replace(merged, answer_mode=rewritten.answer_mode)
+        if rewritten.subject_role:
+            merged = replace(merged, subject_role=rewritten.subject_role)
+        if rewritten.preferred_fact_kinds:
+            merged = replace(
+                merged,
+                preferred_fact_kinds=rewritten.preferred_fact_kinds,
+            )
+        normalized_query = str(rewritten.retrieval_query or "").strip()
+        if normalized_query:
+            merged = replace(merged, retrieval_query=normalized_query)
+        if rewritten.time_range is not None:
+            merged = replace(merged, time_range=rewritten.time_range)
+        if rewritten.subject_role == "requester" and requester_id is not None:
+            merged = replace(
+                merged,
+                speaker_ids=(requester_id,),
+                subject_ids=(requester_id,),
+                subject_binding="requester",
+            )
+        history_modes = frozenset(
+            {"assessment", "summary", "mention", "dated_history", "general_history"}
+        )
+        needs_history = bool(
+            merged.time_range is not None
+            or _FOLLOW_UP_PATTERN.search(original)
+            or _HISTORY_PATTERN.search(original)
+            or merged.answer_mode in history_modes
+        )
+        return replace(merged, needs_history=needs_history, rewrite_used=True)
+
     def _parse_rewrite_response(
         self,
         original: str,
@@ -1763,6 +1902,9 @@ class MemoryQueryResolver:
             "speaker_ids",
             "time_range",
             "confidence",
+            "answer_mode",
+            "subject_role",
+            "fact_kinds",
         }
         if not isinstance(payload, dict) or set(payload) - allowed_fields:
             return None
@@ -1787,6 +1929,31 @@ class MemoryQueryResolver:
         time_range = MemoryQueryResolver._parse_rewrite_time_range(payload.get("time_range"), now)
         if payload.get("time_range") is not None and time_range is None:
             return None
+        answer_mode_value = payload.get("answer_mode")
+        answer_mode = (
+            str(answer_mode_value).strip()
+            if isinstance(answer_mode_value, str)
+            and str(answer_mode_value).strip() in _SEMANTIC_ANSWER_MODES
+            else ""
+        )
+        subject_role_value = payload.get("subject_role")
+        subject_role = (
+            str(subject_role_value).strip()
+            if isinstance(subject_role_value, str)
+            and str(subject_role_value).strip() in _SEMANTIC_SUBJECT_ROLES
+            else ""
+        )
+        raw_fact_kinds = payload.get("fact_kinds")
+        fact_kinds = ()
+        if isinstance(raw_fact_kinds, list):
+            fact_kinds = tuple(
+                dict.fromkeys(
+                    str(kind).strip()
+                    for kind in raw_fact_kinds
+                    if isinstance(kind, str)
+                    and str(kind).strip() in _SEMANTIC_FACT_KINDS
+                )
+            )
         return ResolvedMemoryQuery(
             original_query=original,
             retrieval_query=retrieval_query.strip(),
@@ -1799,6 +1966,9 @@ class MemoryQueryResolver:
             time_range=time_range,
             rewrite_used=True,
             confidence=float(confidence),
+            answer_mode=answer_mode,
+            subject_role=subject_role,
+            preferred_fact_kinds=fact_kinds,
         )
 
     def _identities_are_valid(self, identities: Sequence[str]) -> bool:

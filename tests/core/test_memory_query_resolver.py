@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import json
 import time
 
 import pytest
@@ -2115,3 +2116,105 @@ def test_rewrite_subject_must_be_group_member_and_mentioned() -> None:
     )
     assert kept_pronoun is not None
     assert kept_pronoun.subject_ids == ("10001",)
+
+
+def _rewrite_provider(payload: dict) -> object:
+    return lambda query, recent, timeout_seconds: json.dumps(payload)
+
+
+def test_bare_first_person_viewing_question_binds_requester_without_whitelist() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "我最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        requester_id=900000101,
+    )
+
+    assert result.subject_ids == ("900000101",)
+    assert result.subject_binding == "requester"
+    assert result.topic_query == "最近在看什么动画"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "我最近在看什么动画",
+        "我在追什么番",
+        "最近我在看什么动画",
+        "我最近在补什么番剧",
+        "我现在在看什么",
+    ),
+)
+def test_current_viewing_question_variants_bind_requester_without_whitelist(
+    query: str,
+) -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_ids == ("10001",)
+
+
+def test_semantic_rewrite_sets_current_fact_intent_for_viewing_question() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "最近在看 动画",
+                "answer_mode": "current_fact",
+                "subject_role": "requester",
+                "fact_kinds": ["current"],
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "我最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        requester_id=900000101,
+    )
+
+    assert result.subject_ids == ("900000101",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+    assert result.retrieval_query == "最近在看 动画"
+    assert result.preferred_fact_kinds == ("current",)
+    assert result.needs_history is False
+    assert result.rewrite_used is True
+
+
+def test_semantic_rewrite_keeps_member_subject_for_member_question() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "阿渣 最近在看 动画",
+                "answer_mode": "current_fact",
+                "subject_role": "member",
+                "speaker_ids": ["10001"],
+                "fact_kinds": ["current"],
+                "confidence": 0.9,
+            }
+        )
+    )
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "阿渣最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.answer_mode == "current_fact"
+    assert result.preferred_fact_kinds == ("current",)
