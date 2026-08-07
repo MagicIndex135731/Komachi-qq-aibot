@@ -2209,6 +2209,12 @@ def test_store_enqueue_gates_memory_disabled_groups(sqlite_engine) -> None:
     assert projected is not None
 
 
+def test_background_service_module_imports_json_for_vector_serialization() -> None:
+    import app.core.memory_background_service as module
+
+    assert module.json.dumps([0.1, 0.2], separators=(",", ":")) == "[0.1,0.2]"
+
+
 def test_store_claim_retires_memory_disabled_group_jobs(sqlite_engine) -> None:
     store = SqlAlchemyMemoryBackgroundStore(
         sqlite_engine,
