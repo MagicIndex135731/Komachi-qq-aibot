@@ -282,6 +282,45 @@ class RuntimeFactsInspectingLlm:
         return "今天是 2026-05-09。"
 
 
+class BuiltinSearchAwareLlm:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.reply_kwargs: list[dict] = []
+        self.supports_selective_web_search = True
+        self.supports_forced_web_search = True
+
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, **kwargs) -> str:
+        del conversation_key
+        self.calls.append(prompt_lines)
+        self.reply_kwargs.append(kwargs)
+        return "replied"
+
+
+class CapturingMemoryOrchestrator:
+    def __init__(self) -> None:
+        self.seen_available_inputs: list[int] = []
+
+    def build_context(self, request):
+        self.seen_available_inputs.append(request.available_input)
+        return MemoryContextResult(
+            group_id=request.group_id,
+            packed_context=LegacyMemoryPromptContext(
+                recent_messages=[],
+                full_history_messages=[],
+                full_history_preamble=[],
+                full_history_enabled=False,
+                member_focus_lines=[],
+                summaries=[],
+                relevant_history_messages=[],
+                memories=[],
+                history_detail=False,
+            ),
+            selected_source_msg_ids=(),
+            estimated_tokens=0,
+            mode="normal",
+        )
+
+
 class RelativeYearSearchLlm:
     def __init__(self) -> None:
         self.calls = []
@@ -3901,6 +3940,175 @@ async def test_router_skips_search_decision_call_when_no_search_client(sqlite_en
     assert llm.search_decision_calls == 0
     assert llm.reply_calls == 1
     assert [outbound.text for outbound in sender.sent] == ["I checked just enough."]
+
+
+@pytest.mark.asyncio
+async def test_router_attaches_builtin_web_search_for_addressed_turn_without_time_keywords(
+    sqlite_engine, monkeypatch
+) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+    )
+    router.runtime.settings.llm_builtin_web_search = True
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="builtin-auto-1",
+            plain_text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert llm.reply_kwargs[-1]["allow_web_search"] is True
+    assert llm.reply_kwargs[-1].get("force_web_search") is not True
+    joined = "\n".join(llm.calls[-1])
+    assert "Runtime facts:" in joined
+    assert "Web search priority:" in joined
+    assert "Never present old chat memory as current fact" in joined
+    assert [outbound.text for outbound in sender.sent] == ["replied"]
+
+
+@pytest.mark.asyncio
+async def test_router_forces_builtin_web_search_for_explicit_request(
+    sqlite_engine, monkeypatch
+) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+    )
+    router.runtime.settings.llm_builtin_web_search = True
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="builtin-forced-1",
+            plain_text="联网搜索最新台风登陆地点",
+        )
+    )
+
+    assert llm.reply_kwargs[-1]["allow_web_search"] is True
+    assert llm.reply_kwargs[-1]["force_web_search"] is True
+    joined = "\n".join(llm.calls[-1])
+    assert "Runtime facts:" in joined
+    assert "Web search priority:" in joined
+    assert [outbound.text for outbound in sender.sent] == ["replied"]
+
+
+@pytest.mark.asyncio
+async def test_router_compacts_memory_budget_for_explicit_search_turn(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+        memory_orchestrator=memory,
+    )
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="compact-forced-1",
+            plain_text="联网搜索最新台风登陆地点",
+        )
+    )
+
+    assert memory.seen_available_inputs == [6000]
+
+
+@pytest.mark.asyncio
+async def test_router_caps_memory_budget_for_auto_search_turn(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+        memory_orchestrator=memory,
+    )
+    router.runtime.settings.llm_builtin_web_search = True
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="compact-auto-1",
+            plain_text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert memory.seen_available_inputs == [12000]
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_memory_budget_when_search_is_unavailable(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+        memory_orchestrator=memory,
+    )
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="no-search-budget-1",
+            plain_text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert memory.seen_available_inputs == [217040]
 
 
 @pytest.mark.asyncio

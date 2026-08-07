@@ -4,10 +4,12 @@ from app.core.search_policy import (
     build_forced_search_query,
     build_current_datetime_facts,
     build_search_decision_prompt,
+    build_search_priority_instructions,
     detect_address_intent,
     is_general_search_decision_candidate,
     is_explicit_search_request,
     is_search_verification_query,
+    memory_budget_for_search,
     needs_external_lookup_search,
     needs_reference_search,
     is_time_sensitive_request,
@@ -252,3 +254,61 @@ def test_build_search_decision_prompt_matches_plan_structure() -> None:
         "Recent messages:\n1: old msg\n2: newer msg",
         "Target message: \u6700\u8fd1\u65b0\u756a\u53e3\u7891\u600e\u4e48\u6837",
     ]
+
+
+def test_memory_budget_for_search_forced_search_gets_compact_budget() -> None:
+    budget = memory_budget_for_search(
+        available_input=100_000,
+        forced_search=True,
+        auto_search_eligible=True,
+        compact_budget=6000,
+        auto_budget=12000,
+    )
+
+    assert budget == 6000
+
+
+def test_memory_budget_for_search_auto_search_gets_moderate_budget() -> None:
+    budget = memory_budget_for_search(
+        available_input=100_000,
+        forced_search=False,
+        auto_search_eligible=True,
+        compact_budget=6000,
+        auto_budget=12000,
+    )
+
+    assert budget == 12000
+
+
+def test_memory_budget_for_search_without_search_keeps_available_input() -> None:
+    budget = memory_budget_for_search(
+        available_input=100_000,
+        forced_search=False,
+        auto_search_eligible=False,
+        compact_budget=6000,
+        auto_budget=12000,
+    )
+
+    assert budget == 100_000
+
+
+def test_memory_budget_for_search_never_exceeds_available_input() -> None:
+    budget = memory_budget_for_search(
+        available_input=3000,
+        forced_search=True,
+        auto_search_eligible=True,
+        compact_budget=6000,
+        auto_budget=12000,
+    )
+
+    assert budget == 3000
+
+
+def test_search_priority_instructions_prefer_fresh_results_and_say_miss() -> None:
+    instructions = build_search_priority_instructions()
+
+    assert len(instructions) == 2
+    assert "prefer its fresh results over chat memory" in instructions[0]
+    assert "Treat chat memory as background only" in instructions[0]
+    assert "say the search did not hit" in instructions[1]
+    assert "Never present old chat memory as current fact" in instructions[1]

@@ -189,6 +189,16 @@ class AppSettings(BaseSettings):
         le=200,
         alias="MEMORY_FACT_SEMANTIC_CANDIDATES",
     )
+    memory_search_compact_budget_tokens: int = Field(
+        default=6000,
+        ge=1024,
+        alias="MEMORY_SEARCH_COMPACT_BUDGET_TOKENS",
+    )
+    memory_search_auto_budget_tokens: int = Field(
+        default=12000,
+        ge=2048,
+        alias="MEMORY_SEARCH_AUTO_BUDGET_TOKENS",
+    )
     memory_max_evidence_messages: int = Field(
         default=150,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",

@@ -247,6 +247,15 @@ GENERAL_SEARCH_QUESTION_PATTERN = re.compile(
     r"(什么|谁|哪|哪里|哪个|哪家|怎么|为何|为什么|如何|多少|几|能不能|值不值得|值得吗|是不是|是否|好不好)"
 )
 
+SEARCH_PRIORITY_INSTRUCTIONS = (
+    "Web search priority: if the question depends on current time, latest status, weather, "
+    "news, events, rankings, or any fact that may have changed, call web_search and prefer "
+    "its fresh results over chat memory. Treat chat memory as background only.",
+    "If web search does not return the requested current information, say the search did not "
+    "hit and ask for a typhoon name, keyword, or screenshot. Never present old chat memory as "
+    "current fact.",
+)
+
 
 @dataclass(slots=True)
 class AddressDecision:
@@ -423,6 +432,33 @@ def is_general_search_decision_candidate(text: str) -> bool:
     if GENERAL_SEARCH_QUESTION_PATTERN.search(normalized):
         return True
     return any(hint in normalized for hint in GENERAL_SEARCH_HINTS)
+
+
+def build_search_priority_instructions() -> list[str]:
+    return list(SEARCH_PRIORITY_INSTRUCTIONS)
+
+
+def memory_budget_for_search(
+    *,
+    available_input: int,
+    forced_search: bool,
+    auto_search_eligible: bool,
+    compact_budget: int,
+    auto_budget: int,
+) -> int:
+    """Bound the memory pack by whether this turn carries a search tool.
+
+    A guaranteed search (forced) gets the smallest budget so fresh results
+    dominate; a model-decided search (auto) gets a moderate budget so old
+    evidence cannot drown the tool output. This is state-driven, not
+    keyword-driven.
+    """
+    available_input = max(1, int(available_input))
+    if forced_search:
+        return min(available_input, max(1, int(compact_budget)))
+    if auto_search_eligible:
+        return min(available_input, max(1, int(auto_budget)))
+    return available_input
 
 
 def build_forced_search_query(text: str, *, bot_names: set[str]) -> str:

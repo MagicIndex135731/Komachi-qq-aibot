@@ -58,9 +58,12 @@ from app.core.search_policy import (
     build_forced_search_query,
     build_current_datetime_facts,
     build_search_decision_prompt,
+    build_search_priority_instructions,
     detect_address_intent,
     is_explicit_search_request,
     is_general_search_decision_candidate,
+    is_search_verification_query,
+    memory_budget_for_search,
     needs_external_lookup_search,
     needs_reference_search,
     is_time_sensitive_request,
@@ -1338,6 +1341,21 @@ class InboundRouter:
                 time_sensitive,
                 recent_minute_traffic,
             )
+            explicit_search_request = is_explicit_search_request(event.plain_text)
+            reference_search_request = needs_reference_search(event.plain_text)
+            external_lookup_search_request = needs_external_lookup_search(event.plain_text)
+            general_search_candidate = is_general_search_decision_candidate(event.plain_text)
+            proactive_time_sensitive_turn = decision.reason == "proactive_score" and time_sensitive
+            forced_search_request = addressed_turn and (
+                explicit_search_request or reference_search_request or external_lookup_search_request
+            )
+            builtin_web_search_eligible = (
+                self.web_search_client is None
+                and (
+                    (addressed_turn and not is_search_verification_query(event.plain_text))
+                    or proactive_time_sensitive_turn
+                )
+            )
             if not decision.should_reply:
                 return PreparedGroupReply(False)
             group_image_request = self._build_group_image_request(
@@ -1423,6 +1441,15 @@ class InboundRouter:
                     else 0
                 ),
             )
+            available_memory_input = memory_budget_for_search(
+                available_input=available_memory_input,
+                forced_search=forced_search_request,
+                auto_search_eligible=(
+                    builtin_web_search_eligible and self.runtime.settings.llm_builtin_web_search
+                ),
+                compact_budget=self.runtime.settings.memory_search_compact_budget_tokens,
+                auto_budget=self.runtime.settings.memory_search_auto_budget_tokens,
+            )
             memory_tool_executor = None
             if memory_enabled and self.runtime.settings.memory_memory_tools_enabled:
                 member_names: dict[str, int] = {}
@@ -1498,11 +1525,9 @@ class InboundRouter:
                     "Do not repeat sensitive details from replies marked as blocked by QQ. "
                     "Acknowledge only that the previous reply may contain sensitive information and could not be sent.",
                 ]
-            runtime_facts: list[str] = []
+            runtime_facts: list[str] = build_current_datetime_facts(datetime.now().astimezone())
             grounding_notes: list[str] = []
             current_datetime_context_required = needs_current_datetime_context(event.plain_text)
-            if current_datetime_context_required:
-                runtime_facts = build_current_datetime_facts(datetime.now().astimezone())
             web_results: list[str] = []
             web_pages: list[str] = []
             search_hits = []
@@ -1516,21 +1541,12 @@ class InboundRouter:
                     requires_user_visible_failure_reply=True,
                 )
             search_reference_time = self._normalize_timestamp(event.timestamp).astimezone()
-            explicit_search_request = is_explicit_search_request(event.plain_text)
-            reference_search_request = needs_reference_search(event.plain_text)
-            external_lookup_search_request = needs_external_lookup_search(event.plain_text)
-            general_search_candidate = is_general_search_decision_candidate(event.plain_text)
-            proactive_time_sensitive_turn = decision.reason == "proactive_score" and time_sensitive
-            forced_search_request = addressed_turn and (
-                explicit_search_request or reference_search_request or external_lookup_search_request
-            )
             addressed_optional_search_eligible = (
                 addressed_turn and (time_sensitive or general_search_candidate) and not forced_search_request
             )
-            builtin_web_search_eligible = (
-                self.web_search_client is None
-                and not current_datetime_context_required
-                and (forced_search_request or addressed_optional_search_eligible or proactive_time_sensitive_turn)
+            search_priority_turn = bool(
+                forced_search_request
+                or (builtin_web_search_eligible and self.runtime.settings.llm_builtin_web_search)
             )
             if (
                 self.web_search_client is not None
@@ -1567,6 +1583,7 @@ class InboundRouter:
                     try:
                         parsed_search = parse_search_decision(self.llm_client.generate_text(search_prompt))
                         if parsed_search.should_search:
+                            search_priority_turn = True
                             parsed_search = SearchDecision(
                                 True,
                                 normalize_relative_time_query(parsed_search.query, now=search_reference_time),
@@ -1648,6 +1665,11 @@ class InboundRouter:
                     )
 
             proactive_turn = not addressed_turn
+            if search_priority_turn:
+                group_policy_lines = [
+                    *group_policy_lines,
+                    *build_search_priority_instructions(),
+                ]
             group_policy_lines = [
                 *group_policy_lines,
                 url_reply_policy_instruction(event.plain_text),
