@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
+import json
 import logging
+import os
+from pathlib import Path
 
 from sqlalchemy import bindparam, text
 
@@ -29,6 +32,27 @@ from app.main import (
 from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all, session_scope
 from app.storage.repositories import MessageRepository, RetrievalDocumentRepository
+
+
+def _write_group_ready_marker(*, log_dir: Path, state: str) -> None:
+    """Persist gateway readiness for external start/status scripts.
+
+    ``connected`` is written as soon as the OneBot websocket is up (the bot is
+    already consuming messages at that point); ``ready`` is written after the
+    startup backfill and startup-window mention replay complete. The marker is
+    refreshed on every reconnect, so start/status scripts can treat a fresh
+    marker as proof the bot is accepting messages.
+    """
+    payload = {
+        "pid": os.getpid(),
+        "state": state,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "group.ready.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def _max_message_id(engine) -> int:
@@ -288,20 +312,26 @@ async def run() -> None:
             await router.handle_group_message(event)
 
         async def backfill_group_history_on_connect() -> None:
-            watermark_message_id = _max_message_id(engine)
-            await backfill_recent_group_history(
-                router=router,
-                gateway=gateway,
-                bot_qq=settings.bot_qq,
-                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
-            )
-            await _replay_startup_window_mentions(
-                engine=engine,
-                router=router,
-                settings=settings,
-                runtime=runtime,
-                watermark_message_id=watermark_message_id,
-            )
+            _write_group_ready_marker(log_dir=settings.log_dir, state="connected")
+            try:
+                watermark_message_id = _max_message_id(engine)
+                await backfill_recent_group_history(
+                    router=router,
+                    gateway=gateway,
+                    bot_qq=settings.bot_qq,
+                    bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+                )
+                await _replay_startup_window_mentions(
+                    engine=engine,
+                    router=router,
+                    settings=settings,
+                    runtime=runtime,
+                    watermark_message_id=watermark_message_id,
+                )
+            except Exception:
+                logging.exception("startup_backfill_failed; continuing to accept messages")
+            _write_group_ready_marker(log_dir=settings.log_dir, state="ready")
+            logging.info("group_ready accepting_messages=True state=ready")
 
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)

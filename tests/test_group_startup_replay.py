@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 
 import app.group_main as group_main
@@ -87,6 +88,27 @@ def _watermark(sqlite_engine) -> int:
             )
         ).scalar_one()
         return int(row)
+
+
+def test_write_group_ready_marker_writes_fresh_json(tmp_path) -> None:
+    group_main._write_group_ready_marker(log_dir=tmp_path, state="ready")
+
+    payload = json.loads((tmp_path / "group.ready.json").read_text(encoding="utf-8"))
+    assert payload["state"] == "ready"
+    assert payload["pid"] > 0
+    assert "updated_at" in payload
+
+
+def test_write_group_ready_marker_refreshes_connected_state(tmp_path) -> None:
+    group_main._write_group_ready_marker(log_dir=tmp_path, state="connected")
+    first = json.loads((tmp_path / "group.ready.json").read_text(encoding="utf-8"))
+
+    group_main._write_group_ready_marker(log_dir=tmp_path, state="ready")
+    second = json.loads((tmp_path / "group.ready.json").read_text(encoding="utf-8"))
+
+    assert first["state"] == "connected"
+    assert second["state"] == "ready"
+    assert second["updated_at"] >= first["updated_at"]
 
 
 def test_startup_window_mention_rows_filters(sqlite_engine) -> None:

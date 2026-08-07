@@ -107,6 +107,7 @@ if [[ "${probe_ok}" != true ]]; then
 fi
 
 echo "Waiting for xiaomachi bot heartbeat..."
+heartbeat_ok=false
 for _ in $(seq 1 60); do
   heartbeat_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/group.heartbeat.json 2>/dev/null || true)"
   if python3 - "${heartbeat_payload}" <<'PY'
@@ -120,8 +121,46 @@ age = (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()
 print(f"state={d.get('state')} pid={d.get('pid')} heartbeat_age_seconds={age:.1f}")
 raise SystemExit(0 if d.get("state") == "alive" and age <= 20 else 1)
 PY
-  then exit 0; fi
+  then
+    heartbeat_ok=true
+    break
+  fi
   sleep 5
 done
-docker compose -f "${compose_file}" logs --tail=80 xiaomachi
-exit 1
+if [[ "${heartbeat_ok}" != true ]]; then
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi
+  exit 1
+fi
+
+echo "Waiting for xiaomachi bot to accept messages (gateway ready)..."
+ready_ok=false
+for attempt in $(seq 1 60); do
+  ready_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/group.ready.json 2>/dev/null || true)"
+  if python3 - "${ready_payload}" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+if not sys.argv[1]: raise SystemExit(1)
+d = json.loads(sys.argv[1])
+t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
+if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+age = (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()
+state = str(d.get("state", ""))
+print(f"state={state} ready_age_seconds={age:.1f}")
+if state not in ("connected", "ready"): raise SystemExit(1)
+if age > 60: raise SystemExit(1)
+PY
+  then
+    ready_ok=true
+    break
+  fi
+  echo "  waiting for bot gateway readiness (${attempt}/60)"
+  sleep 5
+done
+if [[ "${ready_ok}" != true ]]; then
+  echo "Bot did not reach gateway-ready state (not yet accepting messages)."
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi
+  exit 1
+fi
+
+echo "Xiaomachi bot is up and accepting messages."
+exit 0

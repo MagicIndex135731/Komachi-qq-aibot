@@ -395,9 +395,22 @@ def test_status_script_uses_on_demand_probes_before_logs() -> None:
     assert 'docker compose -f "${compose_file}" logs --tail=80 xiaomachi' in script
 
 
+def test_status_script_waits_for_gateway_ready_marker() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+
+    assert "Waiting for xiaomachi bot heartbeat..." in script
+    assert "group.heartbeat.json" in script
+    assert "Waiting for xiaomachi bot to accept messages (gateway ready)..." in script
+    assert "group.ready.json" in script
+    assert "ready_age_seconds" in script
+    assert 'state not in ("connected", "ready")' in script
+    assert "Xiaomachi bot is up and accepting messages." in script
+
+
 def test_start_script_waits_for_status_readiness() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
     assert 'bash "${SCRIPT_DIR}/status.sh"' in script
+    assert "Xiaomachi startup complete: bot is up and accepting messages." in script
 
 
 def test_start_and_stop_manage_wsl_keepalive_anchor() -> None:

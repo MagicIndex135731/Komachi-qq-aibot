@@ -116,4 +116,5 @@ docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
 docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
 bash "${SCRIPT_DIR}/status.sh"
+echo "Xiaomachi startup complete: bot is up and accepting messages."
 startup_complete=true
