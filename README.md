@@ -4,6 +4,19 @@
 
 完整的系统架构、消息工作流、商用 API、QQ/OneBot 服务和 Memory V3 原理见 [小町工程设计与运行原理](docs/ARCHITECTURE.md)。
 
+## 功能亮点
+
+- **人格化群聊**：小町人格、@/主动回复、群策略、安全规则与 QQ 拦截降级，普通群聊与开发控制台共用一套运行时。
+- **Memory V3 分层记忆**：最近消息、episode 摘要、结构化事实、用户画像、群公共上下文分层编排；模型可调用原生记忆工具
+  `memory_search` / `memory_read` / `memory_write` 主动取上下文，而不是依赖单一 RAG 召回碰运气。
+- **语义排序 + 持久向量**：本地 bge-small-zh 在 CUDA 上运行，事实向量预计算并持久化，冷启动零重算、排序稳定。
+- **问法鲁棒性**：首人称（我喜欢/我喜欢看/我想看）、自称原话（我什么时候说过/哪条）、评价（觉得/怎么看/如何评价）、
+  引用消息代词（他/她=被引用消息发送人）、成员昵称 vs QQ 号等问法族统一处理，口语与错字变体可命中。
+- **按群记忆策略**：默认群只使用最近 100 条消息作为上下文；完整分层记忆仅在明确开启的群生效（当前为 100000001）。
+- **质量可度量**：全量 1222 项测试通过；300 例真实历史压力回归 **290/300（96.7%）**，跨群违规 0；离线问法矩阵为必过门禁。
+- **数据治理**：每条事实绑定真实消息 source、可纠正/撤回；历史噪音清理、向量回填、按群数据清理脚本均幂等且先备份。
+- **可观测与安全**：`memory_runtime`/指标/心跳日志，跨群隔离 fail-closed，敏感投递自动降级不泄露。
+
 ## 日常操作
 
 在资源管理器中双击：
@@ -54,11 +67,40 @@
 
 ### 群和人格
 
-- `configs/groups.yaml`：控制群是否接收、发言、主动回复、归档和生图。
+- `configs/groups.yaml`：控制群是否接收、发言、主动回复、归档、生图和**记忆系统**。
 - `configs/persona.yaml`：人格、称呼和回复风格。
 - `configs/safety.yaml`：安全限制。
 
 群配置只有同时设置 `enabled: true` 和 `speak: true` 才允许小町在该群回复。
+记忆按群开关：`memory_enabled: false` 的群（默认）只使用最近
+`recent_context_limit`（默认 100）条消息作为上下文，不生成、不检索、不产生任何记忆数据；
+`memory_enabled: true` 的群启用完整分层记忆（当前生产为 100000001）。
+
+### 记忆系统（Memory V3）
+
+- `MEMORY_LAYERED_MEMORY_ENABLED=true`：查询侧接通 episode 摘要、结构化事实与用户画像；
+  `MEMORY_MEMORY_TOOLS_ENABLED=true`：启用模型原生记忆工具（带 source 约束与审计）。
+- `MEMORY_FACT_SEMANTIC_RANKING_ENABLED=true`：事实按“问法意图类型 + 语义相似度 + 字面匹配 +
+  重要性/置信度/时效”排序，目标类型事实进入上下文；向量持久化于
+  `memory_item_semantic_vectors`，由后台与回填脚本写入。
+- `MEMORY_QUERY_REWRITE_ENABLED=true`：确定性绑定失败时做一次受约束改写，不改宽时间范围、
+  不虚构成员。
+- `MEMORY_EMBEDDING_DEVICE=cuda`：生产使用 CUDA 推理，Docker 通过 CDI 只把 GPU 分配给
+  `xiaomachi`。
+
+维护命令（均在容器内执行，先备份）：
+
+```bash
+# 事实向量全量/增量回填
+python -m scripts.backfill_memory_item_semantic_vectors --database /workspace/data/bot.db --batch-size 100
+# 历史噪音清理（plan 先看候选，run 再执行，可恢复）
+python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
+python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
+# 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
+python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id 100000002 --dry-run
+# 真实历史压力回归（300 例）
+python -m scripts.memory_stress_eval run --database /workspace/data/backups/<备份>.db --limit-cases 300
+```
 
 ### 文本、搜索和上下文
 
@@ -213,6 +255,13 @@ py -3.12 -m venv .venv
 ```
 
 提交前至少运行受影响测试、`docker compose config`、PowerShell/Bash 语法检查和 `git diff --check`。
+
+质量基线（2026-08-07）：
+
+- 全量 `pytest`：1222 passed。
+- 300 例真实历史压力回归：**290/300（96.7%）**；decision/plan/preference/relationship/
+  running_joke/raw_history/first_person 类别 100%，跨群违规 0。
+- 离线问法矩阵：同一事实 5-8 种问法召回同一 source 集，歧义与跨群变体 fail-closed。
 
 ## Git 回退
 

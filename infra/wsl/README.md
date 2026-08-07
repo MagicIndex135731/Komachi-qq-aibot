@@ -118,6 +118,33 @@ Toolkit，并确保 `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 已�
 确认模型已经缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`，可保证离线重启不会
 等待模型站点超时。
 
+### 按群记忆策略与日常维护（Memory V3）
+
+记忆系统按群开关，配置在 `configs/groups.yaml`：
+
+- `memory_enabled: false`（默认）：该群**不使用任何记忆**，回复只取最近
+  `recent_context_limit`（默认 100）条消息作为上下文；后台不生成、不检索、不入队。
+- `memory_enabled: true`：启用完整分层记忆（episode 摘要、结构化事实、用户画像、
+  记忆工具、语义排序）。当前生产仅 100000001 开启。
+
+日常维护命令（容器内，先备份）：
+
+```bash
+# 事实向量回填（幂等、可断点）
+python -m scripts.backfill_memory_item_semantic_vectors --database /workspace/data/bot.db --batch-size 100
+# 历史噪音清理（plan -> 备份 -> run；可恢复）
+python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
+python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
+# 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
+python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id <GROUP_ID> --dry-run
+# 300 例真实历史压力回归
+python -m scripts.memory_stress_eval run --database /workspace/data/backups/<备份>.db --limit-cases 300
+```
+
+质量基线（2026-08-07）：全量 pytest 1222 passed；300 例压力回归 290/300（96.7%），
+跨群违规 0；离线问法矩阵为必过门禁。发布只重建 `xiaomachi`，绝不重启
+`xiaomachi-llbot`。
+
 ## 验收
 
 ```bash
