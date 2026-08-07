@@ -1466,6 +1466,60 @@ def test_member_verb_infix_memory_query_binds_member() -> None:
     assert result.answer_mode == "current_fact"
 
 
+@pytest.mark.parametrize(
+    ("query", "expect_detail"),
+    (
+        ("我自称巴萨球迷是哪条，发一下原话", True),
+        ("我具体什么时候说的自己是巴萨球迷？", True),
+        ("我是巴萨球迷是哪句话说的？", True),
+        ("我哪句话说过我是巴萨球迷？", True),
+        ("我什么时候发过我是巴萨球迷？", False),
+        ("我发的哪条消息说了我是巴萨球迷？", True),
+    ),
+)
+def test_first_person_claim_quote_variants_bind_requester(
+    query: str,
+    expect_detail: bool,
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+        requester_id=20001,
+    )
+
+    assert result.subject_ids == ("20001",)
+    assert result.subject_binding == "requester"
+    assert result.needs_history is True
+    assert result.needs_detail is expect_detail
+
+
+def test_first_person_claim_quote_with_other_person_pronoun_stays_unbound() -> None:
+    result = MemoryQueryResolver().resolve(
+        "我想知道你什么时候说过我是巴萨球迷？",
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+        requester_id=20001,
+    )
+
+    # Pronoun points at another person: never bind the requester. The query is
+    # treated as an ambiguous person-memory question and fails closed.
+    assert result.subject_ids == ()
+
+
+def test_first_person_claim_quote_without_requester_stays_unbound() -> None:
+    result = MemoryQueryResolver().resolve(
+        "我自称巴萨球迷是哪条，发一下原话",
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+    )
+
+    assert result.subject_ids is None
+
+
 def test_bad_or_unsafe_rewrite_json_falls_back_to_original_question() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=lambda *_: '{"retrieval_query":"x","group_id":"forged"}'

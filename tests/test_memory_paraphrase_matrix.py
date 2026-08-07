@@ -68,6 +68,12 @@ FIRST_PERSON_VARIANTS = (
     "我最喜欢喝什么？",
 )
 
+CLAIM_VARIANTS = (
+    ("我什么时候说过我喜欢喝豆浆？", False),
+    ("我哪句话说过我喜欢喝豆浆？", True),
+    ("我自称喜欢喝豆浆是哪条？", True),
+)
+
 
 @pytest.fixture
 def seeded(sqlite_engine) -> dict:
@@ -128,6 +134,21 @@ def seeded(sqlite_engine) -> dict:
             )
             session.flush()
             first_person_query_ids[variant] = int(row.id)
+        claim_query_ids: dict[str, int] = {}
+        for index, (variant, _expect_detail) in enumerate(CLAIM_VARIANTS):
+            row = messages.add_group_message(
+                platform_msg_id=f"para-claim-query-{index}",
+                group_id=100,
+                user_id=99,
+                timestamp=observed_at + timedelta(minutes=index + 1),
+                plain_text=variant,
+                raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+            session.flush()
+            claim_query_ids[variant] = int(row.id)
         first_person_source = messages.add_group_message(
             platform_msg_id="para-firstperson-source",
             group_id=100,
@@ -204,6 +225,7 @@ def seeded(sqlite_engine) -> dict:
         "query_ids": query_ids,
         "first_person_source": "para-firstperson-source",
         "first_person_query_ids": first_person_query_ids,
+        "claim_query_ids": claim_query_ids,
         "cross_group_query_id": int(cross_row.id),
         "fact": fact,
         "profile": profile,
@@ -313,6 +335,37 @@ def test_first_person_variants_bind_requester_and_recall_same_source(
             trace.result.packed_context.grounding_policy
             == MEMORY_GROUNDING_WITH_EVIDENCE
         ), variant
+
+
+def test_first_person_claim_variants_bind_requester_and_recall_same_source(
+    sqlite_engine,
+    tmp_path,
+    seeded,
+) -> None:
+    runtime = build_memory_runtime(
+        settings=_settings(tmp_path),
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    for variant, expect_detail in CLAIM_VARIANTS:
+        trace = runtime.v2_provider.evaluate(
+            runtime.build_request(
+                group_id=100,
+                message_id=seeded["claim_query_ids"][variant],
+            )
+        )
+        assert trace.resolved_query.subject_ids == ("99",), variant
+        assert trace.resolved_query.subject_binding == "requester", variant
+        assert trace.resolved_query.needs_history is True, variant
+        assert trace.resolved_query.needs_detail is expect_detail, variant
+        fact_sources = {
+            source_id
+            for fact in trace.result.packed_context.facts
+            if "提问者喜欢喝豆浆" in fact.text
+            for source_id in fact.source_msg_ids
+        }
+        assert fact_sources == {seeded["first_person_source"]}, variant
 
 
 def test_paraphrase_variant_cross_group_fails_closed(

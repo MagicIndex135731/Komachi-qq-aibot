@@ -142,9 +142,12 @@ _SPEECH_NAME_PATTERN = re.compile(r"([\u4e00-\u9fff]{2,3})(?=说|表示|提到|�
 _JOINED_NAME_PATTERN = re.compile(r"([\u4e00-\u9fff]{2})(?=和|、)|(?:和|、)([\u4e00-\u9fff]{2})(?=都|和|、|说|表示|提到|认为)")
 _FOLLOW_UP_PATTERN = re.compile(r"详细讲讲|后来呢|之前那个|那个人|他说了什么|她说了什么|最后怎么样")
 _HISTORY_PATTERN = re.compile(
-    r"以前|曾经|过去|历史|之前|当时|那时|说过|发过|提过|聊过|发言"
+    r"以前|曾经|过去|历史|之前|当时|那时|说过|发过|提过|聊过|发言|"
+    r"自称|哪条|哪句话|哪一句|什么时候|哪一次|原话"
 )
-_DETAIL_PATTERN = re.compile(r"详细|经过|后来|最后|怎么处理")
+_DETAIL_PATTERN = re.compile(
+    r"详细|经过|后来|最后|怎么处理|原话|哪条|哪句话|哪一句|具体什么时候|哪一次"
+)
 _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:评价|点评|分析|总结|概括|说说|怎么看)\s*(?:一下)?我|"
     r"(?:我|我的)(?:平时|一般|通常)?"
@@ -255,6 +258,16 @@ _TEMPORAL_FIRST_PERSON_HISTORY_PATTERN = re.compile(
     r"^\s*(?:最近|昨天|今天|前天|以前|曾经|过去|当时)\s*(?:我|我的).*"
     r"(?:说过|说了|发过|发言|提到|聊过|表现|最喜欢|"
     r"喜欢(?:看|听|玩|用|吃|喝|读|追)?什么|讨厌什么)"
+)
+_FIRST_PERSON_CLAIM_QUOTE_PATTERN = re.compile(
+    r"^\s*(?:我|我的).{0,32}?"
+    r"(?:自称|说过|说的|发过|发的|提过|提到|讲过|表示过).{0,32}?"
+    r"(?:是哪条|哪句话|哪一句|什么时候|哪一次|哪个时候|原话)"
+)
+_FIRST_PERSON_CLAIM_TIME_PATTERN = re.compile(
+    r"^\s*(?:我|我的).{0,16}?"
+    r"(?:什么时候|哪一次|哪个时候|哪条|哪句话|哪一句)"
+    r".{0,24}?(?:自称|说过|说的|发过|发的|提过|提到|讲过|表示过)"
 )
 _NON_PERSON_MEMORY_SUBJECTS = frozenset(
     {
@@ -1367,6 +1380,15 @@ class MemoryQueryResolver:
 
     @staticmethod
     def _is_first_person_subject(query: str) -> bool:
+        claim_match = (
+            _FIRST_PERSON_CLAIM_QUOTE_PATTERN.search(query)
+            or _FIRST_PERSON_CLAIM_TIME_PATTERN.search(query)
+        )
+        if claim_match is not None:
+            start, end = claim_match.span()
+            if re.search(r"[你您他她]", query[start:end]):
+                return False
+            return True
         return bool(
             _FIRST_PERSON_SUBJECT_PATTERN.search(query)
             or _FIRST_PERSON_HISTORY_PATTERN.search(query)
