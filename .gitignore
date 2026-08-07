@@ -34,6 +34,9 @@ dbg_service_*/
 .worktrees/
 release/
 
+# 生产群配置覆盖（含真实群号，不提交 Git）
+configs/groups.local.yaml
+
 # WSL/Docker deployment runtime state
 infra/wsl/.env
 infra/wsl/runtime/

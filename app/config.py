@@ -284,5 +284,24 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     persona = _read_yaml(settings.config_dir / "persona.yaml")
     group_policy = _read_yaml(settings.config_dir / "groups.yaml")
+    local_groups_path = settings.config_dir / "groups.local.yaml"
+    if local_groups_path.exists():
+        local_policy = _read_yaml(local_groups_path)
+        if isinstance(local_policy, dict):
+            group_policy = _deep_merge_mapping(group_policy, local_policy)
     safety = _read_yaml(settings.config_dir / "safety.yaml")
     return RuntimeConfig(settings=settings, persona=persona, group_policy=group_policy, safety=safety)
+
+
+def _deep_merge_mapping(base: dict, overlay: dict) -> dict:
+    """Merge overlay over base, recursing into nested mappings."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if key == "groups" and isinstance(value, dict):
+            # 生产覆盖文件提供完整、真实的群表，整体替换占位群表。
+            merged[key] = value
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_mapping(merged[key], value)
+        else:
+            merged[key] = value
+    return merged

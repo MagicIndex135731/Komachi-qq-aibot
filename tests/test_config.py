@@ -33,6 +33,47 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
     assert runtime.safety["must_disclose_ai_identity"] is True
 
 
+def test_groups_local_overlay_replaces_placeholder_groups(tmp_path, monkeypatch) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "persona.yaml").write_text("name: x\nidentity: AI\n", encoding="utf-8")
+    (config_dir / "groups.yaml").write_text(
+        "default_group_behavior:\n  memory_enabled: false\n  recent_context_limit: 100\n"
+        "groups:\n"
+        '  "100000001":\n'
+        "    enabled: true\n"
+        "    speak: true\n"
+        "    memory_enabled: true\n",
+        encoding="utf-8",
+    )
+    (config_dir / "groups.local.yaml").write_text(
+        "groups:\n"
+        '  "100000001":\n'
+        "    enabled: true\n"
+        "    speak: true\n"
+        "    memory_enabled: true\n"
+        "    recent_context_limit: null\n",
+        encoding="utf-8",
+    )
+    (config_dir / "safety.yaml").write_text(
+        "must_disclose_ai_identity: true\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+
+    settings = AppSettings(config_dir=config_dir, data_dir=tmp_path / "data")
+    runtime = load_runtime_config(settings)
+
+    assert set(runtime.group_policy["groups"]) == {"100000001"}
+    assert runtime.group_policy["groups"]["100000001"]["memory_enabled"] is True
+    assert runtime.group_policy["default_group_behavior"]["recent_context_limit"] == 100
+
+
 def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
