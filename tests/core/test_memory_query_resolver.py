@@ -1466,6 +1466,103 @@ def test_member_verb_infix_memory_query_binds_member() -> None:
     assert result.answer_mode == "current_fact"
 
 
+def test_english_media_title_with_short_latin_member_aliases_stays_single_subject() -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="", group_card="加菲猫"),
+        GroupMemberIdentity(user_id=10002, nickname="", group_card="To"),
+        GroupMemberIdentity(user_id=10003, nickname="", group_card="V"),
+    )
+    result = MemoryQueryResolver().resolve(
+        "加菲猫喜欢ToLove吗？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+
+
+def test_standalone_latin_member_alias_still_marks_second_person() -> None:
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="", group_card="加菲猫"),
+        GroupMemberIdentity(user_id=10002, nickname="", group_card="To"),
+    )
+    result = MemoryQueryResolver().resolve(
+        "加菲猫和To喜欢什么动画？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+    )
+
+    assert result.subject_ids == ()
+
+
+def test_hyphenated_group_card_binds_member() -> None:
+    members = (
+        GroupMemberIdentity(
+            user_id=10001,
+            nickname="Ray Fluorite",
+            group_card="21-集成-Ray",
+        ),
+    )
+    result = MemoryQueryResolver().resolve(
+        "21-集成-Ray以前说过风吹着吗？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+
+
+def test_mixed_alias_containing_another_latin_alias_stays_single_subject() -> None:
+    members = (
+        GroupMemberIdentity(
+            user_id=10001,
+            nickname="Ray Fluorite",
+            group_card="21-集成-Ray",
+        ),
+        GroupMemberIdentity(user_id=10002, nickname="Ray", group_card=""),
+    )
+    result = MemoryQueryResolver().resolve(
+        "21-集成-Ray以前说过风吹着吗？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+
+
+def test_single_cjk_char_alias_inside_chinese_word_is_not_a_person() -> None:
+    members = (
+        GroupMemberIdentity(
+            user_id=10001,
+            nickname="Ray Fluorite",
+            group_card="21-集成-Ray",
+        ),
+        GroupMemberIdentity(user_id=10002, nickname="Ray", group_card=""),
+        GroupMemberIdentity(user_id=10003, nickname="风", group_card=""),
+    )
+    result = MemoryQueryResolver().resolve(
+        "21-集成-Ray以前说过风吹着吗？",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        group_id=12345,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+
+
 @pytest.mark.parametrize(
     ("query", "expect_detail"),
     (

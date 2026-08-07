@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from app.core.memory_fact_ranking import (
     filter_member_query_features,
     matching_member_fact_ids,
     memory_query_features,
+    preferred_kinds_for_query,
     rank_member_facts,
 )
 
@@ -19,6 +21,8 @@ def _fact(
     predicate: str = "",
     object_text: str = "",
     memory_kind: str = "fact",
+    last_seen_at=None,
+    valid_from=None,
 ):
     return SimpleNamespace(
         id=fact_id,
@@ -28,7 +32,42 @@ def _fact(
         memory_kind=memory_kind,
         importance=importance,
         confidence=confidence,
+        last_seen_at=last_seen_at,
+        valid_from=valid_from,
     )
+
+
+def test_preferred_kinds_for_query_intent_mapping() -> None:
+    cases = (
+        ("阿渣喜欢什么动画？", ("preference",)),
+        ("阿渣讨厌什么？", ("taboo", "preference")),
+        ("阿渣不喜欢什么？", ("taboo", "preference")),
+        ("阿渣有什么梗？", ("running_joke",)),
+        ("阿渣和谁是什么关系？", ("relationship",)),
+        ("阿渣打算做什么？", ("plan",)),
+        ("阿渣决定了什么？", ("decision",)),
+        ("阿渣最近在做什么？", ("current",)),
+        ("阿渣最近发生了什么？", ("event",)),
+        ("介绍一下阿渣", ("profile",)),
+        ("阿渣是什么样的人？", ("profile",)),
+        ("今天天气怎么样", ()),
+    )
+    for query, expected in cases:
+        assert preferred_kinds_for_query(
+            query=query,
+            answer_mode="general_history",
+        ) == expected, query
+
+
+def test_preferred_kinds_for_query_current_fact_fallback() -> None:
+    assert preferred_kinds_for_query(
+        query="还记得阿渣吗？",
+        answer_mode="current_fact",
+    ) == ("preference", "taboo", "profile")
+    assert preferred_kinds_for_query(
+        query="还记得阿渣吗？",
+        answer_mode="general_history",
+    ) == ()
 
 
 def test_memory_query_features_extract_entities_and_cjk_grams() -> None:
@@ -122,3 +161,35 @@ def test_rank_member_facts_prefers_kind_before_importance() -> None:
         preferred_kinds=("preference", "taboo", "profile"),
     )
     assert [fact.id for fact in ranked] == [3, 2, 1]
+
+
+def test_rank_member_facts_recency_breaks_ties() -> None:
+    older = _fact(
+        1,
+        "用户表示自己在做前后端",
+        importance=3,
+        confidence=0.8,
+        memory_kind="current",
+        last_seen_at=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    newer = _fact(
+        2,
+        "用户表示自己在做前后端",
+        importance=3,
+        confidence=0.8,
+        memory_kind="current",
+        last_seen_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    no_date = _fact(
+        3,
+        "用户表示自己在做前后端",
+        importance=3,
+        confidence=0.8,
+        memory_kind="current",
+    )
+    ranked = rank_member_facts(
+        (older, no_date, newer),
+        query_features=("不存在",),
+        limit=3,
+    )
+    assert [fact.id for fact in ranked] == [2, 1, 3]

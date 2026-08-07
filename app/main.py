@@ -36,6 +36,7 @@ from app.core.memory_fact_ranking import (
     filter_member_query_features,
     matching_member_fact_ids,
     memory_query_features,
+    preferred_kinds_for_query,
     rank_member_facts,
 )
 from app.core.memory_fact_semantics import SemanticFactRanker
@@ -715,9 +716,10 @@ def build_memory_runtime(
                     query_features,
                     aliases=member_aliases,
                 )
-                preferred_kinds: tuple[str, ...] = ()
-                if resolved_query.answer_mode == "current_fact":
-                    preferred_kinds = ("preference", "taboo", "profile")
+                preferred_kinds: tuple[str, ...] = preferred_kinds_for_query(
+                    query=str(resolved_query.original_query),
+                    answer_mode=resolved_query.answer_mode,
+                )
                 for subject_id in subject_ids:
                     candidates = memories.list_group_memories_for_subject(
                         scope_id=str(group_id),
@@ -730,7 +732,6 @@ def build_memory_runtime(
                     semantic_scores: dict[int, float] = {}
                     if (
                         settings.memory_fact_semantic_ranking_enabled
-                        and resolved_query.answer_mode in {"current_fact", "assessment"}
                     ):
                         semantic_candidates = candidates[
                             : settings.memory_fact_semantic_candidates

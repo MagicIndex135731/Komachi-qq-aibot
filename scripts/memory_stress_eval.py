@@ -24,6 +24,10 @@ from sqlalchemy.pool import NullPool
 
 from app.config import AppSettings
 from app.core.legacy_memory_context import GroupMemoryContextRequest
+from app.core.member_identity import (
+    group_member_identities_from_messages,
+    normalize_member_alias,
+)
 from app.core.memory_context_packer import EvidenceMessage
 from app.main import build_llm_client, build_memory_runtime
 from app.storage.db import session_scope
@@ -78,8 +82,30 @@ KIND_QUERY_TEMPLATES = {
 
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]{3,6}")
 _LATIN_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_\-]{2,}")
-_CLEAN_ALIAS = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9_\-]{2,16}$")
+_CLEAN_ALIAS = re.compile(
+    r"^(?=.*[\u4e00-\u9fffA-Za-z0-9])[\u4e00-\u9fffA-Za-z0-9_\-]{2,16}$"
+)
 _NOISY_KEYWORD = re.compile(r"[吗呢了吧的你我他她这那是不有和与]")
+
+
+def _runtime_in_scope_aliases(engine, group_id: int) -> set[str]:
+    """Aliases the runtime member loader would treat as in-scope."""
+    with session_scope(engine) as session:
+        rows = MessageRepository(session).list_recent_group_member_messages(
+            group_id=None,
+            limit=None,
+        )
+    members = group_member_identities_from_messages(
+        rows,
+        target_group_id=int(group_id),
+    )
+    return {
+        normalize_member_alias(alias)
+        for member in members
+        if member.in_scope
+        for alias in (member.nickname, member.group_card)
+        if normalize_member_alias(alias)
+    }
 
 
 def _iter_rows(engine, statement: str, parameters: dict | None = None):
@@ -243,6 +269,10 @@ def _build_cases(
 ) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     group_ids = _group_ids(engine)
+    in_scope_aliases_by_group: dict[int, set[str]] = {
+        int(group_id): _runtime_in_scope_aliases(engine, int(group_id))
+        for group_id in group_ids
+    }
     fact_rows = list(
         _iter_rows(
             engine,
@@ -256,6 +286,11 @@ def _build_cases(
         if kind not in KIND_QUERY_TEMPLATES or int(subject_id) in excluded_user_ids:
             continue
         alias = _member_alias(engine, int(subject_id))
+        if (
+            normalize_member_alias(alias)
+            not in in_scope_aliases_by_group.get(int(scope_id), set())
+        ):
+            continue
         if not _alias_is_unique(engine, int(scope_id), alias, int(subject_id)):
             continue
         expected = list(
@@ -301,6 +336,11 @@ def _build_cases(
             if value not in excluded_user_ids
         ]:
             alias = _member_alias(engine, user_id)
+            if (
+                normalize_member_alias(alias)
+                not in in_scope_aliases_by_group.get(int(group_id), set())
+            ):
+                continue
             if not _alias_is_unique(engine, group_id, alias, user_id):
                 continue
             for keyword in _topic_keywords(engine, group_id, user_id)[:4]:
@@ -330,6 +370,11 @@ def _build_cases(
         ]:
             for keyword in _topic_keywords(engine, group_id, user_id)[:2]:
                 alias = _member_alias(engine, user_id)
+                if (
+                    normalize_member_alias(alias)
+                    not in in_scope_aliases_by_group.get(int(group_id), set())
+                ):
+                    continue
                 if not _alias_is_unique(engine, group_id, alias, user_id):
                     continue
                 other_groups = [
@@ -375,6 +420,12 @@ def _build_cases(
     for scope_id, subject_id, content, source_id, source_ids in first_person:
         if int(subject_id) in excluded_user_ids:
             continue
+        alias = _member_alias(engine, int(subject_id))
+        if (
+            normalize_member_alias(alias)
+            not in in_scope_aliases_by_group.get(int(scope_id), set())
+        ):
+            continue
         expected = list(
             dict.fromkeys(
                 [
@@ -385,11 +436,18 @@ def _build_cases(
         )
         if not expected:
             continue
+        content_text = str(content or "")
+        if any(token in content_text for token in ("讨厌", "不喜欢", "反感")):
+            query_text = "我讨厌什么？"
+        elif any(token in content_text for token in ("喜欢", "偏好", "最爱")):
+            query_text = "我最喜欢什么？"
+        else:
+            continue
         cases.append(
             {
                 "category": "first_person",
                 "group_id": int(scope_id),
-                "query": "我最喜欢什么？" if "喜欢" in str(content) else "我讨厌什么？",
+                "query": query_text,
                 "expected": expected,
                 "requester_id": int(subject_id),
                 "content": str(content)[:80],

@@ -748,6 +748,31 @@ class MemoryQueryResolver:
         )
 
     @staticmethod
+    def _alias_presence_matches(
+        normalized_query: str,
+        normalized_alias: str,
+    ) -> list[re.Match]:
+        """Find alias occurrences, requiring word boundaries for short aliases.
+
+        A pure-Latin alias such as "to" or "v" must stand alone; it must not
+        match inside an English word or title ("tolove"). A single-CJK-char
+        alias must stand alone too; it must not match inside a Chinese word
+        ("风" inside "风吹着").
+        """
+        if not normalized_alias:
+            return []
+        if re.fullmatch(r"[a-z0-9]+", normalized_alias):
+            pattern = rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])"
+            return list(re.finditer(pattern, normalized_query))
+        if re.fullmatch(r"[\u4e00-\u9fff]", normalized_alias):
+            pattern = (
+                rf"(?<![\u4e00-\u9fff]){re.escape(normalized_alias)}"
+                rf"(?![\u4e00-\u9fff])"
+            )
+            return list(re.finditer(pattern, normalized_query))
+        return list(re.finditer(re.escape(normalized_alias), normalized_query))
+
+    @staticmethod
     def _has_restricted_alias_shadow(
         query: str,
         *,
@@ -776,7 +801,10 @@ class MemoryQueryResolver:
         target_spans = tuple(
             (target_alias, target_match.start(), target_match.end())
             for target_alias in target_aliases
-            for target_match in re.finditer(re.escape(target_alias), normalized_query)
+            for target_match in MemoryQueryResolver._alias_presence_matches(
+                normalized_query,
+                target_alias,
+            )
         )
         for identity in group_members:
             if identity.in_scope and int(identity.user_id) not in exclude_user_ids:
@@ -785,9 +813,9 @@ class MemoryQueryResolver:
                 restricted_alias = normalize_member_alias(alias)
                 if not restricted_alias:
                     continue
-                for restricted_match in re.finditer(
-                    re.escape(restricted_alias),
+                for restricted_match in MemoryQueryResolver._alias_presence_matches(
                     normalized_query,
+                    restricted_alias,
                 ):
                     restricted_start, restricted_end = restricted_match.span()
                     if restricted_alias in target_aliases:
@@ -1271,21 +1299,43 @@ class MemoryQueryResolver:
 
         # 4) two distinct member aliases used as people (not media topics).
         normalized_query = normalize_member_alias(query)
-        present_by_id: dict[int, set[str]] = {}
+        alias_spans: dict[str, list[tuple[int, int, int]]] = {}
         for member in group_members:
             if not member.in_scope or int(member.user_id) in exclude_user_ids:
                 continue
-            user_id = int(member.user_id)
             for alias in dict.fromkeys((member.group_card, member.nickname)):
                 normalized_alias = normalize_member_alias(alias)
-                if (
-                    not normalized_alias
-                    or normalized_alias in common_aliases
-                    or normalized_alias not in normalized_query
-                ):
+                if not normalized_alias or normalized_alias in common_aliases:
+                    continue
+                spans = [
+                    (match.start(), match.end(), int(member.user_id))
+                    for match in MemoryQueryResolver._alias_presence_matches(
+                        normalized_query,
+                        normalized_alias,
+                    )
+                ]
+                if spans:
+                    alias_spans.setdefault(normalized_alias, []).extend(spans)
+        present_by_id: dict[int, set[str]] = {}
+        for normalized_alias, spans in alias_spans.items():
+            for start, end, user_id in spans:
+                covered_by_longer = any(
+                    len(other_alias) > len(normalized_alias)
+                    and other_user_id != user_id
+                    and other_start <= start
+                    and end <= other_end
+                    for other_alias, other_spans in alias_spans.items()
+                    for other_start, other_end, other_user_id in other_spans
+                )
+                if covered_by_longer:
                     continue
                 person_use = False
-                for match in re.finditer(re.escape(normalized_alias), normalized_query):
+                for match in MemoryQueryResolver._alias_presence_matches(
+                    normalized_query,
+                    normalized_alias,
+                ):
+                    if match.start() != start or match.end() != end:
+                        continue
                     following = normalized_query[match.end() :]
                     if any(
                         following.startswith(normalize_member_alias(suffix))
