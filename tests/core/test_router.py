@@ -2685,17 +2685,18 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
         users = UserRepository(session)
         groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
         users.upsert_user(user_id=20001, nickname="Alice", group_card="")
-        MessageRepository(session).add_group_message(
-            platform_msg_id="inflight-seed-1",
-            group_id=10001,
-            user_id=20001,
-            timestamp=datetime(2026, 5, 9, 11, 59, 30, tzinfo=UTC),
-            plain_text="recent setup",
-            raw_json={"post_type": "message", "message_id": "inflight-seed-1"},
-            msg_type="text",
-            reply_to_msg_id=None,
-            mentioned_bot=False,
-        )
+        for seed_index in range(5):
+            MessageRepository(session).add_group_message(
+                platform_msg_id=f"inflight-seed-{seed_index + 1}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 11, 59, 26 + seed_index, tzinfo=UTC),
+                plain_text=f"recent setup {seed_index + 1}",
+                raw_json={"post_type": "message", "message_id": f"inflight-seed-{seed_index + 1}"},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
 
     first_event = make_event(group_id=10001, mentioned_bot=True, message_id="inflight-1")
     second_event = make_event(
@@ -2714,7 +2715,17 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
     assert len(llm.calls) == 2
     assert "I am here." not in "\n".join(llm.calls[1])
     assert llm.calls[1][3].startswith("Reply style: ")
-    assert llm.calls[1][4] == "Recent messages:\nAlice: recent setup\nAlice: @Mira hi\nAlice: How are you?"
+    assert (
+        llm.calls[1][4]
+        == "Recent messages:\n"
+        "Alice: recent setup 1\n"
+        "Alice: recent setup 2\n"
+        "Alice: recent setup 3\n"
+        "Alice: recent setup 4\n"
+        "Alice: recent setup 5\n"
+        "Alice: @Mira hi\n"
+        "Alice: How are you?"
+    )
 
     sender.release_first_send.set()
     await first_task
@@ -3150,7 +3161,7 @@ async def test_router_uses_recent_minute_traffic_for_proactive_reply(sqlite_engi
                 reply_to_msg_id=None,
                 mentioned_bot=False,
             )
-        for index, second in enumerate((20, 40), start=1):
+        for index, second in enumerate((10, 20, 30, 40, 50), start=1):
             MessageRepository(session).add_group_message(
                 platform_msg_id=f"recent-traffic-{index}",
                 group_id=10001,
@@ -3719,7 +3730,7 @@ async def test_router_logs_proactive_reply_decision(sqlite_engine, monkeypatch, 
         users = UserRepository(session)
         groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
         users.upsert_user(user_id=20001, nickname="Alice", group_card="")
-        for index, second in enumerate((20, 40), start=1):
+        for index, second in enumerate((10, 20, 30, 40, 50), start=1):
             MessageRepository(session).add_group_message(
                 platform_msg_id=f"proactive-log-seed-{index}",
                 group_id=10001,

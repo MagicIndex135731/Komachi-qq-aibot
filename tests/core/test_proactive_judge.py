@@ -71,6 +71,18 @@ def test_parse_proactive_judge_no() -> None:
     assert result == ProactiveJudgeResult(False, "无聊的琐事")
 
 
+def test_parse_proactive_judge_single_line_slash_format() -> None:
+    result = parse_proactive_judge("DECISION: yes / REASON: 天气吐槽正热闹")
+    assert result.should_interject is True
+    assert result.reason == "天气吐槽正热闹"
+
+
+def test_parse_proactive_judge_decision_anywhere_in_text() -> None:
+    result = parse_proactive_judge("让我想想…DECISION: no / REASON: 太无聊了")
+    assert result.should_interject is False
+    assert result.reason == "太无聊了"
+
+
 def test_parse_proactive_judge_case_insensitive_and_loose_whitespace() -> None:
     result = parse_proactive_judge("  decision : YES \n reason: 有槽点 ")
     assert result.should_interject is True

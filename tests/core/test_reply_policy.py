@@ -151,6 +151,20 @@ def test_reply_policy_low_traffic_blocks_proactive_candidate() -> None:
     assert decision.reason == "below_threshold"
 
 
+def test_reply_policy_four_messages_in_minute_is_below_five_gate() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(make_policy_input(group_traffic_last_minute=4))
+    assert decision.should_reply is False
+    assert decision.reason == "below_threshold"
+
+
+def test_reply_policy_five_messages_in_minute_passes_gate() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(make_policy_input(group_traffic_last_minute=5))
+    assert decision.should_reply is True
+    assert decision.reason == "proactive_candidate"
+
+
 def test_reply_policy_judge_disabled_blocks_proactive_candidate() -> None:
     policy = ReplyPolicy()
     decision = policy.decide(make_policy_input(proactive_judge_enabled=False))
@@ -162,7 +176,7 @@ def test_reply_policy_judge_enabled_emits_candidate_without_scoring() -> None:
     policy = ReplyPolicy()
     decision = policy.decide(
         make_policy_input(
-            group_traffic_last_minute=2,
+            group_traffic_last_minute=5,
             proactive_judge_enabled=True,
         )
     )

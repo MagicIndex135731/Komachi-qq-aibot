@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 import re
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -29,7 +33,7 @@ def build_proactive_judge_prompt(
     local_now = now.astimezone()
     return [
         f"System persona: Decide whether {bot_name} should proactively chime in with one short teasing message in this group chat.",
-        "Safety rules: Reply with exactly two lines in this grammar: DECISION: yes|no / REASON: <one short line>. Do not add anything else.",
+        "Safety rules: Reply with exactly two separate lines, each on its own line, in this grammar:\nDECISION: yes|no\nREASON: <one short line>\nDo not put DECISION and REASON on the same line, do not use slashes between them, and do not add markdown, bullets, or anything else.",
         "Group policy: Say yes only when the conversation is lively and a short, smug, playful interjection would naturally fit (a funny claim, a dumb take, big news, a teasing opportunity, or a topic the bot clearly has a strong opinion on). Say no for boring logistics, private personal details, off-topic noise, long technical discussion without a hook, or anything where butting in would be annoying. Stay selective: silence is the default.",
         f"Current time: {local_now.strftime('%Y-%m-%d %H:%M')}.",
         "Recent messages:",
@@ -38,8 +42,8 @@ def build_proactive_judge_prompt(
     ]
 
 
-_DECISION_PATTERN = re.compile(r"^\s*DECISION\s*:\s*(yes|no)\s*$", re.IGNORECASE | re.MULTILINE)
-_REASON_PATTERN = re.compile(r"^\s*REASON\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_DECISION_PATTERN = re.compile(r"DECISION\s*:\s*(yes|no)", re.IGNORECASE)
+_REASON_PATTERN = re.compile(r"REASON\s*:\s*(.+?)(?:\n|$)", re.IGNORECASE)
 
 
 def parse_proactive_judge(text: str | None) -> ProactiveJudgeResult:
@@ -68,4 +72,10 @@ def judge_proactive_interjection(
         raw = client.generate_text(prompt_lines)
     except Exception:  # noqa: BLE001 - degrade safely on any provider failure
         return ProactiveJudgeResult(False, "judge_error")
-    return parse_proactive_judge(raw)
+    result = parse_proactive_judge(raw)
+    if result.reason == "malformed":
+        logger.warning(
+            "proactive_judge_parse_failed raw=%s",
+            (raw or "")[:300].replace("\n", "\\n"),
+        )
+    return result
