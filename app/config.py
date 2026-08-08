@@ -90,6 +90,38 @@ class AppSettings(BaseSettings):
     memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
     memory_episode_max_messages: int = Field(default=70, alias="MEMORY_EPISODE_MAX_MESSAGES")
     memory_episode_max_tokens: int = Field(default=8000, alias="MEMORY_EPISODE_MAX_TOKENS")
+    memory_episode_topic_judge_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_ENABLED",
+    )
+    memory_episode_topic_judge_context_messages: int = Field(
+        default=20,
+        ge=2,
+        le=30,
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_CONTEXT_MESSAGES",
+    )
+    memory_episode_topic_judge_start_messages: int = Field(
+        default=50,
+        ge=1,
+        le=100,
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_START_MESSAGES",
+    )
+    memory_episode_topic_judge_interval: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_INTERVAL",
+    )
+    memory_episode_topic_judge_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+        default="low",
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_REASONING_EFFORT",
+    )
+    memory_episode_topic_judge_max_output_tokens: int = Field(
+        default=128,
+        ge=32,
+        le=512,
+        alias="MEMORY_EPISODE_TOPIC_JUDGE_MAX_OUTPUT_TOKENS",
+    )
     memory_chunk_max_tokens: int = Field(default=2400, alias="MEMORY_CHUNK_MAX_TOKENS")
     memory_chunk_overlap_messages: int = Field(default=8, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
     memory_chunk_max_messages: int = Field(default=40, ge=1, alias="MEMORY_CHUNK_MAX_MESSAGES")

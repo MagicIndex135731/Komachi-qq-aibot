@@ -590,6 +590,117 @@ def test_enqueue_is_constant_scope_and_allocation_runs_only_in_worker() -> None:
     assert [message.id for message in store.episode_messages[1]] == [1]
 
 
+class FakeTopicJudge:
+    def __init__(self, switched: bool) -> None:
+        self.switched = switched
+        self.calls: list[list[str]] = []
+
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+        self.calls.append(prompt_lines)
+        return (
+            "TOPIC: different\nREASON: test"
+            if self.switched
+            else "TOPIC: same\nREASON: test"
+        )
+
+
+def test_topic_judge_splits_episode_at_early_check_point() -> None:
+    store = FakeStore()
+    store.messages[10001] = [_message(i, minute=i) for i in range(1, 55)]
+    judge = FakeTopicJudge(switched=True)
+    service = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="test-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        idle_minutes=30,
+        max_messages=70,
+        max_tokens=8000,
+        chunk_max_tokens=1800,
+        chunk_overlap_messages=5,
+        poll_interval_seconds=0.01,
+        topic_judge_client=judge,
+        topic_judge_enabled=True,
+        topic_judge_context_messages=4,
+        topic_judge_start_messages=50,
+        topic_judge_interval=5,
+    )
+
+    service.enqueue_message(group_id=10001, message_id=54, now=NOW)
+    assert service.run_once(now=NOW)
+    assert len(store.episodes) == 2
+    episode_ids = sorted(store.episodes)
+    first, second = episode_ids[0], episode_ids[1]
+    assert [message.id for message in store.episode_messages[first]] == list(range(1, 51))
+    assert [message.id for message in store.episode_messages[second]] == list(range(51, 55))
+    assert len(judge.calls) == 1
+
+
+def test_topic_judge_same_keeps_long_episode_together() -> None:
+    store = FakeStore()
+    store.messages[10001] = [_message(i, minute=i) for i in range(1, 55)]
+    judge = FakeTopicJudge(switched=False)
+    service = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="test-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        idle_minutes=30,
+        max_messages=70,
+        max_tokens=8000,
+        chunk_max_tokens=1800,
+        chunk_overlap_messages=5,
+        poll_interval_seconds=0.01,
+        topic_judge_client=judge,
+        topic_judge_enabled=True,
+        topic_judge_context_messages=4,
+        topic_judge_start_messages=50,
+        topic_judge_interval=5,
+    )
+
+    service.enqueue_message(group_id=10001, message_id=54, now=NOW)
+    assert service.run_once(now=NOW)
+    assert len(store.episodes) == 1
+    episode_id = next(iter(store.episodes))
+    assert [message.id for message in store.episode_messages[episode_id]] == list(range(1, 55))
+    assert len(judge.calls) == 1
+
+
+def test_idle_candidate_splits_without_topic_judge_call() -> None:
+    store = FakeStore()
+    store.messages[10001] = [
+        _message(1, minute=0),
+        _message(2, minute=1),
+        _message(3, minute=40),
+    ]
+    judge = FakeTopicJudge(switched=False)
+    service = MemoryBackgroundService(
+        store=store,
+        deriver=FakeDeriver(),
+        worker_id="test-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        idle_minutes=30,
+        max_messages=70,
+        max_tokens=8000,
+        chunk_max_tokens=1800,
+        chunk_overlap_messages=5,
+        poll_interval_seconds=0.01,
+        topic_judge_client=judge,
+        topic_judge_enabled=True,
+        topic_judge_context_messages=4,
+        topic_judge_start_messages=50,
+        topic_judge_interval=5,
+    )
+
+    service.enqueue_message(group_id=10001, message_id=3, now=NOW)
+    assert service.run_once(now=NOW)
+    assert len(store.episodes) == 2
+    assert len(judge.calls) == 0
+
+
 def test_sqlalchemy_raw_message_projection_queues_id_only_jobs_and_fts_survives_embedding_failure(
     sqlite_engine,
 ) -> None:

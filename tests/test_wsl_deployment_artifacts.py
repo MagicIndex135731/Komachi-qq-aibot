@@ -216,7 +216,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         "MEMORY_EMBEDDING_BASE_URL=",
         "MEMORY_EMBEDDING_API_KEY=",
         "MEMORY_EMBEDDING_VERSION=",
-        "MEMORY_EPISODE_IDLE_MINUTES=10",
+            "MEMORY_EPISODE_IDLE_MINUTES=10",
             "MEMORY_EPISODE_MAX_MESSAGES=70",
             "MEMORY_EPISODE_MAX_TOKENS=8000",
             "MEMORY_CHUNK_MAX_TOKENS=2400",

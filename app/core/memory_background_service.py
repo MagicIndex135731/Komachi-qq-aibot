@@ -14,6 +14,11 @@ from app.core.episode_segmenter import (
     build_overlap_windows,
     decide_episode_boundary,
     estimate_message_tokens,
+    EpisodeBoundaryDecision,
+)
+from app.core.episode_topic_judge import (
+    build_topic_judge_prompt,
+    judge_topic_switch,
 )
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.memory_compaction import (
@@ -1515,6 +1520,11 @@ class MemoryBackgroundService:
         reconciliation_interval_seconds: float = 300.0,
         reconciliation_batch_size: int = 500,
         memory_enabled_group_ids: frozenset[int] | None = None,
+        topic_judge_client=None,
+        topic_judge_enabled: bool = False,
+        topic_judge_context_messages: int = 8,
+        topic_judge_start_messages: int = 50,
+        topic_judge_interval: int = 5,
     ) -> None:
         self.store = store
         self.deriver = deriver
@@ -1548,6 +1558,11 @@ class MemoryBackgroundService:
             if memory_enabled_group_ids is None
             else frozenset(int(value) for value in memory_enabled_group_ids)
         )
+        self.topic_judge_client = topic_judge_client
+        self.topic_judge_enabled = bool(topic_judge_enabled)
+        self.topic_judge_context_messages = max(2, int(topic_judge_context_messages))
+        self.topic_judge_start_messages = max(1, int(topic_judge_start_messages))
+        self.topic_judge_interval = max(1, int(topic_judge_interval))
         configure_generations = getattr(store, "configure_generations", None)
         if callable(configure_generations):
             configure_generations(
@@ -1619,6 +1634,32 @@ class MemoryBackgroundService:
         )
         self._wake_event.set()
         return queued
+
+    def _topic_switched(self, *, episode_messages, current) -> bool:
+        """Ask the topic judge whether ``current`` starts a new topic.
+
+        Degrades to ``switched=True`` on any failure so episodes never grow
+        unbounded because of a flaky judge call.
+        """
+        recent = [
+            f"{row.user_id}: {str(row.plain_text or '').strip()}"
+            for row in episode_messages[-self.topic_judge_context_messages :]
+            if str(row.plain_text or "").strip()
+        ]
+        current_text = str(current.plain_text or "").strip()
+        if not current_text:
+            return False
+        prompt = build_topic_judge_prompt(
+            recent_messages=recent,
+            current_message=current_text,
+            now=_utc(current.timestamp),
+            context_messages=self.topic_judge_context_messages,
+        )
+        result = judge_topic_switch(
+            client=self.topic_judge_client,
+            prompt_lines=prompt,
+        )
+        return result.switched
 
     def enqueue_raw_message_index(
         self,
@@ -2006,6 +2047,26 @@ class MemoryBackgroundService:
                         max_tokens=self.max_tokens,
                         bot_user_id=self.bot_user_id,
                     )
+                    if (
+                        self.topic_judge_enabled
+                        and self.topic_judge_client is not None
+                    ):
+                        if (
+                            not decision.should_close
+                            and open_episode.message_count
+                            >= self.topic_judge_start_messages
+                            and open_episode.message_count
+                            % self.topic_judge_interval
+                            == 0
+                        ):
+                            if self._topic_switched(
+                                episode_messages=episode_messages,
+                                current=message,
+                            ):
+                                decision = EpisodeBoundaryDecision(
+                                    True,
+                                    "topic_switch",
+                                )
                     if decision.should_close:
                         self._close_and_enqueue(
                             episode=open_episode,

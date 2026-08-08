@@ -140,6 +140,49 @@ def test_reply_and_continuous_bot_turn_extend_soft_boundary_but_not_hard_limit()
     assert (hard.should_close, hard.reason) == (True, "hard_limit")
 
 
+def test_user_picking_up_after_bot_reply_stays_in_same_episode_within_grace() -> None:
+    previous = _message(50, user_id=999)
+    current = _message(
+        51,
+        user_id=10001,
+        at=previous.timestamp + timedelta(minutes=3),
+    )
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=50,
+        open_token_count=100,
+        open_platform_msg_ids={f"m-{index}" for index in range(1, 51)},
+        idle_minutes=5,
+        max_messages=50,
+        max_tokens=8000,
+        bot_user_id=999,
+    )
+    assert decision.should_close is False
+    assert decision.extended_for_continuity is True
+
+
+def test_user_picking_up_after_bot_reply_beyond_grace_splits_episode() -> None:
+    previous = _message(50, user_id=999)
+    current = _message(
+        51,
+        user_id=10001,
+        at=previous.timestamp + timedelta(minutes=10),
+    )
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=50,
+        open_token_count=100,
+        open_platform_msg_ids={f"m-{index}" for index in range(1, 51)},
+        idle_minutes=5,
+        max_messages=50,
+        max_tokens=8000,
+        bot_user_id=999,
+    )
+    assert (decision.should_close, decision.reason) == (True, "idle")
+
+
 def test_overlap_windows_stay_ordered_bounded_and_keep_about_five_message_overlap() -> (
     None
 ):

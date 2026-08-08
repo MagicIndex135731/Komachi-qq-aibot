@@ -57,15 +57,23 @@ def _has_continuity(
     current: EpisodeMessageLike,
     open_platform_msg_ids: set[str],
     bot_user_id: int | None,
+    bot_grace_seconds: int = 300,
 ) -> bool:
     if current.reply_to_msg_id and current.reply_to_msg_id in open_platform_msg_ids:
         return True
     if bot_user_id is None:
         return False
-    # An addressed user turn immediately following a bot reply is the common
-    # continuous @bot Q&A shape. The explicit mention is intentionally
-    # required; ordinary chatter after a bot message does not extend episodes.
-    return current.mentioned_bot and previous.user_id == bot_user_id
+    if current.mentioned_bot and previous.user_id == bot_user_id:
+        return True
+    # A user picking up right after the bot answered (without @) stays in the
+    # same episode for a short grace window, so isolated bot replies do not
+    # become one-message episodes.
+    if previous.user_id == bot_user_id and current.user_id != bot_user_id:
+        previous_at = _normalized_timestamp(previous.timestamp)
+        current_at = _normalized_timestamp(current.timestamp)
+        gap = (current_at - previous_at).total_seconds()
+        return 0 <= gap <= max(0, int(bot_grace_seconds))
+    return False
 
 
 def decide_episode_boundary(
@@ -118,6 +126,7 @@ def decide_episode_boundary(
         current=current,
         open_platform_msg_ids=open_platform_msg_ids,
         bot_user_id=bot_user_id,
+        bot_grace_seconds=300,
     ):
         return EpisodeBoundaryDecision(
             False,
