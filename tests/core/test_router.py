@@ -4875,9 +4875,17 @@ class FakeProactiveJudgeLlm:
     def __init__(self, decision: bool) -> None:
         self.decision = decision
         self.calls: list[list[str]] = []
+        self.seen_images: list[list[ImageAttachment]] = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(
+        self,
+        prompt_lines: list[str],
+        *,
+        conversation_key=None,
+        images=None,
+    ) -> str:
         self.calls.append(prompt_lines)
+        self.seen_images.append(list(images or []))
         if self.decision:
             return "DECISION: yes\nREASON: 有槽点"
         return "DECISION: no\nREASON: 没意思"
@@ -4978,3 +4986,65 @@ async def test_router_proactive_candidate_without_judge_client_stays_silent(sqli
 
     assert sender.sent == []
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_judge_and_generation_include_recent_images(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        image_raw = {
+            "message": [
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "recent.png",
+                        "url": "http://example/recent.png",
+                    },
+                }
+            ],
+            "message_id": "img-recent-1",
+        }
+        MessageRepository(session).add_group_message(
+            platform_msg_id="img-recent-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 9, 11, 59, 40, tzinfo=UTC),
+            plain_text="",
+            raw_json=image_raw,
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="judge-img-1",
+            plain_text="这图好怪",
+            reply_to_msg_id="img-recent-1",
+        )
+    )
+
+    assert len(judge.calls) == 1
+    assert judge.seen_images[0], "judge should receive images from the recent window"
+    assert any(image.url == "http://example/recent.png" for image in judge.seen_images[0])
+    assert len(sender.sent) == 1
+    assert llm.calls[-1]["images"], "generation should receive the image pool too"
+    assert any(image.url == "http://example/recent.png" for image in llm.calls[-1]["images"])

@@ -24,6 +24,22 @@ class ExplodingLlm:
         raise RuntimeError("provider down")
 
 
+class ImageAwareJudgeLlm:
+    def __init__(self) -> None:
+        self.seen_images = None
+
+    def generate_text(
+        self,
+        prompt_lines: list[str],
+        *,
+        conversation_key=None,
+        images=None,
+    ) -> str:
+        del prompt_lines, conversation_key
+        self.seen_images = images
+        return "DECISION: no\nREASON: 不接"
+
+
 def test_build_proactive_judge_prompt_includes_recent_and_target() -> None:
     now = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
     lines = build_proactive_judge_prompt(
@@ -105,3 +121,11 @@ def test_judge_returns_yes_when_model_agrees() -> None:
 def test_judge_degrades_to_no_on_provider_error() -> None:
     result = judge_proactive_interjection(client=ExplodingLlm(), prompt_lines=["p"])
     assert result == ProactiveJudgeResult(False, "judge_error")
+
+
+def test_judge_passes_images_to_client() -> None:
+    client = ImageAwareJudgeLlm()
+    result = judge_proactive_interjection(client=client, prompt_lines=["p"], images=[object()])
+    assert result.should_interject is False
+    assert client.seen_images is not None
+    assert len(client.seen_images) == 1

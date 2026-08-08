@@ -176,7 +176,7 @@ class AppSettings(BaseSettings):
         alias="PROACTIVE_JUDGE_MAX_OUTPUT_TOKENS",
     )
     proactive_judge_context_messages: int = Field(
-        default=5,
+        default=20,
         ge=1,
         le=20,
         alias="PROACTIVE_JUDGE_CONTEXT_MESSAGES",
@@ -186,6 +186,18 @@ class AppSettings(BaseSettings):
         ge=20,
         le=1000,
         alias="PROACTIVE_JUDGE_MAX_CHARS_PER_MESSAGE",
+    )
+    proactive_recent_messages_limit: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        alias="PROACTIVE_RECENT_MESSAGES_LIMIT",
+    )
+    proactive_image_max_count: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        alias="PROACTIVE_IMAGE_MAX_COUNT",
     )
     memory_memory_tool_max_rounds: int = Field(
         default=2,

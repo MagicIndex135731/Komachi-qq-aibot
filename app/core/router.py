@@ -716,6 +716,41 @@ class InboundRouter:
     def _strip_group_image_request_prefix(self, text: str) -> str:
         stripped = GROUP_IMAGE_REFERENCE_PROMPT_PREFIX.sub("", text, count=1)
         return stripped.strip(" \t,，。.!！?？")
+    def _collect_recent_images(
+        self,
+        *,
+        event,
+        messages,
+        recent_messages,
+        limit_messages: int,
+        max_images: int,
+    ) -> list[ImageAttachment]:
+        """Collect images inside a recent-message window, newest first."""
+        collected: list[ImageAttachment] = []
+        seen: set[str] = set()
+
+        def add_images(images: list[ImageAttachment]) -> None:
+            for image in images:
+                key = image.file_id or image.local_path or image.url or ""
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                if len(collected) >= max_images:
+                    return
+                collected.append(image)
+
+        add_images(list(event.images))
+        if event.reply_to_msg_id is not None:
+            quoted = messages.get_by_platform_msg_id(event.reply_to_msg_id)
+            if quoted is not None:
+                add_images(extract_images_from_raw_payload(quoted.raw_json))
+        for message in reversed(recent_messages[-limit_messages:]):
+            if len(collected) >= max_images:
+                break
+            add_images(extract_images_from_raw_payload(message.raw_json))
+        return collected
+
 
     def _looks_like_reference_image_generation_request(
         self,
@@ -1379,6 +1414,13 @@ class InboundRouter:
             if decision.reason == "proactive_candidate":
                 if self.proactive_judge_client is None:
                     return PreparedGroupReply(False)
+                judge_images = self._collect_recent_images(
+                    event=event,
+                    messages=messages,
+                    recent_messages=recent_messages,
+                    limit_messages=self.runtime.settings.proactive_judge_context_messages,
+                    max_images=self.runtime.settings.proactive_image_max_count,
+                )
                 judge_prompt = build_proactive_judge_prompt(
                     bot_name=persona_name,
                     target_message=event.plain_text,
@@ -1390,6 +1432,7 @@ class InboundRouter:
                 judge_result = judge_proactive_interjection(
                     client=self.proactive_judge_client,
                     prompt_lines=judge_prompt,
+                    images=judge_images,
                 )
                 logger.info(
                     "interjection_judge group_id=%s msg_id=%s should_interject=%s reason=%s",
@@ -1400,6 +1443,27 @@ class InboundRouter:
                 )
                 if not judge_result.should_interject:
                     return PreparedGroupReply(False)
+                recent_image_pool = self._collect_recent_images(
+                    event=event,
+                    messages=messages,
+                    recent_messages=recent_messages,
+                    limit_messages=self.runtime.settings.proactive_recent_messages_limit,
+                    max_images=self.runtime.settings.proactive_image_max_count,
+                )
+                if group_image_resolved_turn is None:
+                    group_image_resolved_turn = ResolvedImageTurn(
+                        images=recent_image_pool,
+                        source_msg_id=event.platform_msg_id,
+                        source_kind="recent",
+                    )
+                elif recent_image_pool:
+                    merged_images = list(group_image_resolved_turn.images)
+                    for image in recent_image_pool:
+                        if len(merged_images) >= self.runtime.settings.proactive_image_max_count:
+                            break
+                        if image not in merged_images:
+                            merged_images.append(image)
+                    group_image_resolved_turn.images = merged_images
             group_image_request = self._build_group_image_request(
                 event=event,
                 addressed_turn=addressed_turn,
@@ -1413,6 +1477,11 @@ class InboundRouter:
                 )
 
             assert self.memory_orchestrator is not None
+            interjection_memory_limit = (
+                self.runtime.settings.proactive_recent_messages_limit
+                if decision.reason == "proactive_candidate"
+                else len(recent_messages)
+            )
             recent_memory_messages = tuple(
                 EvidenceMessage(
                     source_msg_id=message.platform_msg_id,
@@ -1428,7 +1497,7 @@ class InboundRouter:
                     is_bot=message.user_id == self.runtime.settings.bot_qq,
                     user_id=message.user_id,
                 )
-                for message in recent_messages
+                for message in recent_messages[-interjection_memory_limit:]
             )
             quoted_memory_message: EvidenceMessage | None = None
             if event.reply_to_msg_id is not None:
@@ -1579,7 +1648,11 @@ class InboundRouter:
             web_pages: list[str] = []
             search_hits = []
             page_reads = []
-            target_images = resolved_image_turn.images if resolved_image_turn is not None else []
+            target_images = (
+                group_image_resolved_turn.images
+                if group_image_resolved_turn is not None
+                else []
+            )
             if target_images and not self.runtime.settings.llm_supports_vision_input:
                 return PreparedGroupReply(
                     should_reply=True,

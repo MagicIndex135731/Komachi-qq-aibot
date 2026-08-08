@@ -62,6 +62,7 @@ def judge_proactive_interjection(
     *,
     client,
     prompt_lines: list[str],
+    images: list | None = None,
 ) -> ProactiveJudgeResult:
     """Ask the upstream model whether this turn deserves a proactive interjection.
 
@@ -69,7 +70,10 @@ def judge_proactive_interjection(
     because of a flaky call.
     """
     try:
-        raw = client.generate_text(prompt_lines)
+        if images:
+            raw = client.generate_text(prompt_lines, images=images)
+        else:
+            raw = client.generate_text(prompt_lines)
     except Exception:  # noqa: BLE001 - degrade safely on any provider failure
         return ProactiveJudgeResult(False, "judge_error")
     result = parse_proactive_judge(raw)
