@@ -2270,3 +2270,102 @@ def test_semantic_rewrite_model_denial_clears_deterministic_time_range() -> None
     assert result.subject_ids in (None, ())
     assert result.time_range is None
     assert result.needs_history is False
+
+
+def test_mention_pattern_does_not_capture_at_plus_arbitrary_who() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "@小町 锐评下群里阿玙和阿渣谁对群更有贡献",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.answer_mode != "mention"
+
+
+@pytest.mark.parametrize("query", ("谁提到我", "最近谁@我", "他们@我了吗"))
+def test_mention_pattern_still_captures_real_mention_queries(query: str) -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.answer_mode == "mention"
+
+
+def test_semantic_rewrite_general_mode_clears_memory_intent() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "宜宾地震 页岩气",
+                "answer_mode": "general",
+                "subject_role": "none",
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "宜宾地震真的是在采集页岩吗",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is True
+    assert result.subject_ids in (None, ())
+    assert result.time_range is None
+    assert result.needs_history is False
+    assert result.preferred_fact_kinds == ()
+
+
+def test_semantic_rewrite_member_role_without_id_is_ignored() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "贵州习酒 来历",
+                "answer_mode": "general",
+                "subject_role": "member",
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "贵州习酒什么来历",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is True
+    assert result.subject_role != "member"
+    assert result.subject_ids in (None, ())
+
+
+def test_explicit_search_questions_skip_semantic_rewrite() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "台风 登陆",
+                "answer_mode": "general_history",
+                "subject_role": "none",
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "联网搜索最新台风登陆地点",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is False

@@ -22,6 +22,7 @@ from app.core.member_identity import (
     classify_group_member_reference,
     normalize_member_alias,
 )
+from app.core.search_policy import is_explicit_search_request
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,7 @@ class ResolvedMemoryQuery:
     subject_aliases_removed: tuple[str, ...] = ()
     subject_role: str = ""
     preferred_fact_kinds: tuple[str, ...] = ()
+    semantic_general: bool = False
 
     @property
     def resolved_query(self) -> str:
@@ -177,7 +179,7 @@ _SUMMARY_PATTERN = re.compile(
 )
 _MENTION_PATTERN = re.compile(
     r"(?:谁|哪些人|有人).*(?:提到|说到|叫|@)|"
-    r"(?:提到|说到|叫|@).*(?:谁|哪些人)|"
+    r"(?:提到|说到|叫|@)\s*我?\s*(?:谁|哪些人)|"
     r"(?:他们|她们|大家|群里).*(?:叫|提到|说到|@)\s*我"
 )
 _REQUESTER_MENTION_PATTERN = re.compile(
@@ -1835,6 +1837,8 @@ class MemoryQueryResolver:
         text = str(query or "").strip()
         if len(text) < 4:
             return False
+        if is_explicit_search_request(text):
+            return False
         return bool(re.search(
             r"什么|啥|吗|呢|哪|怎么|如何|多少|几|谁|怎么样|咋样|是不是|有没有",
             text,
@@ -1854,11 +1858,29 @@ class MemoryQueryResolver:
         caller-provided requester id, and member subjects keep their validated
         speaker ids. The model supplies intent and retrieval text, not identity.
         """
+        if rewritten.semantic_general:
+            return replace(
+                plan,
+                retrieval_query=(
+                    str(rewritten.retrieval_query or "").strip()
+                    or plan.retrieval_query
+                ),
+                time_range=None,
+                needs_history=False,
+                subject_ids=(),
+                speaker_ids=(),
+                subject_binding="unbound",
+                subject_role="",
+                preferred_fact_kinds=(),
+                rewrite_used=True,
+            )
         merged = plan
         if rewritten.answer_mode in _SEMANTIC_ANSWER_MODES:
             merged = replace(merged, answer_mode=rewritten.answer_mode)
         if rewritten.subject_role:
             merged = replace(merged, subject_role=rewritten.subject_role)
+        if rewritten.subject_role == "member" and not rewritten.speaker_ids:
+            merged = replace(merged, subject_role="")
         if rewritten.preferred_fact_kinds:
             merged = replace(
                 merged,
@@ -1948,12 +1970,14 @@ class MemoryQueryResolver:
             else None
         )
         answer_mode_value = payload.get("answer_mode")
-        answer_mode = (
-            str(answer_mode_value).strip()
-            if isinstance(answer_mode_value, str)
-            and str(answer_mode_value).strip() in _SEMANTIC_ANSWER_MODES
-            else ""
-        )
+        semantic_general = False
+        answer_mode = ""
+        if isinstance(answer_mode_value, str):
+            stripped_mode = answer_mode_value.strip()
+            if stripped_mode == "general":
+                semantic_general = True
+            elif stripped_mode in _SEMANTIC_ANSWER_MODES:
+                answer_mode = stripped_mode
         subject_role_value = payload.get("subject_role")
         subject_role = (
             str(subject_role_value).strip()
@@ -1987,6 +2011,7 @@ class MemoryQueryResolver:
             answer_mode=answer_mode,
             subject_role=subject_role,
             preferred_fact_kinds=fact_kinds,
+            semantic_general=semantic_general,
         )
 
     def _identities_are_valid(self, identities: Sequence[str]) -> bool:

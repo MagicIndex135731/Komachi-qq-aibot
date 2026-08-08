@@ -85,7 +85,7 @@ class AppSettings(BaseSettings):
     memory_embedding_version: str = Field(default="", alias="MEMORY_EMBEDDING_VERSION")
     memory_embedding_timeout_seconds: float = Field(default=10.0, alias="MEMORY_EMBEDDING_TIMEOUT_SECONDS")
     memory_retrieval_channel_timeout_seconds: float = Field(
-        default=2.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
+        default=4.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
     )
     memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
     memory_episode_max_messages: int = Field(default=50, alias="MEMORY_EPISODE_MAX_MESSAGES")

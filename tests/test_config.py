@@ -207,7 +207,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_embedding_provider == "local"
     assert settings.memory_embedding_device == "cpu"
     assert settings.memory_embedding_local_files_only is False
-    assert settings.memory_retrieval_channel_timeout_seconds == 2.0
+    assert settings.memory_retrieval_channel_timeout_seconds == 4.0
     assert settings.memory_embedding_model == "BAAI/bge-small-zh-v1.5"
     assert settings.memory_embedding_dimensions == 512
     assert settings.memory_embedding_cache_dir == Path("/workspace/data/models")

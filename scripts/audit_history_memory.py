@@ -75,6 +75,9 @@ HISTORY_WORDS = (
 )
 RELATIVE_TIME_WORDS = ("今天", "昨天", "前天", "上周", "去年", "今年")
 WEATHER_WORDS = ("天气", "温度", "气温", "台风", "降雨", "预警")
+IMAGE_REQUEST_WORDS = ("画一张", "画个", "生成一张", "生成个", "帮我画", "画图", "图片生成")
+HYPOTHETICAL_WORDS = ("如果", "假如", "假设", "要是")
+GAME_PLAY_WORDS = ("猜动画", "猜游戏", "你问我", "我回答", "来玩", "游戏规则")
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +176,9 @@ def _labels(text: str, member_names: set[str]) -> dict[str, bool]:
         "short": len(text) <= 4,
         "explicit_search": is_explicit_search_request(text),
         "time_sensitive": is_time_sensitive_request(text),
+        "image_request": any(word in text for word in IMAGE_REQUEST_WORDS),
+        "hypothetical": any(word in text for word in HYPOTHETICAL_WORDS),
+        "game_play": any(word in text for word in GAME_PLAY_WORDS),
     }
 
 
@@ -182,6 +188,7 @@ def _check_issues(row: AuditRow) -> tuple[str, ...]:
     should_rewrite = len(row.text) >= 4 and (
         (labels["question"] or labels["member_name"])
         and not labels["explicit_search"]
+        and not labels["image_request"]
     )
     if should_rewrite and not row.rewrite_used:
         issues.append("model_channel_unused")
@@ -191,7 +198,8 @@ def _check_issues(row: AuditRow) -> tuple[str, ...]:
         and (row.time_range or row.answer_mode == "dated_history")
     ):
         issues.append("realtime_question_treated_as_history")
-    if row.rewrite_used:
+    low_risk = labels["hypothetical"] or labels["game_play"] or labels["image_request"]
+    if row.rewrite_used and not low_risk:
         if labels["first_person"] and labels["question"] and row.subject_role not in (
             "requester",
             "member",
