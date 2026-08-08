@@ -4,12 +4,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import ceil
 from typing import Protocol, Sequence
-from zoneinfo import ZoneInfo
 
 from app.core.context_builder import _estimate_tokens
 
-
-ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 class EpisodeMessageLike(Protocol):
     id: int
@@ -103,11 +100,6 @@ def decide_episode_boundary(
 
     reason = ""
     if (
-        previous_at.astimezone(ASIA_SHANGHAI).date()
-        != current_at.astimezone(ASIA_SHANGHAI).date()
-    ):
-        reason = "day"
-    elif (
         current_at > previous_at
         and (current_at - previous_at).total_seconds() >= max(0, int(idle_minutes)) * 60
     ):

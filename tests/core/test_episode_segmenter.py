@@ -41,7 +41,7 @@ def _message(
     )
 
 
-def test_episode_boundaries_cover_idle_day_count_and_token_limits() -> None:
+def test_episode_boundaries_cover_idle_count_token_and_active_cross_day() -> None:
     previous = _message(1, at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC))
 
     idle = decide_episode_boundary(
@@ -54,13 +54,13 @@ def test_episode_boundaries_cover_idle_day_count_and_token_limits() -> None:
         max_messages=50,
         max_tokens=8000,
     )
-    day = decide_episode_boundary(
-        previous=previous,
-        current=_message(2, at=datetime(2026, 7, 24, 0, 1, tzinfo=UTC)),
+    cross_day_active = decide_episode_boundary(
+        previous=_message(1, at=datetime(2026, 7, 23, 23, 50, tzinfo=UTC)),
+        current=_message(2, at=datetime(2026, 7, 24, 0, 5, tzinfo=UTC)),
         open_message_count=2,
         open_token_count=10,
         open_platform_msg_ids={"m-1"},
-        idle_minutes=60 * 24,
+        idle_minutes=30,
         max_messages=50,
         max_tokens=8000,
     )
@@ -86,7 +86,7 @@ def test_episode_boundaries_cover_idle_day_count_and_token_limits() -> None:
     )
 
     assert (idle.should_close, idle.reason) == (True, "idle")
-    assert (day.should_close, day.reason) == (True, "day")
+    assert (cross_day_active.should_close, cross_day_active.reason) == (False, "")
     assert (count.should_close, count.reason) == (True, "message_limit")
     assert (token.should_close, token.reason) == (True, "token_limit")
 
@@ -259,7 +259,7 @@ def test_episode_day_boundary_still_closes_when_local_days_differ() -> None:
     assert (decision.should_close, decision.reason) == (False, "")
 
 
-def test_episode_day_boundary_closes_on_real_utc_crossing_with_local_crossing() -> None:
+def test_episode_active_cross_day_continues_same_episode() -> None:
     previous = _message(1, at=datetime(2026, 7, 16, 15, 0, tzinfo=UTC))  # Shanghai 7/16 23:00
     current = _message(2, at=datetime(2026, 7, 16, 17, 0, tzinfo=UTC))   # Shanghai 7/17 01:00
 
@@ -269,9 +269,9 @@ def test_episode_day_boundary_closes_on_real_utc_crossing_with_local_crossing() 
         open_message_count=2,
         open_token_count=10,
         open_platform_msg_ids={"m-1"},
-        idle_minutes=60 * 24,
+        idle_minutes=60 * 3,
         max_messages=50,
         max_tokens=8000,
     )
 
-    assert (decision.should_close, decision.reason) == (True, "day")
+    assert (decision.should_close, decision.reason) == (False, "")
