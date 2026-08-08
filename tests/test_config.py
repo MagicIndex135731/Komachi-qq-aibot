@@ -215,7 +215,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_embedding_api_key == ""
     assert settings.memory_embedding_version == ""
     assert settings.memory_episode_idle_minutes == 10
-    assert settings.memory_episode_max_messages == 50
+    assert settings.memory_episode_max_messages == 70
     assert settings.memory_episode_max_tokens == 8000
     assert settings.memory_chunk_max_tokens == 2400
     assert settings.memory_chunk_overlap_messages == 8
@@ -237,7 +237,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_history_protected_min_tokens == 2400
     assert settings.memory_recent_protected_min_messages == 1
     assert settings.memory_history_protected_min_messages == 1
-    assert settings.memory_adaptive_max_recent_messages == 120
+    assert settings.memory_adaptive_max_recent_messages == 80
     assert settings.memory_adaptive_max_history_messages == 300
     assert settings.memory_layered_memory_enabled is False
     assert settings.memory_memory_tools_enabled is False
@@ -287,7 +287,7 @@ def test_app_settings_adaptive_profile_uses_wide_snapshot_and_char_safety_cap(
         _env_file=None,
     )
 
-    assert settings.memory_recent_snapshot_limit == 120
+    assert settings.memory_recent_snapshot_limit == 80
     assert settings.memory_effective_context_budget_chars == 48000
 
 

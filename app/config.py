@@ -88,7 +88,7 @@ class AppSettings(BaseSettings):
         default=4.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
     )
     memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
-    memory_episode_max_messages: int = Field(default=50, alias="MEMORY_EPISODE_MAX_MESSAGES")
+    memory_episode_max_messages: int = Field(default=70, alias="MEMORY_EPISODE_MAX_MESSAGES")
     memory_episode_max_tokens: int = Field(default=8000, alias="MEMORY_EPISODE_MAX_TOKENS")
     memory_chunk_max_tokens: int = Field(default=2400, alias="MEMORY_CHUNK_MAX_TOKENS")
     memory_chunk_overlap_messages: int = Field(default=8, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
@@ -140,7 +140,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_HISTORY_PROTECTED_MIN_MESSAGES",
     )
     memory_adaptive_max_recent_messages: int = Field(
-        default=120,
+        default=80,
         gt=0,
         alias="MEMORY_ADAPTIVE_MAX_RECENT_MESSAGES",
     )
