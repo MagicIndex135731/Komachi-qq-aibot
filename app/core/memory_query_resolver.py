@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import json
+import logging
 import re
 from typing import Callable, Literal, Protocol, Sequence
 from zoneinfo import ZoneInfo
@@ -23,6 +24,9 @@ from app.core.member_identity import (
     normalize_member_alias,
 )
 from app.core.search_policy import is_explicit_search_request
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1880,6 +1884,14 @@ class MemoryQueryResolver:
         if rewritten.subject_role:
             merged = replace(merged, subject_role=rewritten.subject_role)
         if rewritten.subject_role == "member" and not rewritten.speaker_ids:
+            merged = replace(merged, subject_role="")
+        if rewritten.subject_role in {"group", "none"} and rewritten.speaker_ids:
+            logger.info(
+                "memory_rewrite_role_mismatch role=%s speakers=%s query=%s",
+                rewritten.subject_role,
+                rewritten.speaker_ids,
+                rewritten.original_query[:80],
+            )
             merged = replace(merged, subject_role="")
         if rewritten.preferred_fact_kinds:
             merged = replace(

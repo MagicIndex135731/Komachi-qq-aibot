@@ -200,11 +200,15 @@ def _check_issues(row: AuditRow) -> tuple[str, ...]:
         issues.append("realtime_question_treated_as_history")
     low_risk = labels["hypothetical"] or labels["game_play"] or labels["image_request"]
     if row.rewrite_used and not low_risk:
-        if labels["first_person"] and labels["question"] and row.subject_role not in (
-            "requester",
-            "member",
-        ):
-            issues.append("first_person_not_bound")
+        if labels["first_person"] and labels["question"]:
+            bound_to_requester = bool(row.subject_ids) and row.subject_ids == (
+                str(row.user_id),
+            )
+            if bound_to_requester:
+                if row.subject_role not in ("requester", "member"):
+                    issues.append("role_label_mismatch")
+            elif row.subject_role not in ("requester", "member"):
+                issues.append("first_person_not_bound")
         if (
             labels["member_name"]
             and labels["question"]
@@ -224,7 +228,7 @@ def _check_issues(row: AuditRow) -> tuple[str, ...]:
             issues.append("empty_retrieval_query")
     if labels["long"] and labels["explicit_search"]:
         issues.append("long_text_triggers_forced_search")
-    if labels["short"] and not labels["question"] and row.fact_count > 8:
+    if labels["short"] and not labels["question"] and row.fact_count > 25:
         issues.append("short_message_packs_many_facts")
     if row.answer_mode == "general_history" and row.time_range and not labels["history_word"]:
         issues.append("time_range_without_history_intent")

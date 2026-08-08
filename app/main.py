@@ -389,6 +389,8 @@ def _build_query_rewrite_provider(*, settings: AppSettings, llm_client, engine=N
             "subject_role 取 requester（问题主语是“我/我的/我自己”）、member（明确提到"
             "某位群成员）、group（问整个群）、none（无明确主体）。member 时 speaker_ids 只能填"
             "近期上下文里真实出现的群成员，未明确提到成员时 speaker_ids 留空数组。\n"
+            "subject_role 必须与 speaker_ids 一致：member 时必须给出且只含该成员 id；"
+            "requester 表示主语是提问者本人；不要把 group 或 none 与个人 id 混在一起。\n"
             "fact_kinds 是模型判断最适合回答的事实类别数组，可取 current、preference、"
             "taboo、profile、plan、decision、event、relationship、running_joke 等，"
             "按语义判断而非机械匹配关键词。\n"

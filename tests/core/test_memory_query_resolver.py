@@ -2349,6 +2349,30 @@ def test_semantic_rewrite_member_role_without_id_is_ignored() -> None:
     assert result.subject_ids in (None, ())
 
 
+def test_semantic_rewrite_group_role_with_personal_id_is_cleared_but_subject_kept() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "我都在群里讨论过哪些话题",
+                "answer_mode": "general_history",
+                "subject_role": "group",
+                "speaker_ids": ["10001"],
+                "confidence": 0.9,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "我都在群里讨论过哪些话题",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_role == ""
+    assert result.subject_ids == ("10001",)
+
+
 def test_explicit_search_questions_skip_semantic_rewrite() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=_rewrite_provider(
