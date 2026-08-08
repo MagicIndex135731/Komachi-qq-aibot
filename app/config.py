@@ -188,7 +188,7 @@ class AppSettings(BaseSettings):
         alias="PROACTIVE_JUDGE_MAX_CHARS_PER_MESSAGE",
     )
     proactive_recent_messages_limit: int = Field(
-        default=20,
+        default=50,
         ge=1,
         le=200,
         alias="PROACTIVE_RECENT_MESSAGES_LIMIT",
