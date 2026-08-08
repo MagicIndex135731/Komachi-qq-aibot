@@ -31,7 +31,7 @@ class ReplyDecision:
 
 
 class ReplyPolicy:
-    def __init__(self, *, cooldown_seconds: int = 90, proactive_threshold: int = 4) -> None:
+    def __init__(self, *, cooldown_seconds: int = 60, proactive_threshold: int = 3) -> None:
         self.cooldown = timedelta(seconds=cooldown_seconds)
         self.cooldown_seconds = cooldown_seconds
         self.proactive_threshold = proactive_threshold
@@ -59,7 +59,7 @@ class ReplyPolicy:
         if not policy_input.proactive_enabled:
             return ReplyDecision(False, "proactive_disabled", 0)
 
-        if policy_input.group_traffic_last_minute < 3:
+        if policy_input.group_traffic_last_minute < 2:
             return ReplyDecision(False, "below_threshold", 0)
 
         score = 1

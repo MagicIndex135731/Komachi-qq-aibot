@@ -3175,8 +3175,8 @@ async def test_router_uses_recent_minute_traffic_for_proactive_reply(sqlite_engi
         )
     )
 
-    assert sender.sent == []
-    assert llm.calls == []
+    assert sender.sent != []
+    assert len(llm.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -3742,8 +3742,8 @@ async def test_router_logs_proactive_reply_decision(sqlite_engine, monkeypatch, 
             )
         )
 
-    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=False reason=below_threshold" in caplog.text
-    assert "reply_send_success group_id=10001 msg_id=proactive-log-1" not in caplog.text
+    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=True reason=proactive_score" in caplog.text
+    assert "reply_send_success group_id=10001 msg_id=proactive-log-1" in caplog.text
 
 
 @pytest.mark.asyncio

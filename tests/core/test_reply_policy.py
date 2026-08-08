@@ -199,3 +199,43 @@ def test_reply_policy_constructor_cooldown_still_blocks_proactive_reply() -> Non
 
     assert decision.should_reply is False
     assert decision.reason == "cooldown"
+
+
+def test_reply_policy_default_threshold_allows_interjection_with_light_traffic() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(
+        make_policy_input(
+            group_traffic_last_minute=2,
+            has_interjection_opportunity=True,
+        )
+    )
+
+    assert decision.should_reply is True
+    assert decision.reason == "proactive_score"
+    assert decision.score == 3
+
+
+def test_reply_policy_traffic_below_two_stays_silent_for_interjection() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(
+        make_policy_input(
+            group_traffic_last_minute=1,
+            has_interjection_opportunity=True,
+        )
+    )
+
+    assert decision.should_reply is False
+    assert decision.reason == "below_threshold"
+
+
+def test_reply_policy_traffic_alone_never_triggers_proactive_without_opportunity() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(
+        make_policy_input(
+            group_traffic_last_minute=9,
+            has_interjection_opportunity=False,
+        )
+    )
+
+    assert decision.should_reply is False
+    assert decision.reason == "below_threshold"

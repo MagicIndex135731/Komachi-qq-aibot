@@ -27,6 +27,8 @@ def test_build_human_chat_style_lines_for_proactive_turn_pushes_short_human_inte
     assert any("mild opinion" in line for line in lines)
     assert any("not just agree" in line for line in lines)
     assert any("small fresh angle" in line for line in lines)
+    assert any("mesugaki" in line for line in lines)
+    assert any("teasing" in line for line in lines)
 
 
 def test_normalize_chat_reply_flattens_markdown_list_into_chat_text() -> None:
