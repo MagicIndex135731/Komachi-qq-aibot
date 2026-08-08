@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
+
+from app.core.time_utils import ASIA_SHANGHAI
 
 
 class RuntimeHeartbeat:
@@ -38,7 +40,7 @@ class RuntimeHeartbeat:
         payload = {
             "pid": os.getpid(),
             "state": state,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
         }
         self.heartbeat_file.write_text(
             json.dumps(payload, ensure_ascii=False),

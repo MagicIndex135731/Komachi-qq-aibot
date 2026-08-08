@@ -6,6 +6,7 @@ from math import ceil
 from typing import Protocol, Sequence
 
 from app.core.context_builder import _estimate_tokens
+from app.core.time_utils import ASIA_SHANGHAI
 
 
 class EpisodeMessageLike(Protocol):
@@ -46,7 +47,7 @@ def estimate_message_tokens(text: str) -> int:
 
 def _normalized_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        return value.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
     return value.astimezone(UTC)
 
 

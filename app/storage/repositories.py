@@ -34,6 +34,7 @@ from app.storage.models import (
 )
 from app.providers.embeddings import hashed_text_embedding
 from app.storage.db import validate_retrieval_vector_table_name
+from app.core.time_utils import shanghai_naive, shanghai_now_naive
 
 
 _INELIGIBLE_DELIVERY_STATES = (
@@ -48,7 +49,7 @@ ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 def _as_local_day(value: datetime) -> date:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
+        return value.date()
     return value.astimezone(ASIA_SHANGHAI).date()
 
 # sqlite-vec rejects KNN queries above this engine limit.  Hard filters such
@@ -138,7 +139,7 @@ class RetrievalEmbeddingCoverage:
 def _normalize_utc_sqlite_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
-    return value.astimezone(UTC).replace(tzinfo=None)
+    return value.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
 
 
 def _mentioned_user_ids(raw_json: object) -> frozenset[str]:
@@ -470,7 +471,7 @@ class MessageRepository:
             platform_msg_id=platform_msg_id,
             group_id=group_id,
             user_id=user_id,
-            timestamp=timestamp,
+            timestamp=shanghai_naive(timestamp),
             plain_text=plain_text,
             raw_json=raw_json,
             msg_type=msg_type,
@@ -497,7 +498,7 @@ class MessageRepository:
             platform_msg_id=platform_msg_id,
             group_id=None,
             user_id=user_id,
-            timestamp=timestamp,
+            timestamp=shanghai_naive(timestamp),
             plain_text=plain_text,
             raw_json=raw_json,
             msg_type=msg_type,
@@ -966,7 +967,7 @@ class MessageRepository:
         if timestamp is None:
             return None
         if timestamp.tzinfo is None:
-            return timestamp.replace(tzinfo=UTC)
+            return timestamp.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
         return timestamp
 
 
@@ -1327,7 +1328,7 @@ class MemoryRepository:
         memory.valid_from = memory.valid_from or valid_from
         memory.valid_until = valid_until
         memory.expires_at = valid_until
-        memory.last_seen_at = valid_from or datetime.now(UTC)
+        memory.last_seen_at = valid_from or shanghai_now_naive()
         self.session.flush()
         if previous_content is not None and previous_content != content:
             _deactivate_memory_retrieval_documents(

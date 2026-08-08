@@ -473,8 +473,8 @@ class InboundRouter:
 
     def _normalize_timestamp(self, value: datetime) -> datetime:
         if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value
+            return value.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
+        return value.astimezone(UTC)
 
     def _build_local_generation_failure_reply(self, *, target_images: list[ImageAttachment] | None) -> str:
         if target_images:

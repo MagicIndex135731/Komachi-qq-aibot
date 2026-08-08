@@ -15,6 +15,7 @@ from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncerta
 from app.core.chat_style import normalize_chat_reply
 from app.core.group_image_generation import ImageJobResult, PrivateImageGenerationRequest, PrivateImageGenerationService
 from app.core.image_turn_resolver import resolve_private_images_for_turn
+from app.core.time_utils import ASIA_SHANGHAI
 from app.core.persona_engine import render_persona, render_safety_lines
 from app.core.router import (
     AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
@@ -2914,7 +2915,7 @@ class DevControlService:
 
     def _normalize_private_timestamp(self, value):
         if getattr(value, "tzinfo", None) is None:
-            return value.replace(tzinfo=UTC)
+            return value.replace(tzinfo=ASIA_SHANGHAI)
         return value
 
     def _recent_private_owner_turns(self, recent_turns: list[str]) -> list[str]:

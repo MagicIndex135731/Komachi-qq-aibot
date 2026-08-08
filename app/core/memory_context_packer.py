@@ -883,7 +883,11 @@ class MemoryContextPacker:
 
     @staticmethod
     def _display_time(value: datetime) -> str:
-        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        utc_value = (
+            value.replace(tzinfo=_SHANGHAI).astimezone(UTC)
+            if value.tzinfo is None
+            else value.astimezone(UTC)
+        )
         return utc_value.astimezone(_SHANGHAI).strftime("%Y-%m-%d %H:%M +08")
 
     @staticmethod

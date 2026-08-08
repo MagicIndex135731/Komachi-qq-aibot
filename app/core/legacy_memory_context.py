@@ -75,7 +75,7 @@ class LegacyMemoryPromptContext:
 
 def normalize_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        return value.replace(tzinfo=ASIA_SHANGHAI)
     return value
 
 

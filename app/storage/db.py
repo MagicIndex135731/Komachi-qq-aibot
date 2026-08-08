@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 import json
 import math
 import re
@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.time_utils import shanghai_now_naive
 from app.storage.models import Base
 from app.providers.embeddings import hashed_text_embedding
 
@@ -448,7 +449,7 @@ def _initialize_optional_retrieval_fts(engine: Engine) -> bool:
                 ).scalar_one()
                 or 0
             )
-            now = datetime.now(UTC).replace(tzinfo=None)
+            now = shanghai_now_naive()
             connection.execute(
                 text(
                     "INSERT INTO retrieval_index_state ("
@@ -511,7 +512,7 @@ def _record_retrieval_fts_unavailable(engine: Engine) -> None:
                     ") ON CONFLICT(channel, generation) DO UPDATE SET "
                     "status = 'unavailable', updated_at = excluded.updated_at"
                 ),
-                {"updated_at": datetime.now(UTC).replace(tzinfo=None)},
+                {"updated_at": shanghai_now_naive()},
             )
     except SQLAlchemyError:
         return
@@ -618,7 +619,7 @@ def ensure_retrieval_vector_generation(
                     ),
                     {
                         "generation": generation,
-                        "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                        "updated_at": shanghai_now_naive(),
                     },
                 )
 
@@ -645,7 +646,7 @@ def ensure_retrieval_vector_generation(
                     **identity,
                     "generation": generation,
                     "physical_table": physical_table,
-                    "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                    "updated_at": shanghai_now_naive(),
                 },
             )
             connection.execute(
@@ -720,7 +721,7 @@ def create_retrieval_vector_generation(
                     "dimensions": resolved_dimensions,
                     "version": str(version),
                     "document_family": resolved_document_family,
-                    "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                    "updated_at": shanghai_now_naive(),
                 },
             )
             connection.execute(
@@ -982,7 +983,7 @@ def write_retrieval_vector_embeddings(
                         "document_id": document_id,
                         "group_id": group_id,
                         "document_family": str(state.document_family or ""),
-                        "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                        "updated_at": shanghai_now_naive(),
                     },
                 )
                 if int(updated.rowcount or 0) != 1:
@@ -1041,7 +1042,7 @@ def mark_retrieval_vector_embeddings_failed(
                 "document_ids": tuple(int(value) for value in document_ids),
                 "document_family": str(state.document_family or ""),
                 "error_code": str(error_code or "")[:96],
-                "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                "updated_at": shanghai_now_naive(),
             },
         )
         return int(result.rowcount or 0)
@@ -1177,7 +1178,7 @@ def refresh_retrieval_vector_generation(
                     "status": status,
                     "total_documents": total_documents,
                     "indexed_documents": indexed_documents,
-                    "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                    "updated_at": shanghai_now_naive(),
                     "generation": int(generation),
                 },
             )
@@ -1267,7 +1268,7 @@ def activate_retrieval_vector_generation(
                 if int(deactivated.rowcount or 0) != 1:
                     connection.rollback()
                     return False
-            activated_at = datetime.now(UTC).replace(tzinfo=None)
+            activated_at = shanghai_now_naive()
             activated = connection.execute(
                 text(
                     "UPDATE retrieval_index_state SET is_active = 1, "
@@ -1365,7 +1366,7 @@ def rollback_retrieval_vector_generation(
             if int(deactivated.rowcount or 0) != 1:
                 connection.rollback()
                 return False
-            activated_at = datetime.now(UTC).replace(tzinfo=None)
+            activated_at = shanghai_now_naive()
             activated = connection.execute(
                 text(
                     "UPDATE retrieval_index_state SET is_active = 1, "

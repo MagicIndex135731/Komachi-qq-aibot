@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
+
+from app.core.time_utils import ASIA_SHANGHAI
 
 from sqlalchemy import (
     JSON,
@@ -25,7 +27,7 @@ class Base(DeclarativeBase):
 
 
 def _utc_now() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(ASIA_SHANGHAI).replace(tzinfo=None)
 
 
 class Group(Base):
@@ -141,7 +143,7 @@ class MemoryItemSemanticVector(Base):
     vector_json: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
+        default=lambda: datetime.now(ASIA_SHANGHAI).replace(tzinfo=None),
     )
 
 

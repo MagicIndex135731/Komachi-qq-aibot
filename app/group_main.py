@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import datetime
 import json
 import logging
 import os
@@ -14,6 +14,7 @@ from app.adapters.onebot_models import parse_group_message_event
 from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
+from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
 from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.reply_policy import ReplyPolicy
@@ -47,7 +48,7 @@ def _write_group_ready_marker(*, log_dir: Path, state: str) -> None:
     payload = {
         "pid": os.getpid(),
         "state": state,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
     }
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "group.ready.json").write_text(

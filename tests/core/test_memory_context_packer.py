@@ -473,7 +473,7 @@ def test_rendered_evidence_time_is_explicit_shanghai_time() -> None:
         recent_messages=(source,),
     )
 
-    assert "2026-07-24 00:30 +08" in packed.text
+    assert "2026-07-23 16:30 +08" in packed.text
 
 
 def test_rendered_history_includes_uin_source_and_reply_relationship() -> None:

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import re
 
 from app.core.message_content import ImageAttachment, extract_images_from_raw_payload
+from app.core.time_utils import ASIA_SHANGHAI
 
 
 IMAGE_INTENT_KEYWORDS = (
@@ -60,7 +61,7 @@ class ResolvedImageTurn:
 
 def _normalize_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        return value.replace(tzinfo=ASIA_SHANGHAI)
     return value
 
 

@@ -15,6 +15,7 @@ from app.core.episode_segmenter import (
     decide_episode_boundary,
     estimate_message_tokens,
 )
+from app.core.time_utils import ASIA_SHANGHAI
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
@@ -47,7 +48,7 @@ class EpisodeAppendConflict(RuntimeError):
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        return value.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
     return value.astimezone(UTC)
 
 

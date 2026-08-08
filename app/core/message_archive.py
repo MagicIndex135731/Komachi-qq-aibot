@@ -167,7 +167,7 @@ def _record_from_db_message(*, message: Message, user: User) -> dict:
 
 def _ensure_utc(timestamp: datetime) -> datetime:
     if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=UTC)
+        return timestamp.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
     return timestamp.astimezone(UTC)
 
 
