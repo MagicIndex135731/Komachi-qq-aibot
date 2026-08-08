@@ -331,9 +331,40 @@ def _mentioned_uins(raw_json: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _build_query_rewrite_provider(*, settings: AppSettings, llm_client):
+def _build_query_rewrite_provider(*, settings: AppSettings, llm_client, engine=None):
     if not settings.memory_query_rewrite_enabled:
         return None
+
+    # Semantic understanding is a small JSON-parse task: give production a
+    # dedicated low-reasoning client so it does not pay the main model's
+    # high-reasoning latency (~12s observed) on every addressed question.
+    # Test fakes keep their injected client untouched.
+    rewrite_llm = llm_client
+    if isinstance(llm_client, LlmClient) and llm_client.reasoning_effort not in (
+        "",
+        "low",
+        "minimal",
+    ):
+        rewrite_llm = LlmClient(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            fallback_model=settings.llm_fallback_model,
+            vision_model="",
+            responses_model=settings.llm_model,
+            responses_only=True,
+            image_responses_model=settings.llm_model,
+            builtin_web_search=False,
+            web_search_context_size="low",
+            reasoning_effort="low",
+            max_output_tokens=512,
+            usage_recorder=(
+                build_usage_recorder(engine)
+                if engine is not None
+                else llm_client.usage_recorder
+            ),
+            tool_event_recorder=None,
+        )
 
     def rewrite(query: str, recent_messages, timeout_seconds: float) -> str:
         del timeout_seconds
@@ -366,7 +397,7 @@ def _build_query_rewrite_provider(*, settings: AppSettings, llm_client):
             f"当前问题：{query[:1000]}\n"
             f"近期上下文：{json.dumps(recent, ensure_ascii=False)}"
         )
-        raw = llm_client.generate_text([prompt])
+        raw = rewrite_llm.generate_text([prompt])
         return str(raw)[: max(64, int(settings.memory_query_rewrite_max_output_tokens) * 8)]
 
     return rewrite
@@ -596,7 +627,11 @@ def build_memory_runtime(
                 type(exc).__name__,
             )
     resolver = MemoryQueryResolver(
-        _build_query_rewrite_provider(settings=settings, llm_client=llm_client),
+        _build_query_rewrite_provider(
+            settings=settings,
+            llm_client=llm_client,
+            engine=engine,
+        ),
         rewrite_timeout_seconds=settings.memory_query_rewrite_timeout_seconds,
     )
     history_classifier = MemoryQueryResolver()
