@@ -152,7 +152,7 @@ class ScopedMemoryRetrievalChannels:
                 model=identity.model,
                 dimensions=identity.dimensions,
                 version=identity.version,
-                generation=self._vector_generation,
+                generation=None,
                 limit=limit,
                 subject_ids=self._subject_ids(resolved_query),
                 **self._vector_hard_filters(resolved_query),

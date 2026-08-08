@@ -2065,7 +2065,7 @@ def test_raw_v3_generation_is_additive_kind_scoped_and_activated_by_cas(
     assert activate_retrieval_vector_generation(
         sqlite_engine,
         generation=raw_generation,
-        expected_active_generation=active_generation,
+        expected_active_generation=None,
     )
     assert (
         find_active_retrieval_vector_generation(
@@ -2509,7 +2509,7 @@ def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generation
     assert activate_retrieval_vector_generation(
         sqlite_engine,
         generation=raw_generation,
-        expected_active_generation=legacy_generation,
+        expected_active_generation=None,
     )
 
     assert resume_retrieval_vector_generation(
@@ -2542,18 +2542,14 @@ def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generation
         )
         assert new_episode.id is not None
 
-    assert rollback_retrieval_vector_generation(
-        sqlite_engine,
-        generation=legacy_generation,
-        expected_active_generation=raw_generation,
-    )
     with sqlite_engine.connect() as connection:
-        active = connection.execute(
+        legacy_state = connection.execute(
             text(
-                "SELECT generation FROM retrieval_index_state "
-                "WHERE channel = 'vector' AND is_active = 1"
-            )
-        ).scalar_one()
+                "SELECT is_active, document_family FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND generation = :generation"
+            ),
+            {"generation": legacy_generation},
+        ).one()
         raw_state = connection.execute(
             text(
                 "SELECT is_active, document_family, physical_table "
@@ -2569,8 +2565,9 @@ def test_legacy_coverage_excludes_raw_and_explicit_rollback_preserves_generation
             ),
             {"physical_table": raw_state.physical_table},
         ).scalar_one_or_none()
-    assert int(active) == legacy_generation
-    assert not bool(raw_state.is_active)
+    assert bool(legacy_state.is_active)
+    assert legacy_state.document_family == ""
+    assert bool(raw_state.is_active)
     assert raw_state.document_family == "raw_message_v3"
     assert raw_table_exists == 1
 

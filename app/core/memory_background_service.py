@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -9,6 +9,8 @@ import logging
 import math
 import re
 from typing import Protocol, Sequence
+
+from sqlalchemy.exc import IntegrityError
 
 from app.core.episode_segmenter import (
     build_overlap_windows,
@@ -34,6 +36,7 @@ from app.storage.db import (
     session_scope,
     write_retrieval_vector_embeddings,
 )
+from app.storage.repositories import MemoryRepository
 from app.storage.models import RetrievalDocument
 from app.storage.repositories import (
     EpisodeRepository,
@@ -1529,6 +1532,7 @@ class MemoryBackgroundService:
         post_segment_client=None,
         post_segment_enabled: bool = False,
         post_segment_min_messages: int = 25,
+        current_ttl_hours: int = 24,
     ) -> None:
         self.store = store
         self.deriver = deriver
@@ -1570,6 +1574,8 @@ class MemoryBackgroundService:
         self.post_segment_client = post_segment_client
         self.post_segment_enabled = bool(post_segment_enabled)
         self.post_segment_min_messages = max(1, int(post_segment_min_messages))
+        self.current_ttl_hours = max(1, int(current_ttl_hours))
+        self._next_current_expiry_at: datetime | None = None
         configure_generations = getattr(store, "configure_generations", None)
         if callable(configure_generations):
             configure_generations(
@@ -1667,6 +1673,46 @@ class MemoryBackgroundService:
             prompt_lines=prompt,
         )
         return result.switched
+
+    def _apply_current_default_expiry(
+        self,
+        derivation: EpisodeDerivation,
+        *,
+        now: datetime,
+    ) -> EpisodeDerivation:
+        """Give current-state facts a bounded validity so stale states expire."""
+        until = (now + timedelta(hours=self.current_ttl_hours)).isoformat()
+        facts = tuple(
+            replace(fact, valid_until=fact.valid_until or until)
+            if fact.kind == "current" and not fact.valid_until
+            else fact
+            for fact in derivation.facts
+        )
+        return EpisodeDerivation(
+            summary=derivation.summary,
+            facts=facts,
+            events=derivation.events,
+            windows=derivation.windows,
+        )
+
+    def _expire_stale_current_memories(self, now: datetime) -> int:
+        if (
+            self._next_current_expiry_at is not None
+            and now < self._next_current_expiry_at
+        ):
+            return 0
+        self._next_current_expiry_at = now + timedelta(minutes=15)
+        engine = getattr(self.store, "engine", None)
+        if engine is None:
+            return 0
+        try:
+            with session_scope(engine) as session:
+                return MemoryRepository(session).expire_stale_current_memories(
+                    now=now
+                )
+        except Exception:
+            logger.exception("memory_current_expiry_failed")
+            return 0
 
     def enqueue_raw_message_index(
         self,
@@ -1833,6 +1879,7 @@ class MemoryBackgroundService:
             lease_seconds=self.lease_seconds,
         )
         if job is None:
+            self._expire_stale_current_memories(resolved_now)
             if self._reconcile_raw_message_projections(resolved_now):
                 return True
             return self._close_idle_episode(resolved_now)
@@ -2107,6 +2154,16 @@ class MemoryBackgroundService:
                     )
                     restart_batch = True
                     break
+                except IntegrityError:
+                    # A concurrent late-arrival re-allocation may already have
+                    # appended this message to the current episode. Treat the
+                    # conflict as idempotent success and move on.
+                    logger.info(
+                        "episode_append_integrity_conflict group_id=%s message_id=%s",
+                        job.group_id,
+                        message.id,
+                    )
+                    continue
                 appended += 1
             if restart_batch:
                 continue
@@ -2234,6 +2291,14 @@ class MemoryBackgroundService:
                     messages=safe_messages,
                     windows=windows,
                 )
+            derivation = _filter_bot_subject_facts(
+                derivation,
+                bot_user_id=self.bot_user_id,
+            )
+            derivation = self._apply_current_default_expiry(
+                derivation,
+                now=now,
+            )
             _validate_derivation_sources(
                 derivation,
                 allowed_source_ids={
@@ -2522,3 +2587,30 @@ def _validate_derivation_sources(
             for source_id in window.source_platform_msg_ids
         ):
             raise ValueError("retrieval window has invalid source message provenance")
+
+
+def _filter_bot_subject_facts(
+    derivation: EpisodeDerivation,
+    *,
+    bot_user_id: int | None,
+) -> EpisodeDerivation:
+    """Drop personal facts whose subject is the bot itself.
+
+    The upstream model sometimes records the assistant's own replies as user
+    plans/decisions. Those rows pollute member profiles, so they are filtered
+    before persistence. Group-level facts (subject_id=group) are kept.
+    """
+    if bot_user_id is None:
+        return derivation
+    bot = str(int(bot_user_id))
+    facts = tuple(
+        fact
+        for fact in derivation.facts
+        if str(fact.subject_id or "") != bot
+    )
+    return EpisodeDerivation(
+        summary=derivation.summary,
+        facts=facts,
+        events=derivation.events,
+        windows=derivation.windows,
+    )

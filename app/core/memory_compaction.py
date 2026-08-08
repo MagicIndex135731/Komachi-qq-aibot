@@ -211,6 +211,11 @@ def build_memory_compaction_prompt(
         messages_label = "Citable messages"
 
     lines = [instructions]
+    lines.append(
+        "重要：不要从机器人（小町/助手）自己的发言中提取用户个人事实；"
+        "个人事实的 subject 必须是真实群成员，且该成员是引用来源的作者。"
+        "机器人发言最多作为群级事实的辅助证据，不能作为个人事实的来源。"
+    )
     if previous:
         lines.extend((f"{history_label}:", previous))
     lines.append(f"{messages_label}:")

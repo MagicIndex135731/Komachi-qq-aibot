@@ -454,10 +454,11 @@ def _initialize_optional_retrieval_fts(engine: Engine) -> bool:
                 text(
                     "INSERT INTO retrieval_index_state ("
                     "channel, generation, physical_table, provider, model, dimensions, "
-                    "version, status, total_documents, indexed_documents, is_active, updated_at"
+                    "version, document_family, status, total_documents, indexed_documents, "
+                    "is_active, updated_at"
                     ") VALUES ("
                     "'fts', 1, 'retrieval_documents_fts', 'sqlite', 'trigram', NULL, "
-                    "'1', 'ready', :total_documents, :indexed_documents, 0, :updated_at"
+                    "'1', '', 'ready', :total_documents, :indexed_documents, 0, :updated_at"
                     ") ON CONFLICT(channel, generation) DO UPDATE SET "
                     "physical_table = excluded.physical_table, provider = excluded.provider, "
                     "model = excluded.model, version = excluded.version, status = excluded.status, "
@@ -505,10 +506,11 @@ def _record_retrieval_fts_unavailable(engine: Engine) -> None:
                 text(
                     "INSERT INTO retrieval_index_state ("
                     "channel, generation, physical_table, provider, model, dimensions, "
-                    "version, status, total_documents, indexed_documents, is_active, updated_at"
+                    "version, document_family, status, total_documents, indexed_documents, "
+                    "is_active, updated_at"
                     ") VALUES ("
                     "'fts', 1, 'retrieval_documents_fts', 'sqlite', 'trigram', NULL, "
-                    "'1', 'unavailable', 0, 0, 0, :updated_at"
+                    "'1', '', 'unavailable', 0, 0, 0, :updated_at"
                     ") ON CONFLICT(channel, generation) DO UPDATE SET "
                     "status = 'unavailable', updated_at = excluded.updated_at"
                 ),
@@ -636,10 +638,11 @@ def ensure_retrieval_vector_generation(
                 text(
                     "INSERT INTO retrieval_index_state ("
                     "channel, generation, physical_table, provider, model, dimensions, "
-                    "version, status, total_documents, indexed_documents, is_active, updated_at"
+                    "version, document_family, status, total_documents, indexed_documents, "
+                    "is_active, updated_at"
                     ") VALUES ("
                     "'vector', :generation, :physical_table, :provider, :model, :dimensions, "
-                    ":version, 'building', 0, 0, 0, :updated_at"
+                    ":version, '', 'building', 0, 0, 0, :updated_at"
                     ")"
                 ),
                 {
@@ -1220,7 +1223,7 @@ def activate_retrieval_vector_generation(
                 return False
             target = connection.execute(
                 text(
-                    "SELECT physical_table FROM retrieval_index_state "
+                    "SELECT physical_table, document_family FROM retrieval_index_state "
                     "WHERE channel = 'vector' AND generation = :generation "
                     "AND status = 'ready' "
                     "AND total_documents = indexed_documents"
@@ -1234,11 +1237,14 @@ def activate_retrieval_vector_generation(
                 str(target.physical_table),
                 generation=int(generation),
             )
+            target_family = str(target.document_family or "")
             active_generation = connection.execute(
                 text(
                     "SELECT generation FROM retrieval_index_state "
-                    "WHERE channel = 'vector' AND is_active = 1"
-                )
+                    "WHERE channel = 'vector' AND is_active = 1 "
+                    "AND document_family = :document_family"
+                ),
+                {"document_family": target_family},
             ).scalar_one_or_none()
             if active_generation is not None and int(active_generation) == int(generation):
                 connection.commit()
@@ -1343,7 +1349,8 @@ def rollback_retrieval_vector_generation(
             active_generation = connection.execute(
                 text(
                     "SELECT generation FROM retrieval_index_state "
-                    "WHERE channel = 'vector' AND is_active = 1"
+                    "WHERE channel = 'vector' AND is_active = 1 "
+                    "AND document_family = ''"
                 )
             ).scalar_one_or_none()
             if bool(target.is_active):

@@ -375,6 +375,7 @@ class RetrievalIndexState(Base):
         Index(
             "ux_retrieval_index_state_active_channel",
             "channel",
+            "document_family",
             unique=True,
             sqlite_where=text("is_active = 1"),
         ),
@@ -392,6 +393,7 @@ class RetrievalIndexState(Base):
     total_documents: Mapped[int] = mapped_column(Integer, default=0)
     indexed_documents: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    document_family: Mapped[str] = mapped_column(String(64), default="")
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 

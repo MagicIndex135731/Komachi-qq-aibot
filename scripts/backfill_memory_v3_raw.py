@@ -260,7 +260,10 @@ def _prepare_generation(
         vector_generation = None
         vector_identity = None
         resumed_generation = args.resume_generation is not None
-        active_before = _active_vector_generation(engine)
+        active_before = _active_vector_generation(
+            engine,
+            document_family="raw_message_v3",
+        )
         if not args.fts_only:
             settings = AppSettings()
             provider = build_embedding_provider(
@@ -603,26 +606,23 @@ def _activate_prepared_generation(
             _emit_report(report, output=args.output)
             return 0
         except Exception as activation_error:
-            if expected_active_generation is None:
-                raise RuntimeError(
-                    "activation failed after CAS and no rollback generation exists"
-                ) from activation_error
             try:
-                rolled_back = rollback_retrieval_vector_generation(
-                    engine,
-                    generation=expected_active_generation,
-                    expected_active_generation=generation,
-                )
+                with engine.connect() as connection:
+                    connection.execute(
+                        text(
+                            "UPDATE retrieval_index_state SET is_active = 0 "
+                            "WHERE channel = 'vector' AND generation = :generation "
+                            "AND is_active = 1"
+                        ),
+                        {"generation": int(generation)},
+                    )
+                    connection.commit()
             except Exception as rollback_error:
                 raise RuntimeError(
                     "activation and automatic rollback both failed"
                 ) from rollback_error
-            if not rolled_back:
-                raise RuntimeError(
-                    "activation failed and automatic rollback was rejected"
-                ) from activation_error
             raise RuntimeError(
-                "activation failed after CAS; legacy generation was restored"
+                "activation failed after CAS; raw generation was deactivated"
             ) from activation_error
     finally:
         engine.dispose()
@@ -641,10 +641,9 @@ def _rollback_prepared_generation(
         raise ValueError("prepared-report does not match the database")
     try:
         raw_generation = int(prepared["vector_generation"])
-        legacy_generation = int(prepared["expected_active_generation"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
-            "prepared-report does not contain a rollback generation pair"
+            "prepared-report does not contain a vector generation"
         ) from exc
     engine = build_engine(args.database)
     try:
@@ -655,19 +654,25 @@ def _rollback_prepared_generation(
             ).scalar_one()
         if str(integrity).strip().casefold() != "ok":
             raise RuntimeError("database integrity check failed")
-        if not rollback_retrieval_vector_generation(
-            engine,
-            generation=legacy_generation,
-            expected_active_generation=raw_generation,
-        ):
-            raise RuntimeError("vector generation rollback CAS was rejected")
+        with engine.connect() as connection:
+            deactivated = connection.execute(
+                text(
+                    "UPDATE retrieval_index_state SET is_active = 0 "
+                    "WHERE channel = 'vector' AND generation = :generation "
+                    "AND is_active = 1"
+                ),
+                {"generation": int(raw_generation)},
+            )
+            connection.commit()
+        if int(deactivated.rowcount or 0) != 1:
+            raise RuntimeError("raw generation rollback CAS was rejected")
         report = {
             "phase": "rolled_back",
             "completed_at": datetime.now(UTC).isoformat(),
             "database_path": str(args.database.resolve()),
             "manifest_sha256": message_ledger_manifest_sha256(manifest),
             "deactivated_generation": raw_generation,
-            "active_generation": legacy_generation,
+            "active_generation": None,
             "database_integrity": "ok",
             "ledger_check": "not_required_for_rollback",
         }
@@ -1328,13 +1333,15 @@ def _count_live_messages(
     return total
 
 
-def _active_vector_generation(engine) -> int | None:
+def _active_vector_generation(engine, *, document_family: str = "raw_message_v3") -> int | None:
     with engine.connect() as connection:
         value = connection.execute(
             text(
                 "SELECT generation FROM retrieval_index_state "
-                "WHERE channel = 'vector' AND is_active = 1"
-            )
+                "WHERE channel = 'vector' AND is_active = 1 "
+                "AND document_family = :document_family"
+            ),
+            {"document_family": document_family},
         ).scalar_one_or_none()
     return int(value) if value is not None else None
 

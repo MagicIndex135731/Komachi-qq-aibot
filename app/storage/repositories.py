@@ -1913,6 +1913,29 @@ class MemoryRepository:
         self.session.flush()
         return len(rows)
 
+    def expire_stale_current_memories(self, *, now: datetime) -> int:
+        """Deactivate current-state memories whose validity window has passed."""
+        normalized_now = _normalize_utc_sqlite_timestamp(now)
+        rows = list(
+            self.session.scalars(
+                select(MemoryItem.id).where(
+                    MemoryItem.memory_kind == "current",
+                    MemoryItem.status == "active",
+                    MemoryItem.valid_until.is_not(None),
+                    MemoryItem.valid_until < normalized_now,
+                )
+            )
+        )
+        if not rows:
+            return 0
+        deactivated = self.deactivate_memory_items(
+            rows,
+            valid_until=normalized_now,
+        )
+        if deactivated:
+            self.delete_memory_item_semantic_vectors(rows)
+        return deactivated
+
     def _sync_memory_indexes(self, memory: MemoryItem) -> None:
         self._sync_fts(memory)
         self._sync_vector(memory)

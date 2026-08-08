@@ -806,6 +806,114 @@ def test_post_segment_disabled_derives_whole_episode_once() -> None:
     assert deriver.calls[0][1] == tuple(range(1, 61))
 
 
+class BotFactDeriver(FakeDeriver):
+    def derive(self, *, episode, messages, windows) -> EpisodeDerivation:
+        super().derive(episode=episode, messages=messages, windows=windows)
+        return EpisodeDerivation(
+            summary="summary",
+            facts=(
+                DerivedFact(
+                    content="user plan",
+                    source_msg_ids=("m-1",),
+                    kind="plan",
+                    subject_id="10001",
+                ),
+                DerivedFact(
+                    content="bot lecture",
+                    source_msg_ids=("m-2",),
+                    kind="decision",
+                    subject_id="999",
+                ),
+            ),
+            events=(),
+            windows=windows,
+        )
+
+
+def test_bot_subject_facts_are_filtered_before_persist() -> None:
+    store = FakeStore()
+    rows = [_message(i, minute=i) for i in range(1, 4)]
+    episode = store.create_episode(
+        group_id=10001,
+        first_message=rows[0],
+        segmentation_generation="segment-v2",
+        backfill_run_id=None,
+    )
+    for row in rows:
+        store.append_message(episode_id=episode.id, message=row, estimated_tokens=1)
+    store.close_episode(
+        episode_id=episode.id,
+        reason="idle",
+        content_hash="hash",
+        compaction_generation="compact-v2",
+        now=NOW,
+    )
+    store.enqueue_episode_processing(
+        episode_id=episode.id,
+        group_id=10001,
+        compaction_generation="compact-v2",
+        backfill_run_id=None,
+        now=NOW,
+    )
+    service = MemoryBackgroundService(
+        store=store,
+        deriver=BotFactDeriver(),
+        worker_id="test-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        idle_minutes=30,
+        max_messages=70,
+        max_tokens=8000,
+        chunk_max_tokens=1800,
+        chunk_overlap_messages=5,
+        poll_interval_seconds=0.01,
+        bot_user_id=999,
+    )
+
+    assert service.run_once(now=NOW)
+    assert store.compactions
+    persisted = store.compactions[-1][1]
+    assert [fact.content for fact in persisted.facts] == ["user plan"]
+
+
+def test_current_facts_get_default_expiry() -> None:
+    service = MemoryBackgroundService(
+        store=FakeStore(),
+        deriver=FakeDeriver(),
+        worker_id="test-worker",
+        segmentation_generation="segment-v2",
+        compaction_generation="compact-v2",
+        current_ttl_hours=24,
+    )
+    derivation = EpisodeDerivation(
+        summary="s",
+        facts=(
+            DerivedFact(
+                content="in kitchen",
+                source_msg_ids=("m-1",),
+                kind="current",
+                subject_id="10001",
+            ),
+            DerivedFact(
+                content="likes anime",
+                source_msg_ids=("m-2",),
+                kind="preference",
+                subject_id="10001",
+            ),
+        ),
+        events=(),
+        windows=(),
+    )
+    result = service._apply_current_default_expiry(
+        derivation,
+        now=datetime(2026, 8, 9, 0, 0, tzinfo=UTC),
+    )
+    current = next(fact for fact in result.facts if fact.kind == "current")
+    preference = next(fact for fact in result.facts if fact.kind == "preference")
+    assert current.valid_until == "2026-08-10T00:00:00+00:00"
+    assert preference.valid_until is None
+
+
 def test_sqlalchemy_raw_message_projection_queues_id_only_jobs_and_fts_survives_embedding_failure(
     sqlite_engine,
 ) -> None:

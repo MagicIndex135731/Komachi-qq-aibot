@@ -1114,6 +1114,7 @@ def build_memory_runtime(
             ),
             post_segment_enabled=settings.memory_episode_post_segment_enabled,
             post_segment_min_messages=settings.memory_episode_post_segment_min_messages,
+            current_ttl_hours=settings.memory_current_default_ttl_hours,
         )
 
     def enqueue_shadow_sync(request: ShadowJobRequest) -> None:

@@ -142,6 +142,12 @@ class AppSettings(BaseSettings):
         le=8192,
         alias="MEMORY_EPISODE_POST_SEGMENT_MAX_OUTPUT_TOKENS",
     )
+    memory_current_default_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        alias="MEMORY_CURRENT_DEFAULT_TTL_HOURS",
+    )
     memory_chunk_max_tokens: int = Field(default=2400, alias="MEMORY_CHUNK_MAX_TOKENS")
     memory_chunk_overlap_messages: int = Field(default=8, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
     memory_chunk_max_messages: int = Field(default=40, ge=1, alias="MEMORY_CHUNK_MAX_MESSAGES")

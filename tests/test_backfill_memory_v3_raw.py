@@ -782,7 +782,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         active = connection.execute(
             text(
                 "SELECT generation FROM retrieval_index_state "
-                "WHERE channel = 'vector' AND is_active = 1"
+                "WHERE channel = 'vector' AND is_active = 1 AND document_family = ''"
             )
         ).scalar_one()
     engine.dispose()
@@ -799,18 +799,19 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
     def snapshot_live_high_watermarks(*args, **kwargs):
         nonlocal fail_post_activation_once
         if fail_post_activation_once:
-            with build_engine(database).connect() as connection:
-                active = int(
-                    connection.execute(
+                with build_engine(database).connect() as connection:
+                    active = connection.execute(
                         text(
                             "SELECT generation FROM retrieval_index_state "
-                            "WHERE channel = 'vector' AND is_active = 1"
+                            "WHERE channel = 'vector' AND is_active = 1 AND document_family = 'raw_message_v3'"
                         )
-                    ).scalar_one()
-                )
-            if active == int(prepared_report["vector_generation"]):
-                fail_post_activation_once = False
-                raise RuntimeError("injected post-activation failure")
+                    ).scalar_one_or_none()
+                if (
+                    active is not None
+                    and int(active) == int(prepared_report["vector_generation"])
+                ):
+                    fail_post_activation_once = False
+                    raise RuntimeError("injected post-activation failure")
         return real_snapshot_live_high_watermarks(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -818,7 +819,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         "_snapshot_live_high_watermarks",
         snapshot_live_high_watermarks,
     )
-    with pytest.raises(RuntimeError, match="legacy generation was restored"):
+    with pytest.raises(RuntimeError, match="raw generation was deactivated"):
         main(
             [
                 "--phase",
@@ -841,7 +842,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
             connection.execute(
                 text(
                     "SELECT generation FROM retrieval_index_state "
-                    "WHERE channel = 'vector' AND is_active = 1"
+                    "WHERE channel = 'vector' AND is_active = 1 AND document_family = ''"
                 )
             ).scalar_one()
         )
@@ -862,7 +863,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         return real_emit_report(*args, **kwargs)
 
     monkeypatch.setattr(backfill_v3, "_emit_report", emit_report)
-    with pytest.raises(RuntimeError, match="legacy generation was restored"):
+    with pytest.raises(RuntimeError, match="raw generation was deactivated"):
         main(
             [
                 "--phase",
@@ -885,7 +886,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
             connection.execute(
                 text(
                     "SELECT generation FROM retrieval_index_state "
-                    "WHERE channel = 'vector' AND is_active = 1"
+                    "WHERE channel = 'vector' AND is_active = 1 AND document_family = ''"
                 )
             ).scalar_one()
         )
@@ -919,7 +920,7 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
             text(
                 "SELECT generation, physical_table, document_family, total_documents, "
                 "indexed_documents FROM retrieval_index_state "
-                "WHERE channel = 'vector' AND is_active = 1"
+                "WHERE channel = 'vector' AND is_active = 1 AND document_family = 'raw_message_v3'"
             )
         ).one()
         vector_count = connection.execute(
@@ -961,12 +962,18 @@ def test_vector_backfill_prepares_without_activation_then_checks_ledger_inside_e
         rolled_back = connection.execute(
             text(
                 "SELECT generation, document_family FROM retrieval_index_state "
-                "WHERE channel = 'vector' AND is_active = 1"
+                "WHERE channel = 'vector' AND is_active = 1 AND document_family = 'raw_message_v3'"
             )
-        ).one()
+        ).scalar_one_or_none()
+        legacy_active = connection.execute(
+            text(
+                "SELECT generation FROM retrieval_index_state "
+                "WHERE channel = 'vector' AND is_active = 1 AND document_family = ''"
+            )
+        ).scalar_one()
     engine.dispose()
-    assert int(rolled_back.generation) == active_generation
-    assert rolled_back.document_family == ""
+    assert rolled_back is None
+    assert int(legacy_active) == active_generation
 
 
 def test_vector_backfill_catches_live_messages_around_activation_and_resumes(
