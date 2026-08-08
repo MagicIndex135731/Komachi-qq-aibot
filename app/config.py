@@ -157,6 +157,36 @@ class AppSettings(BaseSettings):
         default=False,
         alias="MEMORY_MEMORY_TOOLS_ENABLED",
     )
+    proactive_model_judge_enabled: bool = Field(
+        default=False,
+        alias="PROACTIVE_MODEL_JUDGE_ENABLED",
+    )
+    proactive_judge_model: str = Field(
+        default="",
+        alias="PROACTIVE_JUDGE_MODEL",
+    )
+    proactive_judge_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+        default="low",
+        alias="PROACTIVE_JUDGE_REASONING_EFFORT",
+    )
+    proactive_judge_max_output_tokens: int = Field(
+        default=256,
+        ge=64,
+        le=2048,
+        alias="PROACTIVE_JUDGE_MAX_OUTPUT_TOKENS",
+    )
+    proactive_judge_context_messages: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        alias="PROACTIVE_JUDGE_CONTEXT_MESSAGES",
+    )
+    proactive_judge_max_chars_per_message: int = Field(
+        default=120,
+        ge=20,
+        le=1000,
+        alias="PROACTIVE_JUDGE_MAX_CHARS_PER_MESSAGE",
+    )
     memory_memory_tool_max_rounds: int = Field(
         default=2,
         ge=1,

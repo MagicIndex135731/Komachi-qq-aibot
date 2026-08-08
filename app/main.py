@@ -224,6 +224,40 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
     )
 
 
+def build_proactive_judge_client(*, settings: AppSettings, llm_client, engine=None):
+    """Build the lightweight upstream-model judge used to decide interjections.
+
+    Returns ``None`` when disabled (then proactive candidates stay silent) or
+    when the primary client is a test fake. The judge intentionally uses a low
+    reasoning effort and a small output budget so every candidate message costs
+    only one cheap call.
+    """
+    if not settings.proactive_model_judge_enabled:
+        return None
+    if not isinstance(llm_client, LlmClient):
+        return None
+    judge_model = (settings.proactive_judge_model or "").strip() or settings.llm_model
+    fallback_model = (settings.llm_fallback_model or "").strip()
+    if fallback_model == judge_model:
+        fallback_model = ""
+    return LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=judge_model,
+        fallback_model=fallback_model,
+        vision_model="",
+        responses_model=judge_model,
+        responses_only=True,
+        image_responses_model=judge_model,
+        builtin_web_search=False,
+        web_search_context_size="low",
+        reasoning_effort=settings.proactive_judge_reasoning_effort,
+        max_output_tokens=settings.proactive_judge_max_output_tokens,
+        usage_recorder=getattr(llm_client, "usage_recorder", None),
+        tool_event_recorder=None,
+    )
+
+
 def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     del llm_client
     required = {
@@ -1116,6 +1150,11 @@ async def run() -> None:
         gateway = NapCatGateway(ws_url=settings.napcat_ws_url, reconnect_forever=True)
         sender = Sender(gateway)
         llm_client = build_llm_client(settings=settings, engine=engine)
+        proactive_judge_client = build_proactive_judge_client(
+            settings=settings,
+            llm_client=llm_client,
+            engine=engine,
+        )
         group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
         web_search_client = build_web_search_client(settings)
         group_image_service = build_group_image_service(
@@ -1178,6 +1217,7 @@ async def run() -> None:
             runtime=runtime,
             sender=sender,
             llm_client=llm_client,
+            proactive_judge_client=proactive_judge_client,
             reply_policy=ReplyPolicy(),
             context_builder=ContextBuilder(),
             admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),

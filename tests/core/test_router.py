@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.adapters.onebot_models import GroupMessageEvent
 from app.adapters.sender import QQMessageBlockedError, Sender
+from app.config import AppSettings
 from app.core.legacy_memory_context import LegacyMemoryPromptContext
 from app.core.message_content import ImageAttachment
 from app.core.memory_context_packer import PackedMemoryContext
@@ -2676,6 +2677,8 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
     sender = BlockingSender()
     llm = FakeLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    enable_proactive_model_judge(router)
+    router.proactive_judge_client = FakeProactiveJudgeLlm(decision=True)
 
     with session_scope(sqlite_engine) as session:
         groups = GroupRepository(session)
@@ -3127,6 +3130,8 @@ async def test_router_uses_recent_minute_traffic_for_proactive_reply(sqlite_engi
     sender = FakeSender()
     llm = FakeLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    enable_proactive_model_judge(router)
+    router.proactive_judge_client = FakeProactiveJudgeLlm(decision=True)
 
     with session_scope(sqlite_engine) as session:
         groups = GroupRepository(session)
@@ -3706,6 +3711,8 @@ async def test_router_logs_proactive_reply_decision(sqlite_engine, monkeypatch, 
         llm_client=llm,
         web_search_client=None,
     )
+    enable_proactive_model_judge(router)
+    router.proactive_judge_client = FakeProactiveJudgeLlm(decision=True)
 
     with session_scope(sqlite_engine) as session:
         groups = GroupRepository(session)
@@ -3742,7 +3749,8 @@ async def test_router_logs_proactive_reply_decision(sqlite_engine, monkeypatch, 
             )
         )
 
-    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=True reason=proactive_score" in caplog.text
+    assert "reply_decision group_id=10001 msg_id=proactive-log-1 should_reply=True reason=proactive_candidate" in caplog.text
+    assert "interjection_judge group_id=10001 msg_id=proactive-log-1 should_interject=True" in caplog.text
     assert "reply_send_success group_id=10001 msg_id=proactive-log-1" in caplog.text
 
 
@@ -4850,3 +4858,112 @@ def test_query_mentions_member_detects_nickname_card_and_id() -> None:
     assert router._query_mentions_member("Bob 怎么说？", users) is True
     assert router._query_mentions_member("10002 咋看？", users) is True
     assert router._query_mentions_member("八仙怎么样？", users) is False
+
+
+class FakeProactiveJudgeLlm:
+    def __init__(self, decision: bool) -> None:
+        self.decision = decision
+        self.calls: list[list[str]] = []
+
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+        self.calls.append(prompt_lines)
+        if self.decision:
+            return "DECISION: yes\nREASON: 有槽点"
+        return "DECISION: no\nREASON: 没意思"
+
+
+class AlwaysCandidateReplyPolicy:
+    def decide(self, policy_input) -> ReplyDecision:
+        del policy_input
+        return ReplyDecision(True, "proactive_candidate", 1)
+
+
+def enable_proactive_model_judge(router) -> None:
+    values = router.runtime.settings.model_dump()
+    values["proactive_model_judge_enabled"] = True
+    router.runtime.settings = AppSettings.model_construct(**values)
+
+
+@pytest.mark.asyncio
+async def test_router_model_judge_no_keeps_bot_silent(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("不该发")
+    judge = FakeProactiveJudgeLlm(decision=False)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="judge-no-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []
+    assert len(judge.calls) == 1
+    assert any("DECISION: yes|no" in line for line in judge.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_router_model_judge_yes_runs_full_proactive_flow(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("是啊，半小时制这个设定一出来，钱包先累趴了。")
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="judge-yes-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert len(judge.calls) == 1
+    assert len(sender.sent) == 1
+    assert sender.sent[0].text == "是啊，半小时制这个设定一出来，钱包先累趴了。"
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_candidate_without_judge_client_stays_silent(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("不该发")
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="judge-none-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []

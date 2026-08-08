@@ -23,6 +23,7 @@ from app.main import (
     build_group_image_service,
     build_llm_client,
     build_memory_runtime,
+    build_proactive_judge_client,
     build_web_search_client,
     create_runtime_banner,
     should_enable_memory_in_group,
@@ -239,6 +240,11 @@ async def run() -> None:
         )
         sender = Sender(gateway)
         llm_client = build_llm_client(settings=settings, engine=engine)
+        proactive_judge_client = build_proactive_judge_client(
+            settings=settings,
+            llm_client=llm_client,
+            engine=engine,
+        )
         group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
         web_search_client = build_web_search_client(settings)
         group_image_service = build_group_image_service(
@@ -275,6 +281,7 @@ async def run() -> None:
             runtime=runtime,
             sender=sender,
             llm_client=llm_client,
+            proactive_judge_client=proactive_judge_client,
             reply_policy=ReplyPolicy(),
             context_builder=ContextBuilder(),
             admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),

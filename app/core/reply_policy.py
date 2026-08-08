@@ -10,15 +10,14 @@ class PolicyInput:
     group_speak_enabled: bool
     mentioned_bot: bool
     named_bot: bool
-    direct_question: bool
     same_thread_followup: bool
     recent_bot_reply_at: datetime | None
     now: datetime
     quiet_hours: tuple[time, time] | None
     proactive_enabled: bool
     group_traffic_last_minute: int
+    proactive_judge_enabled: bool = False
     addressed_without_at: bool = False
-    has_interjection_opportunity: bool = False
     proactive_interval_seconds: tuple[int, int] = (180, 480)
     event_id: str = ""
 
@@ -31,10 +30,9 @@ class ReplyDecision:
 
 
 class ReplyPolicy:
-    def __init__(self, *, cooldown_seconds: int = 60, proactive_threshold: int = 3) -> None:
+    def __init__(self, *, cooldown_seconds: int = 60) -> None:
         self.cooldown = timedelta(seconds=cooldown_seconds)
         self.cooldown_seconds = cooldown_seconds
-        self.proactive_threshold = proactive_threshold
 
     def decide(self, policy_input: PolicyInput) -> ReplyDecision:
         if not policy_input.group_speak_enabled:
@@ -62,14 +60,10 @@ class ReplyPolicy:
         if policy_input.group_traffic_last_minute < 2:
             return ReplyDecision(False, "below_threshold", 0)
 
-        score = 1
-        if policy_input.direct_question:
-            score += 3
-        if policy_input.has_interjection_opportunity:
-            score += 2
+        if not policy_input.proactive_judge_enabled:
+            return ReplyDecision(False, "proactive_judge_disabled", 0)
 
-        should_reply = score >= self.proactive_threshold
-        return ReplyDecision(should_reply, "proactive_score" if should_reply else "below_threshold", score)
+        return ReplyDecision(True, "proactive_candidate", 1)
 
     def _in_cooldown(self, policy_input: PolicyInput) -> bool:
         if policy_input.recent_bot_reply_at is None:

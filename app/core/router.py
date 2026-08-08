@@ -54,6 +54,10 @@ from app.core.member_identity import (
 )
 from app.core.memory_orchestrator import MemoryContextResult, MemoryOrchestrator
 from app.core.persona_engine import render_persona, render_safety_lines
+from app.core.proactive_judge import (
+    build_proactive_judge_prompt,
+    judge_proactive_interjection,
+)
 from app.core.reply_policy import PolicyInput, ReplyPolicy
 from app.core.search_policy import (
     build_forced_search_query,
@@ -221,6 +225,7 @@ class InboundRouter:
     reply_policy: ReplyPolicy
     context_builder: ContextBuilder
     admin_parser: AdminCommandParser
+    proactive_judge_client: object | None = None
     web_search_client: WebSearchClient | None = None
     dev_control_service: object | None = None
     group_image_service: object | None = None
@@ -1323,7 +1328,6 @@ class InboundRouter:
                     group_speak_enabled=speak_enabled,
                     mentioned_bot=event.mentioned_bot,
                     named_bot=named_bot,
-                    direct_question=("?" in event.plain_text) or ("？" in event.plain_text),
                     same_thread_followup=reply_to_bot or image_followup_trigger,
                     recent_bot_reply_at=messages.last_bot_reply_at(
                         group_id=event.group_id,
@@ -1333,8 +1337,8 @@ class InboundRouter:
                     quiet_hours=quiet_hours,
                     proactive_enabled=proactive_enabled,
                     group_traffic_last_minute=recent_minute_traffic,
+                    proactive_judge_enabled=self.runtime.settings.proactive_model_judge_enabled,
                     addressed_without_at=addressed_without_at,
-                    has_interjection_opportunity=address_decision.is_addressed or time_sensitive,
                     proactive_interval_seconds=proactive_interval,
                     event_id=event.platform_msg_id,
                 )
@@ -1356,7 +1360,10 @@ class InboundRouter:
             reference_search_request = needs_reference_search(event.plain_text)
             external_lookup_search_request = needs_external_lookup_search(event.plain_text)
             general_search_candidate = is_general_search_decision_candidate(event.plain_text)
-            proactive_time_sensitive_turn = decision.reason == "proactive_score" and time_sensitive
+            proactive_time_sensitive_turn = decision.reason in (
+                "proactive_score",
+                "proactive_candidate",
+            ) and time_sensitive
             forced_search_request = addressed_turn and (
                 explicit_search_request or reference_search_request or external_lookup_search_request
             )
@@ -1369,6 +1376,30 @@ class InboundRouter:
             )
             if not decision.should_reply:
                 return PreparedGroupReply(False)
+            if decision.reason == "proactive_candidate":
+                if self.proactive_judge_client is None:
+                    return PreparedGroupReply(False)
+                judge_prompt = build_proactive_judge_prompt(
+                    bot_name=persona_name,
+                    target_message=event.plain_text,
+                    recent_messages=recent_lines,
+                    now=event.timestamp,
+                    context_messages=self.runtime.settings.proactive_judge_context_messages,
+                    max_chars_per_message=self.runtime.settings.proactive_judge_max_chars_per_message,
+                )
+                judge_result = judge_proactive_interjection(
+                    client=self.proactive_judge_client,
+                    prompt_lines=judge_prompt,
+                )
+                logger.info(
+                    "interjection_judge group_id=%s msg_id=%s should_interject=%s reason=%s",
+                    event.group_id,
+                    event.platform_msg_id,
+                    judge_result.should_interject,
+                    judge_result.reason or "none",
+                )
+                if not judge_result.should_interject:
+                    return PreparedGroupReply(False)
             group_image_request = self._build_group_image_request(
                 event=event,
                 addressed_turn=addressed_turn,
