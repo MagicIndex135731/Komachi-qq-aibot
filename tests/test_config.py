@@ -224,15 +224,15 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_query_rewrite_timeout_seconds == 3.0
     assert settings.memory_query_rewrite_max_output_tokens == 256
     assert settings.memory_llm_rerank_enabled is False
-    assert settings.memory_normal_context_budget_tokens == 32000
+    assert settings.memory_normal_context_budget_tokens == 48000
     assert settings.memory_detail_context_budget_tokens == 64000
     assert settings.memory_recent_context_budget_tokens == 10000
     assert settings.memory_history_context_budget_tokens == 24000
-    assert settings.memory_context_budget_chars == 12000
+    assert settings.memory_context_budget_chars == 24000
     assert settings.memory_adaptive_context_enabled is False
     assert settings.memory_adaptive_context_budget_chars == 48000
     assert settings.memory_recent_snapshot_limit == 60
-    assert settings.memory_effective_context_budget_chars == 12000
+    assert settings.memory_effective_context_budget_chars == 24000
     assert settings.memory_recent_protected_min_tokens == 1200
     assert settings.memory_history_protected_min_tokens == 2400
     assert settings.memory_recent_protected_min_messages == 1
@@ -244,13 +244,13 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_memory_tool_max_rounds == 2
     assert settings.memory_memory_tool_max_results == 5
     assert settings.memory_memory_tool_timeout_seconds == 2.0
-    assert settings.memory_member_fact_supplement_limit == 10
+    assert settings.memory_member_fact_supplement_limit == 20
     assert settings.memory_fact_semantic_ranking_enabled is False
     assert settings.memory_fact_semantic_candidates == 60
-    assert settings.memory_max_evidence_messages == 150
+    assert settings.memory_max_evidence_messages == 300
     assert settings.memory_fts_candidate_limit == 30
     assert settings.memory_vector_candidate_limit == 30
-    assert settings.memory_final_episode_limit == 6
+    assert settings.memory_final_episode_limit == 12
 
 
 def test_app_settings_rejects_invalid_enabled_adaptive_budget(tmp_path, monkeypatch) -> None:

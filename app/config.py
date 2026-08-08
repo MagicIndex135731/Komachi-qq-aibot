@@ -99,7 +99,7 @@ class AppSettings(BaseSettings):
         default=256, alias="MEMORY_QUERY_REWRITE_MAX_OUTPUT_TOKENS"
     )
     memory_llm_rerank_enabled: bool = Field(default=False, alias="MEMORY_LLM_RERANK_ENABLED")
-    memory_normal_context_budget_tokens: int = Field(default=32000, alias="MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS")
+    memory_normal_context_budget_tokens: int = Field(default=48000, alias="MEMORY_NORMAL_CONTEXT_BUDGET_TOKENS")
     memory_detail_context_budget_tokens: int = Field(default=64000, alias="MEMORY_DETAIL_CONTEXT_BUDGET_TOKENS")
     memory_recent_context_budget_tokens: int = Field(default=10000, alias="MEMORY_RECENT_CONTEXT_BUDGET_TOKENS")
     memory_history_context_budget_tokens: int = Field(
@@ -107,7 +107,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_HISTORY_CONTEXT_BUDGET_TOKENS",
     )
     memory_context_budget_chars: int = Field(
-        default=12000,
+        default=24000,
         alias="MEMORY_CONTEXT_BUDGET_CHARS",
     )
     memory_adaptive_context_enabled: bool = Field(
@@ -175,7 +175,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_MEMORY_TOOL_TIMEOUT_SECONDS",
     )
     memory_member_fact_supplement_limit: int = Field(
-        default=10,
+        default=20,
         ge=1,
         le=30,
         alias="MEMORY_MEMBER_FACT_SUPPLEMENT_LIMIT",
@@ -201,12 +201,12 @@ class AppSettings(BaseSettings):
         alias="MEMORY_SEARCH_AUTO_BUDGET_TOKENS",
     )
     memory_max_evidence_messages: int = Field(
-        default=150,
+        default=300,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",
     )
     memory_fts_candidate_limit: int = Field(default=30, alias="MEMORY_FTS_CANDIDATE_LIMIT")
     memory_vector_candidate_limit: int = Field(default=30, alias="MEMORY_VECTOR_CANDIDATE_LIMIT")
-    memory_final_episode_limit: int = Field(default=6, alias="MEMORY_FINAL_EPISODE_LIMIT")
+    memory_final_episode_limit: int = Field(default=12, alias="MEMORY_FINAL_EPISODE_LIMIT")
     llm_context_window_tokens: int = Field(default=258000, alias="LLM_CONTEXT_WINDOW_TOKENS")
     llm_max_output_tokens: int = Field(default=8192, alias="LLM_MAX_OUTPUT_TOKENS")
     llm_context_safety_margin_tokens: int = Field(default=32768, alias="LLM_CONTEXT_SAFETY_MARGIN_TOKENS")

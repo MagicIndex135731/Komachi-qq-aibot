@@ -139,8 +139,8 @@ def test_raw_v3_activation_switch_controls_strict_provider_and_document_family(
     )
     assert raw_runtime.memory_orchestrator.strict_scoped_fallback is True
     assert "fact" not in raw_runtime.v2_provider._retriever.channels
-    assert raw_runtime.v2_provider._retriever.candidate_limit == 300
-    assert raw_runtime.v2_provider._retriever.final_limit == 150
+    assert raw_runtime.v2_provider._retriever.candidate_limit == 600
+    assert raw_runtime.v2_provider._retriever.final_limit == 300
     assert raw_runtime.v2_provider._historical_no_hit_omit_recent is True
 
     adaptive_runtime = build_memory_runtime(
