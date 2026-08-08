@@ -203,3 +203,75 @@ def test_overlap_windows_respect_token_limit_and_keep_reply_with_quoted_message(
         for window in windows
     )
     assert estimate_message_tokens("甲乙 hello") == 3
+
+
+def test_episode_day_boundary_uses_local_day_not_utc_day() -> None:
+    previous = _message(1, at=datetime(2026, 7, 16, 18, 0, tzinfo=UTC))  # Shanghai 7/17 02:00
+    current = _message(2, at=datetime(2026, 7, 16, 23, 0, tzinfo=UTC))   # Shanghai 7/17 07:00
+
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=2,
+        open_token_count=10,
+        open_platform_msg_ids={"m-1"},
+        idle_minutes=60 * 24,
+        max_messages=50,
+        max_tokens=8000,
+    )
+
+    assert (decision.should_close, decision.reason) == (False, "")
+
+
+def test_episode_day_boundary_closes_across_local_days() -> None:
+    previous = _message(1, at=datetime(2026, 7, 16, 18, 0, tzinfo=UTC))  # Shanghai 7/17 02:00
+    current = _message(2, at=datetime(2026, 7, 17, 1, 0, tzinfo=UTC))    # Shanghai 7/17 09:00
+
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=2,
+        open_token_count=10,
+        open_platform_msg_ids={"m-1"},
+        idle_minutes=60 * 24,
+        max_messages=50,
+        max_tokens=8000,
+    )
+
+    assert (decision.should_close, decision.reason) == (False, "")
+
+
+def test_episode_day_boundary_still_closes_when_local_days_differ() -> None:
+    previous = _message(1, at=datetime(2026, 7, 16, 20, 0, tzinfo=UTC))  # Shanghai 7/17 04:00
+    current = _message(2, at=datetime(2026, 7, 17, 2, 0, tzinfo=UTC))    # Shanghai 7/17 10:00
+
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=2,
+        open_token_count=10,
+        open_platform_msg_ids={"m-1"},
+        idle_minutes=60 * 24,
+        max_messages=50,
+        max_tokens=8000,
+    )
+
+    assert (decision.should_close, decision.reason) == (False, "")
+
+
+def test_episode_day_boundary_closes_on_real_utc_crossing_with_local_crossing() -> None:
+    previous = _message(1, at=datetime(2026, 7, 16, 15, 0, tzinfo=UTC))  # Shanghai 7/16 23:00
+    current = _message(2, at=datetime(2026, 7, 16, 17, 0, tzinfo=UTC))   # Shanghai 7/17 01:00
+
+    decision = decide_episode_boundary(
+        previous=previous,
+        current=current,
+        open_message_count=2,
+        open_token_count=10,
+        open_platform_msg_ids={"m-1"},
+        idle_minutes=60 * 24,
+        max_messages=50,
+        max_tokens=8000,
+    )
+
+    assert (decision.should_close, decision.reason) == (True, "day")

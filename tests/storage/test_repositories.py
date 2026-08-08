@@ -469,3 +469,48 @@ def test_usage_repository_normalizes_local_timezone_timestamps_to_utc_window(tmp
         "cached_input_tokens": 0,
         "output_tokens": 50,
     }
+
+
+def test_list_group_messages_for_day_uses_local_day(tmp_path) -> None:
+    from datetime import date
+
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="test-group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="Alice",
+            group_card="",
+        )
+        MessageRepository(session).add_group_message(
+            platform_msg_id="local-day-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 7, 16, 18, 0, tzinfo=UTC),  # Shanghai 7/17 02:00
+            plain_text="本地日消息",
+            raw_json={"sender": {"nickname": "Alice", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    with session_scope(engine) as session:
+        messages = MessageRepository(session)
+        local_day = messages.list_group_messages_for_day(
+            group_id=10001,
+            day=date(2026, 7, 17),
+        )
+        utc_day = messages.list_group_messages_for_day(
+            group_id=10001,
+            day=date(2026, 7, 16),
+        )
+
+    assert [message.platform_msg_id for message in local_day] == ["local-day-1"]
+    assert utc_day == []

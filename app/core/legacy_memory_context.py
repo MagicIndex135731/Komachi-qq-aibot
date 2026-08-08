@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import re
+from zoneinfo import ZoneInfo
 
 from app.config import AppSettings
 from app.core.context_builder import ContextBuilder
@@ -22,6 +23,8 @@ from app.storage.repositories import (
     SummaryRepository,
     UserRepository,
 )
+
+ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 _LOOKUP_NORMALIZER = re.compile(
@@ -300,8 +303,8 @@ class LegacyMemoryContext:
         if not selected_rows:
             selected_rows = summary_rows[-self.settings.context_summary_limit :]
         rendered = [
-            f"[{normalize_timestamp(summary.start_at).date().isoformat()} to "
-            f"{normalize_timestamp(summary.end_at).date().isoformat()}] {summary.content}"
+            f"[{normalize_timestamp(summary.start_at).astimezone(ASIA_SHANGHAI).date().isoformat()} to "
+            f"{normalize_timestamp(summary.end_at).astimezone(ASIA_SHANGHAI).date().isoformat()}] {summary.content}"
             for summary in selected_rows
         ]
         source_ids: list[str] = []

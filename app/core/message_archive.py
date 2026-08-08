@@ -4,6 +4,7 @@ import json
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -11,6 +12,14 @@ from app.core.message_content import extract_images_from_raw_payload
 from app.storage.db import session_scope
 from app.storage.models import Message, User
 
+
+ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _as_local_day(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(ASIA_SHANGHAI).date().isoformat()
 
 def append_group_message_archive(
     *,
@@ -28,7 +37,7 @@ def append_group_message_archive(
     direction: str,
     image_local_paths: list[str],
 ) -> Path:
-    archive_path = history_dir / f"group-{group_id}" / f"{timestamp.date().isoformat()}.jsonl"
+    archive_path = history_dir / f"group-{group_id}" / f"{_as_local_day(timestamp)}.jsonl"
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "timestamp": timestamp.isoformat(),

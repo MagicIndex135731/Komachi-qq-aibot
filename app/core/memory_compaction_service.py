@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from threading import Lock
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
@@ -20,6 +21,8 @@ from app.storage.repositories import JobRepository, MemoryRepository, MessageRep
 
 
 logger = logging.getLogger(__name__)
+
+ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class MemoryBackgroundLifecycle(Protocol):
@@ -367,7 +370,13 @@ class MemoryCompactionService:
             if not prompt_messages:
                 JobRepository(session).mark_job_status(job_id=job_id, status="completed", payload_json=payload)
                 return
-            day_key = f"semantic-daily:{rows[-1].timestamp.date().isoformat()}"
+            day_timestamp = rows[-1].timestamp
+            if day_timestamp.tzinfo is None:
+                day_timestamp = day_timestamp.replace(tzinfo=UTC)
+            day_key = (
+                "semantic-daily:"
+                f"{day_timestamp.astimezone(ASIA_SHANGHAI).date().isoformat()}"
+            )
             existing_daily = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
                 limit=1,
@@ -456,7 +465,7 @@ class MemoryCompactionService:
             previous_daily = existing_daily[-1] if existing_daily else None
             daily_rows = MessageRepository(session).list_group_messages_for_day(
                 group_id=group_id,
-                day=end_at.date(),
+                day=day_timestamp.astimezone(ASIA_SHANGHAI).date(),
                 excluded_user_ids=self.excluded_user_ids,
             )
             daily_rows = daily_rows or rows

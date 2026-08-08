@@ -6,6 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 import logging
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo
 
 from app.adapters.sender import (
     OutboundMessage,
@@ -89,6 +90,8 @@ from app.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
+
+ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 _QUOTED_PRONOUN_PATTERN = re.compile(r"他|她|那位|这位|这个人|那家伙")
@@ -1093,7 +1096,10 @@ class InboundRouter:
                         source_end_msg_id=window_messages[-1].platform_msg_id,
                     )
                     session.flush()
-                    daily_key = f"daily:{self._normalize_timestamp(inbound_message.timestamp).date().isoformat()}"
+                    daily_key = (
+                        "daily:"
+                        f"{self._normalize_timestamp(inbound_message.timestamp).astimezone(ASIA_SHANGHAI).date().isoformat()}"
+                    )
                     existing_daily = summaries.list_group_summaries(
                         scope_id=str(event.group_id),
                         limit=1,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import re
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Integer, String, bindparam, cast, func, or_, select, text, true
 from sqlalchemy.exc import SQLAlchemyError
@@ -41,6 +42,14 @@ _INELIGIBLE_DELIVERY_STATES = (
     "uncertain",
     "deleted",
 )
+
+ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _as_local_day(value: datetime) -> date:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(ASIA_SHANGHAI).date()
 
 # sqlite-vec rejects KNN queries above this engine limit.  Hard filters such
 # as speaker/time are validated after vector ranking, so expansion may reach
@@ -703,7 +712,7 @@ class MessageRepository:
         return [
             message
             for message in self.session.scalars(stmt)
-            if message.timestamp.date() == day
+            if _as_local_day(message.timestamp) == day
             and message.user_id not in excluded
             and not self._is_reserved_outbound(message)
             and not self._is_unconfirmed_outbound(message)
