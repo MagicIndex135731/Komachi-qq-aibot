@@ -122,6 +122,26 @@ class AppSettings(BaseSettings):
         le=512,
         alias="MEMORY_EPISODE_TOPIC_JUDGE_MAX_OUTPUT_TOKENS",
     )
+    memory_episode_post_segment_enabled: bool = Field(
+        default=False,
+        alias="MEMORY_EPISODE_POST_SEGMENT_ENABLED",
+    )
+    memory_episode_post_segment_min_messages: int = Field(
+        default=25,
+        ge=5,
+        le=120,
+        alias="MEMORY_EPISODE_POST_SEGMENT_MIN_MESSAGES",
+    )
+    memory_episode_post_segment_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+        default="low",
+        alias="MEMORY_EPISODE_POST_SEGMENT_REASONING_EFFORT",
+    )
+    memory_episode_post_segment_max_output_tokens: int = Field(
+        default=2048,
+        ge=256,
+        le=8192,
+        alias="MEMORY_EPISODE_POST_SEGMENT_MAX_OUTPUT_TOKENS",
+    )
     memory_chunk_max_tokens: int = Field(default=2400, alias="MEMORY_CHUNK_MAX_TOKENS")
     memory_chunk_overlap_messages: int = Field(default=8, alias="MEMORY_CHUNK_OVERLAP_MESSAGES")
     memory_chunk_max_messages: int = Field(default=40, ge=1, alias="MEMORY_CHUNK_MAX_MESSAGES")

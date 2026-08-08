@@ -20,6 +20,7 @@ from app.core.episode_topic_judge import (
     build_topic_judge_prompt,
     judge_topic_switch,
 )
+from app.core.episode_post_segment import post_segment_episode
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
@@ -1525,6 +1526,9 @@ class MemoryBackgroundService:
         topic_judge_context_messages: int = 8,
         topic_judge_start_messages: int = 50,
         topic_judge_interval: int = 5,
+        post_segment_client=None,
+        post_segment_enabled: bool = False,
+        post_segment_min_messages: int = 25,
     ) -> None:
         self.store = store
         self.deriver = deriver
@@ -1563,6 +1567,9 @@ class MemoryBackgroundService:
         self.topic_judge_context_messages = max(2, int(topic_judge_context_messages))
         self.topic_judge_start_messages = max(1, int(topic_judge_start_messages))
         self.topic_judge_interval = max(1, int(topic_judge_interval))
+        self.post_segment_client = post_segment_client
+        self.post_segment_enabled = bool(post_segment_enabled)
+        self.post_segment_min_messages = max(1, int(post_segment_min_messages))
         configure_generations = getattr(store, "configure_generations", None)
         if callable(configure_generations):
             configure_generations(
@@ -2198,12 +2205,35 @@ class MemoryBackgroundService:
                 windows=(),
             )
         else:
-            windows = self._build_windows(safe_messages)
-            derivation = self.deriver.derive(
-                episode=episode,
-                messages=safe_messages,
-                windows=windows,
-            )
+            if (
+                self.post_segment_enabled
+                and self.post_segment_client is not None
+                and len(safe_messages) >= self.post_segment_min_messages
+            ):
+                pieces = post_segment_episode(
+                    client=self.post_segment_client,
+                    messages=safe_messages,
+                    min_messages=self.post_segment_min_messages,
+                )
+                derivations = []
+                for piece in pieces:
+                    piece_messages = tuple(piece)
+                    piece_windows = self._build_windows(piece_messages)
+                    derivations.append(
+                        self.deriver.derive(
+                            episode=episode,
+                            messages=piece_messages,
+                            windows=piece_windows,
+                        )
+                    )
+                derivation = self._merge_derivations(derivations)
+            else:
+                windows = self._build_windows(safe_messages)
+                derivation = self.deriver.derive(
+                    episode=episode,
+                    messages=safe_messages,
+                    windows=windows,
+                )
             _validate_derivation_sources(
                 derivation,
                 allowed_source_ids={
@@ -2270,6 +2300,37 @@ class MemoryBackgroundService:
                     "memory_fact_vector_index_failed episode_id=%s",
                     episode.id,
                 )
+
+    @staticmethod
+    def _merge_derivations(
+        derivations: Sequence[EpisodeDerivation],
+    ) -> EpisodeDerivation:
+        summaries = [
+            f"【片段 {index + 1}】{derivation.summary}"
+            for index, derivation in enumerate(derivations)
+            if derivation.summary.strip()
+        ]
+        facts = tuple(
+            fact
+            for derivation in derivations
+            for fact in derivation.facts
+        )
+        events = tuple(
+            event
+            for derivation in derivations
+            for event in derivation.events
+        )
+        windows = tuple(
+            window
+            for derivation in derivations
+            for window in derivation.windows
+        )
+        return EpisodeDerivation(
+            summary="\n\n".join(summaries),
+            facts=facts,
+            events=events,
+            windows=windows,
+        )
 
     def _build_windows(
         self,

@@ -286,6 +286,34 @@ def build_episode_topic_judge_client(*, settings: AppSettings, llm_client, engin
     )
 
 
+def build_episode_post_segment_client(*, settings: AppSettings, llm_client, engine=None):
+    """Build the lightweight upstream-model client for post-hoc topic splitting."""
+    if not settings.memory_episode_post_segment_enabled:
+        return None
+    if not isinstance(llm_client, LlmClient):
+        return None
+    judge_model = settings.llm_model
+    fallback_model = (settings.llm_fallback_model or "").strip()
+    if fallback_model == judge_model:
+        fallback_model = ""
+    return LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=judge_model,
+        fallback_model=fallback_model,
+        vision_model="",
+        responses_model=judge_model,
+        responses_only=True,
+        image_responses_model=judge_model,
+        builtin_web_search=False,
+        web_search_context_size="low",
+        reasoning_effort=settings.memory_episode_post_segment_reasoning_effort,
+        max_output_tokens=settings.memory_episode_post_segment_max_output_tokens,
+        usage_recorder=getattr(llm_client, "usage_recorder", None),
+        tool_event_recorder=None,
+    )
+
+
 def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     del llm_client
     required = {
@@ -1079,6 +1107,13 @@ def build_memory_runtime(
             topic_judge_context_messages=settings.memory_episode_topic_judge_context_messages,
             topic_judge_start_messages=settings.memory_episode_topic_judge_start_messages,
             topic_judge_interval=settings.memory_episode_topic_judge_interval,
+            post_segment_client=build_episode_post_segment_client(
+                settings=settings,
+                llm_client=llm_client,
+                engine=engine,
+            ),
+            post_segment_enabled=settings.memory_episode_post_segment_enabled,
+            post_segment_min_messages=settings.memory_episode_post_segment_min_messages,
         )
 
     def enqueue_shadow_sync(request: ShadowJobRequest) -> None:
