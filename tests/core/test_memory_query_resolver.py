@@ -2325,6 +2325,39 @@ def test_semantic_rewrite_general_mode_clears_memory_intent() -> None:
     assert result.preferred_fact_kinds == ()
 
 
+def test_semantic_rewrite_general_keeps_rule_bound_member_subject() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "laptop display output ports",
+                "answer_mode": "general",
+                "subject_role": "none",
+                "confidence": 0.98,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "what display outputs does Noir et Noir's laptop have",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+        group_members=(
+            GroupMemberIdentity(
+                user_id=900000102,
+                nickname="Noir et Noir",
+                group_card="唉，gpt5.6 sol",
+                in_scope=True,
+            ),
+        ),
+    )
+
+    assert result.rewrite_used is True
+    assert result.subject_ids == ("900000102",)
+    assert result.subject_binding == "explicit"
+    assert result.retrieval_query == "laptop display output ports"
+
+
 def test_semantic_rewrite_member_role_without_id_is_ignored() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=_rewrite_provider(

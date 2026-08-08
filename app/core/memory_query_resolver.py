@@ -1863,6 +1863,20 @@ class MemoryQueryResolver:
         speaker ids. The model supplies intent and retrieval text, not identity.
         """
         if rewritten.semantic_general:
+            if plan.subject_binding == "explicit":
+                # A general/commonsense rewrite must not drop a rule-bound
+                # member or requester identity. "Look up X's laptop ports"
+                # still needs X's own history even when the model labels the
+                # question general.
+                return replace(
+                    plan,
+                    retrieval_query=(
+                        str(rewritten.retrieval_query or "").strip()
+                        or plan.retrieval_query
+                    ),
+                    preferred_fact_kinds=(),
+                    rewrite_used=True,
+                )
             return replace(
                 plan,
                 retrieval_query=(
