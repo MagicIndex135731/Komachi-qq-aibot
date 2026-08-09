@@ -1617,7 +1617,17 @@ class InboundRouter:
                 use_full_history=use_full_history,
             )
             if memory_enabled:
-                memory_result = self.memory_orchestrator.build_context(memory_request)
+                if decision.reason == "proactive_candidate":
+                    # Interjections must stay grounded in the immediate chat:
+                    # historical retrieval often drags in stale topics and makes
+                    # the roast look random. Recent messages + images only.
+                    memory_result = self.memory_orchestrator.recent_provider(
+                        memory_request
+                    )
+                else:
+                    memory_result = self.memory_orchestrator.build_context(
+                        memory_request
+                    )
             else:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
@@ -1630,6 +1640,11 @@ class InboundRouter:
             relevant_history_lines = memory_context.relevant_history_messages
             relevant_memories = memory_context.memories
             history_detail = memory_context.history_detail
+            if decision.reason == "proactive_candidate":
+                group_policy_lines = [
+                    *group_policy_lines,
+                    "Proactive interjections must react only to the recent messages and any visible image above. Never invent details, plot, or context that is not actually present in them.",
+                ]
             if full_history_enabled or relevant_history_lines or packed_memory_context is not None:
                 group_policy_lines = [
                     *group_policy_lines,

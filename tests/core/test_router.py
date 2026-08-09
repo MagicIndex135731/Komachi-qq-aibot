@@ -5085,3 +5085,39 @@ async def test_router_throttles_back_to_back_proactive_interjections(sqlite_engi
     assert len(sender.sent) == 1
     assert len(llm.calls) == 1
     assert len(judge.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("就这？")
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    def fail_build_context(request):
+        del request
+        raise AssertionError("proactive turns must not call build_context")
+
+    router.memory_orchestrator.build_context = fail_build_context
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="proactive-no-history-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert len(sender.sent) == 1
+    assert "Proactive interjections must react only to the recent messages" in "\n".join(
+        llm.calls[0]
+    )
