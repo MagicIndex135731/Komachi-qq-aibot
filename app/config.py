@@ -30,6 +30,11 @@ class AppSettings(BaseSettings):
         default="",
         alias="LLM_REASONING_EFFORT",
     )
+    llm_timeout_seconds: float = Field(
+        default=120.0,
+        gt=10,
+        alias="LLM_TIMEOUT_SECONDS",
+    )
     llm_supports_vision_input: bool = Field(default=True, alias="LLM_SUPPORTS_VISION_INPUT")
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
     group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")

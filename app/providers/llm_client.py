@@ -96,6 +96,7 @@ class LlmClient:
         web_search_context_size: str = "high",
         reasoning_effort: str = "",
         max_output_tokens: int = 8192,
+        timeout_seconds: float = 30.0,
         http_client: httpx.Client | None = None,
         usage_recorder=None,
         tool_event_recorder: Callable[[dict[str, Any]], None] | None = None,
@@ -121,7 +122,10 @@ class LlmClient:
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.max_output_tokens = max(1, int(max_output_tokens))
-        self.http_client = http_client or httpx.Client(timeout=30.0, trust_env=True)
+        self.http_client = http_client or httpx.Client(
+            timeout=max(10.0, float(timeout_seconds)),
+            trust_env=True,
+        )
         self.usage_recorder = usage_recorder
         self.tool_event_recorder = tool_event_recorder
         self._conversation_response_ids: dict[str, str] = {}

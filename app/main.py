@@ -219,6 +219,7 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         web_search_context_size=settings.llm_builtin_web_search_context_size,
         reasoning_effort=settings.llm_reasoning_effort,
         max_output_tokens=settings.llm_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
         usage_recorder=build_usage_recorder(engine),
         tool_event_recorder=record_tool_event,
     )
@@ -253,6 +254,7 @@ def build_proactive_judge_client(*, settings: AppSettings, llm_client, engine=No
         web_search_context_size="low",
         reasoning_effort=settings.proactive_judge_reasoning_effort,
         max_output_tokens=settings.proactive_judge_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
         usage_recorder=getattr(llm_client, "usage_recorder", None),
         tool_event_recorder=None,
     )
@@ -281,6 +283,7 @@ def build_episode_topic_judge_client(*, settings: AppSettings, llm_client, engin
         web_search_context_size="low",
         reasoning_effort=settings.memory_episode_topic_judge_reasoning_effort,
         max_output_tokens=settings.memory_episode_topic_judge_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
         usage_recorder=getattr(llm_client, "usage_recorder", None),
         tool_event_recorder=None,
     )
@@ -309,6 +312,7 @@ def build_episode_post_segment_client(*, settings: AppSettings, llm_client, engi
         web_search_context_size="low",
         reasoning_effort=settings.memory_episode_post_segment_reasoning_effort,
         max_output_tokens=settings.memory_episode_post_segment_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
         usage_recorder=getattr(llm_client, "usage_recorder", None),
         tool_event_recorder=None,
     )
@@ -335,6 +339,7 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
         image_generations_endpoint=settings.group_image_generations_endpoint,
         image_edits_endpoint=settings.group_image_edits_endpoint,
         max_output_tokens=settings.llm_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
         usage_recorder=build_usage_recorder(engine),
     )
 
@@ -448,6 +453,7 @@ def _build_query_rewrite_provider(*, settings: AppSettings, llm_client, engine=N
             web_search_context_size="low",
             reasoning_effort="low",
             max_output_tokens=512,
+            timeout_seconds=settings.llm_timeout_seconds,
             usage_recorder=(
                 build_usage_recorder(engine)
                 if engine is not None

@@ -480,7 +480,7 @@ class InboundRouter:
 
     def _build_local_generation_failure_reply(self, *, target_images: list[ImageAttachment] | None) -> str:
         if target_images:
-            return "我这边刚刚图没读出来，你再发一下或者再叫我一次。"
+            return "我这边刚想回你的时候卡了一下，图还没顾上看，你再叫我一次。"
         return "我这边刚刚卡了一下，结果没拿到。你再叫我一次，我马上接上。"
 
     def _build_vision_unavailable_reply(self) -> str:
