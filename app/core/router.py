@@ -232,6 +232,8 @@ class InboundRouter:
     memory_compaction_service: object | None = None
     memory_orchestrator: MemoryOrchestrator | None = None
     pending_group_image_turns: dict[tuple[int, int], tuple[datetime, list[ImageAttachment]]] = field(default_factory=dict)
+    _last_proactive_at: dict[int, datetime] = field(default_factory=dict)
+    _proactive_inflight: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.memory_orchestrator is not None:
@@ -1414,6 +1416,16 @@ class InboundRouter:
             if decision.reason == "proactive_candidate":
                 if self.proactive_judge_client is None:
                     return PreparedGroupReply(False)
+                interjection_group = event.group_id
+                if interjection_group in self._proactive_inflight:
+                    return PreparedGroupReply(False)
+                last_proactive_at = self._last_proactive_at.get(interjection_group)
+                if last_proactive_at is not None:
+                    elapsed = (
+                        self._normalize_timestamp(event.timestamp) - last_proactive_at
+                    ).total_seconds()
+                    if elapsed < float(proactive_interval[0]):
+                        return PreparedGroupReply(False)
                 judge_images = self._collect_recent_images(
                     event=event,
                     messages=messages,
@@ -1443,6 +1455,7 @@ class InboundRouter:
                 )
                 if not judge_result.should_interject:
                     return PreparedGroupReply(False)
+                self._proactive_inflight.add(interjection_group)
                 recent_image_pool = self._collect_recent_images(
                     event=event,
                     messages=messages,
@@ -2308,62 +2321,78 @@ class InboundRouter:
         )
         if not prepared_reply.should_reply:
             return
-        if prepared_reply.group_image_request is not None:
-            await self._handle_group_image_request(event, prepared_reply.group_image_request)
-            return
-        if prepared_reply.prebuilt_reply_text is not None:
-            await self._send_prebuilt_reply(event, prepared_reply.prebuilt_reply_text)
-            return
-        if prepared_reply.prompt_lines is None:
-            return
-
+        proactive_cleanup_group = (
+            event.group_id if prepared_reply.proactive_turn else None
+        )
         try:
-            reply_text = await asyncio.to_thread(
-                self._generate_group_reply_text,
-                event=event,
-                prepared_reply=prepared_reply,
-            )
-        except Exception:
-            logger.exception(
-                "reply_generation_failed group_id=%s msg_id=%s",
-                event.group_id,
-                event.platform_msg_id,
-            )
-            if prepared_reply.requires_user_visible_failure_reply:
-                try:
-                    await self._send_prebuilt_reply(
-                        event,
-                        self._build_local_generation_failure_reply(target_images=prepared_reply.target_images),
-                    )
-                except Exception:
-                    logger.exception(
-                        "reply_fallback_send_failed group_id=%s msg_id=%s",
-                        event.group_id,
-                        event.platform_msg_id,
-                    )
-            return
+            if prepared_reply.group_image_request is not None:
+                await self._handle_group_image_request(
+                    event, prepared_reply.group_image_request
+                )
+                return
+            if prepared_reply.prebuilt_reply_text is not None:
+                await self._send_prebuilt_reply(
+                    event, prepared_reply.prebuilt_reply_text
+                )
+                return
+            if prepared_reply.prompt_lines is None:
+                return
 
-        if not reply_text.strip():
-            logger.warning(
-                "reply_generation_empty group_id=%s msg_id=%s",
-                event.group_id,
-                event.platform_msg_id,
-            )
-            if prepared_reply.requires_user_visible_failure_reply:
-                try:
-                    await self._send_prebuilt_reply(
-                        event,
-                        self._build_local_generation_failure_reply(target_images=prepared_reply.target_images),
-                    )
-                except Exception:
-                    logger.exception(
-                        "reply_fallback_send_failed group_id=%s msg_id=%s",
-                        event.group_id,
-                        event.platform_msg_id,
-                    )
-            return
+            try:
+                reply_text = await asyncio.to_thread(
+                    self._generate_group_reply_text,
+                    event=event,
+                    prepared_reply=prepared_reply,
+                )
+            except Exception:
+                logger.exception(
+                    "reply_generation_failed group_id=%s msg_id=%s",
+                    event.group_id,
+                    event.platform_msg_id,
+                )
+                if prepared_reply.requires_user_visible_failure_reply:
+                    try:
+                        await self._send_prebuilt_reply(
+                            event,
+                            self._build_local_generation_failure_reply(
+                                target_images=prepared_reply.target_images
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "reply_fallback_send_failed group_id=%s msg_id=%s",
+                            event.group_id,
+                            event.platform_msg_id,
+                        )
+                return
 
-        await self._send_prebuilt_reply(event, reply_text)
+            if not reply_text.strip():
+                logger.warning(
+                    "reply_generation_empty group_id=%s msg_id=%s",
+                    event.group_id,
+                    event.platform_msg_id,
+                )
+                if prepared_reply.requires_user_visible_failure_reply:
+                    try:
+                        await self._send_prebuilt_reply(
+                            event,
+                            self._build_local_generation_failure_reply(
+                                target_images=prepared_reply.target_images
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "reply_fallback_send_failed group_id=%s msg_id=%s",
+                            event.group_id,
+                            event.platform_msg_id,
+                        )
+                return
+
+            await self._send_prebuilt_reply(event, reply_text)
+        finally:
+            if proactive_cleanup_group is not None:
+                self._last_proactive_at[proactive_cleanup_group] = datetime.now(UTC)
+                self._proactive_inflight.discard(proactive_cleanup_group)
 
     def _ingest_bbot_listener_cache(self, event) -> None:
         entries = extract_listener_cache_entries(

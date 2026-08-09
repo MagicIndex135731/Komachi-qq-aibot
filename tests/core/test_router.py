@@ -3218,7 +3218,7 @@ async def test_router_keeps_full_proactive_reply_content_in_one_message(sqlite_e
     )
 
     assert [outbound.text for outbound in sender.sent] == [
-        "是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。"
+        "是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。"
     ]
     assert any("8-16 Chinese characters" in line for line in llm.calls[0] if line.startswith("Reply style: "))
     assert any("Do not rely on later truncation" in line for line in llm.calls[0] if line.startswith("Reply style: "))
@@ -3249,7 +3249,7 @@ async def test_router_treats_unaddressed_direct_trigger_as_short_group_interject
     )
 
     assert [outbound.text for outbound in sender.sent] == [
-        "那日本人来一碗杨国福，算扯平了。本质上就是互相把对方的日常饭当异国体验项目。Komachi给饮食全球化但钱包一起受苦打高分。"
+        "那日本人来一碗杨国福，算扯平了。"
     ]
     assert any("one complete short sentence" in line for line in llm.calls[0] if line.startswith("Reply style: "))
     assert any("Do not rely on later truncation" in line for line in llm.calls[0] if line.startswith("Reply style: "))
@@ -5048,3 +5048,40 @@ async def test_router_proactive_judge_and_generation_include_recent_images(sqlit
     assert len(sender.sent) == 1
     assert llm.calls[-1]["images"], "generation should receive the image pool too"
     assert any(image.url == "http://example/recent.png" for image in llm.calls[-1]["images"])
+
+
+@pytest.mark.asyncio
+async def test_router_throttles_back_to_back_proactive_interjections(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("就这？")
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="throttle-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="throttle-2",
+            plain_text="这也太离谱了吧",
+        )
+    )
+
+    assert len(sender.sent) == 1
+    assert len(llm.calls) == 1
+    assert len(judge.calls) == 1

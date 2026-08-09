@@ -50,6 +50,12 @@ def build_human_chat_style_lines(*, proactive_turn: bool = False) -> list[str]:
                 "For proactive interjections, favor teasing put-downs like 就这？ or 不会吧不会吧 when the topic invites it.",
             ]
         )
+        lines.append(
+            "For proactive interjections, this is a sharp roast, not a speech: output exactly ONE short line (usually 10-20 Chinese characters), land the jab, and stop."
+        )
+        lines.append(
+            "For proactive interjections, never write a paragraph, never join clauses into a long run-on, never explain, recap, or conclude."
+        )
     return lines
 
 
@@ -235,4 +241,10 @@ def normalize_brief_group_interjection_reply(text: str) -> str:
     normalized = normalize_chat_reply(text)
     if not normalized:
         return normalized
-    return _strip_proactive_formal_leadins(normalized)
+    normalized = _strip_proactive_formal_leadins(normalized)
+    # Keep the first complete sentence as a safety net for long drafts; never
+    # cut mid-sentence. The model is instructed to output one short roast line.
+    sentence_match = re.match(rf"^(.+?[{re.escape(SENTENCE_ENDINGS)}])", normalized)
+    if sentence_match:
+        return sentence_match.group(1).strip()
+    return normalized

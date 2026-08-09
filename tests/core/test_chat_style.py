@@ -73,6 +73,11 @@ def test_normalize_brief_group_interjection_reply_does_not_hard_truncate_long_cl
     )
 
 
+
+def test_normalize_brief_group_interjection_keeps_first_complete_sentence_only() -> None:
+    raw = "First jab. Second unnecessary sentence."
+    assert normalize_brief_group_interjection_reply(raw) == "First jab."
+
 def test_normalize_chat_reply_strips_model_think_blocks() -> None:
     raw = (
         "<think>Considering concise responses I should keep this short.</think> "
