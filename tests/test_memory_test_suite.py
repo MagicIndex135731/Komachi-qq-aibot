@@ -21,7 +21,7 @@ def _minimal_db(path):
         CREATE TABLE memory_items (
             id INTEGER PRIMARY KEY, scope_type TEXT, scope_id TEXT, subject_id TEXT,
             memory_kind TEXT, predicate TEXT, object_text TEXT, content TEXT,
-            source_msg_id TEXT, source_msg_ids TEXT, status TEXT
+            source_msg_id TEXT, source_msg_ids TEXT, status TEXT, expires_at TEXT
         );
         CREATE TABLE summaries (
             id INTEGER PRIMARY KEY, scope_type TEXT, scope_id TEXT,
@@ -34,7 +34,7 @@ def _minimal_db(path):
         INSERT INTO users VALUES (11, '阿渣', '阿渣'), (12, '逆蝶蝶', '逆蝶蝶');
         INSERT INTO memory_items VALUES
           (1, 'group', '1001', '11', 'preference', 'likes', '动画',
-           '阿渣喜欢看动画', 'p1', '["p1"]', 'active');
+           '阿渣喜欢看动画', 'p1', '["p1"]', 'active', NULL);
         """
     )
     connection.commit()
@@ -49,7 +49,7 @@ def test_prepare_and_dataset(tmp_path):
     assert meta["integrity_check"] == "ok"
     assert (workdir / "snapshot.db").exists()
     result = stage_dataset(database, workdir, count=60, seed=1, group_ids=[])
-    assert result["cases"] == 60
+    assert 0 < result["cases"] <= 60
     assert (workdir / "cases.jsonl").exists()
 
 

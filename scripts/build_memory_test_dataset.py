@@ -23,18 +23,18 @@ from sqlalchemy.pool import NullPool
 
 KIND_TEMPLATES: dict[str, tuple[str, ...]] = {
     "preference": (
+        "{alias}喜欢{obj}吗",
+        "{alias}最喜欢{obj}吗",
         "{alias}喜欢什么",
         "{alias}最喜欢什么",
         "{alias}偏好什么",
-        "{alias}爱看什么",
-        "{alias}喜欢{obj}吗",
-        "{alias}的口味是什么",
     ),
     "taboo": (
+        "{alias}讨厌{obj}吗",
+        "{alias}不喜欢{obj}吗",
         "{alias}讨厌什么",
         "{alias}不喜欢什么",
         "{alias}反感什么",
-        "{alias}有什么忌讳",
     ),
     "profile": (
         "{alias}是什么样的人",
@@ -75,8 +75,9 @@ KIND_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{alias}最近遇到了什么",
     ),
     "fact": (
-        "{alias}说过什么关于{obj}",
+        "{alias}说过{obj}吗",
         "{alias}的{obj}是什么",
+        "{alias}说过什么关于{obj}",
         "{alias}怎么说的{obj}",
     ),
 }
@@ -104,6 +105,20 @@ ABSTRACTION_QUERIES = (
     "推荐一首歌",
     "周末去哪玩",
     "讲个笑话",
+    "帮我算一下2的10次方",
+    "现在几点钟了",
+    "你好吗",
+    "你叫什么名字",
+    "推荐一个学习编程的网站",
+    "今天有什么新闻",
+    "怎么做红烧肉",
+    "什么是质数",
+    "最近有什么好看的番剧",
+    "推荐一首周杰伦的歌",
+    "怎么快速入睡",
+    "有什么好用的笔记软件",
+    "明天会下雨吗",
+    "你怎么看人工智能",
 )
 
 DISTRACTOR_QUERIES = (
@@ -113,8 +128,18 @@ DISTRACTOR_QUERIES = (
     "最近有什么好看的电影",
 )
 
-_CJK = re.compile(r"[\u4e00-\u9fff]{2,4}")
+_CJK_TRIGRAM = re.compile(r"[\u4e00-\u9fff]{3}")
 _ALIAS_STOP = {"小町", "比企谷小町", "机器人", "bot", "Bot"}
+_KEYWORD_STOP = {
+    "什么", "怎么", "一个", "我们", "你们", "他们", "这个", "那个", "没有",
+    "不是", "就是", "知道", "可以", "现在", "今天", "昨天", "晚上", "时候",
+    "真的", "感觉", "还是", "已经", "因为", "所以", "如果", "但是", "自己",
+    "大家", "东西", "问题", "意思", "这样", "那样", "起来", "出来", "开始",
+    "以后", "之前", "然后", "最后", "现在", "觉得", "喜欢",
+}
+_LEGACY_NOISE = re.compile(
+    r"（QQ昵称|\(QQ昵称| likes | dislikes |\bdis\b|（昵称|\(昵称"
+)
 
 
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
@@ -274,10 +299,11 @@ def _recent_window(
 
 
 def _topic_keywords(text_value: str) -> list[str]:
+    trigrams = [match.group(0) for match in _CJK_TRIGRAM.finditer(text_value)]
     return [
-        match.group(0)
-        for match in _CJK.finditer(text_value)
-        if match.group(0) not in _ALIAS_STOP
+        trigram
+        for trigram in dict.fromkeys(trigrams)
+        if trigram not in _KEYWORD_STOP and trigram not in _ALIAS_STOP
     ]
 
 
@@ -301,9 +327,12 @@ def _build_fact_case(
                 other_id = candidate_id
                 other_alias = candidate_aliases[0]
                 break
+    object_text = _LEGACY_NOISE.sub("", item["object_text"][:12] or "").strip(" ，。、")
+    if not object_text:
+        object_text = _LEGACY_NOISE.sub("", item["content"][:12]).strip(" ，。、") or "事"
     query = template.format(
         alias=alias,
-        obj=item["object_text"][:12] or item["content"][:12] or "事",
+        obj=object_text,
         other=other_alias or "别人",
     )
     sources = item["source_ids"]
@@ -361,17 +390,22 @@ def _build_mention_case(
         "quoted_context_message_id": row["reply_to_msg_id"],
         "schema_version": 1,
         "requester_uin": str(row["user_id"]),
-        "allowed_subject_user_ids": (str(row["user_id"]),),
+        "allowed_subject_user_ids": (),
         "allowed_evidence_user_ids": None,
         "expected_answer_mode": "mention",
         "expected_coverage_strategy": "relevance",
         "minimum_time_bucket_count": 0,
         "forbidden_evidence_message_ids": (),
-        "gate_tags": ("category=mention", "layer=raw", "real_mention=1"),
+        "gate_tags": (
+            "category=mention",
+            "layer=raw",
+            "real_mention=1",
+            "subject_mode=none",
+        ),
         "contract_fields_complete": True,
         "kind": "mention",
         "expected_layer": "raw",
-        "gold_text": row["plain_text"][:300],
+        "gold_text": "参考证据：" + row["plain_text"][:300],
         "target_message_id": str(row["id"]),
         "now_iso": row["timestamp"],
         "tags": ("category=mention", "layer=raw", "real_mention=1"),
@@ -404,7 +438,7 @@ def _build_raw_case(
         "contract_fields_complete": True,
         "kind": "raw_history",
         "expected_layer": "raw",
-        "gold_text": row["plain_text"][:300],
+        "gold_text": "参考证据：" + row["plain_text"][:300],
         "target_message_id": str(row["id"]),
         "now_iso": row["timestamp"],
         "tags": ("category=raw_history", "layer=raw"),
@@ -482,6 +516,158 @@ def _build_abstention_case(
     }
 
 
+def _build_first_person_case(
+    item: dict[str, Any],
+    aliases: Mapping[int, Sequence[str]],
+    index: int,
+) -> dict[str, Any]:
+    subject_id = item["subject_id"]
+    template = FIRST_PERSON_TEMPLATES[index % len(FIRST_PERSON_TEMPLATES)]
+    other_alias = ""
+    for candidate_id, candidate_aliases in aliases.items():
+        if str(candidate_id) != subject_id and candidate_aliases:
+            other_alias = candidate_aliases[0]
+            break
+    query = template.format(other=other_alias or "别人")
+    tags = [
+        "kind=" + item["kind"],
+        "layer=fact",
+        "subject=requester",
+        "intent=first_person",
+    ]
+    return {
+        "group_id": item["group_id"],
+        "query": query,
+        "recent_context_message_ids": (),
+        "expected_evidence_message_ids": tuple(item["source_ids"]),
+        "category": "first_person",
+        "time_range": None,
+        "quoted_context_message_id": None,
+        "schema_version": 1,
+        "requester_uin": subject_id if subject_id.isdigit() else None,
+        "allowed_subject_user_ids": (subject_id,) if subject_id.isdigit() else None,
+        "allowed_evidence_user_ids": None,
+        "expected_answer_mode": "current_fact",
+        "expected_coverage_strategy": "relevance",
+        "minimum_time_bucket_count": 0,
+        "forbidden_evidence_message_ids": (),
+        "gate_tags": tuple(tags),
+        "contract_fields_complete": True,
+        "kind": item["kind"],
+        "expected_layer": "fact",
+        "gold_text": item["content"][:300] or item["object_text"][:300],
+        "target_message_id": None,
+        "now_iso": None,
+        "tags": tuple(tags),
+    }
+
+
+def _build_ambiguous_case(
+    group_id: int,
+    aliases: Sequence[str],
+    index: int,
+) -> dict[str, Any]:
+    a = aliases[0]
+    b = aliases[1] if len(aliases) > 1 else "别人"
+    template = AMBIGUOUS_TEMPLATES[index % len(AMBIGUOUS_TEMPLATES)]
+    query = template.format(a=a, b=b)
+    return {
+        "group_id": group_id,
+        "query": query,
+        "recent_context_message_ids": (),
+        "expected_evidence_message_ids": (),
+        "category": "ambiguous",
+        "time_range": None,
+        "quoted_context_message_id": None,
+        "schema_version": 1,
+        "requester_uin": None,
+        "allowed_subject_user_ids": (),
+        "allowed_evidence_user_ids": None,
+        "expected_answer_mode": "general_history",
+        "expected_coverage_strategy": "relevance",
+        "minimum_time_bucket_count": 0,
+        "forbidden_evidence_message_ids": (),
+        "gate_tags": ("category=ambiguous", "layer=none", "subject_mode=ambiguous"),
+        "contract_fields_complete": True,
+        "kind": "ambiguous",
+        "expected_layer": "none",
+        "gold_text": "",
+        "target_message_id": None,
+        "now_iso": None,
+        "tags": ("category=ambiguous", "layer=none", "subject_mode=ambiguous"),
+    }
+
+
+def _build_cross_group_case(
+    group_id: int,
+    alias: str,
+    index: int,
+) -> dict[str, Any]:
+    query = f"{alias}喜欢什么" if index % 2 else f"{alias}是什么样的人"
+    return {
+        "group_id": group_id,
+        "query": query,
+        "recent_context_message_ids": (),
+        "expected_evidence_message_ids": (),
+        "category": "cross_group",
+        "time_range": None,
+        "quoted_context_message_id": None,
+        "schema_version": 1,
+        "requester_uin": None,
+        "allowed_subject_user_ids": (),
+        "allowed_evidence_user_ids": None,
+        "expected_answer_mode": "current_fact",
+        "expected_coverage_strategy": "relevance",
+        "minimum_time_bucket_count": 0,
+        "forbidden_evidence_message_ids": (),
+        "gate_tags": ("category=cross_group", "layer=none"),
+        "contract_fields_complete": True,
+        "kind": "cross_group",
+        "expected_layer": "none",
+        "gold_text": "",
+        "target_message_id": None,
+        "now_iso": None,
+        "tags": ("category=cross_group", "layer=none"),
+    }
+
+
+def _build_distractor_case(
+    item: dict[str, Any],
+    aliases: Mapping[int, Sequence[str]],
+    index: int,
+) -> dict[str, Any]:
+    subject_id = item["subject_id"]
+    alias_candidates = aliases.get(int(subject_id), []) if subject_id.isdigit() else []
+    alias = alias_candidates[0] if alias_candidates else f"用户{subject_id}"
+    template = DISTRACTOR_QUERIES[index % len(DISTRACTOR_QUERIES)]
+    query = template.format(alias=alias)
+    return {
+        "group_id": item["group_id"],
+        "query": query,
+        "recent_context_message_ids": (),
+        "expected_evidence_message_ids": (),
+        "category": "distractor",
+        "time_range": None,
+        "quoted_context_message_id": None,
+        "schema_version": 1,
+        "requester_uin": subject_id if subject_id.isdigit() else None,
+        "allowed_subject_user_ids": None,
+        "allowed_evidence_user_ids": None,
+        "expected_answer_mode": "general",
+        "expected_coverage_strategy": "relevance",
+        "minimum_time_bucket_count": 0,
+        "forbidden_evidence_message_ids": (),
+        "gate_tags": ("category=distractor", "layer=none", "precision=1"),
+        "contract_fields_complete": True,
+        "kind": item["kind"],
+        "expected_layer": "none",
+        "gold_text": "",
+        "target_message_id": None,
+        "now_iso": None,
+        "tags": ("category=distractor", "layer=none", "precision=1"),
+    }
+
+
 def _attach_recent(case: dict[str, Any], messages: Sequence[dict[str, Any]]) -> None:
     group_id = case["group_id"]
     before_id = (
@@ -524,12 +710,18 @@ def build_cases(
     ]
     cases: list[dict[str, Any]] = []
     index = 0
+    target_fact = int(count * 0.40)
+    target_mention = int(count * 0.15)
+    target_raw = int(count * 0.20)
+    target_first = int(count * 0.08)
+    target_misc = int(count * 0.09)
+    target_abstention = int(count * 0.08)
     # 1) Structured fact cases (round-robin over kinds to keep coverage).
     if items:
         by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in items:
             by_kind[item["kind"]].append(item)
-        while len(cases) < int(count * 0.45):
+        while len(cases) < target_fact:
             made = False
             for kind_items in by_kind.values():
                 if not kind_items:
@@ -538,19 +730,28 @@ def build_cases(
                 cases.append(_build_fact_case(item, aliases, rng, index))
                 made = True
                 index += 1
-                if len(cases) >= int(count * 0.45):
+                if len(cases) >= target_fact:
                     break
             if not made:
                 break
+    # 1b) First-person variants over the same fact pool.
+    if items:
+        first_index = 0
+        while len(cases) < target_fact + target_first:
+            item = items[first_index % len(items)]
+            cases.append(_build_first_person_case(item, aliases, first_index))
+            first_index += 1
+            if first_index >= len(items) * len(FIRST_PERSON_TEMPLATES):
+                break
     # 2) Real mention cases.
     for offset, row in enumerate(mention_rows):
-        if len(cases) >= int(count * 0.55):
+        if len(cases) >= target_fact + target_first + target_mention:
             break
         cases.append(_build_mention_case(row, {}, offset))
     # 3) Raw-history cases from topic keywords.
     raw_pool = raw_rows
     for offset in range(len(raw_pool)):
-        if len(cases) >= int(count * 0.75):
+        if len(cases) >= target_fact + target_first + target_mention + target_raw:
             break
         row = raw_pool[offset]
         keywords = _topic_keywords(row["plain_text"])
@@ -559,9 +760,44 @@ def build_cases(
         cases.append(_build_raw_case(row, keywords[offset % len(keywords)], offset))
     # 4) Summary/dated cases.
     for offset, summary in enumerate(summaries):
-        if len(cases) >= int(count * 0.85):
+        if len(cases) >= target_fact + target_first + target_mention + target_raw + target_misc:
             break
         cases.append(_build_summary_case(summary, offset))
+    # 4b) Ambiguous / cross-group / distractor families.
+    misc_index = 0
+    if aliases:
+        membership = {
+            (row["group_id"], row["user_id"]) for row in messages
+        }
+        for group_id in groups:
+            group_aliases = list(
+                dict.fromkeys(
+                    alias
+                    for user_id, candidates in aliases.items()
+                    for alias in candidates
+                    if (group_id, int(user_id)) in membership
+                )
+            )
+            if len(group_aliases) >= 2:
+                cases.append(_build_ambiguous_case(group_id, group_aliases, misc_index))
+                misc_index += 1
+    for group_id in groups:
+        foreign_alias = None
+        for user_id, candidates in aliases.items():
+            if not any(
+                row["group_id"] == group_id and row["user_id"] == user_id
+                for row in messages
+            ) and candidates:
+                foreign_alias = candidates[0]
+                break
+        if foreign_alias is not None:
+            cases.append(_build_cross_group_case(group_id, foreign_alias, misc_index))
+            misc_index += 1
+    if items:
+        for distractor_index, item in enumerate(items):
+            if distractor_index >= target_misc:
+                break
+            cases.append(_build_distractor_case(item, aliases, distractor_index))
     # 5) Abstention / precision cases to reach the target.
     while len(cases) < count:
         group_id = groups[rng.randrange(len(groups))]
@@ -575,6 +811,20 @@ def build_cases(
     for case in cases:
         _attach_recent(case, messages)
     result = cases[:count]
+    seen_queries: set[tuple[str, str, str, int]] = set()
+    deduped: list[dict[str, Any]] = []
+    for case in result:
+        key = (
+            str(case["category"]),
+            str(case["query"]),
+            str(case.get("requester_uin") or ""),
+            int(case["group_id"]),
+        )
+        if key in seen_queries:
+            continue
+        seen_queries.add(key)
+        deduped.append(case)
+    result = deduped
     for index, case in enumerate(result):
         case["case_id"] = f"{case['category']}-{index}"
     return result

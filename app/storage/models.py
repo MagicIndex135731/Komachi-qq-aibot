@@ -359,6 +359,11 @@ class RetrievalDocumentMessage(Base):
             name="ux_retrieval_document_messages_ordinal",
         ),
         Index("ix_retrieval_document_messages_group_message", "group_id", "message_id"),
+        Index(
+            "ix_retrieval_document_messages_group_document",
+            "group_id",
+            "document_id",
+        ),
     )
 
     document_id: Mapped[int] = mapped_column(Integer, primary_key=True)

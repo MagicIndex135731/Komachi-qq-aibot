@@ -309,7 +309,9 @@ def run_cases(
             line = line.strip()
             if line:
                 try:
-                    done_ids.add(str(json.loads(line)["case_id"]))
+                    entry = json.loads(line)
+                    if bool(entry.get("ok")):
+                        done_ids.add(str(entry["case_id"]))
                 except (json.JSONDecodeError, KeyError):
                     continue
     if settings is None:
@@ -361,11 +363,14 @@ def run_cases(
             output_price_mtok=output_price_mtok,
         )
         rows.append(row)
+        completed_ok = "provider_failed" not in (
+            row.get("protocol_failure_codes") or ()
+        )
         if progress_path is not None:
-            completed.append({"case_id": case_id})
+            completed.append({"case_id": case_id, "ok": completed_ok})
             progress_path.parent.mkdir(parents=True, exist_ok=True)
             with progress_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"case_id": case_id}) + "\n")
+                handle.write(json.dumps({"case_id": case_id, "ok": completed_ok}) + "\n")
     summary = {
         "requested": len(selected),
         "executed": len(rows),
@@ -564,6 +569,12 @@ def _run_case(
         len(gold & citations) / len(gold) if gold else float(not citations)
     )
     total_ms = (perf_counter() - started) * 1000
+    packed_fact_count = len(tuple(getattr(packed, "facts", ())))
+    packed_summary_count = len(tuple(getattr(packed, "summaries", ())))
+    packed_segment_messages = sum(
+        len(tuple(getattr(segment, "messages", ())))
+        for segment in tuple(getattr(packed, "evidence_segments", ()))
+    )
     row: dict[str, Any] = {
         "case_id": case_id,
         "category": str(case.get("category") or "unknown"),
@@ -580,6 +591,10 @@ def _run_case(
         "citation_recall": citation_recall,
         "protocol_failure_codes": list(protocol_failures),
         "citation_failure_codes": list(citation_failures),
+        "packed_fact_count": packed_fact_count,
+        "packed_summary_count": packed_summary_count,
+        "packed_segment_messages": packed_segment_messages,
+        "packed_source_ids": packet_source_ids,
         "input_tokens": int(getattr(answer_observation, "input_tokens", 0)),
         "output_tokens": int(getattr(answer_observation, "output_tokens", 0)),
         "ttft_ms": float(getattr(answer_observation, "ttft_ms", 0.0)),

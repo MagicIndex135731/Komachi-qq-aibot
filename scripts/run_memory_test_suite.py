@@ -69,6 +69,19 @@ def stage_prepare(database: Path, workdir: Path) -> dict[str, Any]:
     finally:
         source.close()
         target.close()
+    migration_error = ""
+    try:
+        from sqlalchemy import create_engine as _migration_engine_factory
+        from app.storage.db import _apply_schema_migrations
+
+        migration_engine = _migration_engine_factory(f"sqlite:///{snapshot}")
+        try:
+            with migration_engine.begin() as connection:
+                _apply_schema_migrations(connection)
+        finally:
+            migration_engine.dispose()
+    except Exception as exc:  # pragma: no cover - defensive for odd snapshots
+        migration_error = f"{type(exc).__name__}: {str(exc)[:200]}"
     check = sqlite3.connect(str(snapshot))
     try:
         integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
@@ -80,14 +93,30 @@ def stage_prepare(database: Path, workdir: Path) -> dict[str, Any]:
             )
         ]
         message_count = check.execute("SELECT count(*) FROM messages").fetchone()[0]
+        message_columns = {
+            str(row[1]) for row in check.execute("PRAGMA table_info(messages)")
+        }
+        document_columns = {
+            str(row[1])
+            for row in check.execute("PRAGMA table_info(retrieval_documents)")
+        }
     finally:
         check.close()
+    schema_issues: list[str] = []
+    if "raw_json" not in message_columns:
+        schema_issues.append("messages.raw_json missing")
+    for column in ("embedding_eligible", "embedding_status", "embedding_generation"):
+        if column not in document_columns:
+            schema_issues.append(f"retrieval_documents.{column} missing")
     meta = {
         "source": str(database),
         "snapshot": str(snapshot),
         "integrity_check": integrity,
         "message_count": int(message_count),
         "fts_tables": fts_tables,
+        "schema_ready": not schema_issues,
+        "schema_issues": schema_issues,
+        "migration_error": migration_error or None,
     }
     (workdir / "snapshot-meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
@@ -213,6 +242,25 @@ def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSett
         if actual_subject is not None
         else None
     )
+    cross_group_violation = False
+    if "cross_group" in tags and packed_ids:
+        placeholders = ",".join(f":pid_{index}" for index in range(len(packed_ids)))
+        parameters = {f"pid_{index}": str(value) for index, value in enumerate(packed_ids)}
+        if placeholders:
+            rows = list(
+                _iter_rows(
+                    engine,
+                    "SELECT platform_msg_id, group_id FROM messages "
+                    f"WHERE platform_msg_id IN ({placeholders})",
+                    parameters,
+                )
+            )
+            foreign_sources = [
+                str(row[0])
+                for row in rows
+                if row[1] is not None and int(row[1]) != group_id
+            ]
+            cross_group_violation = bool(foreign_sources)
     return {
         "case_id": str(case.get("case_id") or ""),
         "category": str(case.get("category") or "unknown"),
@@ -222,11 +270,23 @@ def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSett
         "packed_source_ids": packed_ids,
         "subject_expected": expected_subject,
         "subject_actual": actual_subject_tuple,
+        "subject_match": actual_subject_tuple == expected_subject,
         "raw_hit": bool(packed.evidence_segments),
         "fact_hit": bool(packed.facts),
         "summary_hit": bool(packed.summaries),
         "latency_ms": latency_ms,
-        "cross_group_violation": "cross_group" in tags and bool(packed_ids),
+        "cross_group_violation": cross_group_violation,
+        "attempted_channels": list(
+            str(value) for value in getattr(trace, "attempted_channels", ())
+        ),
+        "failed_channels": list(
+            str(value) for value in getattr(trace, "failed_channels", ())
+        ),
+        "all_channels_failed": bool(
+            getattr(trace, "failed_channels", ())
+            and set(getattr(trace, "failed_channels", ()))
+            == set(getattr(trace, "attempted_channels", ()))
+        ),
         "query": str(case.get("query", ""))[:120],
     }
 
@@ -466,6 +526,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--database is required")
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    database = args.database
+    prepared_snapshot = workdir / "snapshot.db"
+    if prepared_snapshot.exists() and args.stage != "prepare":
+        # Every stage after prepare must run against the read-only snapshot copy.
+        database = prepared_snapshot
     group_ids = (
         [int(value) for value in args.group_ids.split(",") if value.strip()]
         if args.group_ids
@@ -480,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result["prepare"] = stage_prepare(args.database, workdir)
         elif stage == "dataset":
             result["dataset"] = stage_dataset(
-                args.database,
+                database,
                 workdir,
                 count=args.count,
                 seed=args.seed,
@@ -488,14 +553,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif stage == "offline":
             result["offline"] = stage_offline(
-                args.database,
+                database,
                 workdir,
                 rewrite_enabled=args.rewrite_enabled,
                 channel_timeout=args.channel_timeout,
             )
         elif stage == "fullchain":
             result["fullchain"] = stage_fullchain(
-                args.database,
+                database,
                 workdir,
                 limit=args.fullchain_limit,
                 seed=args.seed,
@@ -512,7 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.stress_groups:
                 raise SystemExit("--stress-groups is required for the stress stage")
             result["stress"] = stage_stress(
-                args.database,
+                database,
                 workdir,
                 groups=args.stress_groups,
                 limit_cases=args.stress_limit,

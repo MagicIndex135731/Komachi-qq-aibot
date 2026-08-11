@@ -320,6 +320,18 @@ def _apply_schema_migrations(connection) -> None:
             },
         )
 
+    if "retrieval_document_messages" in table_names:
+        # The safety/speaker/mention subqueries filter by (group_id,
+        # document_id); without this composite index SQLite falls back to a
+        # group-prefix scan and bm25 queries can take seconds on large corpora.
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_retrieval_document_messages_group_document "
+                "ON retrieval_document_messages (group_id, document_id)"
+            )
+        )
+
 
 def _table_columns(connection, table_name: str) -> set[str]:
     return {

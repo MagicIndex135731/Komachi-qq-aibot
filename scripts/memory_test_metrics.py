@@ -55,12 +55,27 @@ def classification_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if expected:
             bucket["hit"] += int(bool(expected & packed))
         else:
-            bucket["hit"] += int(not packed)
+            bucket["hit"] += int(
+                not (
+                    bool(row.get("raw_hit"))
+                    or bool(row.get("fact_hit"))
+                    or bool(row.get("summary_hit"))
+                )
+            )
         expected_layer = str(row.get("expected_layer") or "raw")
         layer_bucket = per_layer.setdefault(expected_layer, {"hit": 0, "total": 0})
         layer_bucket["total"] += 1
-        layer_hit_key = f"{expected_layer}_hit"
-        layer_bucket["hit"] += int(bool(row.get(layer_hit_key)))
+        if expected_layer == "none":
+            layer_bucket["hit"] += int(
+                not (
+                    bool(row.get("raw_hit"))
+                    or bool(row.get("fact_hit"))
+                    or bool(row.get("summary_hit"))
+                )
+            )
+        else:
+            layer_hit_key = f"{expected_layer}_hit"
+            layer_bucket["hit"] += int(bool(row.get(layer_hit_key)))
         if row.get("subject_expected") is not None:
             subject_total += 1
             subject_correct += int(row.get("subject_actual") == row.get("subject_expected"))
