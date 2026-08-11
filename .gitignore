@@ -30,6 +30,9 @@ data/*.log
 data/napcat/
 data/pytest-temp-*/
 data/tmp/
+data/test-platform/
+data/test-platform-cache/
+data/test-platform-*/
 .codex_tmp*/
 .tmp*/
 .pytest_tmp/

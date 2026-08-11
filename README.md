@@ -243,3 +243,38 @@ git restore --source f63efe1 -- path\to\file
 ```
 
 不要用 `git reset --hard` 处理包含本地运行数据的工作区。
+
+## 记忆测试平台（Memory Test Platform）
+
+对 Memory V3 做全链条评估：解析 → 检索 → 打包 → 上游模型真实请求
+（生成回答 + 引用校验 + 模型判定）。统一驱动：
+
+```bash
+# 0) 前置：容器内生产快照（只读副本）+ 上游模型 API key（环境变量）
+# 1) 一次性全流程（本地冒烟：--count 小值 + --dry-run）
+python -m scripts.run_memory_test_suite --database data/bot.db \
+  --count 100 --fullchain-limit 20 --dry-run
+
+# 2) 正式运行（离线 ≥3000 例 + 全链条 300 例，先 dry-run 看预算）
+python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
+  --count 3000 --fullchain-limit 300 --dry-run
+python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --all
+
+# 3) 分阶段 + 断点 + 缓存
+python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --stage fullchain --resume
+
+# 4) 基线对比与门禁（--baseline-dir 指向旧报告目录）
+python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --stage report \
+  --baseline-dir data/test-platform-baseline \
+  --gate-grounded-accuracy 0.7 --gate-recall 0.6 --gate-protocol-failures 5
+```
+
+阶段：`prepare`（只读快照复制 + integrity/FTS 校验）、`dataset`（分层生成
+≥3000 例）、`offline`（全量离线全链路，零模型成本）、`fullchain`
+（300 例真实模型，响应按 prompt 哈希缓存）、`stress`（复用 300 例压力）、
+`report`（指标聚合/基线 diff/门禁）。产物在 `data/test-platform/`
+（已 gitignore）：`cases.jsonl`、`offline-results.jsonl`、
+`fullchain-results.jsonl`、`report.json/md`、私有明细与缓存。
+
+隐私：公共报告只有聚合数字；prompt、模型原文、judge 原文只进本地私有明细，
+不提交 Git。运行前请确认 API key 与成本预算（`--dry-run` 会先给估算）。
