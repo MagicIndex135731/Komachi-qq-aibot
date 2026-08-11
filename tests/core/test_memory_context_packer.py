@@ -179,19 +179,23 @@ def test_default_budgets_follow_v2_contract_and_recent_has_own_cap() -> None:
     assert packed.estimated_tokens <= 10_000
 
 
-def test_both_modes_allow_bounded_history_and_summary_requires_evidence() -> None:
+def test_both_modes_allow_bounded_history_and_relevant_summary_can_stand_alone() -> None:
     packer = MemoryContextPacker(normal_budget=100, detail_budget=100, token_counter=lambda value: 1)
     segments = tuple(EvidenceSegment(f"ep-{index}", 10 - index, (message(str(index), f"proof {index}"),)) for index in range(7))
     summary = MemorySummary("latest summary", ("x",), relevant=True)
+    irrelevant = MemorySummary("irrelevant summary", ("y",), relevant=False)
 
     normal = packer.pack("normal", available_input=100, target_message_id=None, evidence_segments=segments, summaries=(summary,))
     detail = packer.pack("detail", available_input=100, target_message_id=None, evidence_segments=segments, summaries=(summary,))
     empty = packer.pack("normal", available_input=100, target_message_id=None, summaries=(summary,))
+    empty_irrelevant = packer.pack("normal", available_input=100, target_message_id=None, summaries=(irrelevant,))
 
     assert len(normal.evidence_segments) == 7
     assert len(detail.evidence_segments) == 7
     assert "latest summary" in normal.text
-    assert empty.summaries == ()
+    assert empty.summaries == (summary,)
+    assert "latest summary" in empty.text
+    assert empty_irrelevant.summaries == ()
 
 
 def test_blocked_message_becomes_safe_note_without_sensitive_text() -> None:

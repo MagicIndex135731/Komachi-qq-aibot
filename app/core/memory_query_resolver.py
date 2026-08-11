@@ -161,8 +161,13 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"(?:我|我的)(?:平时|一般|通常)?"
     r"(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"(?:我|我的)(?:讨厌什么|不喜欢什么|过去|以前|历史)|"
+    r"^\s*(?:给出|给|帮我|来|要|想要)?\s*(?:我|我的).{0,8}?画像|"
+    r"^\s*(?:介绍一下|介绍)\s*我|"
     r"^\s*(?:(?:最近|现在|目前)\s*)?(?:我|我的)(?:[^，。！？!?]{0,24}?)?"
     r"(?:什么|啥|吗|呢|哪|怎么|如何|多少|几|是谁)"
+)
+_FIRST_PERSON_OWNERSHIP_PATTERN = re.compile(
+    r"(?:我|我的).{0,24}?(?:主人|爹爹|爸爸|妈妈|称呼)"
 )
 _ASSESSMENT_PATTERN = re.compile(
     r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
@@ -191,7 +196,8 @@ _REQUESTER_MENTION_PATTERN = re.compile(
 )
 _CURRENT_FACT_PATTERN = re.compile(
     r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么|还记得|记得"
+    r"讨厌什么|不喜欢什么|还记得|记得|"
+    r"画像|是什么样的人|哪里人|做什么的|介绍一下|主人|称呼我|叫我"
 )
 _TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
 _TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
@@ -214,7 +220,7 @@ _ASSESSMENT_SCAFFOLD_PATTERN = re.compile(
 )
 _CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
     r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么|还记得|记得"
+    r"讨厌什么|不喜欢什么|还记得|记得|给出|完整|个人|介绍一下"
 )
 _HISTORY_SCAFFOLD_PATTERN = re.compile(
     r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
@@ -409,6 +415,44 @@ class MemoryQueryResolver:
             or _HISTORY_PATTERN.search(original)
             or answer_mode in {"mention", "summary", "assessment"}
         )
+
+        if (
+            normalized_requester_id is not None
+            and _FIRST_PERSON_OWNERSHIP_PATTERN.search(original)
+        ):
+            # "我和X谁是你的主人/称呼" style questions mention another member,
+            # which would otherwise be classified ambiguous and fail closed.
+            # Ownership/称呼 rules belong to the requester; bind to them so the
+            # preference/profile facts (including addressing rules) can load.
+            plan = self._with_topic_query(ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query=original,
+                speaker_ids=(normalized_requester_id,),
+                subject_ids=(normalized_requester_id,),
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=needs_history,
+                needs_detail=needs_detail,
+                group_id=normalized_group_id,
+                requester_id=normalized_requester_id,
+                subject_binding="requester",
+                answer_mode=answer_mode,
+                coverage_mode=coverage_mode,
+            ), aliases=("我的", "我"))
+            if (
+                self._rewrite_provider is not None
+                and self._should_attempt_semantic_resolution(original)
+                and self._semantic_rewrite_needed(plan)
+            ):
+                rewritten = self._try_rewrite(original, recent, current_time)
+                if rewritten is not None:
+                    return self._apply_semantic_understanding(
+                        plan,
+                        rewritten=rewritten,
+                        original=original,
+                        requester_id=normalized_requester_id,
+                    )
+            return plan
 
         direct_reference = self._classify_direct_member_reference(
             original,
@@ -1521,6 +1565,7 @@ class MemoryQueryResolver:
             return True
         return bool(
             _FIRST_PERSON_SUBJECT_PATTERN.search(query)
+            or _FIRST_PERSON_OWNERSHIP_PATTERN.search(query)
             or _FIRST_PERSON_HISTORY_PATTERN.search(query)
             or _TEMPORAL_FIRST_PERSON_HISTORY_PATTERN.search(query)
         )
@@ -1588,7 +1633,7 @@ class MemoryQueryResolver:
         }.get(plan.answer_mode)
         if scaffold is not None:
             topic = scaffold.sub(" ", topic)
-        topic = re.sub(r"^\s*(?:请|麻烦|帮忙|帮我|能否|可以)?\s*", "", topic)
+        topic = re.sub(r"^\s*(?:请|麻烦|帮忙|帮我|给出|给|来|要|想要|能否|可以)?\s*", "", topic)
         topic = re.sub(r"^的|的$", "", topic.strip())
         topic = re.sub(r"^(?:对|关于)\s*", "", topic).strip()
         topic = _TOPIC_PUNCTUATION_PATTERN.sub("", topic).strip()

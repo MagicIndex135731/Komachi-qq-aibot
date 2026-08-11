@@ -53,6 +53,7 @@ from app.core.memory_query_resolver import MemoryQueryResolver
 from app.core.member_identity import GroupMemberIdentity, group_member_identities_from_messages
 from app.core.memory_retrieval_channels import build_memory_retrieval_channels
 from app.core.memory_v2_context import MemoryV2ContextProvider
+from app.core.time_utils import stored_as_utc
 from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.message_archive import sync_group_message_archives_from_db
 from app.core.reply_policy import ReplyPolicy
@@ -988,11 +989,49 @@ def build_memory_runtime(
                     "semantic_window",
                     "semantic_daily",
                 )
+
+            def _relevant(row) -> bool:
+                time_range = resolved_query.time_range
+                if time_range is None:
+                    # No deterministic time range: summaries stay a
+                    # supplement for any history-intent question.
+                    return True
+                start = (
+                    stored_as_utc(row.start_at)
+                    if row.start_at is not None
+                    else None
+                )
+                end = (
+                    stored_as_utc(row.end_at)
+                    if row.end_at is not None
+                    else None
+                )
+                if start is None and end is None:
+                    return False
+                if (
+                    end is not None
+                    and time_range.start is not None
+                    and end <= time_range.start
+                ):
+                    return False
+                if (
+                    start is not None
+                    and time_range.end is not None
+                    and start >= time_range.end
+                ):
+                    return False
+                return True
+
             rows = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
-                limit=settings.context_summary_limit,
+                limit=settings.context_summary_limit * 3,
                 **summary_kwargs,
             )
+            relevant_rows = [
+                row
+                for row in rows
+                if _relevant(row)
+            ][: settings.context_summary_limit]
             return tuple(
                 MemorySummary(
                     text=str(row.content),
@@ -1009,7 +1048,7 @@ def build_memory_runtime(
                     relevant=True,
                     group_id=group_id,
                 )
-                for row in rows
+                for row in relevant_rows
                 if row.source_start_msg_id or row.source_end_msg_id
             )
 

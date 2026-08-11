@@ -18,10 +18,12 @@ from app.core.memory_context_packer import (
     MemorySummary,
 )
 from app.core.memory_eligibility import eligible
-from app.core.hybrid_memory_retriever import MemoryScopeViolation
+from app.core.hybrid_memory_retriever import HybridRetrievalResult, MemoryScopeViolation
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQuery
 from app.core.member_identity import GroupMemberIdentity
+
+_PROFILE_MARKERS = ("画像", "介绍", "是什么样的人", "哪里人", "做什么的")
 
 
 logger = logging.getLogger(__name__)
@@ -145,18 +147,27 @@ class MemoryV2ContextProvider:
         resolved = self._resolver.resolve(request.query, **resolve_kwargs)
         resolve_ms = (perf_counter() - resolve_started) * 1000
         retrieval_started = perf_counter()
-        retrieval_result = self._retriever.retrieve(
-            group_id=request.group_id,
-            resolved_query=resolved,
-        )
+        if self._should_skip_retrieval(resolved):
+            # Plain chit-chat/general questions without history or fact intent
+            # do not need memory retrieval; keep the reply grounded in recent
+            # context only and avoid pulling irrelevant facts/raw noise.
+            retrieval_result = HybridRetrievalResult(())
+            candidates: tuple[object, ...] = ()
+            retrieval_skipped = True
+        else:
+            retrieval_result = self._retriever.retrieve(
+                group_id=request.group_id,
+                resolved_query=resolved,
+            )
+            retrieval_skipped = False
+            candidates = (
+                ()
+                if bool(getattr(retrieval_result, "all_channels_failed", False))
+                else tuple(getattr(retrieval_result, "candidates"))
+            )
         # Retrieval accelerators are optional. If every channel is unavailable,
         # keep the request inside the scoped V3 path and emit explicit
         # no-evidence grounding instead of falling into unscoped legacy memory.
-        candidates = (
-            ()
-            if bool(getattr(retrieval_result, "all_channels_failed", False))
-            else tuple(getattr(retrieval_result, "candidates"))
-        )
         if self._candidate_filter is not None:
             candidates = tuple(
                 self._candidate_filter(
@@ -170,6 +181,13 @@ class MemoryV2ContextProvider:
                 candidates=candidates,
                 retrieval_result=retrieval_result,
                 needs_history=resolved.needs_history,
+                profile_intent=(
+                    resolved.answer_mode == "current_fact"
+                    and any(
+                        marker in (resolved.original_query or "")
+                        for marker in _PROFILE_MARKERS
+                    )
+                ),
             )
         )
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
@@ -207,16 +225,24 @@ class MemoryV2ContextProvider:
                 resolved,
             )
         expansion_ms = (perf_counter() - expansion_started) * 1000
-        facts = tuple(
-            self._fact_loader(
-                group_id=request.group_id,
-                resolved_query=resolved,
+        facts = (
+            ()
+            if retrieval_skipped
+            else tuple(
+                self._fact_loader(
+                    group_id=request.group_id,
+                    resolved_query=resolved,
+                )
             )
         )
-        summaries = tuple(
-            self._summary_loader(
-                group_id=request.group_id,
-                resolved_query=resolved,
+        summaries = (
+            ()
+            if retrieval_skipped
+            else tuple(
+                self._summary_loader(
+                    group_id=request.group_id,
+                    resolved_query=resolved,
+                )
             )
         )
         self._validate_derived_scope(
@@ -233,6 +259,7 @@ class MemoryV2ContextProvider:
                 ()
                 if self._historical_no_hit_omit_recent
                 and resolved.needs_history
+                and resolved.time_range is not None
                 and not segments
                 else request.recent_messages
             ),
@@ -243,6 +270,7 @@ class MemoryV2ContextProvider:
         if (
             self._historical_no_hit_omit_recent
             and resolved.needs_history
+            and resolved.time_range is not None
             and packed.recent_messages
             and not packed.evidence_segments
         ):
@@ -394,8 +422,14 @@ class MemoryV2ContextProvider:
         candidates: Sequence[object],
         retrieval_result: object,
         needs_history: bool,
+        profile_intent: bool = False,
     ) -> tuple[tuple[object, ...], str, tuple[str, ...]]:
         available = tuple(candidates)
+        if profile_intent:
+            # Profile/画像 questions should not flood the context with hundreds
+            # of raw segments; keep a small evidence window so profile facts
+            # and recent messages survive packing.
+            return available[:12], "compact", ("profile_intent",)
         if not self._adaptive_context_enabled or not needs_history:
             return available, "legacy", ()
         if not available:
@@ -420,6 +454,19 @@ class MemoryV2ContextProvider:
         if reasons:
             return available, "expanded", tuple(reasons)
         return compact, "compact", ()
+
+    @staticmethod
+    def _should_skip_retrieval(resolved: ResolvedMemoryQuery) -> bool:
+        """True for plain general questions that need no memory retrieval."""
+        if resolved.answer_mode != "general_history":
+            return False
+        if resolved.needs_history or resolved.time_range is not None:
+            return False
+        if getattr(resolved, "preferred_fact_kinds", ()) or ():
+            return False
+        if getattr(resolved, "subject_ids", None) is not None:
+            return False
+        return True
 
     def _eligible_segments(
         self,

@@ -12,7 +12,7 @@ _CJK = re.compile(r"[\u4e00-\u9fff]+")
 
 _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("taboo", "preference"), re.compile(r"讨厌|不喜欢|反感")),
-    (("preference",), re.compile(r"喜欢|偏好|最爱|爱看|爱听|爱吃|爱喝|爱玩")),
+    (("preference",), re.compile(r"喜欢|偏好|最爱|爱看|爱听|爱吃|爱喝|爱玩|主人|称呼")),
     (("running_joke",), re.compile(r"什么梗|有啥梗|有什么梗|梗")),
     (("relationship",), re.compile(r"什么关系|和谁|和什么人|关系")),
     (("plan",), re.compile(r"打算|计划|准备做")),

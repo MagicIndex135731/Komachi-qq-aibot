@@ -366,8 +366,10 @@ class MemoryContextPacker:
 
         selected_summaries: list[MemorySummary] = []
         summary_blocks: list[str] = []
-        # A summary is only a retrieval supplement, never an empty-evidence filler.
-        if selected_segments:
+        # A summary is normally a retrieval supplement; when the summary is
+        # explicitly relevant (time-range overlap / summary intent) it may
+        # stand alone so dated/summary questions still reach the summary layer.
+        if selected_segments or any(summary.relevant for summary in summaries):
             for summary in summaries:
                 if not summary.relevant:
                     continue
@@ -666,7 +668,7 @@ class MemoryContextPacker:
             for segment in remaining_segments:
                 add_segment(segment)
 
-        if selected_segments:
+        if selected_segments or any(summary.relevant for summary in summaries):
             for summary in summaries:
                 if not summary.relevant:
                     continue

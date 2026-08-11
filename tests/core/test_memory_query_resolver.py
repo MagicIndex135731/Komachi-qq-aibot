@@ -2137,6 +2137,74 @@ def test_bare_first_person_viewing_question_binds_requester_without_whitelist() 
     assert result.topic_query == "最近在看什么动画"
 
 
+def test_first_person_profile_portrait_binds_requester() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "给出我的完整个人画像",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+    assert result.topic_query == "画像"
+
+
+def test_ownership_question_binds_requester_and_uses_fact_intent() -> None:
+    resolver = MemoryQueryResolver()
+
+    result = resolver.resolve(
+        "我和逆蝶蝶两个人到底谁是你的主人",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+
+
+def test_ownership_question_with_member_alias_still_binds_requester() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=20001, nickname="N-Zha", group_card="逆蝶蝶"),
+    )
+
+    result = resolver.resolve(
+        "我和逆蝶蝶两个人到底谁是你的主人",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+
+
+def test_member_profile_portrait_is_current_fact_intent() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "给出阿渣的完整个人画像",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.answer_mode == "current_fact"
+    assert result.topic_query == "画像"
+
+
 @pytest.mark.parametrize(
     "query",
     (

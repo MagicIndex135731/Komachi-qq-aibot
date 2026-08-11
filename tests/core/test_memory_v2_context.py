@@ -25,14 +25,24 @@ from app.core.memory_v2_context import MemoryV2ContextProvider, MemoryV2Request
 @dataclass
 class Resolver:
     detail: bool = False
+    time_range: TimeRange | None = None
+    answer_mode: str = "general_history"
+    needs_history: bool = True
+    subject_ids: tuple[str, ...] | None = None
+    preferred_fact_kinds: tuple[str, ...] = ()
+    original_query: str | None = None
 
     def resolve(self, query, **kwargs):
         return ResolvedMemoryQuery(
-            original_query=query,
+            original_query=self.original_query or query,
             retrieval_query=query,
-            needs_history=True,
+            needs_history=self.needs_history,
             needs_detail=self.detail,
             group_id=kwargs.get("group_id"),
+            time_range=self.time_range,
+            answer_mode=self.answer_mode,
+            subject_ids=self.subject_ids,
+            preferred_fact_kinds=self.preferred_fact_kinds,
         )
 
 
@@ -405,7 +415,12 @@ def test_v2_provider_keeps_all_channel_failure_inside_safe_empty_v3_path() -> No
 def test_historical_v3_no_hit_does_not_inject_unrelated_recent_messages() -> None:
     packer = CapturingPacker()
     provider = MemoryV2ContextProvider(
-        resolver=Resolver(),
+        resolver=Resolver(
+            time_range=TimeRange(
+                datetime(2026, 7, 21, 16, 0, tzinfo=UTC),
+                datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+            )
+        ),
         retriever=Retriever(),
         expander=Expander(),
         packer=packer,
@@ -418,10 +433,31 @@ def test_historical_v3_no_hit_does_not_inject_unrelated_recent_messages() -> Non
     assert packer.recent_messages == ()
 
 
-def test_historical_v3_post_validation_empty_does_not_inject_recent() -> None:
+def test_historical_v3_no_hit_keeps_recent_without_time_range() -> None:
     packer = CapturingPacker()
     provider = MemoryV2ContextProvider(
         resolver=Resolver(),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        historical_no_hit_omit_recent=True,
+    )
+
+    provider(request())
+
+    assert packer.recent_messages == request().recent_messages
+
+
+def test_historical_v3_post_validation_empty_does_not_inject_recent() -> None:
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(
+            time_range=TimeRange(
+                datetime(2026, 7, 21, 16, 0, tzinfo=UTC),
+                datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+            )
+        ),
         retriever=TracedRetriever(),
         expander=Expander(),
         packer=packer,
@@ -437,7 +473,12 @@ def test_historical_v3_post_validation_empty_does_not_inject_recent() -> None:
 def test_historical_v3_post_pack_empty_retries_without_recent() -> None:
     packer = PostPackDropPacker()
     provider = MemoryV2ContextProvider(
-        resolver=Resolver(),
+        resolver=Resolver(
+            time_range=TimeRange(
+                datetime(2026, 7, 21, 16, 0, tzinfo=UTC),
+                datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+            )
+        ),
         retriever=TracedRetriever(),
         expander=OneSegmentExpander(),
         packer=packer,
@@ -451,6 +492,54 @@ def test_historical_v3_post_pack_empty_retries_without_recent() -> None:
     assert packer.recent_calls[0]
     assert packer.recent_calls[1] == ()
     assert result.packed_context.recent_messages == ()
+
+
+def test_plain_general_query_skips_retrieval_and_keeps_recent() -> None:
+    class ExplodingRetriever:
+        def retrieve(self, **_):
+            raise AssertionError("retrieval must be skipped for plain general chat")
+
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(
+            needs_history=False,
+            answer_mode="general_history",
+            subject_ids=None,
+        ),
+        retriever=ExplodingRetriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        historical_no_hit_omit_recent=True,
+    )
+
+    result = provider(request())
+
+    assert packer.recent_messages == request().recent_messages
+    assert result.packed_context.evidence_segments == ()
+
+
+def test_profile_intent_queries_cap_expansion_candidates() -> None:
+    expander = CandidateCapturingExpander()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(
+            needs_history=False,
+            answer_mode="current_fact",
+            subject_ids=("100",),
+            original_query="给出阿渣的完整个人画像",
+        ),
+        retriever=TracedRetriever(),
+        expander=expander,
+        packer=Packer(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        adaptive_context_enabled=True,
+    )
+
+    trace = provider.evaluate(request())
+
+    assert trace.expansion_mode == "compact"
+    assert "profile_intent" in trace.expansion_reasons
+    assert len(expander.candidate_ids[0]) == 2
 
 
 def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
