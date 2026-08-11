@@ -25,6 +25,7 @@ data/backups/
 data/*.bundle
 data/filter-replacements.txt
 data/trellis-backup*/
+data/mention-*
 data/napcat/
 data/pytest-temp-*/
 data/tmp/
