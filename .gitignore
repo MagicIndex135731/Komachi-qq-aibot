@@ -24,6 +24,7 @@ data/models/
 data/backups/
 data/*.bundle
 data/filter-replacements.txt
+data/trellis-backup*/
 data/napcat/
 data/pytest-temp-*/
 data/tmp/
@@ -43,6 +44,9 @@ configs/groups.local.yaml
 infra/wsl/.env
 infra/wsl/runtime/
 infra/wsl/.cache/
+
+# Trellis 仅本地维护，永不推送到 GitHub（含历史 journal、任务、spec）
+.trellis/
 
 # Local bot runtime state
 *.qrcode.png
