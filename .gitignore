@@ -22,6 +22,8 @@ data/logs/
 data/memory_eval/
 data/models/
 data/backups/
+data/*.bundle
+data/filter-replacements.txt
 data/napcat/
 data/pytest-temp-*/
 data/tmp/
