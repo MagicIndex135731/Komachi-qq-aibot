@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Protocol, Sequence
 
+from app.core.time_utils import stored_as_utc
+
 
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -43,7 +45,7 @@ def _recency_value(fact: RankableMemoryFact) -> float:
         if value is None:
             continue
         try:
-            return float(value.timestamp())
+            return float(stored_as_utc(value).timestamp())
         except (AttributeError, OSError, ValueError, TypeError):
             continue
     return 0.0

@@ -15,7 +15,7 @@ from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncerta
 from app.core.chat_style import normalize_chat_reply
 from app.core.group_image_generation import ImageJobResult, PrivateImageGenerationRequest, PrivateImageGenerationService
 from app.core.image_turn_resolver import resolve_private_images_for_turn
-from app.core.time_utils import ASIA_SHANGHAI
+from app.core.time_utils import ASIA_SHANGHAI, shanghai_now_naive
 from app.core.persona_engine import render_persona, render_safety_lines
 from app.core.router import (
     AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
@@ -3632,7 +3632,7 @@ class DevControlService:
             messages.add_private_message(
                 platform_msg_id=platform_msg_id,
                 user_id=sender_user_id,
-                timestamp=datetime.now().astimezone(),
+                timestamp=datetime.now(ASIA_SHANGHAI),
                 plain_text=reply_text,
                 raw_json={
                     "direction": "outbound",

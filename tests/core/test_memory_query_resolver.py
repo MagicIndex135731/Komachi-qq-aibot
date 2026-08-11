@@ -2129,10 +2129,10 @@ def test_bare_first_person_viewing_question_binds_requester_without_whitelist() 
         "我最近在看什么动画",
         recent_messages=(),
         now=NOW,
-        requester_id=900000101,
+        requester_id=10001,
     )
 
-    assert result.subject_ids == ("900000101",)
+    assert result.subject_ids == ("10001",)
     assert result.subject_binding == "requester"
     assert result.topic_query == "最近在看什么动画"
 
@@ -2179,10 +2179,10 @@ def test_semantic_rewrite_sets_current_fact_intent_for_viewing_question() -> Non
         "我最近在看什么动画",
         recent_messages=(),
         now=NOW,
-        requester_id=900000101,
+        requester_id=10001,
     )
 
-    assert result.subject_ids == ("900000101",)
+    assert result.subject_ids == ("10001",)
     assert result.subject_binding == "requester"
     assert result.answer_mode == "current_fact"
     assert result.retrieval_query == "最近在看 动画"
@@ -2238,7 +2238,7 @@ def test_semantic_rewrite_accepts_string_time_range_marker() -> None:
         "我最近在看什么动画",
         recent_messages=(),
         now=NOW,
-        requester_id=900000101,
+        requester_id=10001,
     )
 
     assert result.rewrite_used is True
@@ -2426,3 +2426,61 @@ def test_explicit_search_questions_skip_semantic_rewrite() -> None:
     )
 
     assert result.rewrite_used is False
+
+
+def test_dated_member_question_skips_semantic_rewrite() -> None:
+    calls = {"count": 0}
+
+    def rewrite(query, recent, timeout_seconds):
+        calls["count"] += 1
+        return '{"resolved_query":"昨天 阿渣 说了什么"}'
+
+    resolver = MemoryQueryResolver(rewrite_provider=rewrite, rewrite_timeout_seconds=0.25)
+    members = (GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),)
+
+    result = resolver.resolve(
+        "阿渣昨天说了什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert calls["count"] == 0
+    assert result.rewrite_used is False
+    assert result.subject_ids == ("10001",)
+    assert result.time_range is not None
+
+
+def test_rewrite_time_range_cannot_override_deterministic_window() -> None:
+    conflicting = TimeRange(
+        start=datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+        end=datetime(2026, 7, 23, 16, 0, tzinfo=UTC),
+    )
+
+    def rewrite(query, recent, timeout_seconds):
+        del query, recent, timeout_seconds
+        return json.dumps(
+            {
+                "resolved_query": "昨天群里发生了什么",
+                "time_range": {
+                    "start": conflicting.start.isoformat(),
+                    "end": conflicting.end.isoformat(),
+                },
+            }
+        )
+
+    resolver = MemoryQueryResolver(rewrite_provider=rewrite, rewrite_timeout_seconds=0.25)
+
+    result = resolver.resolve(
+        "昨天群里发生了什么",
+        recent_messages=(),
+        now=NOW,
+        group_id=10,
+        requester_id=42,
+    )
+
+    assert result.rewrite_used is True
+    assert result.time_range == TimeRange(
+        start=datetime(2026, 7, 21, 16, 0, tzinfo=UTC),
+        end=datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+    )

@@ -118,6 +118,20 @@ class HybridMemoryRetriever:
         self.channel_timeout_seconds = float(channel_timeout_seconds)
         self.relevance_pin_limit = max(0, int(relevance_pin_limit))
 
+    def _weights_for(self, resolved_query: Any) -> dict[str, float]:
+        """Per-query channel weights; boost facts for profile/preference intent."""
+        weights = dict(self.channel_weights)
+        preferred_kinds = tuple(
+            str(kind) for kind in getattr(resolved_query, "preferred_fact_kinds", ()) or ()
+        )
+        answer_mode = str(getattr(resolved_query, "answer_mode", "") or "")
+        if answer_mode == "current_fact" or any(
+            kind in {"preference", "taboo", "profile", "relationship"}
+            for kind in preferred_kinds
+        ):
+            weights["fact"] = weights.get("fact", 1.0) * 2.5
+        return weights
+
     def retrieve(self, *, group_id: int, resolved_query: Any) -> HybridRetrievalResult:
         if not self.channels:
             return HybridRetrievalResult(())
@@ -214,8 +228,9 @@ class HybridMemoryRetriever:
             )
 
         accumulated: dict[int, dict[str, Any]] = {}
+        active_weights = self._weights_for(resolved_query)
         for channel in channel_names:
-            weight = float(self.channel_weights.get(channel, 1.0))
+            weight = float(active_weights.get(channel, 1.0))
             for rank, item in enumerate(channel_results.get(channel, ()), start=1):
                 state = accumulated.setdefault(
                     item.document_id,

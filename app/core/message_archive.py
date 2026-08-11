@@ -18,7 +18,7 @@ ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 def _as_local_day(value: datetime) -> str:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
+        value = value.replace(tzinfo=ASIA_SHANGHAI)
     return value.astimezone(ASIA_SHANGHAI).date().isoformat()
 
 def append_group_message_archive(

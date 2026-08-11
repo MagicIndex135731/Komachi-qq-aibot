@@ -86,6 +86,27 @@ def test_append_group_message_archive_skips_duplicate_platform_msg_id(tmp_path) 
     ]
 
 
+def test_append_group_message_archive_uses_shanghai_day_for_naive_stored_timestamp(tmp_path) -> None:
+    """A Shanghai-naive 23:58 message stays in its own day, not the next one."""
+    archive_path = append_group_message_archive(
+        history_dir=tmp_path,
+        group_id=10001,
+        timestamp=datetime(2026, 5, 9, 23, 58),
+        platform_msg_id="msg-evening",
+        user_id=10001,
+        nickname="测试",
+        group_card="",
+        plain_text="晚上好",
+        msg_type="text",
+        mentioned_bot=True,
+        reply_to_msg_id=None,
+        direction="inbound",
+        image_local_paths=[],
+    )
+
+    assert archive_path == tmp_path / "group-10001" / "2026-05-09.jsonl"
+
+
 def test_sync_group_message_archives_from_db_rebuilds_allowed_group_history_from_local_database(
     sqlite_engine,
     tmp_path,

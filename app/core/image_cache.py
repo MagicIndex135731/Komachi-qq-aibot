@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 import mimetypes
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
+
+from app.core.image_optimizer import optimize_image_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -49,49 +52,88 @@ def cache_images_in_raw_payload(
     client = http_client or httpx.Client(timeout=15.0, follow_redirects=True)
     target_dir = cache_dir / str(raw_payload.get("group_id", "unknown"))
     target_dir.mkdir(parents=True, exist_ok=True)
+    message_id = str(raw_payload.get("message_id", "message"))
+    image_items = [
+        (index, item)
+        for index, item in enumerate(message)
+        if isinstance(item, dict) and item.get("type") == "image"
+    ]
 
     try:
-        for index, item in enumerate(message):
-            if not isinstance(item, dict) or item.get("type") != "image":
-                continue
-            data = item.setdefault("data", {})
-            if not isinstance(data, dict):
-                continue
-
-            local_path_text = str(data.get("local_path", "")).strip()
-            if local_path_text and Path(local_path_text).exists():
-                continue
-
-            image_url = str(data.get("url", "")).strip()
-            if not image_url:
-                continue
-
-            try:
-                response = client.get(image_url)
-                response.raise_for_status()
-            except Exception:
-                logger.exception("image_cache_download_failed message_id=%s url=%s", raw_payload.get("message_id"), image_url)
-                continue
-
-            media_type = _guess_media_type(image_url=image_url, response=response)
-            if media_type is None or not response.content:
-                logger.warning(
-                    "image_cache_invalid_content message_id=%s url=%s content_type=%s size=%s",
-                    raw_payload.get("message_id"),
-                    image_url,
-                    response.headers.get("content-type"),
-                    len(response.content),
+        if not image_items:
+            return
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(image_items)),
+            thread_name_prefix="image-cache",
+        ) as pool:
+            futures = [
+                pool.submit(
+                    _download_and_cache_one,
+                    index=index,
+                    item=item,
+                    target_dir=target_dir,
+                    message_id=message_id,
+                    http_client=client,
                 )
-                continue
-
-            suffix = _guess_suffix(
-                media_type=media_type,
-                file_id=str(data.get("file", "")).strip() or None,
-                image_url=image_url,
-            )
-            cached_path = target_dir / f"{raw_payload.get('message_id', 'message')}-{index}{suffix}"
-            cached_path.write_bytes(response.content)
-            data["local_path"] = str(cached_path)
+                for index, item in image_items
+            ]
+            for future in futures:
+                future.result()
     finally:
         if owns_client:
             client.close()
+
+
+def _download_and_cache_one(
+    *,
+    index: int,
+    item: dict[str, Any],
+    target_dir: Path,
+    message_id: str,
+    http_client: httpx.Client,
+) -> None:
+    if not isinstance(item, dict) or item.get("type") != "image":
+        return
+    data = item.setdefault("data", {})
+    if not isinstance(data, dict):
+        return
+
+    local_path_text = str(data.get("local_path", "")).strip()
+    if local_path_text and Path(local_path_text).exists():
+        return
+
+    image_url = str(data.get("url", "")).strip()
+    if not image_url:
+        return
+
+    try:
+        response = http_client.get(image_url)
+        response.raise_for_status()
+    except Exception:
+        logger.exception("image_cache_download_failed message_id=%s url=%s", message_id, image_url)
+        return
+
+    media_type = _guess_media_type(image_url=image_url, response=response)
+    if media_type is None or not response.content:
+        logger.warning(
+            "image_cache_invalid_content message_id=%s url=%s content_type=%s size=%s",
+            message_id,
+            image_url,
+            response.headers.get("content-type"),
+            len(response.content),
+        )
+        return
+
+    content = response.content
+    optimized = optimize_image_bytes(content, media_type=media_type)
+    if optimized is not None:
+        content, media_type = optimized
+
+    suffix = _guess_suffix(
+        media_type=media_type,
+        file_id=str(data.get("file", "")).strip() or None,
+        image_url=image_url,
+    )
+    cached_path = target_dir / f"{message_id}-{index}{suffix}"
+    cached_path.write_bytes(content)
+    data["local_path"] = str(cached_path)

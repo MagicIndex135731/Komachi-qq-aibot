@@ -273,6 +273,70 @@ def test_prompt_builder_has_localized_schema_and_citable_messages() -> None:
     assert "[m-2] Alice likes hotpot" in english
 
 
+def test_prompt_builder_includes_kind_semantic_guidance() -> None:
+    chinese = build_memory_compaction_prompt(
+        language="zh",
+        messages=[{"platform_msg_id": "m-1", "plain_text": "hi"}],
+    )
+    english = build_memory_compaction_prompt(
+        language="en",
+        messages=[{"message_id": "m-2", "content": "hi"}],
+    )
+
+    assert "kind 语义" in chinese
+    assert "decision" in chinese
+    assert "称呼规则只能记录提出者本人适用" in chinese
+    assert "Kind semantics" in english
+    assert "Addressing rules may only be recorded when the requester" in english
+
+
+def test_addressing_rule_decision_is_remapped_to_preference() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "digest",
+            "facts": [
+                _fact(
+                    kind="decision",
+                    subject_id="20001",
+                    predicate="称呼规则",
+                    object_text="以后叫我主人",
+                    content="20001: /grill-me 记录并执行以下要求：将对用户“20001”的回复中的称呼统一改为“主人”",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"20001"},
+        source_subject_ids={"m-1": "20001"},
+    )
+
+    assert len(result.facts) == 1
+    assert result.facts[0].kind == "preference"
+
+
+def test_cross_person_addressing_rule_is_dropped() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "digest",
+            "facts": [
+                _fact(
+                    kind="preference",
+                    subject_id="10001",
+                    predicate="称呼规则",
+                    object_text="以后叫逆蝶蝶主人",
+                    content="10001: 记录并执行：将对用户“20002”的回复中的称呼统一改为“主人”",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"10001"},
+        source_subject_ids={"m-1": "10001"},
+    )
+
+    assert result.facts == ()
+
+
 def test_structured_digest_is_deterministic_and_never_nests_rolling_labels() -> None:
     fact = MemoryFact(
         kind="preference",

@@ -401,7 +401,7 @@ class UserRepository:
         user = self.session.get(User, user_id) or User(user_id=user_id)
         user.nickname = nickname
         user.group_card = group_card
-        now = datetime.now().astimezone()
+        now = shanghai_now_naive()
         user.first_seen_at = user.first_seen_at or now
         user.last_seen_at = now
         self.session.add(user)
@@ -819,6 +819,7 @@ class MessageRepository:
         since: datetime,
         limit: int,
     ) -> list[Message]:
+        since = _normalize_utc_sqlite_timestamp(since)
         stmt = (
             select(Message)
             .where(
@@ -844,6 +845,7 @@ class MessageRepository:
         since: datetime,
         limit: int,
     ) -> list[Message]:
+        since = _normalize_utc_sqlite_timestamp(since)
         stmt = (
             select(Message)
             .where(
@@ -5021,7 +5023,7 @@ class DevSessionRepository:
         return self.session.execute(stmt).scalar_one_or_none()
 
     def create_owner_session(self, *, owner_qq: int, session_mode: str = "project") -> DevSession:
-        now = datetime.now().astimezone()
+        now = shanghai_now_naive()
         dev_session = DevSession(
             owner_qq=owner_qq,
             session_mode=session_mode,
@@ -5038,7 +5040,7 @@ class DevSessionRepository:
         if dev_session is None:
             dev_session = self.create_owner_session(owner_qq=owner_qq, session_mode=session_mode)
         else:
-            dev_session.last_active_at = datetime.now().astimezone()
+            dev_session.last_active_at = shanghai_now_naive()
             self.session.add(dev_session)
         self.session.add(dev_session)
         self.session.flush()
@@ -5067,7 +5069,7 @@ class DevSessionRepository:
         dev_session = self.session.get(DevSession, session_id)
         if dev_session is None:
             return None
-        dev_session.last_active_at = datetime.now().astimezone()
+        dev_session.last_active_at = shanghai_now_naive()
         if summary is not None:
             dev_session.summary = summary
         if last_task_id is not None:
@@ -5092,7 +5094,7 @@ class DevTaskRepository:
         task = DevTask(
             session_id=session_id,
             requested_by_qq=requested_by_qq,
-            requested_at=datetime.now().astimezone(),
+            requested_at=shanghai_now_naive(),
             raw_request_text=raw_request_text,
             intent_type=intent_type,
             status=status,

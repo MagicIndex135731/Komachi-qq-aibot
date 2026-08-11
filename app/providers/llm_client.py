@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.core.image_optimizer import optimize_image_bytes
 from app.core.message_content import ImageAttachment
 from app.providers.image_adapter import (
     FALLBACK_IMAGE_RESPONSE_FORMAT,
@@ -122,8 +123,19 @@ class LlmClient:
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.max_output_tokens = max(1, int(max_output_tokens))
+        total_timeout = max(10.0, float(timeout_seconds))
+        # Cap each retry attempt's silent window (read) below the total so a
+        # stalled upstream burns at most ~90s per attempt instead of the full
+        # total. Attempt count stays unchanged (3).
+        read_timeout = min(90.0, total_timeout)
         self.http_client = http_client or httpx.Client(
-            timeout=max(10.0, float(timeout_seconds)),
+            timeout=httpx.Timeout(
+                timeout=total_timeout,
+                connect=10.0,
+                read=read_timeout,
+                write=min(90.0, max(60.0, total_timeout)),
+                pool=10.0,
+            ),
             trust_env=True,
         )
         self.usage_recorder = usage_recorder
@@ -458,6 +470,10 @@ class LlmClient:
             logger.warning("llm_input_image_local_empty_body local_path=%s file_id=%s", local_path, file_id)
             return None
 
+        optimized = optimize_image_bytes(image_bytes, media_type=media_type)
+        if optimized is not None:
+            image_bytes, media_type = optimized
+
         return {
             "media_type": media_type,
             "data": base64.b64encode(image_bytes).decode("ascii"),
@@ -497,10 +513,14 @@ class LlmClient:
                 logger.warning("llm_input_image_empty_body url=%s file_id=%s", image_url, image.file_id)
                 continue
 
+            content = response.content
+            optimized = optimize_image_bytes(content, media_type=media_type)
+            if optimized is not None:
+                content, media_type = optimized
             encoded_images.append(
                 {
                     "media_type": media_type,
-                    "data": base64.b64encode(response.content).decode("ascii"),
+                    "data": base64.b64encode(content).decode("ascii"),
                 }
             )
         return encoded_images
@@ -571,6 +591,10 @@ class LlmClient:
                 logger.warning("llm_input_image_empty_body url=%s file_id=%s", image_url, image.file_id)
                 continue
 
+            content = response.content
+            optimized = optimize_image_bytes(content, media_type=media_type)
+            if optimized is not None:
+                content, media_type = optimized
             multipart_images.append(
                 (
                     "image",
@@ -580,7 +604,7 @@ class LlmClient:
                             media_type=media_type,
                             index=index,
                         ),
-                        response.content,
+                        content,
                         media_type,
                     ),
                 )
@@ -1196,7 +1220,21 @@ class LlmClient:
 
             content_type = response.headers.get("content-type", "")
             if "text/event-stream" in content_type:
-                return self._extract_responses_result_from_sse(response.text, model=model)
+                sse_result = self._extract_responses_result_from_sse(
+                    response.text,
+                    model=model,
+                )
+                if sse_result.text is not None or sse_result.function_calls:
+                    return sse_result
+                last_error = ValueError("model response did not include output text")
+                logger.warning(
+                    "responses_missing_output attempt=%s sse=True",
+                    attempt,
+                )
+                # The failed attempt already consumed the upstream time;
+                # retry immediately instead of sleeping again. The 3-attempt
+                # budget is unchanged.
+                continue
 
             try:
                 response_data = response.json()
@@ -1212,8 +1250,16 @@ class LlmClient:
                 self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
                 continue
 
-            usage = self._extract_responses_usage(response_data, model=model)
             text = self._extract_responses_text(response_data)
+            if text is None:
+                last_error = ValueError("model response did not include output text")
+                logger.warning(
+                    "responses_missing_output attempt=%s sse=False",
+                    attempt,
+                )
+                # Retry immediately; see the SSE branch above.
+                continue
+            usage = self._extract_responses_usage(response_data, model=model)
             response_id = response_data.get("id") if isinstance(response_data, dict) else None
             return ResponsesStreamResult(text=text, response_id=response_id, usage=usage)
 

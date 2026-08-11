@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import logging
+import re
 from typing import Any, Mapping, Sequence
 
 from app.core.memory_compaction import canonical_key
+from app.core.time_utils import ASIA_SHANGHAI
 from app.core.memory_tools import (
     MEMORY_TOOL_KINDS,
     MEMORY_TOOL_LIMIT_MAX,
@@ -29,6 +31,30 @@ logger = logging.getLogger(__name__)
 PROFILE_KINDS = frozenset({"profile", "fact", "preference", "taboo", "relationship"})
 SUMMARY_LEVELS = ("episode", "semantic_window", "semantic_daily")
 MAX_ITEM_CHARS = 500
+_RELATIVE_DAY_PATTERN = re.compile(r"昨天|今天|前天|上周")
+
+
+def _relative_day_range(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """Resolve 昨天/今天/前天/上周 to an aware UTC range, if present."""
+    if not _RELATIVE_DAY_PATTERN.search(text):
+        return None
+    local_now = now.astimezone(ASIA_SHANGHAI)
+    local_day = datetime(local_now.year, local_now.month, local_now.day, tzinfo=ASIA_SHANGHAI)
+    if "昨天" in text:
+        start = local_day - timedelta(days=1)
+    elif "今天" in text:
+        start = local_day
+    elif "前天" in text:
+        start = local_day - timedelta(days=2)
+    elif "上周" in text:
+        start = local_day - timedelta(days=local_day.weekday() + 7)
+    else:
+        return None
+    if "上周" in text:
+        end = start + timedelta(days=7)
+    else:
+        end = start + timedelta(days=1)
+    return start.astimezone(UTC), end.astimezone(UTC)
 
 
 def _trim(value: str, *, limit: int = MAX_ITEM_CHARS) -> str:
@@ -117,10 +143,15 @@ class MemoryToolExecutor:
         layer = str(arguments.get("layer") or "all").strip()
         limit = max(1, min(self._max_results, int(arguments.get("limit", self._max_results))))
         member = arguments.get("member")
+        if isinstance(member, str) and not member.strip():
+            # The model may pass an empty member string to mean "no
+            # restriction"; treat it exactly like an absent member.
+            member = None
         member_id = self._resolve_member(member)
         if member is not None and member_id is None:
             return '{"error":"member_unresolved"}'
 
+        time_window = _relative_day_range(query, self._now)
         lines: list[str] = []
         with session_scope(self._engine) as session:
             if layer in {"raw", "all"}:
@@ -131,6 +162,8 @@ class MemoryToolExecutor:
                     limit=limit,
                     document_kinds=("raw_message_v3",),
                     speaker_ids=(str(member_id),) if member_id is not None else None,
+                    start_at=time_window[0] if time_window else None,
+                    end_at=time_window[1] if time_window else None,
                 )
                 for document in rows:
                     message_row = session.get(Message, int(document.source_id))

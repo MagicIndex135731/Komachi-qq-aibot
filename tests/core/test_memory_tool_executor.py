@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from app.core.memory_tool_executor import MemoryToolExecutor
+from app.core.memory_tool_executor import MemoryToolExecutor, _relative_day_range
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupRepository,
@@ -174,6 +174,17 @@ def test_memory_search_member_filter_and_unresolved(sqlite_engine) -> None:
     assert unresolved == '{"error":"member_unresolved"}'
 
 
+def test_memory_search_empty_member_string_is_unrestricted(sqlite_engine) -> None:
+    _seed(sqlite_engine)
+    for member in ("", "   "):
+        output = _executor(sqlite_engine).execute(
+            "memory_search",
+            {"query": "冰美式", "layer": "facts", "member": member},
+        )
+        assert "阿渣喜欢喝冰美式" in output
+        assert "member_unresolved" not in output
+
+
 def test_memory_read_returns_profile_and_recent_count(sqlite_engine) -> None:
     _seed(sqlite_engine)
     output = _executor(sqlite_engine).execute("memory_read", {"member": "阿渣"})
@@ -233,3 +244,19 @@ def test_memory_write_rejects_scope_and_source_violations(sqlite_engine) -> None
         '{"error":"kind is not in the allowed set"}'
     )
     assert executor.execute("unknown_tool", {}) == '{"error":"unknown_tool"}'
+
+
+def test_relative_day_range_resolves_shanghai_days() -> None:
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)  # 2026-08-10 20:00 +08
+
+    yesterday = _relative_day_range("昨天我说了什么", now)
+    assert yesterday is not None
+    assert yesterday[0] == datetime(2026, 8, 8, 16, 0, tzinfo=UTC)
+    assert yesterday[1] == datetime(2026, 8, 9, 16, 0, tzinfo=UTC)
+
+    today = _relative_day_range("今天群聊内容", now)
+    assert today is not None
+    assert today[0] == datetime(2026, 8, 9, 16, 0, tzinfo=UTC)
+    assert today[1] == datetime(2026, 8, 10, 16, 0, tzinfo=UTC)
+
+    assert _relative_day_range("没有时间词", now) is None

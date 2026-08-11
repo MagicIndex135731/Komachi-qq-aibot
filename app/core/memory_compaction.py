@@ -19,6 +19,32 @@ import unicodedata
 _ALLOWED_KINDS = frozenset(
     {"fact", "preference", "taboo", "plan", "decision", "profile", "relationship", "event", "running_joke", "current", "expired"}
 )
+
+KIND_SEMANTIC_GUIDANCE_EN = (
+    "Kind semantics - use exactly one of:\n"
+    "- decision: a user's final/confirmed choice (bought X, cancelled Y, quit Z). "
+    "Never addressing rules, opinions, or chit-chat.\n"
+    "- preference: likes/dislikes, opinions, and behavior rules toward the bot; "
+    "addressing rules ('call me master from now on') belong here with predicate starting with 'addressing rule'.\n"
+    "- plan: intended future action. current: what someone is doing now. event: what happened. "
+    "profile: what kind of person. taboo: must-not topics. relationship: who is who to whom. "
+    "running_joke: recurring in-group joke. fact: durable plain fact.\n"
+    "Addressing rules may only be recorded when the requester is the person the rule applies to; "
+    "never record one member changing how the bot addresses another member.\n"
+)
+
+KIND_SEMANTIC_GUIDANCE_ZH = (
+    "kind 语义（只能选一个）：\n"
+    "- decision：用户已拍板的决定（买了X/取消了Y/不玩Z）；不能放称呼规则、观点或闲聊。\n"
+    "- preference：喜欢/讨厌/观点，以及针对机器人的行为约定；称呼规则放这里，predicate 以“称呼规则”开头。\n"
+    "- plan：打算做的未来事项；current：正在做的事；event：发生过的事；profile：是什么样的人；"
+    "taboo：禁区；relationship：人物关系；running_joke：群内固定梗；fact：普通持久事实。\n"
+    "称呼规则只能记录提出者本人适用的（subject=提出者=被称呼对象）；禁止记录帮别人改称呼的规则。\n"
+)
+
+_ADDRESSING_RULE_MARKERS = re.compile(r"(?:称呼|统一改为|以后|回复时|请叫我|叫我)", re.IGNORECASE)
+_ADDRESSING_TARGET_QQ_PATTERN = re.compile(r"(?:对用户|对|针对)\s*[“\"']?\s*(\d{5,12})")
+
 _MAX_SUMMARY_CHARS = 2_000
 _MAX_FIELD_CHARS = 600
 _MAX_FACTS = 64
@@ -180,6 +206,7 @@ def build_memory_compaction_prompt(
             "The previous digest is context only and is never evidence."
         )
         lines = [instructions]
+        lines.append(KIND_SEMANTIC_GUIDANCE_ZH)
         if previous:
             lines.extend(("Previous digest (context only, not evidence):", previous))
         lines.append("Citable messages:")
@@ -211,6 +238,11 @@ def build_memory_compaction_prompt(
         messages_label = "Citable messages"
 
     lines = [instructions]
+    lines.append(
+        KIND_SEMANTIC_GUIDANCE_ZH
+        if normalized_language == "zh"
+        else KIND_SEMANTIC_GUIDANCE_EN
+    )
     lines.append(
         "重要：不要从机器人（小町/助手）自己的发言中提取用户个人事实；"
         "个人事实的 subject 必须是真实群成员，且该成员是引用来源的作者。"
@@ -282,6 +314,18 @@ def _parse_fact(
     confidence = candidate.get("confidence")
     sources_raw = candidate.get("source_msg_ids")
     valid_until = _parse_valid_until(candidate.get("valid_until"))
+
+    addressing_rule = _ADDRESSING_RULE_MARKERS.search(
+        f"{content} {object_text} {predicate}"
+    ) is not None
+    if addressing_rule and kind == "decision":
+        # 称呼/行为规则是 preference，不是 decision；模型误分类时纠正。
+        kind = "preference"
+    if addressing_rule and kind == "preference" and subject_id != "group":
+        target_match = _ADDRESSING_TARGET_QQ_PATTERN.search(content)
+        if target_match is not None and target_match.group(1) != subject_id:
+            # 规则目标明确是另一个 QQ：fail-closed，禁止“替别人改称呼”。
+            return None
 
     if (
         kind not in _ALLOWED_KINDS

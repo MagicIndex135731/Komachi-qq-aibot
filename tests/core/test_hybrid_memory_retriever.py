@@ -647,3 +647,20 @@ def test_temporal_relevance_pins_leave_room_for_every_time_bucket() -> None:
     assert len(result.candidates) == 60
     assert result.candidates[0].document_id == 100
     assert len({(item.start_at.year, item.start_at.month) for item in result.candidates}) >= 9
+
+
+def test_weights_for_boosts_fact_channel_for_profile_preference_intent() -> None:
+    retriever = HybridMemoryRetriever(channels={})
+    base = retriever.channel_weights["fact"]
+
+    preference_query = SimpleNamespace(
+        preferred_fact_kinds=("preference",),
+        answer_mode="assessment",
+    )
+    generic_query = SimpleNamespace(
+        preferred_fact_kinds=(),
+        answer_mode="general_history",
+    )
+
+    assert retriever._weights_for(preference_query)["fact"] == base * 2.5
+    assert retriever._weights_for(generic_query)["fact"] == base

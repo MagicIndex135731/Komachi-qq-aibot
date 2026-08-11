@@ -36,6 +36,7 @@ _LOOKUP_NORMALIZER = re.compile(
 class GroupMemoryContextRequest(MemoryV2Request):
     current_user_id: int
     use_full_history: bool = False
+    recent_limit: int | None = None
 
     @property
     def query_text(self) -> str:
@@ -162,7 +163,7 @@ class LegacyMemoryContext:
 
             recent_messages = messages.list_recent_group_messages(
                 group_id=request.group_id,
-                limit=self.settings.context_recent_limit,
+                limit=request.recent_limit or self.settings.context_recent_limit,
             )
             full_history_messages = (
                 messages.list_group_messages_chronological(

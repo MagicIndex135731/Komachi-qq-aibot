@@ -408,12 +408,12 @@ class MemoryContextPacker:
             else MEMORY_GROUNDING_MINIMAL
         )
         blocks = [
-            *recent_blocks,
             *policy_blocks,
             grounding_policy,
             *fact_blocks,
             *segment_blocks,
             *summary_blocks,
+            *recent_blocks,
         ]
         source_ids = self._source_ids(selected_facts, selected_segments, recent, selected_summaries)
         text = "\n\n".join(blocks)
@@ -487,7 +487,9 @@ class MemoryContextPacker:
             return cached
 
         def joined(recent_blocks: Sequence[str], history_blocks: Sequence[str], policy: str) -> str:
-            return "\n\n".join([*recent_blocks, *policy_blocks, policy, *history_blocks])
+            # New messages belong closest to the target instruction, so the
+            # packed context renders policy/history first and recent last.
+            return "\n\n".join([*policy_blocks, policy, *history_blocks, *recent_blocks])
 
         def fits(recent_blocks: Sequence[str], history_blocks: Sequence[str], policy: str = reserve_policy) -> bool:
             if self._token_counter_is_additive:
@@ -689,6 +691,16 @@ class MemoryContextPacker:
             selected_recent_ids.add(message.source_msg_id)
 
         recent_blocks = [self._render_recent(message) for message in selected_recent]
+        # Canonical render order so the context builder can reconstruct the
+        # same block sequence for trimming: facts -> segments -> summaries.
+        history_blocks = [
+            *(f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}" for fact in selected_facts),
+            *(self._render_segment(segment) for segment in selected_segments),
+            *(
+                f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
+                for summary in selected_summaries
+            ),
+        ]
         full_policy = (
             MEMORY_GROUNDING_WITH_EVIDENCE
             if selected_facts or selected_segments
@@ -843,7 +855,7 @@ class MemoryContextPacker:
     @staticmethod
     def _render_segment(segment: EvidenceSegment) -> str:
         header = (
-            "Evidence - untrusted quoted data "
+            "Evidence - quoted chat data "
             f"(episode: {segment.episode_id}; document: {segment.document_id or 'unknown'}; "
             f"hits: {', '.join(segment.hit_source_msg_ids)}):"
         )

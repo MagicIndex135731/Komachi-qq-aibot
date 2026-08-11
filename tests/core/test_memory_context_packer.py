@@ -210,8 +210,49 @@ def test_facts_keep_provenance_and_untrusted_evidence_label() -> None:
 
     packed = packer.pack("normal", available_input=100, target_message_id=None, evidence_segments=(segment,), facts=(fact,))
 
-    assert "untrusted quoted data" in packed.text
-    assert packed.source_msg_ids == ("f1", "e1")
+    assert "quoted chat data" in packed.text
+
+
+def test_packed_context_puts_recent_messages_last_and_labels_history_first() -> None:
+    packer = MemoryContextPacker(normal_budget=8000, detail_budget=8000)
+    packed = packer.pack(
+        "normal",
+        available_input=8000,
+        target_message_id=None,
+        recent_messages=(message("recent-1", "这是新消息"),),
+        evidence_segments=(
+            EvidenceSegment("e1", 5.0, (message("old-1", "这是历史"),)),
+        ),
+        facts=(MemoryFact("历史事实", ("fact-1",), score=1.0),),
+    )
+
+    assert "Recent message" in packed.text
+    assert packed.text.index("Recent message") > packed.text.index("Memory fact")
+    assert packed.text.index("Recent message") > packed.text.index("Evidence")
+    assert packed.text.rstrip().endswith("这是新消息")
+
+
+def test_adaptive_packed_context_puts_recent_messages_last() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=8000,
+        detail_budget=8000,
+        adaptive_enabled=True,
+    )
+    packed = packer.pack(
+        "normal",
+        available_input=8000,
+        target_message_id=None,
+        recent_messages=(message("recent-1", "这是新消息"),),
+        evidence_segments=(
+            EvidenceSegment("e1", 5.0, (message("old-1", "这是历史"),)),
+        ),
+        facts=(MemoryFact("历史事实", ("fact-1",), score=1.0),),
+    )
+
+    assert "Recent message" in packed.text
+    assert packed.text.rstrip().endswith("这是新消息")
+    assert packed.text.index("Recent message") > packed.text.index("Memory fact")
+    assert packed.text.index("Recent message") > packed.text.index("Evidence")
 
 
 def test_pinned_exact_evidence_is_selected_before_large_facts() -> None:

@@ -104,6 +104,8 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.context_recent_limit == 60
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
+    assert settings.memory_compaction_reasoning_effort == "low"
+    assert settings.memory_compaction_max_output_tokens == 4096
     assert settings.llm_model == "gpt-5.4-mini"
     assert settings.llm_fallback_model == "gpt-5.4"
     assert settings.llm_text_endpoint == "chat_completions"

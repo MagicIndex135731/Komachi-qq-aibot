@@ -309,7 +309,7 @@ class MemoryCompactionService:
                 if next_run_at is None:
                     return
                 if next_run_at.tzinfo is None:
-                    next_run_at = next_run_at.replace(tzinfo=UTC)
+                    next_run_at = next_run_at.replace(tzinfo=ASIA_SHANGHAI)
                 else:
                     next_run_at = next_run_at.astimezone(UTC)
                 delay = max(0.1, min(30.0, (next_run_at - datetime.now(UTC)).total_seconds()))
@@ -372,10 +372,13 @@ class MemoryCompactionService:
                 return
             day_timestamp = rows[-1].timestamp
             if day_timestamp.tzinfo is None:
-                day_timestamp = day_timestamp.replace(tzinfo=UTC)
+                day_timestamp = day_timestamp.replace(tzinfo=ASIA_SHANGHAI)
+            day_aware = day_timestamp.astimezone(ASIA_SHANGHAI)
+            day_start = day_aware.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+            day_end = day_start + timedelta(days=1)
             day_key = (
                 "semantic-daily:"
-                f"{day_timestamp.astimezone(ASIA_SHANGHAI).date().isoformat()}"
+                f"{day_aware.date().isoformat()}"
             )
             existing_daily = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
@@ -463,9 +466,10 @@ class MemoryCompactionService:
                 summary_key=day_key,
             )
             previous_daily = existing_daily[-1] if existing_daily else None
+            labeled_digest = f"[{day_aware.date().isoformat()} 群聊摘要] {digest}"
             daily_rows = MessageRepository(session).list_group_messages_for_day(
                 group_id=group_id,
-                day=day_timestamp.astimezone(ASIA_SHANGHAI).date(),
+                day=day_aware.date(),
                 excluded_user_ids=self.excluded_user_ids,
             )
             daily_rows = daily_rows or rows
@@ -474,12 +478,16 @@ class MemoryCompactionService:
                 scope_id=str(group_id),
                 summary_level="semantic_daily",
                 summary_key=day_key,
-                start_at=previous_daily.start_at if previous_daily else start_at,
-                end_at=end_at,
+                start_at=(
+                    max(previous_daily.start_at, day_start)
+                    if previous_daily is not None
+                    else day_start
+                ),
+                end_at=min(end_at, day_end),
                 content=(
                     previous_daily.content
                     if previous_daily is not None and compaction.rejected_fact_count > 0
-                    else digest
+                    else labeled_digest
                 ),
                 source_count=len(daily_rows),
                 source_start_msg_id=daily_rows[0].platform_msg_id,

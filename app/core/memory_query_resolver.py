@@ -443,6 +443,7 @@ class MemoryQueryResolver:
                     original,
                     member_bound=True,
                 )
+                and self._semantic_rewrite_needed(plan)
             ):
                 rewritten = self._try_rewrite(original, recent, current_time)
                 if rewritten is not None:
@@ -521,6 +522,7 @@ class MemoryQueryResolver:
             if (
                 self._rewrite_provider is not None
                 and self._should_attempt_semantic_resolution(original)
+                and self._semantic_rewrite_needed(plan)
             ):
                 rewritten = self._try_rewrite(original, recent, current_time)
                 if rewritten is not None:
@@ -1841,12 +1843,26 @@ class MemoryQueryResolver:
         text = str(query or "").strip()
         if len(text) < 4:
             return False
+
         if is_explicit_search_request(text):
             return False
         return bool(re.search(
             r"什么|啥|吗|呢|哪|怎么|如何|多少|几|谁|怎么样|咋样|是不是|有没有",
             text,
         )) or member_bound
+
+    def _semantic_rewrite_needed(self, plan: ResolvedMemoryQuery) -> bool:
+        """Skip the LLM rewrite when deterministic parsing already pinned the
+        subject and a concrete time window.
+
+        Dated member questions are fully determined by rules (subject + day
+        range), so the rewrite call only adds 8-23s of latency without recall.
+        """
+        return not (
+            plan.time_range is not None
+            and bool(plan.subject_ids)
+        )
+
 
     def _apply_semantic_understanding(
         self,
@@ -1916,7 +1932,13 @@ class MemoryQueryResolver:
         if normalized_query:
             merged = replace(merged, retrieval_query=normalized_query)
         if rewritten.time_range is not None:
-            merged = replace(merged, time_range=rewritten.time_range)
+            if plan.time_range is not None and rewritten.time_range != plan.time_range:
+                logger.info(
+                    "memory_rewrite_time_range_conflict_keep_deterministic query=%s",
+                    plan.original_query[:80],
+                )
+            else:
+                merged = replace(merged, time_range=rewritten.time_range)
         if rewritten.subject_role == "requester" and requester_id is not None:
             merged = replace(
                 merged,

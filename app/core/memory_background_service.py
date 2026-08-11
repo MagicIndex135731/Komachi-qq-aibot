@@ -23,7 +23,7 @@ from app.core.episode_topic_judge import (
     judge_topic_switch,
 )
 from app.core.episode_post_segment import post_segment_episode
-from app.core.time_utils import ASIA_SHANGHAI
+from app.core.time_utils import ASIA_SHANGHAI, shanghai_naive
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
@@ -922,7 +922,7 @@ class SqlAlchemyMemoryBackgroundStore:
                     ):
                         document.embedding_status = "failed"
                         document.last_error_code = str(error_code or "")[:96]
-                        document.updated_at = _utc(now).replace(tzinfo=None)
+                        document.updated_at = shanghai_naive(now)
                         session.add(document)
             return will_retry
 

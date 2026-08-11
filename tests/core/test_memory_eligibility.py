@@ -54,6 +54,15 @@ def test_eligible_enforces_group_subject_and_half_open_utc_time() -> None:
     ) is False
 
 
+def test_eligible_interprets_naive_source_as_shanghai_clock_face() -> None:
+    """Stored message timestamps are Shanghai-naive; do not read them as UTC."""
+    # Target day = 2026-07-22 Shanghai (UTC 07-21T16:00Z .. 07-22T16:00Z).
+    evening = Source("m1", 10, 42, datetime(2026, 7, 22, 23, 0))
+
+    assert eligible(evening, plan()) is True
+    assert eligible(replace(evening, sent_at=datetime(2026, 7, 23, 1, 0)), plan()) is False
+
+
 def test_eligible_fails_closed_for_missing_scope_provenance_and_ambiguous_subject() -> None:
     matching = Source("m1", 10, 42, datetime(2026, 7, 22, 8, tzinfo=UTC))
 

@@ -68,6 +68,16 @@ class AppSettings(BaseSettings):
     memory_compaction_max_facts: int = Field(default=24, alias="MEMORY_COMPACTION_MAX_FACTS")
     memory_compaction_retry_limit: int = Field(default=3, alias="MEMORY_COMPACTION_RETRY_LIMIT")
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
+    memory_compaction_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+        default="low",
+        alias="MEMORY_COMPACTION_REASONING_EFFORT",
+    )
+    memory_compaction_max_output_tokens: int = Field(
+        default=4096,
+        ge=256,
+        le=16384,
+        alias="MEMORY_COMPACTION_MAX_OUTPUT_TOKENS",
+    )
     memory_orchestration_v2_enabled: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_V2_ENABLED")
     memory_orchestration_shadow_mode: bool = Field(default=False, alias="MEMORY_ORCHESTRATION_SHADOW_MODE")
     memory_raw_v3_enabled: bool = Field(default=False, alias="MEMORY_RAW_V3_ENABLED")

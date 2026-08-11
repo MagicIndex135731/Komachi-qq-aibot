@@ -23,7 +23,12 @@ def _settings() -> AppSettings:
     )
 
 
-def _request(*, group_id: int = 10001, use_full_history: bool = False) -> LegacyMemoryRequest:
+def _request(
+    *,
+    group_id: int = 10001,
+    use_full_history: bool = False,
+    recent_limit: int | None = None,
+) -> LegacyMemoryRequest:
     return LegacyMemoryRequest(
         group_id=group_id,
         query="送外卖去了 加班",
@@ -34,6 +39,7 @@ def _request(*, group_id: int = 10001, use_full_history: bool = False) -> Legacy
         now=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
         current_user_id=20001,
         use_full_history=use_full_history,
+        recent_limit=recent_limit,
     )
 
 
@@ -159,3 +165,37 @@ def test_legacy_context_full_history_is_group_scoped_and_reports_blocked_output(
     assert any("blocked source text" in line for line in context.full_history_messages)
     assert all("must never cross groups" not in line for line in context.full_history_messages)
     assert "other-group-secret" not in result.selected_source_msg_ids
+
+
+def test_legacy_recent_context_honors_request_recent_limit(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="group", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=10002, nickname="Alice", group_card="")
+        users.upsert_user(user_id=123456789, nickname="Mira", group_card="")
+        for index in range(6):
+            messages.add_group_message(
+                platform_msg_id=f"recent-limit-{index}",
+                group_id=10001,
+                user_id=10002,
+                timestamp=datetime(2026, 5, 9, 10, index, tzinfo=UTC),
+                plain_text=f"msg {index}",
+                raw_json={"sender": {"nickname": "Alice", "card": ""}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+    legacy = LegacyMemoryContext(
+        engine=sqlite_engine,
+        settings=_settings(),
+        bot_user_id=123456789,
+        bot_display_name="Mira",
+    )
+    result = legacy.build_recent_context(_request(recent_limit=3))
+
+    recent = result.packed_context.recent_messages
+    assert len(recent) == 3
+    assert recent[-1].endswith("msg 5")

@@ -1,10 +1,12 @@
 import json
 import base64
+import io
 import logging
 from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 
 from app.providers.llm_client import LlmClient, LlmFunctionCall
 from app.core.message_content import ImageAttachment
@@ -2545,3 +2547,98 @@ def test_llm_client_falls_back_to_url_image_response_format_when_b64_json_is_rej
 
     assert [payload["response_format"] for payload in captured_payloads] == ["b64_json", "url"]
     assert result.images == [{"url": "https://img.example.test/generated.png"}]
+
+
+def test_llm_client_compresses_large_downloaded_image_before_responses_payload() -> None:
+    image = Image.effect_noise((1600, 1200), 100).convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    png_bytes = buffer.getvalue()
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                content=png_bytes,
+                headers={"content-type": "image/png"},
+            )
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            text=_responses_stream_body(response_id="resp_opt_1", text="compressed image reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        responses_only=True,
+        http_client=httpx.Client(transport=transport),
+    )
+
+    text = client.generate_text(
+        ["Target message: Alice: look at this"],
+        images=[ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")],
+    )
+
+    assert text == "compressed image reply"
+    image_part = captured["payload"]["input"][0]["content"][1]
+    assert image_part["type"] == "input_image"
+    data_url = image_part["image_url"]
+    assert data_url.startswith("data:image/jpeg;base64,")
+    assert len(data_url) < len("data:image/png;base64,") + len(base64.b64encode(png_bytes).decode("ascii"))
+
+
+def test_llm_client_retries_responses_missing_output_without_sleeping() -> None:
+    attempts = {"count": 0}
+    sleep_attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return httpx.Response(
+                200,
+                text="data: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            text=_responses_stream_body(response_id="resp_retry_1", text="ok after retry"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        responses_only=True,
+        http_client=httpx.Client(transport=transport),
+    )
+    client._sleep_before_retry = lambda *, attempt, max_attempts: sleep_attempts.append(attempt)
+
+    text = client.generate_text(["Target message: Alice: hi"])
+
+    assert text == "ok after retry"
+    assert attempts["count"] == 2
+    assert sleep_attempts == []
+
+
+def test_llm_client_uses_granular_http_timeouts_when_no_client_provided() -> None:
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        timeout_seconds=180,
+    )
+
+    timeout = client.http_client.timeout
+    assert timeout.connect == 10.0
+    assert timeout.read == 90.0
+    assert timeout.write == 90.0
+    assert timeout.pool == 10.0

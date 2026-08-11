@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from sqlalchemy import text
 
 from app.storage.db import build_engine, create_all, session_scope
+from app.core.time_utils import ASIA_SHANGHAI
 from app.storage.repositories import (
     GroupRepository,
     DevSessionRepository,
@@ -45,6 +46,67 @@ def test_repositories_store_groups_users_and_messages(tmp_path) -> None:
     assert recent[0].plain_text == "@bot hi"
     assert recent[0].mentioned_bot is True
     assert message_count == 1
+
+
+def test_recent_user_messages_since_normalizes_utc_window_to_shanghai_naive(tmp_path) -> None:
+    """A 53-minute-old image must not look like it arrived '3 minutes ago'."""
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+
+    with session_scope(engine) as session:
+        messages = MessageRepository(session)
+        GroupRepository(session).upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        UserRepository(session).upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages.add_group_message(
+            platform_msg_id="old-image",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 8, 9, 23, 58, 22, tzinfo=ASIA_SHANGHAI),
+            plain_text="",
+            raw_json={},
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="recent-text",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 8, 10, 0, 50, 0, tzinfo=ASIA_SHANGHAI),
+            plain_text="看看奶子",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=True,
+        )
+
+    # 2026-08-09 16:48 UTC == 2026-08-10 00:48 +08, i.e. 3 minutes before the text.
+    since = datetime(2026, 8, 9, 16, 48, 13, tzinfo=UTC)
+    with session_scope(engine) as session:
+        rows = MessageRepository(session).list_recent_group_messages_for_user_since(
+            group_id=10001,
+            user_id=20001,
+            since=since,
+            limit=20,
+        )
+
+    platform_ids = [row.platform_msg_id for row in rows]
+    assert "recent-text" in platform_ids
+    assert "old-image" not in platform_ids
+
+
+def test_upsert_user_stores_shanghai_naive_seen_times(tmp_path) -> None:
+    from app.core.time_utils import shanghai_now_naive
+
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+    with session_scope(engine) as session:
+        user = UserRepository(session).upsert_user(user_id=20001, nickname="Alice", group_card="")
+        seen = user.last_seen_at
+
+    assert seen is not None
+    assert seen.tzinfo is None
+    assert abs((shanghai_now_naive() - seen).total_seconds()) < 60
 
 
 def test_message_repository_lists_all_direct_replies_in_group_and_time_order(tmp_path) -> None:

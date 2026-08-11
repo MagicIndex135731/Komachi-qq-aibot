@@ -1,6 +1,7 @@
 ﻿import asyncio
 import json
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import pytest
@@ -4891,6 +4892,26 @@ class FakeProactiveJudgeLlm:
         return "DECISION: no\nREASON: 没意思"
 
 
+class BlockingProactiveJudgeLlm(FakeProactiveJudgeLlm):
+    def __init__(self, *, started: threading.Event, release: threading.Event) -> None:
+        super().__init__(decision=True)
+        self.started = started
+        self.release = release
+
+    def generate_text(
+        self,
+        prompt_lines: list[str],
+        *,
+        conversation_key=None,
+        images=None,
+    ) -> str:
+        self.calls.append(prompt_lines)
+        self.seen_images.append(list(images or []))
+        self.started.set()
+        assert self.release.wait(10)
+        return "DECISION: yes\nREASON: 有槽点"
+
+
 class AlwaysCandidateReplyPolicy:
     def decide(self, policy_input) -> ReplyDecision:
         del policy_input
@@ -5088,6 +5109,130 @@ async def test_router_throttles_back_to_back_proactive_interjections(sqlite_engi
 
 
 @pytest.mark.asyncio
+async def test_router_proactive_reservation_blocks_concurrent_second_interjection(sqlite_engine, monkeypatch) -> None:
+    """Two near-simultaneous messages must not both produce an interjection."""
+    sender = FakeSender()
+    llm = LongReplyLlm("就这？")
+    started = threading.Event()
+    release = threading.Event()
+    judge = BlockingProactiveJudgeLlm(started=started, release=release)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    async def first_event() -> None:
+        await router.handle_group_message(
+            make_event(
+                group_id=10001,
+                mentioned_bot=False,
+                message_id="race-1",
+                plain_text="这也太贵了吧",
+            )
+        )
+
+    async def second_event() -> None:
+        await router.handle_group_message(
+            make_event(
+                group_id=10001,
+                mentioned_bot=False,
+                message_id="race-2",
+                plain_text="这也太离谱了吧",
+            )
+        )
+
+    first_task = asyncio.create_task(first_event())
+    await asyncio.to_thread(started.wait, 10)
+    await second_event()
+    release.set()
+    await first_task
+
+    assert len(judge.calls) == 1
+    assert len(sender.sent) == 1
+    assert router._proactive_inflight.get(10001) is None
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_acceptance_rate_zero_blocks_after_judge(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("不该发")
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+    router.runtime.group_policy["groups"]["10001"]["proactive_acceptance_rate"] = 0.0
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="accept-zero-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert sender.sent == []
+    assert llm.calls == []
+    assert len(judge.calls) == 1
+    assert router._proactive_inflight.get(10001) is None
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_acceptance_rate_is_deterministic_per_message(sqlite_engine, monkeypatch) -> None:
+    import zlib
+
+    sender = FakeSender()
+    llm = LongReplyLlm("就这？")
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+    router.runtime.group_policy["groups"]["10001"]["proactive_acceptance_rate"] = 0.5
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    results: dict[str, bool] = {}
+    for index in range(20):
+        message_id = f"accept-roll-{index}"
+        event = make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id=message_id,
+            plain_text="这也太贵了吧",
+        )
+        first = router._prepare_group_reply(event, quoted_raw_payload=None)
+        if first.should_reply:
+            router._release_proactive_slot(group_id=10001)
+        second = router._prepare_group_reply(event, quoted_raw_payload=None)
+        if second.should_reply:
+            router._release_proactive_slot(group_id=10001)
+        assert first.should_reply == second.should_reply
+        results[message_id] = first.should_reply
+
+    accepted = sum(1 for value in results.values() if value)
+    assert 0 < accepted < len(results)
+    # Same message id always lands on the same roll (stable seed).
+    assert results["accept-roll-0"] == (
+        zlib.crc32("accept-roll-0".encode("utf-8")) % 10000 < 5000
+    )
+
+
+@pytest.mark.asyncio
 async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = LongReplyLlm("就这？")
@@ -5121,3 +5266,37 @@ async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, 
     assert "Proactive interjections must react only to the recent messages" in "\n".join(
         llm.calls[0]
     )
+
+
+def test_router_injects_active_addressing_rule_for_user(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("ok")
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    with session_scope(sqlite_engine) as session:
+        MemoryRepository(session).upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="20001",
+            memory_kind="preference",
+            canonical_key="preference|20001|addressing rule|master",
+            predicate="addressing rule",
+            object_text="call me master",
+            content="20001: 以后回复20001时称呼统一改为主人",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=["rule-1"],
+        )
+
+    event = make_event(
+        group_id=10001,
+        mentioned_bot=True,
+        message_id="rule-q",
+        user_id=20001,
+        plain_text="你好",
+    )
+    prepared = router._prepare_group_reply(event, quoted_raw_payload=None)
+
+    prompt = "\n".join(prepared.prompt_lines or [])
+    assert "Active addressing rule for this user" in prompt
+    assert "称呼统一改为主人" in prompt

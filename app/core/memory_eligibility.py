@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Protocol, Sequence
 
 from app.core.memory_query_resolver import MemoryQueryPlan
+from app.core.time_utils import ASIA_SHANGHAI
 
 
 class MemorySource(Protocol):
@@ -23,9 +24,9 @@ _INELIGIBLE_DELIVERY_STATES = frozenset({"reserved", "blocked", "uncertain", "de
 def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
     """Return whether one raw source satisfies every hard query boundary.
 
-    SQLite may return timezone-naive timestamps even for UTC columns, so a
-    naive source timestamp is interpreted as UTC. Query-plan boundaries are
-    always normalized to aware UTC values by the resolver.
+    Message timestamps are stored as a naive Shanghai clock face, so a naive
+    source timestamp is interpreted as Asia/Shanghai. Query-plan boundaries
+    are always normalized to aware UTC values by the resolver.
     """
 
     if source_message is None or plan.group_id is None:
@@ -144,5 +145,5 @@ def _source_time(source: object) -> datetime | None:
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        return value.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
     return value.astimezone(UTC)

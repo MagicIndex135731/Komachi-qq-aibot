@@ -8,6 +8,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -61,13 +62,17 @@ def validate_retrieval_vector_table_name(
 
 
 def build_engine(sqlite_path: Path) -> Engine:
-    engine = create_engine(f"sqlite:///{sqlite_path}", future=True)
+    engine = create_engine(
+        f"sqlite:///{sqlite_path}",
+        future=True,
+        connect_args={"timeout": 30},
+    )
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON;")
-        cursor.execute("PRAGMA busy_timeout=5000;")
+        cursor.execute("PRAGMA busy_timeout=30000;")
         cursor.close()
         try:
             import sqlite_vec
@@ -91,15 +96,29 @@ def create_all(engine: Engine) -> None:
     # ALTERs. Protecting only the ALTER phase leaves a fresh-database race
     # where two processes both observe a missing table before either creates
     # it.
-    with engine.connect() as connection:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+    last_error: Exception | None = None
+    for attempt in range(1, 9):
         try:
-            Base.metadata.create_all(connection)
-            _apply_schema_migrations(connection)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+            with engine.connect() as connection:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                try:
+                    Base.metadata.create_all(connection)
+                    _apply_schema_migrations(connection)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            last_error = None
+            break
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            last_error = exc
+            if attempt < 8:
+                time.sleep(1.5 * attempt)
+    if last_error is not None:
+        raise last_error
     _initialize_optional_memory_fts(engine)
     _initialize_optional_retrieval_fts(engine)
     _initialize_optional_memory_vectors(engine)
