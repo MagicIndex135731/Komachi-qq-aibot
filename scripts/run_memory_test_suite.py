@@ -314,6 +314,24 @@ def stage_fullchain(
 ) -> dict[str, Any]:
     cases = fullchain._load_cases(workdir / "cases.jsonl")
     engine = _engine(database)
+    output = workdir / "fullchain-results.jsonl"
+    detail_path = workdir / "fullchain-results.detail.jsonl"
+    # Recover rows from an interrupted run before resuming so checkpointed
+    # rows are never lost when --resume skips already-completed cases.
+    if detail_path.exists():
+        recovered: list[dict[str, Any]] = []
+        for line in detail_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and value.get("case_id"):
+                recovered.append(value)
+        if recovered:
+            fullchain._merge_results(output, recovered)
     rows, summary = fullchain.run_cases(
         engine,
         cases,
@@ -335,8 +353,8 @@ def stage_fullchain(
         aux_model=aux_model,
         aux_effort=aux_effort,
         progress_path=workdir / "progress-fullchain.jsonl",
+        detail_path=detail_path,
     )
-    output = workdir / "fullchain-results.jsonl"
     if rows:
         fullchain._merge_results(output, rows)
     metrics = fullchain_metrics(rows) if rows else {}

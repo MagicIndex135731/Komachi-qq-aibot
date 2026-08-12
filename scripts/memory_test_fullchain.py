@@ -451,6 +451,7 @@ def run_cases(
     aux_effort: str = DEFAULT_AUX_EFFORT,
     transport_factory: Callable[[Any], Any] | None = None,
     progress_path: Path | None = None,
+    detail_path: Path | None = None,
     settings: Any | None = None,
     runtime: Any | None = None,
     transport: Any | None = None,
@@ -541,6 +542,10 @@ def run_cases(
             provider_backoff=provider_backoff,
         )
         rows.append(row)
+        if detail_path is not None:
+            detail_path.parent.mkdir(parents=True, exist_ok=True)
+            with detail_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         completed_ok = "provider_failed" not in (
             row.get("protocol_failure_codes") or ()
         )

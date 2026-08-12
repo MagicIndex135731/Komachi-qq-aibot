@@ -104,6 +104,73 @@ def test_run_cases_orchestration_with_fake_case_runner(monkeypatch, tmp_path):
     assert summary2["skipped_resumed"] == 6
 
 
+def test_run_cases_detail_path_appends_rows_and_survives_resume(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+    cases = [
+        {"category": f"c{i % 2}", "query": f"q{i}", "case_id": f"case{i}"}
+        for i in range(8)
+    ]
+    calls: list[str] = []
+
+    def fake_run_case(**kwargs):
+        calls.append(str(kwargs["case_id"]))
+        return {"case_id": str(kwargs["case_id"])}
+
+    monkeypatch.setattr(fullchain, "_run_case", fake_run_case)
+    injected = {
+        "settings": fullchain.SimpleNamespace(bot_qq=123456789),
+        "runtime": object(),
+        "transport": object(),
+    }
+    detail = tmp_path / "detail.jsonl"
+    progress = tmp_path / "progress.jsonl"
+    rows, _ = fullchain.run_cases(
+        None,
+        cases,
+        limit=4,
+        seed=1,
+        cache_dir=tmp_path,
+        progress_path=progress,
+        detail_path=detail,
+        model="m",
+        judge_model="m",
+        **injected,
+    )
+    assert len(rows) == 4
+    first_lines = [
+        json.loads(line) for line in detail.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(first_lines) == 4
+    assert {row["case_id"] for row in first_lines} == {row["case_id"] for row in rows}
+    # Resume executes the remaining cases and appends their rows; previously
+    # checkpointed rows stay in the detail file.
+    rows2, summary2 = fullchain.run_cases(
+        None,
+        cases,
+        limit=8,
+        seed=1,
+        cache_dir=tmp_path,
+        resume=True,
+        progress_path=progress,
+        detail_path=detail,
+        model="m",
+        judge_model="m",
+        **injected,
+    )
+    assert summary2["skipped_resumed"] == 4
+    assert len(rows2) == 4
+    all_lines = [
+        json.loads(line) for line in detail.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(all_lines) == 8
+
+
 def test_generate_with_retries_recovers_and_gives_up():
     class FlakyTransport:
         def __init__(self, failures: int):

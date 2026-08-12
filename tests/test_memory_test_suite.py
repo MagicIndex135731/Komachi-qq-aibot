@@ -2,6 +2,7 @@ import json
 import sqlite3
 
 from scripts.run_memory_test_suite import (
+    stage_fullchain,
     stage_dataset,
     stage_prepare,
     stage_report,
@@ -51,6 +52,69 @@ def test_prepare_and_dataset(tmp_path):
     result = stage_dataset(database, workdir, count=60, seed=1, group_ids=[])
     assert 0 < result["cases"] <= 60
     assert (workdir / "cases.jsonl").exists()
+
+
+def test_stage_fullchain_recovers_interrupted_detail_rows(tmp_path, monkeypatch):
+    from scripts import memory_test_fullchain as fullchain_module
+
+    database = tmp_path / "source.db"
+    _minimal_db(database)
+    workdir = tmp_path / "run"
+    workdir.mkdir()
+    (workdir / "cases.jsonl").write_text(
+        json.dumps({"category": "fact", "query": "q", "case_id": "case-a"})
+        + "\n",
+        encoding="utf-8",
+    )
+    detail = workdir / "fullchain-results.detail.jsonl"
+    detail.write_text(
+        json.dumps({"case_id": "case-a", "answer": "ok"}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    output = workdir / "fullchain-results.jsonl"
+    output.write_text(
+        json.dumps({"case_id": "old", "answer": "stale"}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    calls: dict[str, object] = {}
+
+    def fake_run_cases(engine, cases, **kwargs):
+        calls["resume"] = kwargs.get("resume")
+        calls["detail_path"] = kwargs.get("detail_path")
+        return [], {"requested": 1, "executed": 0, "skipped_resumed": 1}
+
+    monkeypatch.setattr(fullchain_module, "run_cases", fake_run_cases)
+    stage_fullchain(
+        database,
+        workdir,
+        limit=5,
+        seed=1,
+        model="m",
+        judge_model="m",
+        dry_run=False,
+        resume=True,
+        rewrite_enabled=True,
+        channel_timeout=0.5,
+        input_price_mtok=1.0,
+        output_price_mtok=5.0,
+        provider_attempts=3,
+        provider_backoff=1.0,
+        answer_model="m",
+        answer_effort="low",
+        aux_model="m",
+        aux_effort="low",
+    )
+    merged = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    merged_ids = {row["case_id"] for row in merged}
+    assert "case-a" in merged_ids
+    assert "old" in merged_ids
+    assert calls["resume"] is True
+    assert calls["detail_path"] == detail
 
 
 def test_report_aggregation(tmp_path):
