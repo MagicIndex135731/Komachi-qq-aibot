@@ -459,6 +459,7 @@ class MemoryQueryResolver:
             group_members,
             exclude_user_ids=excluded_member_ids,
             has_time_range=time_range is not None,
+            requester_id=normalized_requester_id,
         )
         if direct_reference.status == "resolved":
             direct_member = direct_reference.member
@@ -692,6 +693,7 @@ class MemoryQueryResolver:
         *,
         exclude_user_ids: set[int] | frozenset[int],
         has_time_range: bool,
+        requester_id: int | str | None = None,
     ) -> GroupMemberReferenceResolution:
         if (
             _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query)
@@ -790,6 +792,7 @@ class MemoryQueryResolver:
             query,
             group_members,
             exclude_user_ids=exclude_user_ids,
+            requester_id=requester_id,
         )
         if explicit_resolution.status == "resolved":
             if explicit_resolution.member is None:
@@ -1061,17 +1064,21 @@ class MemoryQueryResolver:
             exclude_user_ids=exclude_user_ids,
         )
 
+    @staticmethod
     def _classify_explicit_member_ids(
         query: str,
         group_members: Sequence[GroupMemberIdentity],
         *,
         exclude_user_ids: set[int] | frozenset[int],
+        requester_id: int | str | None = None,
     ) -> GroupMemberReferenceResolution:
         member_ids = {
             int(member.user_id)
             for member in group_members
             if member.in_scope
         }
+        if requester_id is not None:
+            member_ids.add(int(requester_id))
         prefixed_ids = tuple(
             int(value)
             for value in re.findall(

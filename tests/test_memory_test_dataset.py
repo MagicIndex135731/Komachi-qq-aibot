@@ -56,6 +56,7 @@ def _make_db(path):
             (3, "group", "1001", "12", "profile", "is", "很会接梗", "逆蝶蝶很会接梗", "p2", '["p2"]', "active"),
             (4, "group", "1001", "11", "plan", "plans", "一键上号", "阿渣打算开发一键上号功能", "p5", '["p5"]', "active"),
             (5, "group", "1001", "11", "plan", "plans", "唱歌", "阿渣打算周六去海雅唱歌", "p6", '["p6"]', "active"),
+            (6, "group", "1001", "group", "event", "happened", "球赛", "群里聊了球赛", "p6", '["p6"]', "active"),
         ],
     )
     connection.executemany(
@@ -108,3 +109,30 @@ def test_temporal_kind_cases_skip_stale_items(tmp_path):
         "p5" not in case["expected_evidence_message_ids"]
         for case in plan_cases
     )
+
+
+def test_group_subject_alias_and_mention_expected_abstention(tmp_path):
+    database = tmp_path / "snapshot.db"
+    _make_db(database)
+    engine = create_engine(
+        f"sqlite:///{database}",
+        connect_args={"timeout": 60},
+        poolclass=NullPool,
+        future=True,
+    )
+    cases = build_cases(engine, count=120, seed=11)
+    group_cases = [
+        case
+        for case in cases
+        if case.get("tags") and "subject=group" in case["tags"]
+    ]
+    assert group_cases
+    assert all("群里" in case["query"] for case in group_cases)
+    assert all(case["allowed_subject_user_ids"] is None for case in group_cases)
+    mention_cases = [case for case in cases if case["category"] == "mention"]
+    assert mention_cases
+    assert all(case["gold_text"] == "" for case in mention_cases)
+    summary_cases = [case for case in cases if case["category"] == "summary"]
+    assert summary_cases
+    assert all("Recent chat summary" not in case["query"] for case in summary_cases)
+    assert all("summary:" not in case["query"] for case in summary_cases)

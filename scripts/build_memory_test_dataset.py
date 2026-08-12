@@ -144,6 +144,11 @@ _KEYWORD_STOP = {
 _LEGACY_NOISE = re.compile(
     r"（QQ昵称|\(QQ昵称| likes | dislikes |\bdis\b|（昵称|\(昵称"
 )
+_SUMMARY_LEVEL_MARKERS = re.compile(
+    r"^\s*(?:(?:recent\s*chat|daily|weekly|monthly|rolling|semantic|window|compact)\s*)?"
+    r"summary\s*[:：\-]?\s*",
+    re.IGNORECASE,
+)
 
 
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
@@ -364,7 +369,13 @@ def _build_fact_case(
     group_id = item["group_id"]
     subject_id = item["subject_id"]
     alias_candidates = aliases.get(int(subject_id), []) if subject_id.isdigit() else []
-    alias = alias_candidates[0] if alias_candidates else f"用户{subject_id}"
+    if alias_candidates:
+        alias = alias_candidates[0]
+    elif subject_id.isdigit():
+        alias = f"用户{subject_id}"
+    else:
+        # Group-scope memory items have no member alias; ask about the group.
+        alias = "群里"
     templates = KIND_TEMPLATES.get(item["kind"], KIND_TEMPLATES["fact"])
     template = templates[index % len(templates)]
     other_id = None
@@ -453,7 +464,9 @@ def _build_mention_case(
         "contract_fields_complete": True,
         "kind": "mention",
         "expected_layer": "raw",
-        "gold_text": "参考证据：" + row["plain_text"][:300],
+        # A real mention is the user's own message, not a factual reference;
+        # a natural grounded reply and a genuine abstention are both valid.
+        "gold_text": "",
         "target_message_id": str(row["id"]),
         "now_iso": row["timestamp"],
         "tags": ("category=mention", "layer=raw", "real_mention=1"),
@@ -497,10 +510,12 @@ def _build_summary_case(
     summary: dict[str, Any],
     index: int,
 ) -> dict[str, Any]:
-    topic = re.sub(r"\s+", "", summary["content"])[:10] or "最近"
-    query = (
-        f"昨天{('说了' if index % 2 else '聊了')}什么关于{topic}"
-    )
+    # Strip generated summary level headers (e.g. "Recent chat summary: ")
+    # before extracting the topic so queries do not echo the header itself.
+    content = _SUMMARY_LEVEL_MARKERS.sub("", summary["content"], count=1)
+    topic = re.sub(r"[\s:：|,，。;；]+", "", content)[:8]
+    topic_suffix = f"关于{topic}" if topic else ""
+    query = f"昨天{('说了' if index % 2 else '聊了')}什么{topic_suffix}"
     return {
         "group_id": summary["group_id"],
         "query": query,

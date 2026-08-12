@@ -374,6 +374,34 @@ def test_explicit_member_qq_binds_and_conflicting_alias_fails_closed() -> None:
     assert conflicting.subject_ids == ()
 
 
+def test_chinese_user_prefix_qq_binds_to_requester_id() -> None:
+    resolver = MemoryQueryResolver()
+    result = resolver.resolve(
+        "用户10002最近决定了什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=(),
+        requester_id=10002,
+    )
+
+    assert result.speaker_ids == ("10002",)
+    assert result.subject_ids == ("10002",)
+
+
+def test_chinese_user_prefix_qq_binds_to_group_member() -> None:
+    resolver = MemoryQueryResolver()
+    members = (GroupMemberIdentity(user_id=10002, nickname="加菲猫"),)
+    result = resolver.resolve(
+        "用户10002最近决定了什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ("10002",)
+    assert result.subject_ids == ("10002",)
+
+
 @pytest.mark.parametrize(
     ("query", "excluded"),
     (

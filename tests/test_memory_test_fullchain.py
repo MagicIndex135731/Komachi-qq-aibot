@@ -198,7 +198,8 @@ def test_build_answer_prompt_requires_citation_per_claim_and_recommendation_abst
     )
     prompt = fullchain.build_answer_prompt(case, packet)
     text = "\n".join(prompt)
-    assert "Every substantive factual claim in answer must be directly" in text
+    assert "Every substantive factual claim in answer must trace to at least" in text
+    assert "partial but supported answer is better than abstaining" in text
     assert "recommendation, opinion" in text
 
 

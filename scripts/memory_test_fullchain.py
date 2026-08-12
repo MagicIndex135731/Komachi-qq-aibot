@@ -30,9 +30,12 @@ from app.main import build_llm_client, build_memory_runtime
 from app.providers.llm_client import LlmClient
 from scripts.memory_v3_quality_contract import FIXED_ABSTENTION_ANSWER
 from scripts.run_memory_v3_quality_replay import (
+    GeneratedAnswer,
     ObservedResponsesTransport,
     QualityReplayError,
+    _generate_citation_repair_with_retry,
     allowed_citation_ids_from_packed_context,
+    build_answer_repair_prompt,
     parse_judge_decision,
 )
 
@@ -282,13 +285,24 @@ def build_answer_prompt(case: Mapping[str, Any], packed: Any) -> list[str]:
             "cited_source_message_ids must be []."
         ),
         (
-            "Every substantive factual claim in answer must be directly "
-            "supported by at least one cited_source_message_id; if a claim "
-            "cannot be cited, omit it. Prefer the smallest sufficient subset "
-            "of evidence. If the question asks for a recommendation, opinion, "
-            "general knowledge, or an action, do not treat conversation "
-            "excerpts as the answer; abstain unless the packet directly "
-            "contains what is requested."
+            "Every substantive factual claim in answer must trace to at least "
+            "one cited_source_message_id; you may synthesize a claim from "
+            "several facts or summaries and cite the smallest subset that "
+            "directly supports it, and every distinct factual clause needs "
+            "its own citation: leaving any clause uncited is a failure. "
+            "Prefer the smallest sufficient subset of "
+            "evidence. If only part of the packet is relevant, answer with "
+            "exactly that part; do not demand a complete picture before "
+            "answering. For open-ended questions (recent activity, plans, "
+            "decisions, events, profiles, preferences, mentions, summaries), "
+            "answer from the evidence you have even when it is incomplete: a "
+            "partial but supported answer is better than abstaining. Abstain "
+            "only when the packet contains no relevant evidence at all for "
+            "the question. If the question asks for a recommendation, "
+            "opinion, general knowledge, or an action, do not answer from "
+            "conversation excerpts unless the packet contains relevant "
+            "personal facts or preferences about the person; otherwise "
+            "abstain."
         ),
         f"Question:\n{case['query']}",
         "Retrieved memory packet:\n" + _packet_text(packed),
@@ -672,6 +686,45 @@ def _run_case(
         for value in tuple(getattr(packed, "source_msg_ids", ()))
         if str(value)
     ]
+    if not protocol_failures and not abstained:
+        packet_id_set = set(packet_source_ids)
+        if not cited_ids or any(str(value) not in packet_id_set for value in cited_ids):
+            try:
+                original_answer = GeneratedAnswer(
+                    answer=answer_text,
+                    cited_source_message_ids=tuple(cited_ids),
+                    abstained=abstained,
+                )
+                repair_prompt = build_answer_repair_prompt(
+                    original_prompt=answer_prompt,
+                    answer=original_answer,
+                    protocol_failure_codes=(
+                        ("citation_missing",)
+                        if not cited_ids
+                        else ("citation_outside_allowlist",)
+                    ),
+                )
+                outcome = _generate_citation_repair_with_retry(
+                    aux_transport,
+                    repair_prompt,
+                    model=judge_model,
+                    attempts=provider_attempts,
+                    original_answer=original_answer,
+                    allowed_citation_ids=allowed_ids,
+                )
+            except QualityReplayError:
+                outcome = None
+            if (
+                outcome is not None
+                and not outcome.protocol_failure_codes
+                and outcome.answer.answer == answer_text
+                and outcome.answer.abstained == abstained
+                and tuple(outcome.answer.cited_source_message_ids) != tuple(cited_ids)
+            ):
+                answer_text = outcome.answer.answer
+                cited_ids = tuple(outcome.answer.cited_source_message_ids)
+                abstained = outcome.answer.abstained
+                repaired = True
     raw_decision = None
     cached_judge = None
     judge_prompt: list[str] = []
