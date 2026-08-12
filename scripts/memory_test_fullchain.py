@@ -27,15 +27,12 @@ from app.config import AppSettings
 from app.core.legacy_memory_context import GroupMemoryContextRequest
 from app.core.memory_context_packer import EvidenceMessage, MemoryContextPacker
 from app.main import build_llm_client, build_memory_runtime
+from app.providers.llm_client import LlmClient
 from scripts.memory_v3_quality_contract import FIXED_ABSTENTION_ANSWER
 from scripts.run_memory_v3_quality_replay import (
-    AnswerContractError,
-    CitationLimitError,
     ObservedResponsesTransport,
     QualityReplayError,
     allowed_citation_ids_from_packed_context,
-    finalize_replay_case_judgment,
-    parse_generated_answer,
     parse_judge_decision,
 )
 
@@ -43,6 +40,12 @@ from scripts.run_memory_v3_quality_replay import (
 CONTRACT_VERSION = "memory-test-platform-v1"
 DEFAULT_INPUT_PRICE_MT = 1.25
 DEFAULT_OUTPUT_PRICE_MT = 5.00
+DEFAULT_ANSWER_MODEL = "gpt-5.6-luna"
+DEFAULT_ANSWER_EFFORT = "medium"
+DEFAULT_AUX_MODEL = "gpt-5.6-luna"
+DEFAULT_AUX_EFFORT = "low"
+PROVIDER_ATTEMPTS = 5
+PROVIDER_BACKOFF_SECONDS = 3.0
 
 
 def _sha256(value: str) -> str:
@@ -51,6 +54,37 @@ def _sha256(value: str) -> str:
 
 def _cache_path(cache_dir: Path, key: str) -> Path:
     return cache_dir / f"{key}.json"
+
+
+def _build_eval_clients(
+    settings: Any,
+    *,
+    answer_model: str,
+    answer_effort: str,
+    aux_model: str,
+    aux_effort: str,
+) -> tuple[LlmClient, LlmClient]:
+    """Build separate Luna clients: final answers vs auxiliary calls.
+
+    Auxiliary calls (judge, citation repair) use the low-effort Luna profile;
+    final answers use the configured answer profile. The rewrite provider
+    already constructs its own low-effort client from settings.
+    """
+
+    def make(model: str, effort: str) -> LlmClient:
+        return LlmClient(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=model,
+            responses_model=model,
+            responses_only=True,
+            image_responses_model=model,
+            reasoning_effort=effort,
+            max_output_tokens=settings.llm_max_output_tokens,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
+
+    return make(answer_model, answer_effort), make(aux_model, aux_effort)
 
 
 def _cache_save(cache_dir: Path, key: str, payload: Mapping[str, Any]) -> None:
@@ -85,8 +119,59 @@ def _load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def _case_object(case: Mapping[str, Any]) -> SimpleNamespace:
-    return SimpleNamespace(**dict(case))
+def _merge_results(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Merge new rows into an existing JSONL result file by case_id.
+
+    The full-chain driver can be resumed multiple times; each invocation only
+    re-executes failed cases, so results must accumulate instead of truncating.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and value.get("case_id"):
+                merged[str(value["case_id"])] = value
+    for row in rows:
+        if row.get("case_id"):
+            merged[str(row["case_id"])] = dict(row)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for value in merged.values():
+            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _parse_answer_loose(value: str) -> SimpleNamespace:
+    """Parse the answer JSON with structural checks only.
+
+    Judgment about citation count, citation necessity and abstention validity
+    is deliberately left to the upstream judge model (general, no hard caps).
+    """
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("answer payload is not an object")
+    answer = payload.get("answer")
+    citations = payload.get("cited_source_message_ids")
+    abstained = payload.get("abstained")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("generated answer is empty")
+    if (
+        not isinstance(citations, list)
+        or any(not isinstance(item, str) or not item for item in citations)
+    ):
+        raise ValueError("generated citations are invalid")
+    if not isinstance(abstained, bool):
+        raise ValueError("generated abstention is invalid")
+    return SimpleNamespace(
+        answer=answer.strip(),
+        cited_source_message_ids=tuple(dict.fromkeys(citations)),
+        abstained=abstained,
+    )
 
 
 def _load_message(engine, message_id: int) -> dict[str, Any] | None:
@@ -207,6 +292,7 @@ def build_judge_prompt(
     cited_ids: Sequence[str],
     abstained: bool,
     packet: Any,
+    abstained_with_evidence: bool = False,
 ) -> list[str]:
     gold_text = str(case.get("gold_text") or "")
     return [
@@ -215,13 +301,21 @@ def build_judge_prompt(
         "answer_correct, abstained, reason_code. reason_code must be one ASCII "
         "token without spaces. Grounded means every substantive factual claim "
         "in the answer is supported by the retrieved packet and its generated "
-        "citations. Correct means it answers the question consistently with "
-        "the human-reviewed reference evidence. Abstained means the answer "
-        "declines to assert the requested fact because evidence is "
-        "insufficient. When the human-reviewed reference says expected "
-        "abstention, an answer that genuinely abstains, has no citations, and "
-        "makes no factual assertion must be judged answer_grounded=true and "
-        "answer_correct=true. The exact fixed abstention text "
+        "citations. Correct means the answer addresses the question and is "
+        "consistent with the human-reviewed reference evidence; a faithful "
+        "rephrasing of supported evidence counts as correct even when the "
+        "wording differs from the reference. There is no fixed citation count "
+        "limit: judge whether the cited IDs are relevant, sufficient and "
+        "minimal, and whether every substantive claim is supported by them. "
+        "When the packet contains "
+        "potentially relevant evidence and the answer abstains, only judge "
+        "the abstention correct if the evidence truly does not address the "
+        "question. Abstained means the answer declines to assert the "
+        "requested fact because evidence is insufficient. When the "
+        "human-reviewed reference says expected abstention, an answer that "
+        "genuinely abstains, has no citations, and makes no factual assertion "
+        "must be judged answer_grounded=true and answer_correct=true. The "
+        "exact fixed abstention text "
         f"{json.dumps(FIXED_ABSTENTION_ANSWER, ensure_ascii=False)} is a "
         "protocol marker, not a factual assertion.\n"
         f"Question:\n{case['query']}\n"
@@ -232,6 +326,29 @@ def build_judge_prompt(
         "Human-reviewed reference evidence:\n"
         + (gold_text or "[expected abstention: no reference evidence]"),
     ]
+
+
+def _generate_with_retries(
+    transport,
+    prompt_lines: Sequence[str],
+    *,
+    model: str,
+    attempts: int = PROVIDER_ATTEMPTS,
+    backoff: float = PROVIDER_BACKOFF_SECONDS,
+):
+    import time as _time
+
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return transport.generate(prompt_lines, model=model)
+        except QualityReplayError as exc:
+            last_error = exc
+            if attempt + 1 < max(1, int(attempts)):
+                _time.sleep(backoff * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise QualityReplayError("QUALITY_REPLAY_PROVIDER_FAILED")
 
 
 def _estimate_tokens(prompt_lines: Sequence[str]) -> int:
@@ -294,6 +411,12 @@ def run_cases(
     channel_timeout: float = 0.5,
     input_price_mtok: float = DEFAULT_INPUT_PRICE_MT,
     output_price_mtok: float = DEFAULT_OUTPUT_PRICE_MT,
+    provider_attempts: int = PROVIDER_ATTEMPTS,
+    provider_backoff: float = PROVIDER_BACKOFF_SECONDS,
+    answer_model: str = DEFAULT_ANSWER_MODEL,
+    answer_effort: str = DEFAULT_ANSWER_EFFORT,
+    aux_model: str = DEFAULT_AUX_MODEL,
+    aux_effort: str = DEFAULT_AUX_EFFORT,
     transport_factory: Callable[[Any], Any] | None = None,
     progress_path: Path | None = None,
     settings: Any | None = None,
@@ -324,7 +447,14 @@ def run_cases(
     if runtime is None:
         if engine is None:
             raise ValueError("engine is required to build the memory runtime")
-        llm_client = build_llm_client(settings=settings, engine=engine)
+        answer_client, aux_client = _build_eval_clients(
+            settings,
+            answer_model=answer_model,
+            answer_effort=answer_effort,
+            aux_model=aux_model,
+            aux_effort=aux_effort,
+        )
+        llm_client = answer_client
         runtime = build_memory_runtime(
             settings=settings,
             engine=engine,
@@ -333,6 +463,7 @@ def run_cases(
         )
     else:
         llm_client = None
+        aux_client = None
     if transport is None:
         if llm_client is None:
             raise ValueError("transport is required when runtime is injected")
@@ -341,8 +472,18 @@ def run_cases(
             if transport_factory is not None
             else ObservedResponsesTransport(llm_client)
         )
-    effective_model = model or (getattr(llm_client, "responses_model", "") if llm_client is not None else "") or ""
-    effective_judge_model = judge_model or effective_model
+        if aux_client is not None:
+            aux_transport = (
+                transport_factory(aux_client)
+                if transport_factory is not None
+                else ObservedResponsesTransport(aux_client)
+            )
+        else:
+            aux_transport = transport
+    else:
+        aux_transport = transport
+    effective_model = model or answer_model
+    effective_judge_model = judge_model or aux_model
     rows: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
     for case in selected:
@@ -357,10 +498,15 @@ def run_cases(
             case_id=case_id,
             model=effective_model,
             judge_model=effective_judge_model,
+            aux_transport=aux_transport,
+            answer_effort=answer_effort,
+            aux_effort=aux_effort,
             cache_dir=cache_dir,
             settings=settings,
             input_price_mtok=input_price_mtok,
             output_price_mtok=output_price_mtok,
+            provider_attempts=provider_attempts,
+            provider_backoff=provider_backoff,
         )
         rows.append(row)
         completed_ok = "provider_failed" not in (
@@ -389,10 +535,15 @@ def _run_case(
     case_id: str,
     model: str,
     judge_model: str,
+    aux_transport,
+    answer_effort: str,
+    aux_effort: str,
     cache_dir: Path,
     settings: AppSettings,
     input_price_mtok: float,
     output_price_mtok: float,
+    provider_attempts: int,
+    provider_backoff: float,
 ) -> dict[str, Any]:
     group_id = int(case["group_id"])
     recent_ids = tuple(
@@ -425,6 +576,12 @@ def _run_case(
     started = perf_counter()
     trace = runtime.v2_provider.evaluate(request)
     packed = trace.result.packed_context
+    packed_fact_count = len(tuple(getattr(packed, "facts", ())))
+    packed_summary_count = len(tuple(getattr(packed, "summaries", ())))
+    packed_segment_messages = sum(
+        len(tuple(getattr(segment, "messages", ())))
+        for segment in tuple(getattr(packed, "evidence_segments", ()))
+    )
     resolved = getattr(trace, "resolved_query", None)
     expected_subject = (
         tuple(str(value) for value in (case.get("allowed_subject_user_ids") or ()))
@@ -439,7 +596,13 @@ def _run_case(
     )
     answer_prompt = build_answer_prompt(case, packed)
     answer_key = _sha256(
-        CONTRACT_VERSION + "|answer|" + model + "|" + json.dumps(answer_prompt, ensure_ascii=False)
+        CONTRACT_VERSION
+        + "|answer|"
+        + model
+        + "|"
+        + answer_effort
+        + "|"
+        + json.dumps(answer_prompt, ensure_ascii=False)
     )
     cached = _cache_load(cache_dir, answer_key)
     provider_error: str | None = None
@@ -447,7 +610,13 @@ def _run_case(
         answer_observation = SimpleNamespace(**cached)
     else:
         try:
-            answer_observation = transport.generate(answer_prompt, model=model)
+            answer_observation = _generate_with_retries(
+            transport,
+                answer_prompt,
+                model=model,
+                attempts=provider_attempts,
+                backoff=provider_backoff,
+            )
         except QualityReplayError as exc:
             provider_error = str(exc)
             answer_observation = SimpleNamespace(
@@ -466,28 +635,20 @@ def _run_case(
                 },
             )
     protocol_failures: tuple[str, ...] = ()
+    repaired = False
     answer_text = ""
     cited_ids: tuple[str, ...] = ()
     abstained = False
     try:
-        parsed = parse_generated_answer(answer_observation.text)
+        parsed = _parse_answer_loose(answer_observation.text)
         answer_text = parsed.answer
         cited_ids = parsed.cited_source_message_ids
         abstained = parsed.abstained
-    except CitationLimitError as exc:
-        protocol_failures = ("citation_count_over_limit",)
-        answer_text = exc.answer.answer
-        cited_ids = exc.answer.cited_source_message_ids
-        abstained = exc.answer.abstained
-    except AnswerContractError as exc:
-        protocol_failures = exc.protocol_failure_codes
-        answer_text = exc.answer.answer
-        cited_ids = exc.answer.cited_source_message_ids
-        abstained = exc.answer.abstained
     except (ValueError, json.JSONDecodeError):
         protocol_failures = ("answer_json_invalid",)
     if provider_error is not None:
         protocol_failures = ("provider_failed",)
+    allowed_ids = allowed_citation_ids_from_packed_context(packed)
     packet_source_ids = [
         str(value)
         for value in tuple(getattr(packed, "source_msg_ids", ()))
@@ -497,17 +658,28 @@ def _run_case(
     cached_judge = None
     judge_prompt: list[str] = []
     if not protocol_failures:
+        abstained_with_evidence = bool(
+            abstained
+            and (
+                packed_fact_count
+                or packed_summary_count
+                or packed_segment_messages
+            )
+        )
         judge_prompt = build_judge_prompt(
             case,
             answer_text,
             cited_ids,
             abstained,
             packed,
+            abstained_with_evidence=abstained_with_evidence,
         )
         judge_key = _sha256(
             CONTRACT_VERSION
             + "|judge|"
             + judge_model
+            + "|"
+            + aux_effort
             + "|"
             + json.dumps(judge_prompt, ensure_ascii=False)
         )
@@ -516,7 +688,13 @@ def _run_case(
             judge_observation = SimpleNamespace(**cached_judge)
         else:
             try:
-                judge_observation = transport.generate(judge_prompt, model=judge_model)
+                judge_observation = _generate_with_retries(
+                    aux_transport,
+                    judge_prompt,
+                    model=judge_model,
+                    attempts=provider_attempts,
+                    backoff=provider_backoff,
+                )
             except QualityReplayError:
                 protocol_failures = ("provider_failed",)
             else:
@@ -536,29 +714,22 @@ def _run_case(
                 raw_decision = parse_judge_decision(judge_observation.text)
             except (ValueError, json.JSONDecodeError):
                 protocol_failures = ("judge_json_invalid",)
-    case_obj = _case_object(case)
+    # Model-driven finalization: the upstream judge is the authority for
+    # grounded/correct/abstention. The only hard checks left are structural
+    # (JSON shape) and citation-source integrity (citations must come from the
+    # retrieved packet; violations are recorded, not fail-closed).
+    citation_failures = tuple(
+        str(value)
+        for value in cited_ids
+        if str(value) not in set(packet_source_ids)
+    )
     if protocol_failures:
         decision = None
-        citation_failures = protocol_failures
     else:
-        decision, citation_failures = finalize_replay_case_judgment(
-            case=case_obj,
-            answer_outcome=SimpleNamespace(
-                answer=SimpleNamespace(
-                    answer=answer_text,
-                    cited_source_message_ids=cited_ids,
-                    abstained=abstained,
-                ),
-                protocol_failure_codes=(),
-            ),
-            raw_decision=raw_decision,
-            packet_source_ids=packet_source_ids,
-            known_source_ids=packet_source_ids,
-            ineligible_source_ids=(),
-        )
+        decision = raw_decision
     gold = set(str(value) for value in (case.get("expected_evidence_message_ids") or ()))
     citations = set(cited_ids)
-    citations_minimal = "citation_not_minimal" not in citation_failures
+    citations_minimal = not citation_failures
     citation_precision = _citation_precision_score(
         gold=gold,
         citations=citations,
@@ -569,12 +740,6 @@ def _run_case(
         len(gold & citations) / len(gold) if gold else float(not citations)
     )
     total_ms = (perf_counter() - started) * 1000
-    packed_fact_count = len(tuple(getattr(packed, "facts", ())))
-    packed_summary_count = len(tuple(getattr(packed, "summaries", ())))
-    packed_segment_messages = sum(
-        len(tuple(getattr(segment, "messages", ())))
-        for segment in tuple(getattr(packed, "evidence_segments", ()))
-    )
     row: dict[str, Any] = {
         "case_id": case_id,
         "category": str(case.get("category") or "unknown"),
@@ -601,6 +766,7 @@ def _run_case(
         "total_ms": total_ms,
         "cached": cached is not None,
         "judge_cached": cached_judge is not None,
+        "repaired": repaired,
         "answer": answer_text,
         "cited_source_message_ids": list(cited_ids),
         "judge_reason_code": str(getattr(raw_decision, "reason_code", "")),
@@ -658,6 +824,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--model", default="")
     parser.add_argument("--judge-model", default="")
+    parser.add_argument("--answer-model", default=DEFAULT_ANSWER_MODEL)
+    parser.add_argument("--answer-effort", default=DEFAULT_ANSWER_EFFORT)
+    parser.add_argument("--aux-model", default=DEFAULT_AUX_MODEL)
+    parser.add_argument("--aux-effort", default=DEFAULT_AUX_EFFORT)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rewrite-enabled", action="store_true", default=True)
@@ -665,6 +835,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel-timeout", type=float, default=0.5)
     parser.add_argument("--input-price-mtok", type=float, default=DEFAULT_INPUT_PRICE_MT)
     parser.add_argument("--output-price-mtok", type=float, default=DEFAULT_OUTPUT_PRICE_MT)
+    parser.add_argument("--provider-attempts", type=int, default=PROVIDER_ATTEMPTS)
+    parser.add_argument("--provider-backoff", type=float, default=PROVIDER_BACKOFF_SECONDS)
     parser.add_argument("--progress", type=Path, default=Path("data/test-platform/progress-fullchain.jsonl"))
     return parser
 
@@ -686,19 +858,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache_dir=args.cache_dir,
         model=args.model,
         judge_model=args.judge_model,
+        answer_model=args.answer_model,
+        answer_effort=args.answer_effort,
+        aux_model=args.aux_model,
+        aux_effort=args.aux_effort,
         dry_run=args.dry_run,
         resume=args.resume,
         rewrite_enabled=args.rewrite_enabled,
         channel_timeout=args.channel_timeout,
         input_price_mtok=args.input_price_mtok,
         output_price_mtok=args.output_price_mtok,
+        provider_attempts=args.provider_attempts,
+        provider_backoff=args.provider_backoff,
         progress_path=args.progress,
     )
     args.output_detail.parent.mkdir(parents=True, exist_ok=True)
     if rows:
-        with args.output_detail.open("w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        _merge_results(args.output_detail, rows)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

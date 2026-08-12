@@ -260,6 +260,11 @@ python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
   --count 3000 --fullchain-limit 300 --dry-run
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --all
 
+# 模型配置：最终回答 Luna medium，judge/修复/改写 Luna low（默认）
+python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
+  --answer-model gpt-5.6-luna --answer-effort medium \
+  --aux-model gpt-5.6-luna --aux-effort low --stage fullchain
+
 # 3) 分阶段 + 断点 + 缓存
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --stage fullchain --resume
 

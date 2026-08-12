@@ -1,6 +1,9 @@
 import json
 
+import pytest
+
 from scripts import memory_test_fullchain as fullchain
+from scripts.run_memory_v3_quality_replay import QualityReplayError
 
 
 def test_stratify_limit_and_seed():
@@ -99,3 +102,84 @@ def test_run_cases_orchestration_with_fake_case_runner(monkeypatch, tmp_path):
     )
     assert rows2 == []
     assert summary2["skipped_resumed"] == 6
+
+
+def test_generate_with_retries_recovers_and_gives_up():
+    class FlakyTransport:
+        def __init__(self, failures: int):
+            self.failures = failures
+            self.calls = 0
+
+        def generate(self, prompt_lines, *, model):
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise QualityReplayError("QUALITY_REPLAY_PROVIDER_FAILED")
+            return {"text": "ok"}
+
+    flaky = FlakyTransport(2)
+    result = fullchain._generate_with_retries(
+        flaky, ["p"], model="m", attempts=3, backoff=0
+    )
+    assert flaky.calls == 3
+    assert result["text"] == "ok"
+
+    dead = FlakyTransport(99)
+    with pytest.raises(QualityReplayError):
+        fullchain._generate_with_retries(dead, ["p"], model="m", attempts=2, backoff=0)
+    assert dead.calls == 2
+
+
+def test_parse_answer_loose_structural_only():
+    parsed = fullchain._parse_answer_loose(
+        json.dumps(
+            {
+                "answer": "答案",
+                "cited_source_message_ids": ["a", "b", "c", "a"],
+                "abstained": False,
+            }
+        )
+    )
+    assert parsed.answer == "答案"
+    assert parsed.cited_source_message_ids == ("a", "b", "c")
+    assert parsed.abstained is False
+    # No hard citation cap or citation-missing rule: judgment belongs to the model.
+    no_citation = fullchain._parse_answer_loose(
+        json.dumps(
+            {"answer": "答案", "cited_source_message_ids": [], "abstained": False}
+        )
+    )
+    assert no_citation.cited_source_message_ids == ()
+    with pytest.raises(ValueError):
+        fullchain._parse_answer_loose('{"answer": "", "cited_source_message_ids": [], "abstained": false}')
+    with pytest.raises(ValueError):
+        fullchain._parse_answer_loose('{"answer": "x", "cited_source_message_ids": "bad", "abstained": false}')
+
+
+def test_merge_results_accumulates_by_case_id(tmp_path):
+    path = tmp_path / "results.jsonl"
+    fullchain._merge_results(path, [{"case_id": "a", "v": 1}])
+    fullchain._merge_results(path, [{"case_id": "b", "v": 2}, {"case_id": "a", "v": 3}])
+    rows = fullchain._load_cases(path)
+    by_id = {row["case_id"]: row for row in rows}
+    assert set(by_id) == {"a", "b"}
+    assert by_id["a"]["v"] == 3
+
+
+def test_build_eval_clients_luna_medium_answer_and_luna_low_aux():
+    class FakeSettings:
+        llm_base_url = "https://api.example.test/v1"
+        llm_api_key = "test-key"
+        llm_max_output_tokens = 4096
+        llm_timeout_seconds = 120.0
+
+    answer_client, aux_client = fullchain._build_eval_clients(
+        FakeSettings(),
+        answer_model="gpt-5.6-luna",
+        answer_effort="medium",
+        aux_model="gpt-5.6-luna",
+        aux_effort="low",
+    )
+    assert answer_client.responses_model == "gpt-5.6-luna"
+    assert answer_client.reasoning_effort == "medium"
+    assert aux_client.responses_model == "gpt-5.6-luna"
+    assert aux_client.reasoning_effort == "low"

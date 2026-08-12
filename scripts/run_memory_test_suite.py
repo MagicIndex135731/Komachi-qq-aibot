@@ -305,6 +305,12 @@ def stage_fullchain(
     channel_timeout: float,
     input_price_mtok: float,
     output_price_mtok: float,
+    provider_attempts: int,
+    provider_backoff: float,
+    answer_model: str,
+    answer_effort: str,
+    aux_model: str,
+    aux_effort: str,
 ) -> dict[str, Any]:
     cases = fullchain._load_cases(workdir / "cases.jsonl")
     engine = _engine(database)
@@ -322,13 +328,17 @@ def stage_fullchain(
         channel_timeout=channel_timeout,
         input_price_mtok=input_price_mtok,
         output_price_mtok=output_price_mtok,
+        provider_attempts=provider_attempts,
+        provider_backoff=provider_backoff,
+        answer_model=answer_model,
+        answer_effort=answer_effort,
+        aux_model=aux_model,
+        aux_effort=aux_effort,
         progress_path=workdir / "progress-fullchain.jsonl",
     )
     output = workdir / "fullchain-results.jsonl"
     if rows:
-        with output.open("w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        fullchain._merge_results(output, rows)
     metrics = fullchain_metrics(rows) if rows else {}
     return {"summary": summary, "metrics": metrics, "output": str(output)}
 
@@ -509,6 +519,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel-timeout", type=float, default=0.5)
     parser.add_argument("--input-price-mtok", type=float, default=fullchain.DEFAULT_INPUT_PRICE_MT)
     parser.add_argument("--output-price-mtok", type=float, default=fullchain.DEFAULT_OUTPUT_PRICE_MT)
+    parser.add_argument("--provider-attempts", type=int, default=fullchain.PROVIDER_ATTEMPTS)
+    parser.add_argument("--provider-backoff", type=float, default=fullchain.PROVIDER_BACKOFF_SECONDS)
+    parser.add_argument("--answer-model", default=fullchain.DEFAULT_ANSWER_MODEL)
+    parser.add_argument("--answer-effort", default=fullchain.DEFAULT_ANSWER_EFFORT)
+    parser.add_argument("--aux-model", default=fullchain.DEFAULT_AUX_MODEL)
+    parser.add_argument("--aux-effort", default=fullchain.DEFAULT_AUX_EFFORT)
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--stress-groups", type=str, default="")
     parser.add_argument("--stress-limit", type=int, default=300)
@@ -572,6 +588,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 channel_timeout=args.channel_timeout,
                 input_price_mtok=args.input_price_mtok,
                 output_price_mtok=args.output_price_mtok,
+                provider_attempts=args.provider_attempts,
+                provider_backoff=args.provider_backoff,
+                answer_model=args.answer_model,
+                answer_effort=args.answer_effort,
+                aux_model=args.aux_model,
+                aux_effort=args.aux_effort,
             )
         elif stage == "stress":
             if not args.stress_groups:
