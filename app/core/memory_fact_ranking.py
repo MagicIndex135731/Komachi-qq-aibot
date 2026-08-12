@@ -23,6 +23,9 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
 )
 
 
+_RECENCY_INTENT_PATTERN = re.compile(r"最近|现在|目前|近期|当下|刚刚|刚")
+
+
 def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...]:
     """Return the fact kinds that match the question intent.
 
@@ -37,6 +40,15 @@ def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...
     if answer_mode == "current_fact":
         return ("preference", "taboo", "profile")
     return ()
+
+
+def temporal_recency_required(*, query: str) -> bool:
+    """True when the query asks about recent or current facts.
+
+    Temporal questions should rank the freshest facts above older
+    high-importance facts so "recent plans" never returns a stale plan.
+    """
+    return bool(_RECENCY_INTENT_PATTERN.search(str(query or "")))
 
 
 def _recency_value(fact: RankableMemoryFact) -> float:
@@ -122,14 +134,16 @@ def rank_member_facts(
     limit: int,
     preferred_kinds: Sequence[str] = (),
     semantic_scores: Mapping[int, float] | None = None,
+    recency_boost: bool = False,
 ) -> list[RankableMemoryFact]:
     """Rank member facts by query relevance, then importance/confidence.
 
     A fact matches when any query feature appears in its content, predicate or
     object text. Facts whose kind is preferred (for example preference/taboo
     when the question asks about likes) outrank non-preferred kinds; matched
-    facts outrank unmatched ones; importance, confidence and id break ties
-    deterministically.
+    facts outrank unmatched ones. With ``recency_boost`` (temporal questions),
+    the freshest facts outrank older facts; otherwise importance, confidence
+    and id break ties deterministically.
     """
     if limit <= 0:
         return []
@@ -144,7 +158,16 @@ def rank_member_facts(
         for fact_id, score in (semantic_scores or {}).items()
     }
     scored: list[
-        tuple[bool, bool, float, float, float, float, int, RankableMemoryFact]
+        tuple[
+            bool,
+            bool,
+            float,
+            tuple[float, float],
+            float,
+            float,
+            int,
+            RankableMemoryFact,
+        ]
     ] = []
     for fact in facts:
         haystack = " ".join(
@@ -161,7 +184,10 @@ def rank_member_facts(
                 kind in preferred,
                 matched,
                 semantic,
-                float(fact.importance or 1),
+                (
+                    recency if recency_boost else 0.0,
+                    float(fact.importance or 1),
+                ),
                 float(fact.confidence or 0.0),
                 recency,
                 int(fact.id or 0),

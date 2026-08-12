@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import random
@@ -81,6 +81,10 @@ KIND_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{alias}怎么说的{obj}",
     ),
 }
+
+TEMPORAL_KINDS = frozenset({"plan", "current", "event", "decision"})
+RECENCY_WINDOW_DAYS = 45
+
 
 FIRST_PERSON_TEMPLATES = (
     "我喜欢什么",
@@ -246,6 +250,50 @@ def _load_summaries(engine) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _recent_item_pool(
+    items: Sequence[dict[str, Any]],
+    messages: Sequence[dict[str, Any]],
+    *,
+    days: int = RECENCY_WINDOW_DAYS,
+) -> list[dict[str, Any]]:
+    """Keep only memory items whose source messages are recent.
+
+    Temporal queries ("最近有什么计划/现在在做什么") must be paired with
+    recent facts; otherwise the gold reference is stale and the judged
+    answer is marked as a mismatch even when it is a correct fresh answer.
+    """
+    if days <= 0 or not items or not messages:
+        return list(items)
+    ts_by_source: dict[str, datetime] = {}
+    latest: datetime | None = None
+    for row in messages:
+        source_id = str(row.get("platform_msg_id") or "")
+        raw_ts = row.get("timestamp")
+        if not source_id or not raw_ts:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        ts_by_source[source_id] = parsed
+        if latest is None or parsed > latest:
+            latest = parsed
+    if latest is None:
+        return list(items)
+    cutoff = latest - timedelta(days=int(days))
+    recent: list[dict[str, Any]] = []
+    for item in items:
+        if any(
+            ts_by_source.get(str(source_id)) is not None
+            and ts_by_source[str(source_id)] >= cutoff
+            for source_id in item.get("source_ids") or ()
+        ):
+            recent.append(item)
+    return recent
 
 
 def _load_messages(engine) -> list[dict[str, Any]]:
@@ -698,6 +746,8 @@ def build_cases(
         messages = [row for row in messages if row["group_id"] in allowed]
     aliases = _load_aliases(engine)
     items = _load_memory_items(engine)
+    recent_items = _recent_item_pool(items, messages)
+    recent_item_ids = {item["id"] for item in recent_items}
     summaries = _load_summaries(engine)
     groups = sorted({row["group_id"] for row in messages})
     if not groups:
@@ -723,10 +773,19 @@ def build_cases(
             by_kind[item["kind"]].append(item)
         while len(cases) < target_fact:
             made = False
-            for kind_items in by_kind.values():
+            for kind, kind_items in by_kind.items():
                 if not kind_items:
                     continue
-                item = kind_items[index % len(kind_items)]
+                pool = (
+                    kind_items
+                    if kind not in TEMPORAL_KINDS
+                    else [
+                        item
+                        for item in kind_items
+                        if item["id"] in recent_item_ids
+                    ]
+                )
+                item = pool[index % len(pool)]
                 cases.append(_build_fact_case(item, aliases, rng, index))
                 made = True
                 index += 1
@@ -738,10 +797,15 @@ def build_cases(
     if items:
         first_index = 0
         while len(cases) < target_fact + target_first:
-            item = items[first_index % len(items)]
+            template = FIRST_PERSON_TEMPLATES[
+                first_index % len(FIRST_PERSON_TEMPLATES)
+            ]
+            temporal = "最近" in template or "现在" in template
+            pool = recent_items if (temporal and recent_items) else items
+            item = pool[first_index % len(pool)]
             cases.append(_build_first_person_case(item, aliases, first_index))
             first_index += 1
-            if first_index >= len(items) * len(FIRST_PERSON_TEMPLATES):
+            if first_index >= len(pool) * len(FIRST_PERSON_TEMPLATES):
                 break
     # 2) Real mention cases.
     for offset, row in enumerate(mention_rows):

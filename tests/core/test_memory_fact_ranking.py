@@ -9,6 +9,7 @@ from app.core.memory_fact_ranking import (
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    temporal_recency_required,
 )
 
 
@@ -193,3 +194,43 @@ def test_rank_member_facts_recency_breaks_ties() -> None:
         limit=3,
     )
     assert [fact.id for fact in ranked] == [2, 1, 3]
+
+def test_temporal_recency_required_detects_recent_intent() -> None:
+    assert temporal_recency_required(query="阿渣最近有什么计划")
+    assert temporal_recency_required(query="茔草现在在忙什么")
+    assert temporal_recency_required(query="最近聊过什么")
+    assert not temporal_recency_required(query="阿渣喜欢什么动画")
+    assert not temporal_recency_required(query="介绍一下阿渣")
+
+
+def test_rank_member_facts_recency_boost_prefers_fresh_facts() -> None:
+    recent = _fact(
+        2,
+        "用户表示下周去考古",
+        importance=1,
+        confidence=0.5,
+        valid_from=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    stale = _fact(
+        1,
+        "用户表示打算开发一键上号功能",
+        importance=9,
+        confidence=0.9,
+        valid_from=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    features = memory_query_features(query="阿渣最近有什么计划")
+    ranked = rank_member_facts(
+        (stale, recent),
+        query_features=features,
+        limit=6,
+        recency_boost=True,
+    )
+    assert [fact.id for fact in ranked] == [2, 1]
+
+    # Without the boost the old high-importance fact still wins.
+    ranked_plain = rank_member_facts(
+        (stale, recent),
+        query_features=features,
+        limit=6,
+    )
+    assert [fact.id for fact in ranked_plain] == [1, 2]

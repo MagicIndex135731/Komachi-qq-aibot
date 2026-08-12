@@ -183,3 +183,38 @@ def test_build_eval_clients_luna_medium_answer_and_luna_low_aux():
     assert answer_client.reasoning_effort == "medium"
     assert aux_client.responses_model == "gpt-5.6-luna"
     assert aux_client.reasoning_effort == "low"
+
+def test_build_answer_prompt_requires_citation_per_claim_and_recommendation_abstention():
+    case = {
+        "query": "阿渣最近有什么计划",
+        "gold_text": "参考",
+        "expected_evidence_message_ids": ["p1"],
+    }
+    packet = fullchain.SimpleNamespace(
+        evidence_segments=(),
+        facts=(),
+        summaries=(),
+        source_msg_ids=("p1",),
+    )
+    prompt = fullchain.build_answer_prompt(case, packet)
+    text = "\n".join(prompt)
+    assert "Every substantive factual claim in answer must be directly" in text
+    assert "recommendation, opinion" in text
+
+
+def test_build_judge_prompt_allows_open_ended_partial_answers():
+    case = {
+        "query": "阿渣最近有什么计划",
+        "gold_text": "参考",
+        "expected_evidence_message_ids": ["p1"],
+    }
+    packet = fullchain.SimpleNamespace(
+        evidence_segments=(),
+        facts=(),
+        summaries=(),
+        source_msg_ids=("p1",),
+    )
+    prompt = fullchain.build_judge_prompt(case, "answer", ("p1",), False, packet)
+    text = "\n".join(prompt)
+    assert "open-ended questions" in text
+    assert "Do not mark reference_mismatch merely because" in text

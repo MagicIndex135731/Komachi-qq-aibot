@@ -38,6 +38,8 @@ def _make_db(path):
             (2, 1001, "p2", 12, "2026-08-01T10:01:00+08:00", "小町 帮我查一下昨天说的计划", None, 1),
             (3, 1001, "p3", 11, "2026-08-01T10:02:00+08:00", "我讨厌吃香菜", None, 0),
             (4, 1002, "p4", 21, "2026-08-01T10:03:00+08:00", "晚上吃什么", None, 0),
+            (5, 1001, "p5", 11, "2026-01-01T10:00:00+08:00", "阿渣打算开发一键上号功能", None, 0),
+            (6, 1001, "p6", 11, "2026-07-20T10:00:00+08:00", "阿渣打算周六去海雅唱歌", None, 0),
         ],
     )
     connection.executemany(
@@ -52,6 +54,8 @@ def _make_db(path):
             (1, "group", "1001", "11", "preference", "likes", "动画", "阿渣喜欢看动画", "p1", '["p1"]', "active"),
             (2, "group", "1001", "11", "taboo", "dislikes", "香菜", "我讨厌吃香菜", "p3", '["p3"]', "active"),
             (3, "group", "1001", "12", "profile", "is", "很会接梗", "逆蝶蝶很会接梗", "p2", '["p2"]', "active"),
+            (4, "group", "1001", "11", "plan", "plans", "一键上号", "阿渣打算开发一键上号功能", "p5", '["p5"]', "active"),
+            (5, "group", "1001", "11", "plan", "plans", "唱歌", "阿渣打算周六去海雅唱歌", "p6", '["p6"]', "active"),
         ],
     )
     connection.executemany(
@@ -87,3 +91,20 @@ def test_build_cases_schema_and_determinism(tmp_path):
     assert any(case["category"] == "abstention" for case in first)
     assert any(case["category"] == "summary" for case in first)
     assert all("case_id" in case and "gold_text" in case for case in first)
+
+def test_temporal_kind_cases_skip_stale_items(tmp_path):
+    database = tmp_path / "snapshot.db"
+    _make_db(database)
+    engine = create_engine(
+        f"sqlite:///{database}",
+        connect_args={"timeout": 60},
+        poolclass=NullPool,
+        future=True,
+    )
+    cases = build_cases(engine, count=80, seed=3)
+    plan_cases = [case for case in cases if case["category"] == "plan"]
+    assert plan_cases
+    assert all(
+        "p5" not in case["expected_evidence_message_ids"]
+        for case in plan_cases
+    )

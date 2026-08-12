@@ -319,6 +319,12 @@ class AppSettings(BaseSettings):
         default=300,
         alias="MEMORY_MAX_EVIDENCE_MESSAGES",
     )
+    memory_recent_intent_candidate_limit: int = Field(
+        default=48,
+        ge=1,
+        le=300,
+        alias="MEMORY_RECENT_INTENT_CANDIDATE_LIMIT",
+    )
     memory_fts_candidate_limit: int = Field(default=30, alias="MEMORY_FTS_CANDIDATE_LIMIT")
     memory_vector_candidate_limit: int = Field(default=30, alias="MEMORY_VECTOR_CANDIDATE_LIMIT")
     memory_final_episode_limit: int = Field(default=12, alias="MEMORY_FINAL_EPISODE_LIMIT")

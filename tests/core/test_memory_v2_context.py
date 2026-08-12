@@ -930,3 +930,43 @@ def test_required_reference_and_mention_segments_are_pinned() -> None:
 
     assert referenced[0].pinned is True
     assert mentioned[0].pinned is True
+
+def test_recent_intent_candidate_limit_compacts_evidence_window() -> None:
+    provider = MemoryV2ContextProvider(
+        resolver=object(),
+        retriever=object(),
+        expander=object(),
+        packer=object(),
+        source_scope_validator=object(),
+        recent_intent_candidate_limit=3,
+    )
+    selected, mode, reasons = provider._select_expansion_candidates(
+        candidates=tuple(range(10)),
+        retrieval_result=object(),
+        needs_history=True,
+        recent_intent=True,
+    )
+    assert mode == "compact"
+    assert reasons == ("recent_intent",)
+    assert len(selected) == 3
+
+    selected_plain, mode_plain, reasons_plain = provider._select_expansion_candidates(
+        candidates=tuple(range(10)),
+        retrieval_result=object(),
+        needs_history=True,
+    )
+    assert mode_plain == "legacy"
+    assert reasons_plain == ()
+    assert len(selected_plain) == 10
+
+
+def test_recent_intent_candidate_limit_rejects_non_positive() -> None:
+    with pytest.raises(ValueError):
+        MemoryV2ContextProvider(
+            resolver=object(),
+            retriever=object(),
+            expander=object(),
+            packer=object(),
+            source_scope_validator=object(),
+            recent_intent_candidate_limit=0,
+        )

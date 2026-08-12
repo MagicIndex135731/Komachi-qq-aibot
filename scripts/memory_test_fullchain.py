@@ -281,6 +281,15 @@ def build_answer_prompt(case: Mapping[str, Any], packed: Any) -> list[str]:
             f"{json.dumps(FIXED_ABSTENTION_ANSWER, ensure_ascii=False)} and "
             "cited_source_message_ids must be []."
         ),
+        (
+            "Every substantive factual claim in answer must be directly "
+            "supported by at least one cited_source_message_id; if a claim "
+            "cannot be cited, omit it. Prefer the smallest sufficient subset "
+            "of evidence. If the question asks for a recommendation, opinion, "
+            "general knowledge, or an action, do not treat conversation "
+            "excerpts as the answer; abstain unless the packet directly "
+            "contains what is requested."
+        ),
         f"Question:\n{case['query']}",
         "Retrieved memory packet:\n" + _packet_text(packed),
     ]
@@ -304,9 +313,18 @@ def build_judge_prompt(
         "citations. Correct means the answer addresses the question and is "
         "consistent with the human-reviewed reference evidence; a faithful "
         "rephrasing of supported evidence counts as correct even when the "
-        "wording differs from the reference. There is no fixed citation count "
-        "limit: judge whether the cited IDs are relevant, sufficient and "
-        "minimal, and whether every substantive claim is supported by them. "
+        "wording differs from the reference. For open-ended questions "
+        "(recent activity, plans, events, profiles, preferences, mentions), "
+        "an answer is correct when it addresses the question, is grounded in "
+        "the packet, and does not contradict the reference; it need not "
+        "mention every reference item or match its wording, and a missing "
+        "reference item is at most incomplete rather than incorrect unless "
+        "the reference is the only direct answer to a specific question. Do "
+        "not mark reference_mismatch merely because the answer uses supported "
+        "evidence different from the reference. There is no fixed citation "
+        "count limit: judge whether the cited IDs are relevant, sufficient "
+        "and minimal, and whether every substantive claim is supported by "
+        "them. "
         "When the packet contains "
         "potentially relevant evidence and the answer abstains, only judge "
         "the abstention correct if the evidence truly does not address the "

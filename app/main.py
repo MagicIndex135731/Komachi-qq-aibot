@@ -38,6 +38,7 @@ from app.core.memory_fact_ranking import (
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    temporal_recency_required,
 )
 from app.core.memory_fact_semantics import SemanticFactRanker
 from app.core.memory_context_packer import (
@@ -935,6 +936,9 @@ def build_memory_runtime(
                         limit=settings.memory_member_fact_supplement_limit,
                         preferred_kinds=preferred_kinds,
                         semantic_scores=semantic_scores,
+                        recency_boost=temporal_recency_required(
+                            query=str(resolved_query.original_query)
+                        ),
                     ):
                         if row.id in seen_ids:
                             continue
@@ -1136,6 +1140,7 @@ def build_memory_runtime(
         ),
         adaptive_context_enabled=settings.memory_adaptive_context_enabled,
         compact_candidate_limit=settings.memory_max_evidence_messages,
+        recent_intent_candidate_limit=settings.memory_recent_intent_candidate_limit,
     )
 
     shadow_evaluator = _DatabaseShadowEvaluator(

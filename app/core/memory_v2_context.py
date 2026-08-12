@@ -19,6 +19,7 @@ from app.core.memory_context_packer import (
 )
 from app.core.memory_eligibility import eligible
 from app.core.hybrid_memory_retriever import HybridRetrievalResult, MemoryScopeViolation
+from app.core.memory_fact_ranking import temporal_recency_required
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQuery
 from app.core.member_identity import GroupMemberIdentity
@@ -105,6 +106,7 @@ class MemoryV2ContextProvider:
         observability_route: str = "",
         adaptive_context_enabled: bool = False,
         compact_candidate_limit: int = 150,
+        recent_intent_candidate_limit: int | None = None,
     ) -> None:
         self._resolver = resolver
         self._retriever = retriever
@@ -125,6 +127,13 @@ class MemoryV2ContextProvider:
             raise ValueError("compact candidate limit must be positive")
         self._adaptive_context_enabled = bool(adaptive_context_enabled)
         self._compact_candidate_limit = int(compact_candidate_limit)
+        if recent_intent_candidate_limit is not None and recent_intent_candidate_limit <= 0:
+            raise ValueError("recent intent candidate limit must be positive")
+        self._recent_intent_candidate_limit = (
+            int(recent_intent_candidate_limit)
+            if recent_intent_candidate_limit is not None
+            else None
+        )
 
     def __call__(self, request: MemoryV2Request) -> MemoryContextResult:
         return self.evaluate(request).result
@@ -187,6 +196,9 @@ class MemoryV2ContextProvider:
                         marker in (resolved.original_query or "")
                         for marker in _PROFILE_MARKERS
                     )
+                ),
+                recent_intent=temporal_recency_required(
+                    query=str(resolved.original_query or "")
                 ),
             )
         )
@@ -423,6 +435,7 @@ class MemoryV2ContextProvider:
         retrieval_result: object,
         needs_history: bool,
         profile_intent: bool = False,
+        recent_intent: bool = False,
     ) -> tuple[tuple[object, ...], str, tuple[str, ...]]:
         available = tuple(candidates)
         if profile_intent:
@@ -430,6 +443,18 @@ class MemoryV2ContextProvider:
             # of raw segments; keep a small evidence window so profile facts
             # and recent messages survive packing.
             return available[:12], "compact", ("profile_intent",)
+        if (
+            self._recent_intent_candidate_limit is not None
+            and recent_intent
+            and available
+        ):
+            # "最近/现在" questions only need a bounded recency window; hundreds
+            # of raw segments drown out the freshest facts and citations.
+            return (
+                available[: self._recent_intent_candidate_limit],
+                "compact",
+                ("recent_intent",),
+            )
         if not self._adaptive_context_enabled or not needs_history:
             return available, "legacy", ()
         if not available:
