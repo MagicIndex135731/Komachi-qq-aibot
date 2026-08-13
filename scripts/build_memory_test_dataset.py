@@ -301,6 +301,59 @@ def _recent_item_pool(
     return recent
 
 
+def _sort_by_source_recency(
+    items: Sequence[dict[str, Any]],
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort items by their latest source-message timestamp, newest first.
+
+    Temporal queries must pair with the freshest fact for the subject;
+    otherwise the gold reference can be stale while the model answers a
+    newer supported fact and gets judged as a mismatch.
+    """
+    ts_by_source: dict[str, datetime] = {}
+    for row in messages:
+        source_id = str(row.get("platform_msg_id") or "")
+        raw_ts = row.get("timestamp")
+        if not source_id or not raw_ts:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        ts_by_source[source_id] = parsed
+
+    def latest_ts(item: Mapping[str, Any]) -> datetime:
+        timestamps = [
+            ts_by_source[str(source_id)]
+            for source_id in item.get("source_ids") or ()
+            if str(source_id) in ts_by_source
+        ]
+        return max(timestamps) if timestamps else datetime.min.replace(tzinfo=UTC)
+
+    return sorted(items, key=latest_ts, reverse=True)
+
+
+def _dedupe_subject_newest(
+    items: Sequence[dict[str, Any]],
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only the freshest memory item per subject.
+
+    Temporal queries ("最近/现在") describe one current state per subject;
+    keeping several facts for the same subject makes the gold ambiguous and
+    produces false reference_mismatch when the model answers a newer fact.
+    """
+    newest_by_subject: dict[str, dict[str, Any]] = {}
+    for item in _sort_by_source_recency(items, messages):
+        subject = str(item.get("subject_id") or "")
+        if subject not in newest_by_subject:
+            newest_by_subject[subject] = item
+    return list(newest_by_subject.values())
+
+
 def _load_messages(engine) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in _iter_rows(
@@ -794,11 +847,14 @@ def build_cases(
                 pool = (
                     kind_items
                     if kind not in TEMPORAL_KINDS
-                    else [
-                        item
-                        for item in kind_items
-                        if item["id"] in recent_item_ids
-                    ]
+                    else _dedupe_subject_newest(
+                        [
+                            item
+                            for item in kind_items
+                            if item["id"] in recent_item_ids
+                        ],
+                        messages,
+                    )
                 )
                 item = pool[index % len(pool)]
                 cases.append(_build_fact_case(item, aliases, rng, index))
@@ -816,7 +872,11 @@ def build_cases(
                 first_index % len(FIRST_PERSON_TEMPLATES)
             ]
             temporal = "最近" in template or "现在" in template
-            pool = recent_items if (temporal and recent_items) else items
+            pool = (
+                _dedupe_subject_newest(recent_items, messages)
+                if (temporal and recent_items)
+                else items
+            )
             item = pool[first_index % len(pool)]
             cases.append(_build_first_person_case(item, aliases, first_index))
             first_index += 1
