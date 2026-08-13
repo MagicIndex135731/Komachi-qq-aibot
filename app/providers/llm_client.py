@@ -161,7 +161,7 @@ class LlmClient:
 
     def _normalize_reasoning_effort(self, value: str) -> str:
         normalized = (value or "").strip().lower()
-        if normalized in {"minimal", "low", "medium", "high"}:
+        if normalized in {"minimal", "low", "medium", "high", "xhigh", "max"}:
             return normalized
         return ""
 

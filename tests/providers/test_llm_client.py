@@ -1779,6 +1779,35 @@ def test_llm_client_can_attach_reasoning_effort_to_responses() -> None:
     assert captured["payload"]["reasoning"] == {"effort": "medium"}
 
 
+@pytest.mark.parametrize("effort", ["high", "xhigh", "max"])
+def test_llm_client_passes_high_and_extra_high_reasoning_effort(effort) -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_reasoning_x", text="deep reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        reasoning_effort=effort,
+        http_client=httpx.Client(transport=transport),
+    )
+
+    text = client.generate_text(["Target message: Alice: think carefully"])
+
+    assert text == "deep reply"
+    assert captured["payload"]["reasoning"] == {"effort": effort}
+
+
 def test_llm_client_logs_responses_tool_events_from_sse(caplog) -> None:
     body = (
         'event: response.created\n'
