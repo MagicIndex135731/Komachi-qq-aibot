@@ -336,24 +336,6 @@ def _sort_by_source_recency(
     return sorted(items, key=latest_ts, reverse=True)
 
 
-def _dedupe_subject_newest(
-    items: Sequence[dict[str, Any]],
-    messages: Sequence[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep only the freshest memory item per subject.
-
-    Temporal queries ("最近/现在") describe one current state per subject;
-    keeping several facts for the same subject makes the gold ambiguous and
-    produces false reference_mismatch when the model answers a newer fact.
-    """
-    newest_by_subject: dict[str, dict[str, Any]] = {}
-    for item in _sort_by_source_recency(items, messages):
-        subject = str(item.get("subject_id") or "")
-        if subject not in newest_by_subject:
-            newest_by_subject[subject] = item
-    return list(newest_by_subject.values())
-
-
 def _load_messages(engine) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in _iter_rows(
@@ -839,6 +821,7 @@ def build_cases(
         by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in items:
             by_kind[item["kind"]].append(item)
+        temporal_index = 0
         while len(cases) < target_fact:
             made = False
             for kind, kind_items in by_kind.items():
@@ -847,7 +830,7 @@ def build_cases(
                 pool = (
                     kind_items
                     if kind not in TEMPORAL_KINDS
-                    else _dedupe_subject_newest(
+                    else _sort_by_source_recency(
                         [
                             item
                             for item in kind_items
@@ -856,7 +839,11 @@ def build_cases(
                         messages,
                     )
                 )
-                item = pool[index % len(pool)]
+                if kind in TEMPORAL_KINDS:
+                    item = pool[temporal_index % len(pool)]
+                    temporal_index += 1
+                else:
+                    item = pool[index % len(pool)]
                 cases.append(_build_fact_case(item, aliases, rng, index))
                 made = True
                 index += 1
@@ -873,7 +860,7 @@ def build_cases(
             ]
             temporal = "最近" in template or "现在" in template
             pool = (
-                _dedupe_subject_newest(recent_items, messages)
+                _sort_by_source_recency(recent_items, messages)
                 if (temporal and recent_items)
                 else items
             )
