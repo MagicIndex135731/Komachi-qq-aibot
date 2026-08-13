@@ -38,7 +38,7 @@ services:
         HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
         NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
     container_name: xiaomachi-bot
-    restart: "no"
+    restart: "unless-stopped"
     network_mode: host
     working_dir: /workspace
     env_file:
