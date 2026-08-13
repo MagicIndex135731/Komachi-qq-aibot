@@ -49,6 +49,22 @@ DEFAULT_AUX_MODEL = "gpt-5.6-luna"
 DEFAULT_AUX_EFFORT = "low"
 PROVIDER_ATTEMPTS = 5
 PROVIDER_BACKOFF_SECONDS = 3.0
+CITATION_REASON_CODES = frozenset(
+    {
+        "unsupported_citation",
+        "insufficient_citation",
+        "insufficient_citations",
+        "citation_insufficient",
+        "invalid_citation",
+        "citation_not_grounded",
+        "missing_citation",
+        "missing_citations",
+        "citation_error",
+        "citation_id_mismatch",
+        "citation_misinterpretation",
+        "citation_missing",
+    }
+)
 
 
 def _sha256(value: str) -> str:
@@ -307,8 +323,9 @@ def build_answer_prompt(case: Mapping[str, Any], packed: Any) -> list[str]:
             "such as 'probably', 'seems', or 'maybe'. If the question asks "
             "for a recommendation, opinion, general knowledge, or an action, "
             "you must abstain unless the packet contains the person's "
-            "explicitly stated relevant preferences or facts; do not treat "
-            "casual chat as an answer to such requests."
+            "explicit statement of that recommendation (for example 'I "
+            "recommend X' or 'watch X'); inferred preferences alone are not "
+            "enough. Do not treat casual chat as an answer to such requests."
         ),
         f"Question:\n{case['query']}",
         "Retrieved memory packet:\n" + _packet_text(packed),
@@ -356,6 +373,11 @@ def build_judge_prompt(
         "incorrect (answer_correct=false) unless the evidence truly does not "
         "address the question. Abstained means the answer declines to assert "
         "the requested fact because evidence is insufficient. When the "
+        "retrieved packet contains only the recent-message fallback window "
+        "and no fact, summary, or search hit that directly addresses the "
+        "question, treat the answer as having no relevant evidence even if "
+        "recent message IDs are present: a fallback window is not evidence. "
+        "When the "
         "human-reviewed reference says expected abstention, an answer that "
         "genuinely abstains, has no citations, and makes no factual assertion "
         "must be judged answer_grounded=true and answer_correct=true. The "
@@ -801,6 +823,74 @@ def _run_case(
             try:
                 raw_decision = parse_judge_decision(judge_observation.text)
             except (ValueError, json.JSONDecodeError):
+                protocol_failures = ("judge_json_invalid",)
+    # v7: when the judge says the only problem is the citations, repair once
+    # (answer text unchanged) and re-judge with the fixed citation IDs.
+    if (
+        not protocol_failures
+        and raw_decision is not None
+        and not repaired
+        and not abstained
+        and str(getattr(raw_decision, "reason_code", "") or "")
+        in CITATION_REASON_CODES
+    ):
+        try:
+            original_answer = GeneratedAnswer(
+                answer=answer_text,
+                cited_source_message_ids=tuple(cited_ids),
+                abstained=abstained,
+            )
+            repair_prompt = build_answer_repair_prompt(
+                original_prompt=answer_prompt,
+                answer=original_answer,
+                protocol_failure_codes=("citation_insufficient",),
+            )
+            outcome = _generate_citation_repair_with_retry(
+                aux_transport,
+                repair_prompt,
+                model=judge_model,
+                attempts=provider_attempts,
+                original_answer=original_answer,
+                allowed_citation_ids=allowed_ids,
+            )
+        except QualityReplayError:
+            outcome = None
+        if (
+            outcome is not None
+            and not outcome.protocol_failure_codes
+            and outcome.answer.answer == answer_text
+            and outcome.answer.abstained == abstained
+            and tuple(outcome.answer.cited_source_message_ids) != tuple(cited_ids)
+        ):
+            answer_text = outcome.answer.answer
+            cited_ids = tuple(outcome.answer.cited_source_message_ids)
+            abstained = outcome.answer.abstained
+            repaired = True
+            try:
+                judge_observation = _generate_with_retries(
+                    aux_transport,
+                    build_judge_prompt(
+                        case,
+                        answer_text,
+                        cited_ids,
+                        abstained,
+                        packed,
+                        abstained_with_evidence=bool(
+                            abstained
+                            and (
+                                packed_fact_count
+                                or packed_summary_count
+                                or packed_segment_messages
+                            )
+                        ),
+                    ),
+                    model=judge_model,
+                    attempts=provider_attempts,
+                    backoff=provider_backoff,
+                )
+                raw_decision = parse_judge_decision(judge_observation.text)
+            except (QualityReplayError, ValueError, json.JSONDecodeError):
+                raw_decision = None
                 protocol_failures = ("judge_json_invalid",)
     # Model-driven finalization: the upstream judge is the authority for
     # grounded/correct/abstention. The only hard checks left are structural
