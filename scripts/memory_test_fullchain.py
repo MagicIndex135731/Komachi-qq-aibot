@@ -28,6 +28,7 @@ from app.core.legacy_memory_context import GroupMemoryContextRequest
 from app.core.memory_context_packer import EvidenceMessage, MemoryContextPacker
 from app.main import build_llm_client, build_memory_runtime
 from app.providers.llm_client import LlmClient
+from app.storage.db import build_engine as _build_engine
 from scripts.memory_v3_quality_contract import FIXED_ABSTENTION_ANSWER
 from scripts.run_memory_v3_quality_replay import (
     GeneratedAnswer,
@@ -1021,12 +1022,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
-    engine = create_engine(
-        f"sqlite:///{args.database}",
-        connect_args={"timeout": 60},
-        poolclass=NullPool,
-        future=True,
-    )
+    engine = _build_engine(args.database)
     cases = _load_cases(args.cases)
     rows, summary = run_cases(
         engine,

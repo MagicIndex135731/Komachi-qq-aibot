@@ -32,6 +32,7 @@ from sqlalchemy.pool import NullPool
 from app.config import AppSettings
 from app.core.legacy_memory_context import GroupMemoryContextRequest
 from app.main import build_llm_client, build_memory_runtime
+from app.storage.db import build_engine as _build_engine
 from scripts import build_memory_test_dataset as dataset_builder
 from scripts import memory_test_fullchain as fullchain
 from scripts.memory_test_metrics import (
@@ -46,12 +47,7 @@ DEFAULT_WORKDIR = Path("data/test-platform")
 
 
 def _engine(database: Path):
-    return create_engine(
-        f"sqlite:///{database}",
-        connect_args={"timeout": 60},
-        poolclass=NullPool,
-        future=True,
-    )
+    return _build_engine(database)
 
 
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
