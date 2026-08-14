@@ -279,8 +279,12 @@ def parse_citation_contract_decision(value: str) -> CitationContractDecision:
 class ObservedResponsesTransport:
     """Responses SSE transport exposing real first-text-delta time and usage."""
 
-    def __init__(self, client: LlmClient) -> None:
+    def __init__(self, client: LlmClient, *, max_attempts: int | None = None) -> None:
         self.client = client
+        configured_attempts = (
+            client.REQUEST_MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
+        )
+        self.max_attempts = max(1, min(configured_attempts, client.REQUEST_MAX_ATTEMPTS))
 
     def generate(self, prompt_lines: list[str], *, model: str) -> ObservedGeneration:
         instructions, input_lines = self.client._split_prompt_lines(prompt_lines)
@@ -295,7 +299,7 @@ class ObservedResponsesTransport:
         text_deltas: list[str] = []
         ttft_ms: float | None = None
         usage: Mapping[str, Any] | None = None
-        for attempt in range(1, self.client.REQUEST_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
             started = perf_counter()
             text_deltas = []
             ttft_ms = None
@@ -324,6 +328,15 @@ class ObservedResponsesTransport:
                                 candidate = completed.get("usage")
                                 if isinstance(candidate, Mapping):
                                     usage = candidate
+                            # Some OpenAI-compatible proxies send the terminal
+                            # Responses event but keep the SSE socket open for
+                            # a while.  Waiting for connection close makes a
+                            # successful model call look like a read timeout
+                            # and causes the outer evaluation retry path to
+                            # multiply that delay.  ``response.completed`` is
+                            # the protocol terminal event; close the stream
+                            # immediately after collecting usage.
+                            break
                         elif event_type in {"error", "response.failed", "response.incomplete"}:
                             raise QualityReplayError(
                                 "QUALITY_REPLAY_PROVIDER_FAILED",
@@ -341,16 +354,16 @@ class ObservedResponsesTransport:
                     "model=%s endpoint=/responses mode=native retryable=%s",
                     status_code,
                     attempt,
-                    self.client.REQUEST_MAX_ATTEMPTS,
+                    self.max_attempts,
                     prompt_chars,
                     instructions_chars,
                     model,
                     retryable,
                 )
-                if retryable and attempt < self.client.REQUEST_MAX_ATTEMPTS:
+                if retryable and attempt < self.max_attempts:
                     self.client._sleep_before_retry(
                         attempt=attempt,
-                        max_attempts=self.client.REQUEST_MAX_ATTEMPTS,
+                        max_attempts=self.max_attempts,
                     )
                     continue
                 raise QualityReplayError(
@@ -374,16 +387,16 @@ class ObservedResponsesTransport:
                     "reason=%s prompt_chars=%s instructions_chars=%s model=%s "
                     "endpoint=/responses mode=native",
                     attempt,
-                    self.client.REQUEST_MAX_ATTEMPTS,
+                    self.max_attempts,
                     type(exc).__name__,
                     prompt_chars,
                     instructions_chars,
                     model,
                 )
-                if attempt < self.client.REQUEST_MAX_ATTEMPTS:
+                if attempt < self.max_attempts:
                     self.client._sleep_before_retry(
                         attempt=attempt,
-                        max_attempts=self.client.REQUEST_MAX_ATTEMPTS,
+                        max_attempts=self.max_attempts,
                     )
                     continue
                 raise QualityReplayError(

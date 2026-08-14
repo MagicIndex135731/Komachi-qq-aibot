@@ -420,10 +420,11 @@ def stage_report(
             stress = json.loads(stress_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             stress = {}
+    stress_public = _public_stress_metrics(stress)
     report = {
         "offline": offline_metrics,
         "fullchain": fc_metrics,
-        "stress": stress,
+        "stress": stress_public,
         "baseline": None,
     }
     if baseline_dir is not None:
@@ -481,6 +482,27 @@ def stage_report(
         encoding="utf-8",
     )
     return report
+
+
+def _public_stress_metrics(stress: Mapping[str, Any]) -> dict[str, Any]:
+    """Project private stress output into safe aggregate report fields."""
+
+    categories: dict[str, dict[str, Any]] = {}
+    raw_categories = stress.get("categories")
+    if isinstance(raw_categories, Mapping):
+        for name, value in raw_categories.items():
+            if not isinstance(value, Mapping):
+                continue
+            categories[str(name)] = {
+                key: value[key]
+                for key in ("cases", "hits", "hit_rate", "violations", "errors")
+                if key in value
+            }
+    return {
+        "total_cases": stress.get("total_cases", 0),
+        "total_ok": stress.get("total_ok", 0),
+        "categories": categories,
+    }
 
 
 def _render_report_markdown(report: Mapping[str, Any]) -> str:

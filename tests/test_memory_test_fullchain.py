@@ -196,6 +196,28 @@ def test_generate_with_retries_recovers_and_gives_up():
     assert dead.calls == 2
 
 
+def test_generate_with_retries_does_not_repeat_non_retryable_transport_failure():
+    class NonRetryableTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, prompt_lines, *, model):
+            del prompt_lines, model
+            self.calls += 1
+            raise QualityReplayError("QUALITY_REPLAY_PROVIDER_FAILED", retryable=False)
+
+    transport = NonRetryableTransport()
+    with pytest.raises(QualityReplayError):
+        fullchain._generate_with_retries(
+            transport,
+            ["p"],
+            model="m",
+            attempts=5,
+            backoff=0,
+        )
+    assert transport.calls == 1
+
+
 def test_parse_answer_loose_structural_only():
     parsed = fullchain._parse_answer_loose(
         json.dumps(

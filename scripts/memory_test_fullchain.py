@@ -411,6 +411,17 @@ def _generate_with_retries(
             return transport.generate(prompt_lines, model=model)
         except QualityReplayError as exc:
             last_error = exc
+            # ``ObservedResponsesTransport`` already owns the HTTP retry loop.
+            # Do not retry protocol/timeout failures again at this outer layer:
+            # a failed transport attempt is deliberately marked non-retryable
+            # after its bounded internal attempts.  Retrying it here multiplies
+            # the read timeout (3 HTTP attempts x 5 outer attempts) and creates
+            # unexplained multi-minute tails in the evaluation harness.
+            if (
+                str(exc) != "QUALITY_REPLAY_PROVIDER_FAILED"
+                or getattr(exc, "retryable", None) is False
+            ):
+                raise
             if attempt + 1 < max(1, int(attempts)):
                 _time.sleep(backoff * (attempt + 1))
     if last_error is not None:
@@ -538,13 +549,19 @@ def run_cases(
         transport = (
             transport_factory(llm_client)
             if transport_factory is not None
-            else ObservedResponsesTransport(llm_client)
+            else ObservedResponsesTransport(
+                llm_client,
+                max_attempts=provider_attempts,
+            )
         )
         if aux_client is not None:
             aux_transport = (
                 transport_factory(aux_client)
                 if transport_factory is not None
-                else ObservedResponsesTransport(aux_client)
+                else ObservedResponsesTransport(
+                    aux_client,
+                    max_attempts=provider_attempts,
+                )
             )
         else:
             aux_transport = transport
@@ -646,7 +663,10 @@ def _run_case(
         use_full_history=True,
     )
     started = perf_counter()
+    stage_timings_ms: dict[str, float] = {}
+    memory_started = perf_counter()
     trace = runtime.v2_provider.evaluate(request)
+    stage_timings_ms["memory_context"] = (perf_counter() - memory_started) * 1000
     packed = trace.result.packed_context
     packed_fact_count = len(tuple(getattr(packed, "facts", ())))
     packed_summary_count = len(tuple(getattr(packed, "summaries", ())))
@@ -678,12 +698,13 @@ def _run_case(
     )
     cached = _cache_load(cache_dir, answer_key)
     provider_error: str | None = None
+    answer_started = perf_counter()
     if cached is not None:
         answer_observation = SimpleNamespace(**cached)
     else:
         try:
             answer_observation = _generate_with_retries(
-            transport,
+                transport,
                 answer_prompt,
                 model=model,
                 attempts=provider_attempts,
@@ -706,6 +727,7 @@ def _run_case(
                     "model": str(answer_observation.model),
                 },
             )
+    stage_timings_ms["answer"] = (perf_counter() - answer_started) * 1000
     protocol_failures: tuple[str, ...] = ()
     repaired = False
     answer_text = ""
@@ -726,9 +748,13 @@ def _run_case(
         for value in tuple(getattr(packed, "source_msg_ids", ()))
         if str(value)
     ]
+    repair_prejudge_started = perf_counter()
+    repair_prejudge_attempted = False
+    repair_prejudge_error: str | None = None
     if not protocol_failures and not abstained:
         packet_id_set = set(packet_source_ids)
         if not cited_ids or any(str(value) not in packet_id_set for value in cited_ids):
+            repair_prejudge_attempted = True
             try:
                 original_answer = GeneratedAnswer(
                     answer=answer_text,
@@ -752,7 +778,8 @@ def _run_case(
                     original_answer=original_answer,
                     allowed_citation_ids=allowed_ids,
                 )
-            except QualityReplayError:
+            except QualityReplayError as exc:
+                repair_prejudge_error = str(exc)
                 outcome = None
             if (
                 outcome is not None
@@ -765,9 +792,16 @@ def _run_case(
                 cited_ids = tuple(outcome.answer.cited_source_message_ids)
                 abstained = outcome.answer.abstained
                 repaired = True
+    stage_timings_ms["citation_repair_prejudge"] = (
+        (perf_counter() - repair_prejudge_started) * 1000
+        if repair_prejudge_attempted
+        else 0.0
+    )
     raw_decision = None
     cached_judge = None
     judge_prompt: list[str] = []
+    judge_provider_error: str | None = None
+    judge_started = perf_counter()
     if not protocol_failures:
         abstained_with_evidence = bool(
             abstained
@@ -806,8 +840,9 @@ def _run_case(
                     attempts=provider_attempts,
                     backoff=provider_backoff,
                 )
-            except QualityReplayError:
+            except QualityReplayError as exc:
                 protocol_failures = ("provider_failed",)
+                judge_provider_error = str(exc)
             else:
                 _cache_save(
                     cache_dir,
@@ -825,16 +860,25 @@ def _run_case(
                 raw_decision = parse_judge_decision(judge_observation.text)
             except (ValueError, json.JSONDecodeError):
                 protocol_failures = ("judge_json_invalid",)
+    stage_timings_ms["judge"] = (perf_counter() - judge_started) * 1000
     # v7: when the judge says the only problem is the citations, repair once
-    # (answer text unchanged) and re-judge with the fixed citation IDs.
+    # (answer text unchanged) and re-judge with the fixed citation IDs.  A
+    # pre-judge repair already spent that one repair budget; retrying the same
+    # missing-citation case here only duplicates a potentially slow upstream
+    # request without adding evidence.
+    repair_rejudge_started = perf_counter()
+    repair_rejudge_attempted = False
+    repair_rejudge_error: str | None = None
     if (
         not protocol_failures
         and raw_decision is not None
         and not repaired
+        and not repair_prejudge_attempted
         and not abstained
         and str(getattr(raw_decision, "reason_code", "") or "")
         in CITATION_REASON_CODES
     ):
+        repair_rejudge_attempted = True
         try:
             original_answer = GeneratedAnswer(
                 answer=answer_text,
@@ -854,7 +898,8 @@ def _run_case(
                 original_answer=original_answer,
                 allowed_citation_ids=allowed_ids,
             )
-        except QualityReplayError:
+        except QualityReplayError as exc:
+            repair_rejudge_error = str(exc)
             outcome = None
         if (
             outcome is not None
@@ -890,9 +935,20 @@ def _run_case(
                     backoff=provider_backoff,
                 )
                 raw_decision = parse_judge_decision(judge_observation.text)
-            except (QualityReplayError, ValueError, json.JSONDecodeError):
+            except QualityReplayError as exc:
+                raw_decision = None
+                protocol_failures = ("provider_failed",)
+                judge_provider_error = str(exc)
+                repair_rejudge_error = str(exc)
+            except (ValueError, json.JSONDecodeError) as exc:
                 raw_decision = None
                 protocol_failures = ("judge_json_invalid",)
+                repair_rejudge_error = type(exc).__name__
+    stage_timings_ms["citation_repair_rejudge"] = (
+        (perf_counter() - repair_rejudge_started) * 1000
+        if repair_rejudge_attempted
+        else 0.0
+    )
     # Model-driven finalization: the upstream judge is the authority for
     # grounded/correct/abstention. The only hard checks left are structural
     # (JSON shape) and citation-source integrity (citations must come from the
@@ -943,6 +999,13 @@ def _run_case(
         "output_tokens": int(getattr(answer_observation, "output_tokens", 0)),
         "ttft_ms": float(getattr(answer_observation, "ttft_ms", 0.0)),
         "total_ms": total_ms,
+        "stage_timings_ms": {
+            key: round(value, 3) for key, value in stage_timings_ms.items()
+        },
+        "provider_error": provider_error,
+        "judge_provider_error": judge_provider_error,
+        "citation_repair_prejudge_error": repair_prejudge_error,
+        "citation_repair_rejudge_error": repair_rejudge_error,
         "cached": cached is not None,
         "judge_cached": cached_judge is not None,
         "repaired": repaired,

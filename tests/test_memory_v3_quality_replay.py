@@ -51,9 +51,16 @@ from app.providers.llm_client import LlmClient
 
 
 class _TimedSseStream(httpx.SyncByteStream):
-    def __init__(self, *, include_delta: bool = True, include_usage: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        include_delta: bool = True,
+        include_usage: bool = True,
+        linger_after_completed: float = 0.0,
+    ) -> None:
         self.include_delta = include_delta
         self.include_usage = include_usage
+        self.linger_after_completed = linger_after_completed
 
     def __iter__(self):
         if self.include_delta:
@@ -69,6 +76,8 @@ class _TimedSseStream(httpx.SyncByteStream):
             },
         }
         yield ("data: " + json.dumps(completed) + "\n\n").encode()
+        if self.linger_after_completed:
+            time.sleep(self.linger_after_completed)
         yield b"data: [DONE]\n\n"
 
 
@@ -126,6 +135,21 @@ def test_observed_transport_measures_first_delta_not_full_response() -> None:
     assert result.output_tokens == 17
     assert result.ttft_ms >= 0
     assert result.ttft_ms < elapsed_ms - 20
+
+
+def test_observed_transport_stops_after_completed_event() -> None:
+    client = _client(_TimedSseStream(linger_after_completed=0.5))
+    try:
+        started = time.perf_counter()
+        result = ObservedResponsesTransport(client).generate(
+            ["Target message: test"], model="answer-model"
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+    finally:
+        client.http_client.close()
+
+    assert result.input_tokens == 123
+    assert elapsed_ms < 300
 
 
 @pytest.mark.parametrize(
@@ -189,6 +213,33 @@ def test_observed_transport_retries_xbai_403_without_mutating_payload() -> None:
     assert request_bodies[0] == request_bodies[1] == request_bodies[2]
     payload = json.loads(request_bodies[0])
     assert payload["instructions"] == "System persona: native instruction marker"
+
+
+def test_observed_transport_respects_evaluation_attempt_limit() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(502, request=request, json={"error": "temporary"})
+
+    client = LlmClient(
+        base_url="https://provider.invalid",
+        api_key="secret",
+        model="answer-model",
+        responses_model="answer-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **kwargs: None
+    try:
+        with pytest.raises(QualityReplayError, match="^QUALITY_REPLAY_PROVIDER_FAILED$"):
+            ObservedResponsesTransport(client, max_attempts=1).generate(
+                ["Target message: test"], model="answer-model"
+            )
+    finally:
+        client.http_client.close()
+
+    assert attempts == 1
 
 
 def test_observed_transport_exhausts_xbai_403_and_logs_only_safe_metadata(caplog) -> None:

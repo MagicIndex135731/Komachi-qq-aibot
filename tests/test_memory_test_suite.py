@@ -170,3 +170,55 @@ def test_report_aggregation(tmp_path):
     assert report["gate"]["grounded_answer_accuracy"]["passed"] is True
     assert (workdir / "report.json").exists()
     assert (workdir / "report.md").exists()
+
+
+def test_stage_report_projects_private_stress_failures_to_aggregates(tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "stress.json").write_text(
+        json.dumps(
+            {
+                "total_cases": 2,
+                "total_ok": 1,
+                "categories": {
+                    "raw_history": {
+                        "cases": 2,
+                        "hits": 1,
+                        "hit_rate": 0.5,
+                        "violations": 0,
+                        "errors": 0,
+                        "failures": [
+                            {"query": "private query", "expected": ["private-id"]}
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = stage_report(
+        workdir,
+        baseline_dir=None,
+        gate_grounded=None,
+        gate_recall=None,
+        gate_protocol_failures=None,
+        gate_p95_ms=None,
+    )
+
+    assert report["stress"] == {
+        "total_cases": 2,
+        "total_ok": 1,
+        "categories": {
+            "raw_history": {
+                "cases": 2,
+                "hits": 1,
+                "hit_rate": 0.5,
+                "violations": 0,
+                "errors": 0,
+            }
+        },
+    }
+    rendered = (workdir / "report.json").read_text(encoding="utf-8")
+    assert "private query" not in rendered
+    assert "private-id" not in rendered
