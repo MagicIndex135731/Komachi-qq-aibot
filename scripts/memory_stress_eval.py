@@ -19,8 +19,7 @@ import re
 from pathlib import Path
 from typing import Any, Sequence
 
-from sqlalchemy import bindparam, create_engine, event as sa_event, text
-from sqlalchemy.pool import NullPool
+from sqlalchemy import bindparam, text
 
 from app.config import AppSettings
 from app.core.legacy_memory_context import GroupMemoryContextRequest
@@ -30,7 +29,7 @@ from app.core.member_identity import (
 )
 from app.core.memory_context_packer import EvidenceMessage
 from app.main import build_llm_client, build_memory_runtime
-from app.storage.db import session_scope
+from app.storage.db import build_engine, session_scope
 from app.storage.repositories import MessageRepository
 
 
@@ -596,21 +595,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "memory_retrieval_channel_timeout_seconds": 0.5,
         }
     )
-    engine = create_engine(
-        f"sqlite:///{args.database}",
-        connect_args={"timeout": 60},
-        poolclass=NullPool,
-        future=True,
-    )
-
-    @sa_event.listens_for(engine, "connect")
-    def _set_busy_timeout(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA busy_timeout=60000")
-        cursor.close()
-
-    with engine.begin() as connection:
-        connection.execute(text("PRAGMA journal_mode=WAL;"))
+    # Use the shared runtime engine so sqlite-vec is loaded consistently with
+    # the unified offline/fullchain stages.  A plain SQLAlchemy engine silently
+    # makes the vector channel unavailable and turns this benchmark into an
+    # accidental FTS-only measurement.
+    engine = build_engine(args.database)
     try:
         cases = _build_cases(
             engine,
