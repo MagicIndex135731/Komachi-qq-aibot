@@ -767,6 +767,7 @@ def build_memory_runtime(
             engine=engine,
         ),
         rewrite_timeout_seconds=settings.memory_query_rewrite_timeout_seconds,
+        mention_target_ids=(settings.bot_qq,),
     )
     history_classifier = MemoryQueryResolver()
     retriever = HybridMemoryRetriever(
@@ -992,10 +993,15 @@ def build_memory_runtime(
                     "episode",
                     "semantic_window",
                     "semantic_daily",
+                    # Keep reading summaries written by the pre-layered
+                    # runtime. The production snapshot still contains these
+                    # legacy levels and they remain valid derived evidence.
+                    "window",
+                    "daily",
                 )
+            time_range = resolved_query.time_range
 
             def _relevant(row) -> bool:
-                time_range = resolved_query.time_range
                 if time_range is None:
                     # No deterministic time range: summaries stay a
                     # supplement for any history-intent question.
@@ -1029,6 +1035,8 @@ def build_memory_runtime(
             rows = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
                 limit=settings.context_summary_limit * 3,
+                start_at=(time_range.start if time_range is not None else None),
+                end_at=(time_range.end if time_range is not None else None),
                 **summary_kwargs,
             )
             relevant_rows = [

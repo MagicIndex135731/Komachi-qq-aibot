@@ -16,6 +16,68 @@ def test_stratify_limit_and_seed():
     assert [case["query"] for case in selected] == [case["query"] for case in again]
 
 
+def test_fullchain_parser_defaults_to_production_channel_timeout():
+    args = fullchain.build_argument_parser().parse_args(
+        [
+            "--database",
+            "snapshot.db",
+            "--cases",
+            "cases.jsonl",
+            "--output-detail",
+            "detail.jsonl",
+        ]
+    )
+    assert args.channel_timeout == 4.0
+    assert args.prewarm_embedding is False
+
+
+def test_run_cases_prewarms_actual_runtime_embedding_provider(monkeypatch, tmp_path):
+    class FakeEmbeddingProvider:
+        available = True
+        active_accelerator = "cuda"
+        identity = fullchain.SimpleNamespace(provider="local", model="test-model")
+
+        def __init__(self):
+            self.queries: list[str] = []
+
+        def embed_query(self, query: str):
+            self.queries.append(query)
+            return [0.1, 0.2]
+
+    provider = FakeEmbeddingProvider()
+    runtime = fullchain.SimpleNamespace(embedding_provider=provider)
+    monkeypatch.setattr(
+        fullchain,
+        "_run_case",
+        lambda **kwargs: {"case_id": str(kwargs["case_id"])},
+    )
+    rows, summary = fullchain.run_cases(
+        None,
+        [{"category": "fact", "query": "q", "case_id": "case-1"}],
+        limit=1,
+        seed=1,
+        cache_dir=tmp_path,
+        settings=fullchain.SimpleNamespace(bot_qq=123456789),
+        runtime=runtime,
+        transport=object(),
+        prewarm_embedding=True,
+    )
+
+    assert rows == [{"case_id": "case-1"}]
+    assert provider.queries == [fullchain.EMBEDDING_PREWARM_QUERY]
+    assert summary["embedding_prewarm"] == {
+        "provider": "local",
+        "model": "test-model",
+        "accelerator": "cuda",
+        "dimensions": 2,
+    }
+
+
+def test_embedding_prewarm_fails_before_cases_when_provider_is_unavailable():
+    with pytest.raises(RuntimeError, match="embedding provider is unavailable"):
+        fullchain._prewarm_embedding_runtime(fullchain.SimpleNamespace())
+
+
 def test_cache_roundtrip(tmp_path):
     key = fullchain._sha256("hello")
     fullchain._cache_save(
@@ -171,6 +233,68 @@ def test_run_cases_detail_path_appends_rows_and_survives_resume(
     assert len(all_lines) == 8
 
 
+def test_main_passes_output_detail_for_incremental_checkpointing(
+    monkeypatch, tmp_path
+):
+    database = tmp_path / "snapshot.db"
+    cases_path = tmp_path / "cases.jsonl"
+    detail_path = tmp_path / "detail.jsonl"
+    progress_path = tmp_path / "progress.jsonl"
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(fullchain, "_build_engine", lambda path: object())
+    monkeypatch.setattr(fullchain, "_load_cases", lambda path: [{"query": "q"}])
+
+    def fake_run_cases(engine, cases, **kwargs):
+        del engine, cases
+        captured.update(kwargs)
+        return [], {"requested": 1, "executed": 0, "skipped_resumed": 0}
+
+    monkeypatch.setattr(fullchain, "run_cases", fake_run_cases)
+
+    assert fullchain.main(
+        [
+            "--database",
+            str(database),
+            "--cases",
+            str(cases_path),
+            "--output-detail",
+            str(detail_path),
+            "--progress",
+            str(progress_path),
+        ]
+    ) == 0
+    assert captured["detail_path"] == detail_path
+    assert captured["progress_path"] == progress_path
+
+
+def test_provider_preflight_summary_requires_ten_clean_rows():
+    clean_rows = [
+        {
+            "case_id": f"case-{index}",
+            "protocol_failure_codes": [],
+            "answer_prompt_chars": 1000 + index * 100,
+        }
+        for index in range(10)
+    ]
+    passed = fullchain._provider_preflight_summary(clean_rows, expected_cases=10)
+    assert passed["passed"] is True
+    assert passed["completed"] == 10
+    assert passed["provider_failed"] == 0
+    assert passed["provider_no_event"] == 0
+    assert passed["provider_no_event_attempts"] == 0
+
+    failed_rows = [dict(row) for row in clean_rows]
+    failed_rows[-1]["protocol_failure_codes"] = ["provider_failed"]
+    failed_rows[-1]["judge_provider_error"] = "QUALITY_REPLAY_PROVIDER_NO_EVENT"
+    failed_rows[-1]["answer_no_event_attempts"] = 1
+    failed = fullchain._provider_preflight_summary(failed_rows, expected_cases=10)
+    assert failed["passed"] is False
+    assert failed["provider_failed"] == 1
+    assert failed["provider_no_event"] == 1
+    assert failed["provider_no_event_attempts"] == 1
+
+
 def test_generate_with_retries_recovers_and_gives_up():
     class FlakyTransport:
         def __init__(self, failures: int):
@@ -291,6 +415,23 @@ def test_build_answer_prompt_requires_citation_per_claim_and_recommendation_abst
     assert "a partial but supported answer is required" in text
     assert "never infer" in text
     assert "recommendation, opinion" in text
+
+
+def test_build_answer_prompt_includes_production_grounding_policy() -> None:
+    packet = fullchain.SimpleNamespace(
+        evidence_segments=(),
+        facts=(),
+        summaries=(),
+        source_msg_ids=(),
+        grounding_policy="production memory grounding contract",
+    )
+
+    prompt = fullchain.build_answer_prompt(
+        {"query": "昨天群里聊了什么"},
+        packet,
+    )
+
+    assert "production memory grounding contract" in prompt[-1]
 
 
 def test_build_judge_prompt_allows_open_ended_partial_answers():

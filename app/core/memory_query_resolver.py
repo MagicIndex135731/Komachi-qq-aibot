@@ -78,6 +78,7 @@ class ResolvedMemoryQuery:
     entities: tuple[str, ...] = ()
     speaker_ids: tuple[str, ...] = ()
     subject_ids: tuple[str, ...] | None = None
+    mentioned_user_ids: tuple[str, ...] | None = None
     time_range: TimeRange | None = None
     reference_msg_ids: tuple[str, ...] = ()
     rewrite_used: bool = False
@@ -181,6 +182,8 @@ _PERSON_SHAPE_SUFFIX_PATTERN = re.compile(
 )
 _SUMMARY_PATTERN = re.compile(
     r"总结|概括|汇总|发生了什么|"
+    r"(?:今天|昨天|前天|本周|这周|上周).*?群里.*?"
+    r"(?:说了|说过|发了|发过|讲了|聊了)(?:什么|哪些(?:话|内容)?|几条)|"
     r"(?:今天|昨天|前天|本周|这周|上周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?).*?"
     r"(?:都|分别)(?:说了|说过|发了|发过|讲了|聊了)什么|"
     r"(?:说了|说过|发了|发过|讲了|聊了)(?:哪些(?:话|内容)?|几条)|"
@@ -241,7 +244,27 @@ _JOINED_RELATIVE_DAY_QUERY_PATTERN = re.compile(
     r"\s*(?:发生|群里|聊了|都发生|都聊)"
 )
 _SUBJECTLESS_RELATIVE_EVENT_PATTERN = re.compile(
-    r"^\s*(?:今天|昨天|前天).*(?:发生了什么|群里发生|都发生)"
+    r"^\s*(?:今天|昨天|前天).*"
+    r"(?:发生了什么|群里(?:发生|聊了|聊过|说了|说过|发了|发过)|都发生)"
+)
+_SUBJECTLESS_GROUP_HISTORY_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"群里(?:以前|之前|过去).*?(?:提到|说到|聊到|讨论|关于)|"
+    r"(?:之前|以前|过去)\s*关于"
+    r")"
+)
+_QUOTED_HISTORY_TOPIC_PATTERN = re.compile(
+    r"“(?P<curly>[^”]{1,80})”|"
+    r'"(?P<double>[^\"]{1,80})"|'
+    r"「(?P<corner>[^」]{1,80})」|"
+    r"『(?P<white_corner>[^』]{1,80})』|"
+    r"‘(?P<single_curly>[^’]{1,80})’"
+)
+_EXPLICIT_GROUP_HISTORY_TOPIC_PATTERN = re.compile(
+    r"(?:提到|说到|聊到|讨论|关于)\s*"
+    r"(?P<topic>[A-Za-z0-9_\-\u4e00-\u9fff]{2,40}?)"
+    r"(?:时|的时候)?\s*"
+    r"(?:说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么)$"
 )
 _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
     r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
@@ -365,6 +388,7 @@ class MemoryQueryResolver:
         rewrite_timeout_seconds: float = 0.75,
         recent_limit: int = 12,
         identity_validator: IdentityValidator | None = None,
+        mention_target_ids: Sequence[int | str] = (),
     ) -> None:
         if rewrite_timeout_seconds <= 0:
             raise ValueError("rewrite_timeout_seconds must be positive")
@@ -374,6 +398,15 @@ class MemoryQueryResolver:
         self._rewrite_timeout_seconds = rewrite_timeout_seconds
         self._recent_limit = recent_limit
         self._identity_validator = identity_validator
+        if any(isinstance(value, bool) for value in mention_target_ids):
+            raise ValueError("mention target IDs must not be boolean")
+        self._mention_target_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in mention_target_ids
+                if str(value).strip()
+            )
+        )
         self._rewrite_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-query-rewrite")
             if rewrite_provider is not None
@@ -470,15 +503,24 @@ class MemoryQueryResolver:
                 original_query=original,
                 retrieval_query=original,
                 entities=(direct_member.matched_alias,),
-                speaker_ids=direct_subject_ids,
-                subject_ids=direct_subject_ids,
+                speaker_ids=(
+                    () if answer_mode == "mention" else direct_subject_ids
+                ),
+                subject_ids=(
+                    () if answer_mode == "mention" else direct_subject_ids
+                ),
+                mentioned_user_ids=(
+                    direct_subject_ids if answer_mode == "mention" else None
+                ),
                 time_range=time_range,
                 retrieval_mode="temporal" if time_range else "hybrid",
                 needs_history=needs_history,
                 needs_detail=needs_detail,
                 group_id=normalized_group_id,
                 requester_id=normalized_requester_id,
-                subject_binding="explicit",
+                subject_binding=(
+                    "unbound" if answer_mode == "mention" else "explicit"
+                ),
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             ), aliases=(direct_member.matched_alias,))
@@ -554,6 +596,9 @@ class MemoryQueryResolver:
                 retrieval_query=original,
                 speaker_ids=requester_subject,
                 subject_ids=requester_subject,
+                mentioned_user_ids=(
+                    requester_subject if answer_mode == "mention" else None
+                ),
                 time_range=time_range,
                 retrieval_mode="temporal" if time_range else "hybrid",
                 needs_history=needs_history,
@@ -590,7 +635,8 @@ class MemoryQueryResolver:
                 needs_detail=needs_detail,
                 group_id=normalized_group_id,
                 requester_id=normalized_requester_id,
-                subject_binding="requester",
+                mentioned_user_ids=self._mention_target_ids,
+                subject_binding="unbound",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
             )
@@ -673,7 +719,7 @@ class MemoryQueryResolver:
                 coverage_mode=coverage_mode,
             )
 
-        return ResolvedMemoryQuery(
+        plan = ResolvedMemoryQuery(
             original,
             original,
             time_range=time_range,
@@ -685,6 +731,9 @@ class MemoryQueryResolver:
             answer_mode=answer_mode,
             coverage_mode=coverage_mode,
         )
+        if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(original):
+            return self._with_explicit_group_history_topic(plan)
+        return plan
 
     @staticmethod
     def _classify_direct_member_reference(
@@ -698,6 +747,7 @@ class MemoryQueryResolver:
         if (
             _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query)
             or _SUBJECTLESS_RELATIVE_EVENT_PATTERN.search(query)
+            or _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(query)
         ):
             return GroupMemberReferenceResolution("unbound")
         allowed_members = tuple(
@@ -1547,6 +1597,10 @@ class MemoryQueryResolver:
             return False
         if _JOINED_RELATIVE_DAY_QUERY_PATTERN.search(query):
             return False
+        if _SUBJECTLESS_RELATIVE_EVENT_PATTERN.search(query):
+            return False
+        if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(query):
+            return False
         for pattern in (
             _PERSON_MEMORY_SUBJECT_PATTERN,
             _REMEMBER_PERSON_PATTERN,
@@ -1666,6 +1720,46 @@ class MemoryQueryResolver:
             topic_terms=tuple(dict.fromkeys(topic_terms)),
             topic_extraction="deterministic" if topic_query is not None else "none",
             subject_aliases_removed=tuple(removed),
+        )
+
+    @staticmethod
+    def _with_explicit_group_history_topic(
+        plan: ResolvedMemoryQuery,
+    ) -> ResolvedMemoryQuery:
+        quoted = _QUOTED_HISTORY_TOPIC_PATTERN.search(plan.original_query)
+        topic = ""
+        if quoted is not None:
+            topic = next(
+                (
+                    value.strip()
+                    for value in quoted.groupdict().values()
+                    if value and value.strip()
+                ),
+                "",
+            )
+        if not topic:
+            matched = _EXPLICIT_GROUP_HISTORY_TOPIC_PATTERN.search(
+                plan.original_query
+            )
+            if matched is not None:
+                topic = matched.group("topic").strip()
+        if not topic:
+            return plan
+
+        topic_terms = [topic]
+        for suffix in _TOPIC_CATEGORY_SUFFIXES:
+            if not topic.endswith(suffix):
+                continue
+            core = topic[: -len(suffix)].strip()
+            if len(core) >= 2:
+                topic_terms.append(core)
+            break
+        return replace(
+            plan,
+            retrieval_query=topic,
+            topic_query=topic,
+            topic_terms=tuple(dict.fromkeys(topic_terms)),
+            topic_extraction="deterministic",
         )
 
     @staticmethod

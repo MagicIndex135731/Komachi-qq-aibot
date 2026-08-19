@@ -83,6 +83,7 @@ class MemoryV2EvaluationTrace:
     channel_candidate_counts: tuple[tuple[str, int], ...] = ()
     expansion_mode: str = "legacy"
     expansion_reasons: tuple[str, ...] = ()
+    phase_timings_ms: tuple[tuple[str, float], ...] = ()
 
 
 class MemoryV2ContextProvider:
@@ -237,6 +238,7 @@ class MemoryV2ContextProvider:
                 resolved,
             )
         expansion_ms = (perf_counter() - expansion_started) * 1000
+        derived_started = perf_counter()
         facts = (
             ()
             if retrieval_skipped
@@ -262,6 +264,7 @@ class MemoryV2ContextProvider:
             facts=facts,
             summaries=summaries,
         )
+        derived_ms = (perf_counter() - derived_started) * 1000
         packing_started = perf_counter()
         packed = self._packer.pack(
             mode,
@@ -308,6 +311,7 @@ class MemoryV2ContextProvider:
             estimated_tokens=packed.estimated_tokens,
             mode="v2",
         )
+        total_ms = (perf_counter() - evaluation_started) * 1000
         if self._observability_route:
             expanded_source_count = sum(
                 len(segment.messages) for segment in expanded_segments
@@ -323,11 +327,11 @@ class MemoryV2ContextProvider:
                 "attempted_channels=%s failed_channels=%s channel_counts=%s "
                 "pin_counts=%s pin_overflow=%s "
                 "candidate_units=%s expanded_sources=%s rejected_sources=%s "
-                "selected_source_ids=%s recent_messages=%s history_messages=%s "
+                "selected_source_count=%s recent_messages=%s history_messages=%s "
                 "effective_budget=%s recent_tokens=%s history_tokens=%s total_tokens=%s "
                 "spillover=%s degradation_reason=%s "
                 "resolve_ms=%.3f retrieval_ms=%.3f expansion_ms=%.3f "
-                "packing_ms=%.3f total_ms=%.3f",
+                "derived_ms=%.3f packing_ms=%.3f total_ms=%.3f rewrite=%s",
                 self._observability_route,
                 request.group_id,
                 resolved.answer_mode,
@@ -366,7 +370,7 @@ class MemoryV2ContextProvider:
                 len(candidates),
                 expanded_source_count,
                 max(0, expanded_source_count - eligible_source_count),
-                json.dumps(list(packed.source_msg_ids), separators=(",", ":")),
+                len(packed.source_msg_ids),
                 len(packed.recent_messages),
                 sum(len(segment.messages) for segment in packed.evidence_segments),
                 packed.budget,
@@ -378,8 +382,10 @@ class MemoryV2ContextProvider:
                 resolve_ms,
                 retrieval_ms,
                 expansion_ms,
+                derived_ms,
                 packing_ms,
-                (perf_counter() - evaluation_started) * 1000,
+                total_ms,
+                int(bool(resolved.rewrite_used)),
             )
         retrieved_source_msg_ids = tuple(
             dict.fromkeys(
@@ -426,6 +432,14 @@ class MemoryV2ContextProvider:
             ),
             expansion_mode=expansion_mode,
             expansion_reasons=expansion_reasons,
+            phase_timings_ms=(
+                ("resolve", resolve_ms),
+                ("retrieval", retrieval_ms),
+                ("expansion", expansion_ms),
+                ("derived", derived_ms),
+                ("packing", packing_ms),
+                ("total", total_ms),
+            ),
         )
 
     def _select_expansion_candidates(

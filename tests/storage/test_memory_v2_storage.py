@@ -180,6 +180,31 @@ def test_raw_message_v3_projection_is_idempotent_and_revokes_uncertain_source(
         ) == []
 
 
+def test_fts_fallback_matches_separated_short_chinese_topic_terms(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session,
+            group_id=10001,
+            user_id=20001,
+            platform_msg_id="raw-v3-short-topic",
+        )
+        message.plain_text = "我最近在杭州，准备安排周末旅行。"
+        document = RetrievalDocumentRepository(session).project_raw_message_v3(
+            group_id=10001,
+            message_id=message.id,
+        )
+        assert document is not None
+
+        hits = RetrievalDocumentRepository(session).search_group_documents_fts_hits(
+            group_id=10001,
+            query="说说杭州旅行",
+            limit=10,
+            document_kinds=("raw_message_v3",),
+        )
+
+    assert [hit.document_id for hit in hits] == [document.id]
+
+
 def test_deleted_raw_message_is_revoked_and_filtered_by_every_active_channel(
     sqlite_engine,
 ) -> None:

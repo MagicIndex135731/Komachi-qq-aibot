@@ -389,9 +389,12 @@ class MemoryContextPacker:
                     selected_summaries.append(summary)
                     summary_blocks.append(block)
 
+        has_selected_evidence = bool(
+            selected_facts or selected_segments or selected_summaries
+        )
         full_grounding_policy = (
             MEMORY_GROUNDING_WITH_EVIDENCE
-            if selected_facts or selected_segments
+            if has_selected_evidence
             else MEMORY_GROUNDING_NO_EVIDENCE
         )
         content_blocks = [
@@ -566,6 +569,7 @@ class MemoryContextPacker:
         selected_summaries: list[MemorySummary] = []
         selected_recent: list[EvidenceMessage] = []
         history_blocks: list[str] = []
+        summary_blocks: list[str] = []
         selected_history_ids: set[str] = set()
         history_message_count = 0
 
@@ -582,7 +586,7 @@ class MemoryContextPacker:
                 return False
             block = self._render_segment(candidate)
             recent_blocks = [self._render_recent(message) for message in selected_recent]
-            if not fits(recent_blocks, [*history_blocks, block]):
+            if not fits(recent_blocks, [*history_blocks, block, *summary_blocks]):
                 return False
             selected_segments.append(candidate)
             history_blocks.append(block)
@@ -624,8 +628,13 @@ class MemoryContextPacker:
 
         def history_content_tokens() -> int:
             if self._token_counter_is_additive:
-                return sum(block_tokens(block) for block in history_blocks)
-            return self._estimate("\n\n".join(history_blocks))
+                return sum(
+                    block_tokens(block)
+                    for block in (*history_blocks, *summary_blocks)
+                )
+            return self._estimate(
+                "\n\n".join([*history_blocks, *summary_blocks])
+            )
 
         ordered_facts = sorted(facts, key=lambda item: (-item.score, item.text))
         remaining_segments = [item for item in evidence_segments if not item.pinned]
@@ -633,7 +642,7 @@ class MemoryContextPacker:
         def add_fact(fact: MemoryFact) -> bool:
             block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
             recent_blocks = [self._render_recent(message) for message in selected_recent]
-            if not fits(recent_blocks, [*history_blocks, block]):
+            if not fits(recent_blocks, [*history_blocks, block, *summary_blocks]):
                 return False
             selected_facts.append(fact)
             history_blocks.append(block)
@@ -660,6 +669,25 @@ class MemoryContextPacker:
                     break
                 remaining_segments.remove(segment)
 
+        # Explicitly relevant summaries answer summary/time-window intents and
+        # must not be crowded out by optional broad facts or raw segments.
+        # Pinned evidence and the protected history floor still retain their
+        # safety/coverage priority.
+        if selected_segments or any(summary.relevant for summary in summaries):
+            for summary in summaries:
+                if not summary.relevant:
+                    continue
+                block = f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
+                recent_blocks = [
+                    self._render_recent(message) for message in selected_recent
+                ]
+                if fits(
+                    recent_blocks,
+                    [*history_blocks, *summary_blocks, block],
+                ):
+                    selected_summaries.append(summary)
+                    summary_blocks.append(block)
+
         # Historical evidence gets first use of unclaimed shared capacity on a
         # history turn. Once it is exhausted, recent context borrows the rest.
         if pins_fit:
@@ -671,16 +699,6 @@ class MemoryContextPacker:
             for segment in remaining_segments:
                 add_segment(segment)
 
-        if selected_segments or any(summary.relevant for summary in summaries):
-            for summary in summaries:
-                if not summary.relevant:
-                    continue
-                block = f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
-                recent_blocks = [self._render_recent(message) for message in selected_recent]
-                if fits(recent_blocks, [*history_blocks, block]):
-                    selected_summaries.append(summary)
-                    history_blocks.append(block)
-
         selected_recent_ids = {message.source_msg_id for message in selected_recent}
         for message in reversed(recent_candidates):
             if (
@@ -690,7 +708,7 @@ class MemoryContextPacker:
                 continue
             candidate_recent = [message, *selected_recent]
             candidate_blocks = [self._render_recent(item) for item in candidate_recent]
-            if not fits(candidate_blocks, history_blocks):
+            if not fits(candidate_blocks, [*history_blocks, *summary_blocks]):
                 break
             selected_recent = candidate_recent
             selected_recent_ids.add(message.source_msg_id)
@@ -698,7 +716,7 @@ class MemoryContextPacker:
         recent_blocks = [self._render_recent(message) for message in selected_recent]
         # Canonical render order so the context builder can reconstruct the
         # same block sequence for trimming: facts -> segments -> summaries.
-        history_blocks = [
+        packed_history_blocks = [
             *(f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}" for fact in selected_facts),
             *(self._render_segment(segment) for segment in selected_segments),
             *(
@@ -706,26 +724,31 @@ class MemoryContextPacker:
                 for summary in selected_summaries
             ),
         ]
+        has_selected_evidence = bool(
+            selected_facts or selected_segments or selected_summaries
+        )
         full_policy = (
             MEMORY_GROUNDING_WITH_EVIDENCE
-            if selected_facts or selected_segments
+            if has_selected_evidence
             else MEMORY_GROUNDING_NO_EVIDENCE
         )
         fallback_policy = (
             MEMORY_GROUNDING_MINIMAL
-            if selected_facts or selected_segments
+            if has_selected_evidence
             else MEMORY_GROUNDING_NO_EVIDENCE_MINIMAL
         )
-        if fits(recent_blocks, history_blocks, full_policy):
+        if fits(recent_blocks, packed_history_blocks, full_policy):
             grounding_policy = full_policy
-        elif fits(recent_blocks, history_blocks, fallback_policy):
+        elif fits(recent_blocks, packed_history_blocks, fallback_policy):
             grounding_policy = fallback_policy
         else:
             grounding_policy = reserve_policy
-        text = joined(recent_blocks, history_blocks, grounding_policy)
+        text = joined(recent_blocks, packed_history_blocks, grounding_policy)
         recent_tokens = self._estimate("\n\n".join(recent_blocks))
         history_tokens = self._estimate(
-            "\n\n".join([*policy_blocks, grounding_policy, *history_blocks])
+            "\n\n".join(
+                [*policy_blocks, grounding_policy, *packed_history_blocks]
+            )
         )
         total_tokens = self._estimate(text)
         if len(text) > self._context_char_budget or total_tokens > budget:

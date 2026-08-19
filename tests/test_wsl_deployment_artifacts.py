@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sys
 import tomllib
 from pathlib import Path
 
@@ -51,6 +53,13 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
     ]
     assert all(path.exists() for path in bat_files)
     assert all(path.name.isascii() for path in REPO_ROOT.glob("*-wsl.bat"))
+    bat_versions = {
+        line
+        for bat_file in bat_files
+        for line in bat_file.read_text(encoding="utf-8").splitlines()
+        if line.startswith("echo WSL BAT VERSION ")
+    }
+    assert bat_versions == {"echo WSL BAT VERSION 20260815-LINUX-RUNTIME"}
     for bat_file in bat_files:
         content = bat_file.read_text(encoding="utf-8")
         assert content.isascii()
@@ -91,7 +100,11 @@ def test_linux_runtime_installer_copies_allowlist_to_ext4_release_tree() -> None
     assert '"${INSTALL_ROOT}/current"' in script
     assert '"${shared_dir}/.env"' in script
     assert '"${shared_runtime}"' in script
-    assert "app configs infra/wsl .dockerignore pyproject.toml README.md LICENSE" in script
+    # Every top-level path copied by Dockerfile.xiaomachi must exist in the
+    # immutable /opt release tree.  Omitting scripts makes a fresh release
+    # build fail at `COPY scripts ./scripts` even while an old container keeps
+    # running and masks the packaging drift.
+    assert "app configs infra/wsl scripts .dockerignore pyproject.toml README.md LICENSE" in script
     source_copy = script.split('if [[ ! -f "${shared_dir}/.env" ]]', 1)[0]
     assert "-cf - ." not in source_copy
     assert "--exclude='infra/wsl/runtime'" in script
@@ -222,7 +235,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
             "MEMORY_CHUNK_MAX_TOKENS=2400",
             "MEMORY_CHUNK_OVERLAP_MESSAGES=8",
             "MEMORY_CHUNK_MAX_MESSAGES=40",
-        "MEMORY_QUERY_REWRITE_ENABLED=true",
+        "MEMORY_QUERY_REWRITE_ENABLED=false",
         "MEMORY_LAYERED_MEMORY_ENABLED=true",
         "MEMORY_MEMORY_TOOLS_ENABLED=true",
         "MEMORY_FACT_SEMANTIC_RANKING_ENABLED=true",
@@ -398,14 +411,64 @@ def test_status_script_uses_on_demand_probes_before_logs() -> None:
 
 def test_status_script_waits_for_gateway_ready_marker() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    ready_block = script.split(
+        "Waiting for xiaomachi bot to accept messages (gateway ready)...", 1
+    )[1]
 
     assert "Waiting for xiaomachi bot heartbeat..." in script
     assert "group.heartbeat.json" in script
     assert "Waiting for xiaomachi bot to accept messages (gateway ready)..." in script
     assert "group.ready.json" in script
     assert "ready_age_seconds" in script
+    assert "ready_after_container_start_seconds" in script
+    assert "bot_started_at=" in script
+    assert "import json, re, sys" in ready_block
+    assert 're.sub(r"(\\.\\d{6})\\d+", r"\\1", str(sys.argv[2]))' in ready_block
+    assert "if age > 60" not in script
+    assert "if after_start < -5" in script
     assert 'state not in ("connected", "ready")' in script
     assert "Xiaomachi bot is up and accepting messages." in script
+
+
+def test_status_ready_probe_accepts_docker_nanoseconds_and_rejects_old_instance(
+    capsys,
+) -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    marker = 'if python3 - "${ready_payload}" "${bot_started_at}" <<\'PY\'\n'
+    ready_probe = script.split(marker, 1)[1].split("\nPY", 1)[0]
+    original_argv = sys.argv
+    try:
+        sys.argv = [
+            "status-ready-probe",
+            json.dumps(
+                {
+                    "state": "ready",
+                    "updated_at": "2026-08-15T15:44:25+00:00",
+                }
+            ),
+            "2026-08-15T15:44:24.943007974Z",
+        ]
+        exec(compile(ready_probe, "status-ready-probe", "exec"), {})
+        assert "ready_after_container_start_seconds=" in capsys.readouterr().out
+
+        sys.argv = [
+            "status-ready-probe",
+            json.dumps(
+                {
+                    "state": "ready",
+                    "updated_at": "2026-08-15T15:44:00+00:00",
+                }
+            ),
+            "2026-08-15T15:44:24.943007974Z",
+        ]
+        try:
+            exec(compile(ready_probe, "status-ready-probe", "exec"), {})
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("ready marker from an earlier container was accepted")
+    finally:
+        sys.argv = original_argv
 
 
 def test_start_script_waits_for_status_readiness() -> None:

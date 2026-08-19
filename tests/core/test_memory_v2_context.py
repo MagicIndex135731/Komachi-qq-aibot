@@ -565,6 +565,16 @@ def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
     assert trace.failed_channels == ()
     assert trace.channel_candidate_counts == (("bm25", 2), ("vector", 1))
     assert trace.resolved_query.retrieval_query
+    phase_timings = dict(trace.phase_timings_ms)
+    assert set(phase_timings) == {
+        "resolve",
+        "retrieval",
+        "expansion",
+        "derived",
+        "packing",
+        "total",
+    }
+    assert all(value >= 0 for value in phase_timings.values())
 
 
 def test_evaluation_candidate_filter_runs_before_expansion_and_trace() -> None:
@@ -618,6 +628,9 @@ def test_v3_observability_logs_metrics_without_query_or_message_content(
     assert "route=raw_v3" in metrics
     assert "attempted_channels=[\"bm25\",\"vector\"]" in metrics
     assert "channel_counts=[[\"bm25\",2],[\"vector\",1]]" in metrics
+    assert "selected_source_count=" in metrics
+    assert "selected_source_ids=" not in metrics
+    assert "rewrite=0" in metrics
     assert "candidate_units=2" in metrics
     assert "recent_messages=0" in metrics
     assert "history_messages=0" in metrics

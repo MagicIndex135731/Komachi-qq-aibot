@@ -105,6 +105,27 @@ def test_unbound_subject_allows_any_author_but_mention_mode_requires_typed_conte
     ) is False
 
 
+def test_mention_target_is_independent_from_author_subject() -> None:
+    source = Source("m1", 10, 99, datetime(2026, 7, 22, 8, tzinfo=UTC))
+
+    assert eligible(
+        replace(source, mentioned_uins=("90001",)),
+        plan(
+            answer_mode="mention",
+            subject_ids=(),
+            mentioned_user_ids=("90001",),
+        ),
+    ) is True
+    assert eligible(
+        replace(source, mentioned_uins=("42",)),
+        plan(
+            answer_mode="mention",
+            subject_ids=(),
+            mentioned_user_ids=("90001",),
+        ),
+    ) is False
+
+
 def test_naive_sqlite_source_timestamp_is_interpreted_as_utc() -> None:
     source = Source("m1", 10, 42, datetime(2026, 7, 22, 8))
 

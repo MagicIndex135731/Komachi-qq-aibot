@@ -14,6 +14,7 @@ import argparse
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 from pathlib import Path
 import random
 from time import perf_counter
@@ -45,11 +46,15 @@ CONTRACT_VERSION = "memory-test-platform-v1"
 DEFAULT_INPUT_PRICE_MT = 1.25
 DEFAULT_OUTPUT_PRICE_MT = 5.00
 DEFAULT_ANSWER_MODEL = "gpt-5.6-luna"
-DEFAULT_ANSWER_EFFORT = "medium"
+DEFAULT_ANSWER_EFFORT = "high"
 DEFAULT_AUX_MODEL = "gpt-5.6-luna"
-DEFAULT_AUX_EFFORT = "low"
+DEFAULT_AUX_EFFORT = "medium"
 PROVIDER_ATTEMPTS = 5
 PROVIDER_BACKOFF_SECONDS = 3.0
+PROVIDER_PREFLIGHT_CASES = 10
+DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS = 4.0
+EMBEDDING_PREWARM_QUERY = "memory evaluation embedding prewarm"
+logger = logging.getLogger(__name__)
 CITATION_REASON_CODES = frozenset(
     {
         "unsupported_citation",
@@ -86,7 +91,7 @@ def _build_eval_clients(
 ) -> tuple[LlmClient, LlmClient]:
     """Build separate Luna clients: final answers vs auxiliary calls.
 
-    Auxiliary calls (judge, citation repair) use the low-effort Luna profile;
+    Auxiliary calls (judge, citation repair) use the medium-effort Luna profile;
     final answers use the configured answer profile. The rewrite provider
     already constructs its own low-effort client from settings.
     """
@@ -105,6 +110,33 @@ def _build_eval_clients(
         )
 
     return make(answer_model, answer_effort), make(aux_model, aux_effort)
+
+
+def _prewarm_embedding_runtime(runtime: Any) -> dict[str, Any]:
+    """Initialize the evaluation runtime's real embedding provider before timing cases."""
+
+    provider = getattr(runtime, "embedding_provider", None)
+    if provider is None or not bool(getattr(provider, "available", False)):
+        raise RuntimeError("evaluation embedding provider is unavailable")
+    vector = provider.embed_query(EMBEDDING_PREWARM_QUERY)
+    if not vector:
+        raise RuntimeError("evaluation embedding prewarm failed")
+    identity = getattr(provider, "identity", None)
+    accelerator = str(getattr(provider, "active_accelerator", "unknown"))
+    result = {
+        "provider": str(getattr(identity, "provider", "unknown")),
+        "model": str(getattr(identity, "model", "unknown")),
+        "accelerator": accelerator,
+        "dimensions": len(vector),
+    }
+    logger.info(
+        "memory_test_embedding_prewarm provider=%s model=%s accelerator=%s dimensions=%s",
+        result["provider"],
+        result["model"],
+        result["accelerator"],
+        result["dimensions"],
+    )
+    return result
 
 
 def _cache_save(cache_dir: Path, key: str, payload: Mapping[str, Any]) -> None:
@@ -265,6 +297,9 @@ def _parse_dt(value: Any):
 
 def _packet_text(packed: Any) -> str:
     blocks: list[str] = []
+    grounding_policy = str(getattr(packed, "grounding_policy", "") or "").strip()
+    if grounding_policy:
+        blocks.append("Grounding policy: " + grounding_policy)
     for segment in tuple(getattr(packed, "evidence_segments", ())):
         blocks.append(MemoryContextPacker._render_segment(segment))
     for fact in tuple(getattr(packed, "facts", ())):
@@ -486,7 +521,7 @@ def run_cases(
     dry_run: bool = False,
     resume: bool = False,
     rewrite_enabled: bool = True,
-    channel_timeout: float = 0.5,
+    channel_timeout: float = DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS,
     input_price_mtok: float = DEFAULT_INPUT_PRICE_MT,
     output_price_mtok: float = DEFAULT_OUTPUT_PRICE_MT,
     provider_attempts: int = PROVIDER_ATTEMPTS,
@@ -501,6 +536,7 @@ def run_cases(
     settings: Any | None = None,
     runtime: Any | None = None,
     transport: Any | None = None,
+    prewarm_embedding: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     selected = _stratify(cases, limit=limit, seed=seed)
     if dry_run:
@@ -543,6 +579,9 @@ def run_cases(
     else:
         llm_client = None
         aux_client = None
+    embedding_prewarm = (
+        _prewarm_embedding_runtime(runtime) if prewarm_embedding else None
+    )
     if transport is None:
         if llm_client is None:
             raise ValueError("transport is required when runtime is injected")
@@ -612,6 +651,8 @@ def run_cases(
         "skipped_resumed": len(selected) - len(rows),
         "cache_dir": str(cache_dir),
     }
+    if embedding_prewarm is not None:
+        summary["embedding_prewarm"] = embedding_prewarm
     return rows, summary
 
 
@@ -675,6 +716,10 @@ def _run_case(
         for segment in tuple(getattr(packed, "evidence_segments", ()))
     )
     resolved = getattr(trace, "resolved_query", None)
+    memory_phase_timings_ms = {
+        str(key): round(float(value), 3)
+        for key, value in getattr(trace, "phase_timings_ms", ())
+    }
     expected_subject = (
         tuple(str(value) for value in (case.get("allowed_subject_user_ids") or ()))
         if case.get("allowed_subject_user_ids") is not None
@@ -698,6 +743,8 @@ def _run_case(
     )
     cached = _cache_load(cache_dir, answer_key)
     provider_error: str | None = None
+    provider_failure_kind: str | None = None
+    provider_trace: dict[str, str] = {}
     answer_started = perf_counter()
     if cached is not None:
         answer_observation = SimpleNamespace(**cached)
@@ -712,6 +759,10 @@ def _run_case(
             )
         except QualityReplayError as exc:
             provider_error = str(exc)
+            provider_failure_kind = str(
+                getattr(exc, "failure_kind", None) or "provider_failed"
+            )
+            provider_trace = dict(getattr(exc, "safe_metadata", {}) or {})
             answer_observation = SimpleNamespace(
                 text="", input_tokens=0, output_tokens=0, ttft_ms=0.0, model=model
             )
@@ -725,6 +776,15 @@ def _run_case(
                     "output_tokens": int(answer_observation.output_tokens),
                     "ttft_ms": float(answer_observation.ttft_ms),
                     "model": str(answer_observation.model),
+                    "usage_estimated": bool(
+                        getattr(answer_observation, "usage_estimated", False)
+                    ),
+                    "attempt_count": int(
+                        getattr(answer_observation, "attempt_count", 1)
+                    ),
+                    "no_event_attempts": int(
+                        getattr(answer_observation, "no_event_attempts", 0)
+                    ),
                 },
             )
     stage_timings_ms["answer"] = (perf_counter() - answer_started) * 1000
@@ -751,6 +811,7 @@ def _run_case(
     repair_prejudge_started = perf_counter()
     repair_prejudge_attempted = False
     repair_prejudge_error: str | None = None
+    repair_prejudge_no_event_attempts = 0
     if not protocol_failures and not abstained:
         packet_id_set = set(packet_source_ids)
         if not cited_ids or any(str(value) not in packet_id_set for value in cited_ids):
@@ -792,6 +853,10 @@ def _run_case(
                 cited_ids = tuple(outcome.answer.cited_source_message_ids)
                 abstained = outcome.answer.abstained
                 repaired = True
+            if outcome is not None:
+                repair_prejudge_no_event_attempts += int(
+                    getattr(outcome.observation, "no_event_attempts", 0)
+                )
     stage_timings_ms["citation_repair_prejudge"] = (
         (perf_counter() - repair_prejudge_started) * 1000
         if repair_prejudge_attempted
@@ -800,7 +865,12 @@ def _run_case(
     raw_decision = None
     cached_judge = None
     judge_prompt: list[str] = []
+    judge_observation: Any | None = None
     judge_provider_error: str | None = None
+    judge_provider_failure_kind: str | None = None
+    judge_provider_trace: dict[str, str] = {}
+    judge_attempt_count = 0
+    judge_no_event_attempts = 0
     judge_started = perf_counter()
     if not protocol_failures:
         abstained_with_evidence = bool(
@@ -843,6 +913,12 @@ def _run_case(
             except QualityReplayError as exc:
                 protocol_failures = ("provider_failed",)
                 judge_provider_error = str(exc)
+                judge_provider_failure_kind = str(
+                    getattr(exc, "failure_kind", None) or "provider_failed"
+                )
+                judge_provider_trace = dict(
+                    getattr(exc, "safe_metadata", {}) or {}
+                )
             else:
                 _cache_save(
                     cache_dir,
@@ -853,8 +929,24 @@ def _run_case(
                         "output_tokens": int(judge_observation.output_tokens),
                         "ttft_ms": float(judge_observation.ttft_ms),
                         "model": str(judge_observation.model),
+                        "usage_estimated": bool(
+                            getattr(judge_observation, "usage_estimated", False)
+                        ),
+                        "attempt_count": int(
+                            getattr(judge_observation, "attempt_count", 1)
+                        ),
+                        "no_event_attempts": int(
+                            getattr(judge_observation, "no_event_attempts", 0)
+                        ),
                     },
                 )
+        if judge_observation is not None:
+            judge_attempt_count += int(
+                getattr(judge_observation, "attempt_count", 1)
+            )
+            judge_no_event_attempts += int(
+                getattr(judge_observation, "no_event_attempts", 0)
+            )
         if not protocol_failures:
             try:
                 raw_decision = parse_judge_decision(judge_observation.text)
@@ -869,6 +961,7 @@ def _run_case(
     repair_rejudge_started = perf_counter()
     repair_rejudge_attempted = False
     repair_rejudge_error: str | None = None
+    repair_rejudge_no_event_attempts = 0
     if (
         not protocol_failures
         and raw_decision is not None
@@ -912,6 +1005,10 @@ def _run_case(
             cited_ids = tuple(outcome.answer.cited_source_message_ids)
             abstained = outcome.answer.abstained
             repaired = True
+        if outcome is not None:
+            repair_rejudge_no_event_attempts += int(
+                getattr(outcome.observation, "no_event_attempts", 0)
+            )
             try:
                 judge_observation = _generate_with_retries(
                     aux_transport,
@@ -935,10 +1032,22 @@ def _run_case(
                     backoff=provider_backoff,
                 )
                 raw_decision = parse_judge_decision(judge_observation.text)
+                judge_attempt_count += int(
+                    getattr(judge_observation, "attempt_count", 1)
+                )
+                judge_no_event_attempts += int(
+                    getattr(judge_observation, "no_event_attempts", 0)
+                )
             except QualityReplayError as exc:
                 raw_decision = None
                 protocol_failures = ("provider_failed",)
                 judge_provider_error = str(exc)
+                judge_provider_failure_kind = str(
+                    getattr(exc, "failure_kind", None) or "provider_failed"
+                )
+                judge_provider_trace = dict(
+                    getattr(exc, "safe_metadata", {}) or {}
+                )
                 repair_rejudge_error = str(exc)
             except (ValueError, json.JSONDecodeError) as exc:
                 raw_decision = None
@@ -983,6 +1092,18 @@ def _run_case(
         "group_id": group_id,
         "subject_ids": list(actual_subject_tuple or ()),
         "subject_match": actual_subject_tuple == expected_subject,
+        "rewrite_used": bool(getattr(resolved, "rewrite_used", False)),
+        "memory_phase_timings_ms": memory_phase_timings_ms,
+        "attempted_channels": list(
+            str(value) for value in getattr(trace, "attempted_channels", ())
+        ),
+        "failed_channels": list(
+            str(value) for value in getattr(trace, "failed_channels", ())
+        ),
+        "channel_candidate_counts": [
+            [str(channel), int(count)]
+            for channel, count in getattr(trace, "channel_candidate_counts", ())
+        ],
         "answer_grounded": bool(decision and decision.answer_grounded),
         "answer_correct": bool(decision and decision.answer_correct),
         "abstained": bool(decision and decision.abstained),
@@ -998,12 +1119,33 @@ def _run_case(
         "input_tokens": int(getattr(answer_observation, "input_tokens", 0)),
         "output_tokens": int(getattr(answer_observation, "output_tokens", 0)),
         "ttft_ms": float(getattr(answer_observation, "ttft_ms", 0.0)),
+        "usage_estimated": bool(
+            getattr(answer_observation, "usage_estimated", False)
+        ),
+        "answer_attempt_count": int(
+            getattr(answer_observation, "attempt_count", 0)
+        ),
+        "answer_no_event_attempts": int(
+            getattr(answer_observation, "no_event_attempts", 0)
+        ),
+        "judge_attempt_count": judge_attempt_count,
+        "judge_no_event_attempts": judge_no_event_attempts,
+        "citation_repair_prejudge_no_event_attempts": (
+            repair_prejudge_no_event_attempts
+        ),
+        "citation_repair_rejudge_no_event_attempts": (
+            repair_rejudge_no_event_attempts
+        ),
         "total_ms": total_ms,
         "stage_timings_ms": {
             key: round(value, 3) for key, value in stage_timings_ms.items()
         },
         "provider_error": provider_error,
+        "provider_failure_kind": provider_failure_kind,
+        "provider_trace": provider_trace,
         "judge_provider_error": judge_provider_error,
+        "judge_provider_failure_kind": judge_provider_failure_kind,
+        "judge_provider_trace": judge_provider_trace,
         "citation_repair_prejudge_error": repair_prejudge_error,
         "citation_repair_rejudge_error": repair_rejudge_error,
         "cached": cached is not None,
@@ -1014,11 +1156,80 @@ def _run_case(
         "judge_reason_code": str(getattr(raw_decision, "reason_code", "")),
         "query": str(case.get("query", "")),
         "answer_prompt": answer_prompt,
+        "answer_prompt_chars": sum(len(line) for line in answer_prompt),
         "judge_prompt": judge_prompt,
+        "judge_prompt_chars": sum(len(line) for line in judge_prompt),
         "model": model,
         "judge_model": judge_model,
     }
     return row
+
+
+def _provider_preflight_summary(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_cases: int = PROVIDER_PREFLIGHT_CASES,
+) -> dict[str, Any]:
+    """Build a fail-closed online-provider gate without exposing case content."""
+
+    provider_failed = 0
+    provider_no_event = 0
+    provider_no_event_attempts = 0
+    protocol_failed = 0
+    prompt_sizes: list[int] = []
+    error_fields = (
+        "provider_error",
+        "judge_provider_error",
+        "citation_repair_prejudge_error",
+        "citation_repair_rejudge_error",
+    )
+    for row in rows:
+        failures = tuple(str(value) for value in row.get("protocol_failure_codes") or ())
+        if failures:
+            protocol_failed += 1
+        if "provider_failed" in failures:
+            provider_failed += 1
+        if any(
+            str(row.get(field) or "") == "QUALITY_REPLAY_PROVIDER_NO_EVENT"
+            for field in error_fields
+        ):
+            provider_no_event += 1
+        provider_no_event_attempts += sum(
+            int(row.get(field) or 0)
+            for field in (
+                "answer_no_event_attempts",
+                "judge_no_event_attempts",
+                "citation_repair_prejudge_no_event_attempts",
+                "citation_repair_rejudge_no_event_attempts",
+            )
+        )
+        prompt_size = int(row.get("answer_prompt_chars") or 0)
+        if prompt_size > 0:
+            prompt_sizes.append(prompt_size)
+
+    prompt_sizes.sort()
+    prompt_span = {
+        "min": prompt_sizes[0] if prompt_sizes else 0,
+        "median": prompt_sizes[len(prompt_sizes) // 2] if prompt_sizes else 0,
+        "max": prompt_sizes[-1] if prompt_sizes else 0,
+    }
+    passed = (
+        len(rows) == int(expected_cases)
+        and protocol_failed == 0
+        and provider_failed == 0
+        and provider_no_event == 0
+        and provider_no_event_attempts == 0
+    )
+    return {
+        "passed": passed,
+        "expected": int(expected_cases),
+        "completed": len(rows) - provider_failed,
+        "protocol_failed": protocol_failed,
+        "provider_failed": provider_failed,
+        "provider_no_event": provider_no_event,
+        "provider_no_event_attempts": provider_no_event_attempts,
+        "answer_prompt_chars": prompt_span,
+    }
 
 
 def _dry_run_estimate(
@@ -1074,23 +1285,42 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rewrite-enabled", action="store_true", default=True)
     parser.add_argument("--no-rewrite", dest="rewrite_enabled", action="store_false")
-    parser.add_argument("--channel-timeout", type=float, default=0.5)
+    parser.add_argument(
+        "--channel-timeout",
+        type=float,
+        default=DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS,
+        help="Per-channel retrieval timeout; defaults to the production 4s contract.",
+    )
     parser.add_argument("--input-price-mtok", type=float, default=DEFAULT_INPUT_PRICE_MT)
     parser.add_argument("--output-price-mtok", type=float, default=DEFAULT_OUTPUT_PRICE_MT)
     parser.add_argument("--provider-attempts", type=int, default=PROVIDER_ATTEMPTS)
     parser.add_argument("--provider-backoff", type=float, default=PROVIDER_BACKOFF_SECONDS)
+    parser.add_argument(
+        "--prewarm-embedding",
+        action="store_true",
+        help="Prewarm the actual runtime embedding provider before timing cases.",
+    )
+    parser.add_argument(
+        "--provider-preflight",
+        action="store_true",
+        help="Run a fail-closed 10-case online provider gate before a full replay.",
+    )
     parser.add_argument("--progress", type=Path, default=Path("data/test-platform/progress-fullchain.jsonl"))
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_argument_parser().parse_args(argv)
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    if args.provider_preflight and (args.dry_run or args.resume):
+        parser.error("--provider-preflight cannot be combined with --dry-run or --resume")
     engine = _build_engine(args.database)
     cases = _load_cases(args.cases)
+    limit = PROVIDER_PREFLIGHT_CASES if args.provider_preflight else args.limit
     rows, summary = run_cases(
         engine,
         cases,
-        limit=args.limit,
+        limit=limit,
         seed=args.seed,
         cache_dir=args.cache_dir,
         model=args.model,
@@ -1108,12 +1338,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         provider_attempts=args.provider_attempts,
         provider_backoff=args.provider_backoff,
         progress_path=args.progress,
+        detail_path=args.output_detail,
+        prewarm_embedding=args.prewarm_embedding,
     )
     args.output_detail.parent.mkdir(parents=True, exist_ok=True)
     if rows:
         _merge_results(args.output_detail, rows)
+    exit_code = 0
+    if args.provider_preflight:
+        preflight = _provider_preflight_summary(
+            rows,
+            expected_cases=PROVIDER_PREFLIGHT_CASES,
+        )
+        summary["provider_preflight"] = preflight
+        if not preflight["passed"]:
+            exit_code = 2
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

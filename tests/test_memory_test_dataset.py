@@ -149,7 +149,23 @@ def test_group_subject_alias_and_mention_expected_abstention(tmp_path):
     mention_cases = [case for case in cases if case["category"] == "mention"]
     assert mention_cases
     assert all(case["gold_text"] == "" for case in mention_cases)
+    assert all(not case["expected_evidence_message_ids"] for case in mention_cases)
+    assert all(case["allowed_subject_user_ids"] is None for case in mention_cases)
     summary_cases = [case for case in cases if case["category"] == "summary"]
     assert summary_cases
     assert all("Recent chat summary" not in case["query"] for case in summary_cases)
     assert all("summary:" not in case["query"] for case in summary_cases)
+    assert all(case["query"] in {"昨天群里说了什么", "昨天群里聊了什么"} for case in summary_cases)
+    assert all(case["allowed_subject_user_ids"] is None for case in summary_cases)
+    assert all(case["now_iso"] == "2026-08-02T02:05:00+00:00" for case in summary_cases)
+    raw_cases = [case for case in cases if case["category"] == "raw_history"]
+    assert raw_cases
+    assert all("以前" in case["query"] or "之前" in case["query"] for case in raw_cases)
+    distractor_cases = [case for case in cases if case["category"] == "distractor"]
+    assert distractor_cases
+    assert any(case["allowed_subject_user_ids"] for case in distractor_cases)
+    assert all(
+        case["allowed_subject_user_ids"] is None
+        or len(case["allowed_subject_user_ids"]) == 1
+        for case in distractor_cases
+    )

@@ -267,6 +267,13 @@ def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSett
         "subject_expected": expected_subject,
         "subject_actual": actual_subject_tuple,
         "subject_match": actual_subject_tuple == expected_subject,
+        "rewrite_used": bool(
+            getattr(trace.resolved_query, "rewrite_used", False)
+        ),
+        "memory_phase_timings_ms": {
+            str(key): round(float(value), 3)
+            for key, value in getattr(trace, "phase_timings_ms", ())
+        },
         "raw_hit": bool(packed.evidence_segments),
         "fact_hit": bool(packed.facts),
         "summary_hit": bool(packed.summaries),
@@ -553,6 +560,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rewrite-enabled", dest="rewrite_enabled", action="store_true")
     parser.set_defaults(rewrite_enabled=False)
     parser.add_argument("--channel-timeout", type=float, default=0.5)
+    parser.add_argument(
+        "--fullchain-channel-timeout",
+        type=float,
+        default=fullchain.DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS,
+        help="Production-like retrieval timeout for the real-model fullchain stage.",
+    )
     parser.add_argument("--input-price-mtok", type=float, default=fullchain.DEFAULT_INPUT_PRICE_MT)
     parser.add_argument("--output-price-mtok", type=float, default=fullchain.DEFAULT_OUTPUT_PRICE_MT)
     parser.add_argument("--provider-attempts", type=int, default=fullchain.PROVIDER_ATTEMPTS)
@@ -621,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 resume=args.resume,
                 rewrite_enabled=args.rewrite_enabled,
-                channel_timeout=args.channel_timeout,
+                channel_timeout=args.fullchain_channel_timeout,
                 input_price_mtok=args.input_price_mtok,
                 output_price_mtok=args.output_price_mtok,
                 provider_attempts=args.provider_attempts,

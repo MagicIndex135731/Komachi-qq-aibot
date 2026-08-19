@@ -125,9 +125,33 @@ logger = logging.getLogger(__name__)
 class QualityReplayError(RuntimeError):
     """Fail-closed replay error whose message contains no private content."""
 
-    def __init__(self, message: str, *, retryable: bool | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool | None = None,
+        failure_kind: str | None = None,
+        safe_metadata: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.failure_kind = failure_kind
+        self.safe_metadata = dict(safe_metadata or {})
+
+
+def _safe_provider_trace_metadata(headers: Mapping[str, str]) -> dict[str, str]:
+    """Return bounded gateway IDs that are safe to persist for correlation."""
+
+    result: dict[str, str] = {}
+    for header, field in (("x-request-id", "request_id"), ("cf-ray", "cf_ray")):
+        value = str(headers.get(header) or "").strip()
+        if not value or len(value) > 128:
+            continue
+        if value.isascii() and all(
+            character.isalnum() or character in "._:-" for character in value
+        ):
+            result[field] = value
+    return result
 
 
 class AnswerContractError(ValueError):
@@ -158,6 +182,9 @@ class ObservedGeneration:
     ttft_ms: float
     model: str
     endpoint: str = "responses"
+    usage_estimated: bool = False
+    attempt_count: int = 1
+    no_event_attempts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,12 +306,41 @@ def parse_citation_contract_decision(value: str) -> CitationContractDecision:
 class ObservedResponsesTransport:
     """Responses SSE transport exposing real first-text-delta time and usage."""
 
-    def __init__(self, client: LlmClient, *, max_attempts: int | None = None) -> None:
+    # The upstream console shows this provider completing normal requests in
+    # roughly 4--10 seconds, while larger evaluation prompts can legitimately
+    # take a little longer to produce their first text delta. Keep a bounded
+    # per-attempt idle window so a proxy that stops forwarding SSE events
+    # cannot hold one case for the full LlmClient 90-second read cap.
+    DEFAULT_STREAM_READ_TIMEOUT_SECONDS = 25.0
+    DEFAULT_TRANSPORT_FAILURE_ATTEMPTS = 2
+
+    def __init__(
+        self,
+        client: LlmClient,
+        *,
+        max_attempts: int | None = None,
+        read_timeout_seconds: float = DEFAULT_STREAM_READ_TIMEOUT_SECONDS,
+        transport_failure_attempts: int = DEFAULT_TRANSPORT_FAILURE_ATTEMPTS,
+    ) -> None:
         self.client = client
         configured_attempts = (
             client.REQUEST_MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
         )
         self.max_attempts = max(1, min(configured_attempts, client.REQUEST_MAX_ATTEMPTS))
+        timeout_seconds = float(read_timeout_seconds)
+        if timeout_seconds <= 0:
+            raise ValueError("read_timeout_seconds must be positive")
+        self.read_timeout_seconds = timeout_seconds
+        self.transport_failure_attempts = max(
+            1,
+            min(int(transport_failure_attempts), self.max_attempts),
+        )
+
+    def _read_timeout_for_prompt(self, prompt_chars: int) -> float:
+        """Scale the idle window for large prompts without restoring a 90s tail."""
+
+        prompt_scale = min(5.0, max(0.0, float(prompt_chars)) / 3000.0)
+        return min(30.0, self.read_timeout_seconds + prompt_scale)
 
     def generate(self, prompt_lines: list[str], *, model: str) -> ObservedGeneration:
         instructions, input_lines = self.client._split_prompt_lines(prompt_lines)
@@ -296,32 +352,67 @@ class ObservedResponsesTransport:
         )
         prompt_chars = sum(len(line) for line in prompt_lines)
         instructions_chars = len(str(payload.get("instructions") or ""))
+        stream_read_timeout = self._read_timeout_for_prompt(prompt_chars)
         text_deltas: list[str] = []
         ttft_ms: float | None = None
         usage: Mapping[str, Any] | None = None
+        usage_estimated = False
+        transport_failure_count = 0
+        no_event_attempts = 0
         for attempt in range(1, self.max_attempts + 1):
             started = perf_counter()
             text_deltas = []
             ttft_ms = None
             usage = None
+            usage_estimated = False
+            event_count = 0
+            last_event_type = ""
+            safe_trace_metadata: dict[str, str] = {}
             try:
                 with self.client.http_client.stream(
                     "POST",
                     f"{self.client.base_url}/responses",
                     headers={"Authorization": f"Bearer {self.client.api_key}"},
                     json=payload,
+                    timeout=httpx.Timeout(
+                        timeout=stream_read_timeout,
+                        connect=min(10.0, stream_read_timeout),
+                        read=stream_read_timeout,
+                        write=stream_read_timeout,
+                        pool=min(10.0, stream_read_timeout),
+                    ),
                 ) as response:
+                    safe_trace_metadata = _safe_provider_trace_metadata(response.headers)
                     response.raise_for_status()
                     if "text/event-stream" not in response.headers.get("content-type", ""):
                         raise QualityReplayError("QUALITY_REPLAY_NON_STREAM_RESPONSE")
                     for event in _iter_sse_json(response.iter_lines()):
                         event_type = str(event.get("type") or "")
+                        event_count += 1
+                        last_event_type = event_type
                         if event_type == "response.output_text.delta":
                             delta = event.get("delta")
                             if isinstance(delta, str) and delta:
                                 if ttft_ms is None:
                                     ttft_ms = (perf_counter() - started) * 1000.0
                                 text_deltas.append(delta)
+                        elif event_type == "response.output_text.done":
+                            # ``response.output_text.done`` is the terminal
+                            # event for the textual content itself.  A proxy
+                            # may drop the enclosing item/completed events;
+                            # once all text deltas are present, waiting for
+                            # EOF would recreate the local read-timeout tail.
+                            if text_deltas:
+                                usage_estimated = True
+                                logger.info(
+                                    "quality_replay_sse_terminal_fallback "
+                                    "event=response.output_text.done attempt=%s "
+                                    "prompt_chars=%s model=%s",
+                                    attempt,
+                                    prompt_chars,
+                                    model,
+                                )
+                                break
                         elif event_type == "response.completed":
                             completed = event.get("response")
                             if isinstance(completed, Mapping):
@@ -337,21 +428,56 @@ class ObservedResponsesTransport:
                             # the protocol terminal event; close the stream
                             # immediately after collecting usage.
                             break
+                        elif event_type == "response.output_item.done":
+                            # Some OpenAI-compatible SSE proxies forward the
+                            # completed message item but omit the enclosing
+                            # ``response.completed`` event.  Once a text
+                            # message item is complete, waiting for EOF turns
+                            # a successful upstream response into a local read
+                            # timeout and causes an unnecessary duplicate
+                            # request.  Close at this protocol boundary and
+                            # estimate usage below when the proxy did not
+                            # provide it.
+                            item = event.get("item")
+                            item_type = item.get("type") if isinstance(item, Mapping) else None
+                            item_status = item.get("status") if isinstance(item, Mapping) else None
+                            if (
+                                text_deltas
+                                and item_type in (None, "message")
+                                and item_status in (None, "completed")
+                            ):
+                                usage_estimated = True
+                                logger.info(
+                                    "quality_replay_sse_terminal_fallback "
+                                    "event=response.output_item.done attempt=%s "
+                                    "prompt_chars=%s model=%s",
+                                    attempt,
+                                    prompt_chars,
+                                    model,
+                                )
+                                break
                         elif event_type in {"error", "response.failed", "response.incomplete"}:
                             raise QualityReplayError(
                                 "QUALITY_REPLAY_PROVIDER_FAILED",
                                 retryable=False,
+                                failure_kind="provider_failed",
+                                safe_metadata=safe_trace_metadata,
                             )
                 break
             except QualityReplayError:
                 raise
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
+                if exc.response is not None:
+                    safe_trace_metadata = _safe_provider_trace_metadata(
+                        exc.response.headers
+                    )
                 retryable = self.client._is_retryable_responses_status_code(status_code)
                 logger.warning(
                     "quality_replay_provider_http_failure status=%s attempt=%s "
                     "max_attempts=%s prompt_chars=%s instructions_chars=%s "
-                    "model=%s endpoint=/responses mode=native retryable=%s",
+                    "model=%s endpoint=/responses mode=native retryable=%s "
+                    "request_id=%s cf_ray=%s",
                     status_code,
                     attempt,
                     self.max_attempts,
@@ -359,6 +485,8 @@ class ObservedResponsesTransport:
                     instructions_chars,
                     model,
                     retryable,
+                    safe_trace_metadata.get("request_id", "<none>"),
+                    safe_trace_metadata.get("cf_ray", "<none>"),
                 )
                 if retryable and attempt < self.max_attempts:
                     self.client._sleep_before_retry(
@@ -369,6 +497,8 @@ class ObservedResponsesTransport:
                 raise QualityReplayError(
                     "QUALITY_REPLAY_PROVIDER_FAILED",
                     retryable=False,
+                    failure_kind="provider_failed",
+                    safe_metadata=safe_trace_metadata,
                 ) from exc
             except httpx.UnsupportedProtocol as exc:
                 logger.warning(
@@ -380,36 +510,68 @@ class ObservedResponsesTransport:
                 raise QualityReplayError(
                     "QUALITY_REPLAY_PROVIDER_FAILED",
                     retryable=False,
+                    failure_kind="provider_configuration",
                 ) from exc
             except (httpx.HTTPError, OSError) as exc:
+                transport_failure_count += 1
+                no_event = event_count == 0
+                if no_event:
+                    no_event_attempts += 1
                 logger.warning(
                     "quality_replay_provider_transport_failure attempt=%s max_attempts=%s "
+                    "transport_failure_attempt=%s max_transport_failure_attempts=%s "
                     "reason=%s prompt_chars=%s instructions_chars=%s model=%s "
-                    "endpoint=/responses mode=native",
+                    "read_timeout_seconds=%.1f last_event_type=%s event_count=%s "
+                    "text_delta_count=%s endpoint=/responses mode=native "
+                    "request_id=%s cf_ray=%s",
                     attempt,
                     self.max_attempts,
+                    transport_failure_count,
+                    self.transport_failure_attempts,
                     type(exc).__name__,
                     prompt_chars,
                     instructions_chars,
                     model,
+                    stream_read_timeout,
+                    last_event_type or "<none>",
+                    event_count,
+                    len(text_deltas),
+                    safe_trace_metadata.get("request_id", "<none>"),
+                    safe_trace_metadata.get("cf_ray", "<none>"),
                 )
-                if attempt < self.max_attempts:
+                if (
+                    attempt < self.max_attempts
+                    and transport_failure_count < self.transport_failure_attempts
+                ):
                     self.client._sleep_before_retry(
                         attempt=attempt,
                         max_attempts=self.max_attempts,
                     )
                     continue
+                error_code = (
+                    "QUALITY_REPLAY_PROVIDER_NO_EVENT"
+                    if no_event
+                    else "QUALITY_REPLAY_PROVIDER_FAILED"
+                )
                 raise QualityReplayError(
-                    "QUALITY_REPLAY_PROVIDER_FAILED",
+                    error_code,
                     retryable=False,
+                    failure_kind=(
+                        "provider_no_event" if no_event else "provider_transport"
+                    ),
+                    safe_metadata=safe_trace_metadata,
                 ) from exc
 
         if ttft_ms is None or not text_deltas:
             raise QualityReplayError("QUALITY_REPLAY_TTFT_UNOBSERVABLE")
         if usage is None:
-            raise QualityReplayError("QUALITY_REPLAY_USAGE_MISSING")
-        input_tokens = _native_non_negative_int(usage.get("input_tokens"))
-        output_tokens = _native_non_negative_int(usage.get("output_tokens"))
+            if not usage_estimated:
+                raise QualityReplayError("QUALITY_REPLAY_USAGE_MISSING")
+            input_tokens = max(1, prompt_chars // 4)
+            output_tokens = max(1, len("".join(text_deltas)) // 4)
+        else:
+            input_tokens = _native_non_negative_int(usage.get("input_tokens"))
+            output_tokens = _native_non_negative_int(usage.get("output_tokens"))
         if input_tokens <= 0:
             raise QualityReplayError("QUALITY_REPLAY_INPUT_TOKENS_MISSING")
         return ObservedGeneration(
@@ -418,6 +580,9 @@ class ObservedResponsesTransport:
             output_tokens=output_tokens,
             ttft_ms=ttft_ms,
             model=model,
+            usage_estimated=usage_estimated,
+            attempt_count=attempt,
+            no_event_attempts=no_event_attempts,
         )
 
 

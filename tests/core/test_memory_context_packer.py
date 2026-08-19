@@ -6,6 +6,7 @@ from app.core.memory_context_packer import (
     EvidenceMessage,
     EvidenceSegment,
     MEMORY_GROUNDING_NO_EVIDENCE,
+    MEMORY_GROUNDING_WITH_EVIDENCE,
     QQ_BLOCKED_MEMORY_NOTE,
     MemoryContextPacker,
     MemoryFact,
@@ -195,7 +196,90 @@ def test_both_modes_allow_bounded_history_and_relevant_summary_can_stand_alone()
     assert "latest summary" in normal.text
     assert empty.summaries == (summary,)
     assert "latest summary" in empty.text
+    assert empty.grounding_policy == MEMORY_GROUNDING_WITH_EVIDENCE
     assert empty_irrelevant.summaries == ()
+    assert empty_irrelevant.grounding_policy == MEMORY_GROUNDING_NO_EVIDENCE
+
+
+def test_adaptive_relevant_summary_alone_is_memory_evidence() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100,
+        detail_budget=100,
+        recent_budget=100,
+        history_budget=100,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=0,
+        recent_protected_min_messages=0,
+        history_protected_min_messages=0,
+        token_counter=lambda value: 1,
+    )
+    summary = MemorySummary("latest summary", ("x",), relevant=True)
+
+    packed = packer.pack(
+        "normal",
+        available_input=100,
+        target_message_id=None,
+        summaries=(summary,),
+    )
+
+    assert packed.summaries == (summary,)
+    assert packed.grounding_policy == MEMORY_GROUNDING_WITH_EVIDENCE
+
+
+def test_adaptive_relevant_summary_reserves_space_before_optional_history() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=10,
+        detail_budget=10,
+        context_char_budget=20_000,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=0,
+        recent_protected_min_messages=0,
+        history_protected_min_messages=0,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    facts = (
+        MemoryFact("TOKEN " * 5, ("f1",), score=2.0),
+        MemoryFact("TOKEN " * 5, ("f2",), score=1.0),
+    )
+    summary = MemorySummary("TOKEN " * 3, ("s1",), relevant=True)
+
+    packed = packer.pack(
+        "normal",
+        available_input=10,
+        target_message_id=None,
+        facts=facts,
+        summaries=(summary,),
+    )
+
+    assert packed.summaries == (summary,)
+    assert packed.estimated_tokens <= 10
+
+
+def test_adaptive_summary_tokens_are_not_double_counted_for_spillover() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=10,
+        detail_budget=10,
+        context_char_budget=20_000,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=4,
+        recent_protected_min_messages=0,
+        history_protected_min_messages=0,
+        token_counter=lambda value: value.count("TOKEN"),
+    )
+    summary = MemorySummary("TOKEN TOKEN TOKEN", ("s1",), relevant=True)
+
+    packed = packer.pack(
+        "normal",
+        available_input=10,
+        target_message_id=None,
+        summaries=(summary,),
+    )
+
+    assert packed.summaries == (summary,)
+    assert packed.spillover == "none"
 
 
 def test_blocked_message_becomes_safe_note_without_sensitive_text() -> None:

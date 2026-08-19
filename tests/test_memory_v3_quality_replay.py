@@ -81,6 +81,47 @@ class _TimedSseStream(httpx.SyncByteStream):
         yield b"data: [DONE]\n\n"
 
 
+class _OutputItemDoneWithoutCompletedStream(httpx.SyncByteStream):
+    def __iter__(self):
+        yield b'data: {"type":"response.output_text.delta","delta":"{\\"answer\\":\\"ok\\","}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"\\"cited_source_message_ids\\":[\\"m1\\"],\\"abstained\\":false}"}\n\n'
+        yield b'data: {"type":"response.output_text.done","text":"ignored"}\n\n'
+        yield (
+            'data: '
+            + json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                    },
+                }
+            )
+            + "\n\n"
+        ).encode()
+        time.sleep(0.5)
+        yield b"data: [DONE]\n\n"
+
+
+class _OutputTextDoneWithoutTerminalItemStream(httpx.SyncByteStream):
+    def __iter__(self):
+        yield b'data: {"type":"response.output_text.delta","delta":"{\\"answer\\":\\"ok\\","}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"\\"cited_source_message_ids\\":[\\"m1\\"],\\"abstained\\":false}"}\n\n'
+        yield b'data: {"type":"response.output_text.done","text":"ignored"}\n\n'
+        time.sleep(0.5)
+        yield b"data: [DONE]\n\n"
+
+
+class _NoEventTimeoutStream(httpx.SyncByteStream):
+    def __iter__(self):
+        raise httpx.ReadTimeout(
+            "private timeout marker",
+            request=httpx.Request("POST", "https://provider.invalid/v1/responses"),
+        )
+        yield b""  # pragma: no cover - keeps this function a generator
+
+
 def _client(stream: httpx.SyncByteStream) -> LlmClient:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/responses"
@@ -150,6 +191,51 @@ def test_observed_transport_stops_after_completed_event() -> None:
 
     assert result.input_tokens == 123
     assert elapsed_ms < 300
+
+
+def test_observed_transport_stops_after_completed_message_item_without_usage() -> None:
+    client = _client(_OutputItemDoneWithoutCompletedStream())
+    try:
+        started = time.perf_counter()
+        result = ObservedResponsesTransport(client).generate(
+            ["Target message: test"], model="answer-model"
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+    finally:
+        client.http_client.close()
+
+    assert parse_generated_answer(result.text).answer == "ok"
+    assert result.usage_estimated is True
+    assert result.input_tokens == len("Target message: test") // 4
+    assert result.output_tokens >= 1
+    assert elapsed_ms < 300
+
+
+def test_observed_transport_stops_after_output_text_done_without_terminal_item() -> None:
+    client = _client(_OutputTextDoneWithoutTerminalItemStream())
+    try:
+        started = time.perf_counter()
+        result = ObservedResponsesTransport(client).generate(
+            ["Target message: test"], model="answer-model"
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+    finally:
+        client.http_client.close()
+
+    assert parse_generated_answer(result.text).answer == "ok"
+    assert result.usage_estimated is True
+    assert elapsed_ms < 300
+
+
+def test_observed_transport_scales_read_window_for_large_prompts() -> None:
+    client = _client(_TimedSseStream())
+    try:
+        transport = ObservedResponsesTransport(client)
+        assert transport._read_timeout_for_prompt(0) == 25.0
+        assert transport._read_timeout_for_prompt(3000) == 26.0
+        assert transport._read_timeout_for_prompt(50000) == 30.0
+    finally:
+        client.http_client.close()
 
 
 @pytest.mark.parametrize(
@@ -240,6 +326,108 @@ def test_observed_transport_respects_evaluation_attempt_limit() -> None:
         client.http_client.close()
 
     assert attempts == 1
+
+
+def test_observed_transport_caps_no_event_timeouts_and_classifies_them(caplog) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            request=request,
+            headers={
+                "content-type": "text/event-stream",
+                "x-request-id": "req-safe-123",
+                "cf-ray": "ray-safe-456-SIN",
+                "x-private-debug": "private-header-marker",
+            },
+            stream=_NoEventTimeoutStream(),
+        )
+
+    client = LlmClient(
+        base_url="https://provider.invalid/v1",
+        api_key="private-api-key-marker",
+        model="answer-model",
+        responses_model="answer-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **kwargs: None
+    try:
+        with caplog.at_level(logging.WARNING, logger="scripts.run_memory_v3_quality_replay"):
+            with pytest.raises(
+                QualityReplayError,
+                match="^QUALITY_REPLAY_PROVIDER_NO_EVENT$",
+            ) as exc_info:
+                ObservedResponsesTransport(
+                    client,
+                    max_attempts=5,
+                    transport_failure_attempts=2,
+                ).generate(
+                    [
+                        "System persona: private instruction marker",
+                        "Target message: private query marker",
+                    ],
+                    model="answer-model",
+                )
+    finally:
+        client.http_client.close()
+
+    assert attempts == 2
+    assert exc_info.value.retryable is False
+    assert exc_info.value.failure_kind == "provider_no_event"
+    assert exc_info.value.safe_metadata == {
+        "request_id": "req-safe-123",
+        "cf_ray": "ray-safe-456-SIN",
+    }
+    assert "event_count=0" in caplog.text
+    assert "request_id=req-safe-123" in caplog.text
+    assert "cf_ray=ray-safe-456-SIN" in caplog.text
+    assert "private instruction marker" not in caplog.text
+    assert "private query marker" not in caplog.text
+    assert "private timeout marker" not in caplog.text
+    assert "private-header-marker" not in caplog.text
+    assert "private-api-key-marker" not in caplog.text
+
+
+def test_observed_transport_reports_no_event_attempt_before_success() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        stream: httpx.SyncByteStream
+        if attempts == 1:
+            stream = _NoEventTimeoutStream()
+        else:
+            stream = _TimedSseStream()
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    client = LlmClient(
+        base_url="https://provider.invalid/v1",
+        api_key="secret",
+        model="answer-model",
+        responses_model="answer-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **kwargs: None
+    try:
+        result = ObservedResponsesTransport(client, max_attempts=3).generate(
+            ["Target message: test"],
+            model="answer-model",
+        )
+    finally:
+        client.http_client.close()
+
+    assert attempts == 2
+    assert result.attempt_count == 2
+    assert result.no_event_attempts == 1
 
 
 def test_observed_transport_exhausts_xbai_403_and_logs_only_safe_metadata(caplog) -> None:

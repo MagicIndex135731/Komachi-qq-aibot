@@ -1,12 +1,60 @@
 import json
 import sqlite3
 
+from scripts import run_memory_test_suite as suite
 from scripts.run_memory_test_suite import (
+    build_argument_parser,
     stage_fullchain,
     stage_dataset,
     stage_prepare,
     stage_report,
 )
+
+
+def test_suite_parser_separates_offline_and_fullchain_channel_timeouts():
+    args = build_argument_parser().parse_args(["--database", "snapshot.db"])
+    assert args.channel_timeout == 0.5
+    assert args.fullchain_channel_timeout == 4.0
+
+
+def test_suite_main_routes_separate_channel_timeouts(monkeypatch, tmp_path):
+    captured: dict[str, float] = {}
+
+    def fake_offline(database, workdir, **kwargs):
+        del database, workdir
+        captured["offline"] = kwargs["channel_timeout"]
+        return {}
+
+    def fake_fullchain(database, workdir, **kwargs):
+        del database, workdir
+        captured["fullchain"] = kwargs["channel_timeout"]
+        return {}
+
+    monkeypatch.setattr(suite, "stage_offline", fake_offline)
+    monkeypatch.setattr(suite, "stage_fullchain", fake_fullchain)
+    database = tmp_path / "snapshot.db"
+
+    assert suite.main(
+        [
+            "--database",
+            str(database),
+            "--workdir",
+            str(tmp_path / "offline"),
+            "--stage",
+            "offline",
+        ]
+    ) == 0
+    assert suite.main(
+        [
+            "--database",
+            str(database),
+            "--workdir",
+            str(tmp_path / "fullchain"),
+            "--stage",
+            "fullchain",
+        ]
+    ) == 0
+    assert captured == {"offline": 0.5, "fullchain": 4.0}
 
 
 def _minimal_db(path):

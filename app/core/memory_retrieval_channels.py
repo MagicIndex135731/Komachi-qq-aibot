@@ -384,6 +384,11 @@ class ScopedMemoryRetrievalChannels:
 
     @classmethod
     def _subject_ids(cls, resolved_query: Any) -> tuple[str, ...] | None:
+        if getattr(resolved_query, "answer_mode", "") == "mention":
+            # Mention queries scope the *mentioned target*, not the author.
+            # An empty author subject must not become an empty SQL IN filter;
+            # ``mentioned_user_ids`` is passed through separately below.
+            return None
         values = getattr(resolved_query, "subject_ids", None)
         return None if values is None else cls._string_tuple(values)
 
@@ -437,6 +442,10 @@ class ScopedMemoryRetrievalChannels:
     def _mentioned_user_ids(cls, resolved_query: Any) -> tuple[str, ...] | None:
         if getattr(resolved_query, "answer_mode", "") != "mention":
             return None
+        mentioned_user_ids = getattr(resolved_query, "mentioned_user_ids", None)
+        if mentioned_user_ids is not None:
+            return cls._string_tuple(mentioned_user_ids)
+        # Compatibility for callers that construct the pre-split plan shape.
         return cls._subject_ids(resolved_query)
 
 

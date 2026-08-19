@@ -66,6 +66,11 @@ if [[ "${bot_status}" != "running" ]]; then
   docker compose -f "${compose_file}" logs --tail=80 xiaomachi
   exit 1
 fi
+bot_started_at="$(docker inspect --format '{{.State.StartedAt}}' "${bot_container_name}" 2>/dev/null || true)"
+if [[ -z "${bot_started_at}" ]]; then
+  echo "Cannot determine ${bot_container_name} start time."
+  exit 1
+fi
 
 if [[ "${platform}" == "llbot" ]]; then
   echo "LLBot WebUI probe:"
@@ -136,18 +141,29 @@ echo "Waiting for xiaomachi bot to accept messages (gateway ready)..."
 ready_ok=false
 for attempt in $(seq 1 60); do
   ready_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/group.ready.json 2>/dev/null || true)"
-  if python3 - "${ready_payload}" <<'PY'
-import json, sys
+  if python3 - "${ready_payload}" "${bot_started_at}" <<'PY'
+import json, re, sys
 from datetime import datetime, timezone
 if not sys.argv[1]: raise SystemExit(1)
 d = json.loads(sys.argv[1])
 t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
 if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+started_text = re.sub(r"(\.\d{6})\d+", r"\1", str(sys.argv[2]))
+started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+if started.tzinfo is None: started = started.replace(tzinfo=timezone.utc)
 age = (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()
+after_start = (t.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()
 state = str(d.get("state", ""))
-print(f"state={state} ready_age_seconds={age:.1f}")
+print(
+    f"state={state} ready_age_seconds={age:.1f} "
+    f"ready_after_container_start_seconds={after_start:.1f}"
+)
 if state not in ("connected", "ready"): raise SystemExit(1)
-if age > 60: raise SystemExit(1)
+# A ready marker is a state transition, not a heartbeat.  It may remain old
+# for the entire lifetime of a healthy persistent connection.  Reject only a
+# marker inherited from an earlier container instance; heartbeat freshness and
+# the live OneBot probe above cover current liveness.
+if after_start < -5: raise SystemExit(1)
 PY
   then
     ready_ok=true

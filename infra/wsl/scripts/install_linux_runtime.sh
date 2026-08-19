@@ -88,7 +88,7 @@ tar -C "${SOURCE_ROOT}" \
   --exclude='infra/wsl/.env' \
   --exclude='infra/wsl/runtime' \
   -cf - \
-  app configs infra/wsl .dockerignore pyproject.toml README.md LICENSE \
+  app configs infra/wsl scripts .dockerignore pyproject.toml README.md LICENSE \
   | tar -C "${release_dir}" -xf -
 
 if [[ -f "${SOURCE_ROOT}/infra/wsl/.env" ]]; then

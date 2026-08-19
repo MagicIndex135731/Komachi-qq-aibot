@@ -280,6 +280,47 @@ def test_plural_dated_speech_query_uses_summary_coverage_instead_of_top_one(
 
 
 @pytest.mark.parametrize(
+    ("query", "expected_answer_mode"),
+    (
+        ("昨天群里聊了什么", "summary"),
+        ("昨天群里说了什么", "summary"),
+        ("群里以前提到“动画”时说了什么", "general_history"),
+        ('群里以前提到"动画"时说了什么', "general_history"),
+        ("之前关于“动画”说过什么", "general_history"),
+        ("之前关于动画说过什么", "general_history"),
+        ("群里过去讨论「动画」时聊过什么", "general_history"),
+    ),
+)
+def test_explicit_group_history_prefixes_remain_subjectless(
+    query: str,
+    expected_answer_mode: str,
+) -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        # A quoted topic may collide with a real member alias. The explicit
+        # group-history grammar still asks about the topic across the group.
+        GroupMemberIdentity(user_id=10002, nickname="动画"),
+    )
+
+    result = resolver.resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.speaker_ids == ()
+    assert result.subject_ids is None
+    assert result.answer_mode == expected_answer_mode
+    assert result.needs_history is True
+    if "动画" in query:
+        assert result.topic_query == "动画"
+        assert result.retrieval_query == "动画"
+        assert result.topic_terms == ("动画",)
+
+
+@pytest.mark.parametrize(
     "query",
     (
         "阿渣 和 昨天说了什么？",
@@ -1933,6 +1974,21 @@ def test_requester_mention_query_without_requester_fails_closed() -> None:
     assert result.answer_mode == "mention"
     assert result.subject_ids == ()
     assert result.needs_history is True
+
+
+def test_generic_mention_query_keeps_author_subject_empty_and_binds_target() -> None:
+    result = MemoryQueryResolver(mention_target_ids=(90001,)).resolve(
+        "谁提到小町",
+        recent_messages=(),
+        now=NOW,
+        group_id=12345,
+        requester_id=10001,
+    )
+
+    assert result.answer_mode == "mention"
+    assert result.subject_ids == ()
+    assert result.mentioned_user_ids == ("90001",)
+    assert result.subject_binding == "unbound"
 
 
 def test_invalid_or_conflicting_scope_identity_is_rejected() -> None:

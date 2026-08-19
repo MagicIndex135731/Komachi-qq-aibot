@@ -48,6 +48,12 @@
 - `start-xiaomachi-wsl.bat`：启动 `infra/wsl/.env` 中 `QQ_PLATFORM` 选择的平台、小町和 watchdog；启动前会关闭另一平台，避免同号并行。
 - `stop-xiaomachi-wsl.bat`：停止当前 WSL 小町栈。
 - `status-xiaomachi-wsl.bat`：检查容器、OneBot 会话和小町心跳。
+
+修改小町源码、Dockerfile、Compose 或 `infra/wsl/.env` 后，不能只从工作区手动
+`docker compose up`；需要重新执行 Linux runtime 安装，让 `/opt/xiaomachi/current`、
+systemd 和三个 BAT 入口使用同一版本。正常的 `status-xiaomachi-wsl.bat` 必须同时显示
+`xiaomachi-stack.service` 与 `xiaomachi-watchdog.service` 为 active，并通过 OneBot、
+heartbeat 和 gateway-ready 检查。
 - `open-napcat-webui.bat`：手动打开 NapCat 登录页面，不启动或重启容器。
 - `open-llbot-webui.bat`：手动打开 LLBot WebUI，并把本地 WebUI 密码复制到剪贴板。
 
@@ -109,8 +115,9 @@
 - `MEMORY_FACT_SEMANTIC_RANKING_ENABLED=true`：事实按“问法意图类型 + 语义相似度 + 字面匹配 +
   重要性/置信度/时效”排序，目标类型事实进入上下文；向量持久化于
   `memory_item_semantic_vectors`，由后台与回填脚本写入。
-- `MEMORY_QUERY_REWRITE_ENABLED=true`：确定性绑定失败时做一次受约束改写，不改宽时间范围、
-  不虚构成员。
+- `MEMORY_QUERY_REWRITE_ENABLED=false`：生产默认使用确定性解析与受作用域约束的 fallback。
+  2026-08-15 同例 300 A/B 中 rewrite 未改善聚合质量、实际仅 1 例使用，却固定增加约
+  3 秒解析延迟；只有新的同例 A/B 证明质量收益后才重新启用。
 - `MEMORY_EMBEDDING_DEVICE=cuda`：生产使用 CUDA 推理，Docker 通过 CDI 只把 GPU 分配给
   `xiaomachi`。模板默认 `auto`：有 NVIDIA GPU 自动用 CUDA，没有则自动回退 CPU，
   无 CUDA 机器可直接部署运行。
@@ -260,10 +267,17 @@ python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
   --count 3000 --fullchain-limit 300 --dry-run
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --all
 
-# 模型配置：最终回答 Luna medium，judge/修复/改写 Luna low（默认）
+# 当前全链条模型配置：最终回答 Luna high，judge/修复 Luna medium（默认）
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
-  --answer-model gpt-5.6-luna --answer-effort medium \
-  --aux-model gpt-5.6-luna --aux-effort low --stage fullchain
+  --answer-model gpt-5.6-luna --answer-effort high \
+  --aux-model gpt-5.6-luna --aux-effort medium --stage fullchain
+
+# GPU 正式计时：先预热实际 runtime embedding provider，再开始逐例计时
+python -m scripts.memory_test_fullchain --database /tmp/snapshot.db \
+  --cases data/test-platform/cases.jsonl \
+  --output-detail data/test-platform/fullchain-results.jsonl \
+  --cache-dir data/test-platform/cache --limit 300 --no-rewrite \
+  --channel-timeout 4.0 --prewarm-embedding
 
 # 3) 分阶段 + 断点 + 缓存
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --stage fullchain --resume

@@ -144,13 +144,6 @@ _KEYWORD_STOP = {
 _LEGACY_NOISE = re.compile(
     r"（QQ昵称|\(QQ昵称| likes | dislikes |\bdis\b|（昵称|\(昵称"
 )
-_SUMMARY_LEVEL_MARKERS = re.compile(
-    r"^\s*(?:(?:recent\s*chat|daily|weekly|monthly|rolling|semantic|window|compact)\s*)?"
-    r"summary\s*[:：\-]?\s*",
-    re.IGNORECASE,
-)
-
-
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
     with engine.connect() as connection:
         yield from connection.execute(text(statement), parameters or {})
@@ -471,20 +464,24 @@ def _build_mention_case(
     messages_by_id: Mapping[str, dict[str, Any]],
     index: int,
 ) -> dict[str, Any]:
-    sources = [row["platform_msg_id"]]
-    if row["reply_to_msg_id"]:
-        sources.append(str(row["reply_to_msg_id"]))
     return {
         "group_id": row["group_id"],
         "query": row["plain_text"][:200],
         "recent_context_message_ids": (),
-        "expected_evidence_message_ids": tuple(dict.fromkeys(sources)),
+        # A live @bot message is the current request, not historical memory
+        # evidence.  Using it as gold makes source recall and abstention labels
+        # impossible to interpret because the request is deliberately absent
+        # from the historical retrieval corpus at evaluation time.
+        "expected_evidence_message_ids": (),
         "category": "mention",
         "time_range": None,
         "quoted_context_message_id": row["reply_to_msg_id"],
         "schema_version": 1,
         "requester_uin": str(row["user_id"]),
-        "allowed_subject_user_ids": (),
+        # Mention target and personal subject are independent axes.  A plain
+        # @bot request names no historical person, so the subject is unbound
+        # (None), not ambiguous/blocked (()).
+        "allowed_subject_user_ids": None,
         "allowed_evidence_user_ids": None,
         "expected_answer_mode": "mention",
         "expected_coverage_strategy": "relevance",
@@ -513,7 +510,11 @@ def _build_raw_case(
     keyword: str,
     index: int,
 ) -> dict[str, Any]:
-    query = f"说说{keyword}" if index % 2 else f"{keyword}是什么"
+    query = (
+        f"群里以前提到“{keyword}”时说了什么"
+        if index % 2
+        else f"之前关于“{keyword}”说过什么"
+    )
     return {
         "group_id": row["group_id"],
         "query": query,
@@ -545,12 +546,23 @@ def _build_summary_case(
     summary: dict[str, Any],
     index: int,
 ) -> dict[str, Any]:
-    # Strip generated summary level headers (e.g. "Recent chat summary: ")
-    # before extracting the topic so queries do not echo the header itself.
-    content = _SUMMARY_LEVEL_MARKERS.sub("", summary["content"], count=1)
-    topic = re.sub(r"[\s:：|,，。;；]+", "", content)[:8]
-    topic_suffix = f"关于{topic}" if topic else ""
-    query = f"昨天{('说了' if index % 2 else '聊了')}什么{topic_suffix}"
+    # Keep the summary benchmark subject-neutral.  Deriving a topic from the
+    # first summary characters frequently copies a member alias into the
+    # question, which correctly binds a personal subject while the benchmark
+    # still expects an unbound group summary.  That label drift then filters
+    # out the intended summary and masquerades as a retrieval regression.
+    query = f"昨天群里{('说了' if index % 2 else '聊了')}什么"
+    summary_end = summary.get("end_at")
+    summary_clock = None
+    if summary_end is not None:
+        parsed_summary_end = datetime.fromisoformat(
+            str(summary_end).replace("Z", "+00:00")
+        )
+        if parsed_summary_end.tzinfo is None:
+            parsed_summary_end = parsed_summary_end.replace(tzinfo=UTC)
+        summary_clock = (
+            parsed_summary_end + timedelta(days=1)
+        ).isoformat()
     return {
         "group_id": summary["group_id"],
         "query": query,
@@ -577,7 +589,11 @@ def _build_summary_case(
         "expected_layer": "summary",
         "gold_text": summary["content"][:300],
         "target_message_id": None,
-        "now_iso": None,
+        # The query deliberately uses the relative word "昨天".  Place the
+        # evaluation clock one calendar day after the summary boundary so
+        # "昨天" denotes the day covered by the summary, without depending on
+        # the wall clock date of the machine running the test.
+        "now_iso": summary_clock,
         "tags": ("category=summary", "layer=summary"),
     }
 
@@ -749,7 +765,13 @@ def _build_distractor_case(
         "quoted_context_message_id": None,
         "schema_version": 1,
         "requester_uin": subject_id if subject_id.isdigit() else None,
-        "allowed_subject_user_ids": None,
+        # The query explicitly names this member even though no memory answer
+        # should be accepted.  Subject binding and evidence precision are
+        # separate contracts; expecting None here marks correct binding as a
+        # subject mismatch.
+        "allowed_subject_user_ids": (
+            (subject_id,) if subject_id.isdigit() else None
+        ),
         "allowed_evidence_user_ids": None,
         "expected_answer_mode": "general",
         "expected_coverage_strategy": "relevance",
@@ -937,7 +959,7 @@ def build_cases(
     for case in cases:
         _attach_recent(case, messages)
     result = cases[:count]
-    seen_queries: set[tuple[str, str, str, int]] = set()
+    seen_queries: set[tuple[Any, ...]] = set()
     deduped: list[dict[str, Any]] = []
     for case in result:
         key = (
@@ -945,6 +967,12 @@ def build_cases(
             str(case["query"]),
             str(case.get("requester_uin") or ""),
             int(case["group_id"]),
+            str(case.get("now_iso") or ""),
+            tuple(
+                str(value)
+                for value in (case.get("expected_evidence_message_ids") or ())
+            ),
+            str(case.get("expected_layer") or ""),
         )
         if key in seen_queries:
             continue

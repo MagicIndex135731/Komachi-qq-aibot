@@ -47,15 +47,15 @@ def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
         return False
 
     subject_ids = plan.subject_ids
-    if subject_ids is None:
-        if plan.answer_mode == "mention":
-            return False
-        return True
-    if not subject_ids:
-        return False
-
-    allowed = frozenset(subject_ids)
     if plan.answer_mode == "mention":
+        mention_ids = getattr(plan, "mentioned_user_ids", None)
+        if mention_ids is None:
+            # Compatibility for plans created before author subjects and
+            # mention targets became separate fields.
+            mention_ids = subject_ids
+        if not mention_ids:
+            return False
+        allowed = frozenset(mention_ids)
         mentioned = _string_sequence_attr(
             source_message,
             "mentioned_uins",
@@ -63,6 +63,12 @@ def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
             "mention_uins",
         )
         return bool(allowed.intersection(mentioned))
+    if subject_ids is None:
+        return True
+    if not subject_ids:
+        return False
+
+    allowed = frozenset(subject_ids)
     author_id = _string_attr(source_message, "user_id", "speaker_id", "sender_uin")
     if author_id in allowed:
         return True

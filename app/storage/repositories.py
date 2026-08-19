@@ -8,7 +8,7 @@ import re
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Integer, String, bindparam, cast, func, or_, select, text, true
+from sqlalchemy import Integer, String, bindparam, case, cast, func, or_, select, text, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -1139,8 +1139,10 @@ class SummaryRepository:
         *,
         scope_id: str,
         limit: int,
-        summary_levels: list[str] | None = None,
+        summary_levels: Sequence[str] | None = None,
         summary_key: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> list[Summary]:
         if limit <= 0:
             return []
@@ -1149,6 +1151,14 @@ class SummaryRepository:
             filters.append(Summary.summary_level.in_(summary_levels))
         if summary_key is not None:
             filters.append(Summary.summary_key == summary_key)
+        if start_at is not None:
+            filters.append(
+                Summary.end_at >= _normalize_utc_sqlite_timestamp(start_at)
+            )
+        if end_at is not None:
+            filters.append(
+                Summary.start_at < _normalize_utc_sqlite_timestamp(end_at)
+            )
         stmt = select(Summary).where(*filters).order_by(Summary.end_at.desc(), Summary.id.desc()).limit(limit)
         return list(reversed(list(self.session.scalars(stmt))))
 
@@ -4237,10 +4247,25 @@ class RetrievalDocumentRepository:
         normalized_query = str(query or "").strip()
         if not normalized_query:
             return []
+        short_cjk_terms = tuple(
+            dict.fromkeys(
+                term
+                for term in _fts_search_terms(query)
+                if len(term) == 2 and re.fullmatch(r"[\u4e00-\u9fff]{2}", term)
+            )
+        )
+        short_match_score = None
+        fallback_match_conditions = [
+            RetrievalDocument.content.contains(normalized_query),
+            *(
+                RetrievalDocument.content.contains(term)
+                for term in short_cjk_terms
+            ),
+        ]
         document_filters = [
             RetrievalDocument.group_id == int(group_id),
             RetrievalDocument.status == "active",
-            RetrievalDocument.content.contains(normalized_query),
+            or_(*fallback_match_conditions),
             *_retrieval_source_prefilters(
                 group_id=group_id,
                 speaker_ids=(
@@ -4269,11 +4294,30 @@ class RetrievalDocumentRepository:
                 RetrievalDocument.start_at
                 < _normalize_utc_sqlite_timestamp(end_at)
             )
+        if short_cjk_terms:
+            short_match_score = sum(
+                case(
+                    (RetrievalDocument.content.contains(term), 1),
+                    else_=0,
+                )
+                for term in short_cjk_terms
+            )
+            document_filters.append(
+                short_match_score >= (2 if len(short_cjk_terms) >= 2 else 1)
+            )
+        order_by = (
+            (short_match_score.desc(),)
+            if short_match_score is not None
+            else ()
+        ) + (
+            RetrievalDocument.start_at.desc(),
+            RetrievalDocument.id.desc(),
+        )
         candidates = list(
             self.session.scalars(
                 select(RetrievalDocument)
                 .where(*document_filters)
-                .order_by(RetrievalDocument.start_at.desc(), RetrievalDocument.id.desc())
+                .order_by(*order_by)
                 .limit(
                     max(resolved_limit * 4, resolved_limit)
                     if (

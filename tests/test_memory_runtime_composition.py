@@ -1156,6 +1156,18 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             source_start_msg_id="layered-fact-source",
             source_end_msg_id="layered-fact-source",
         )
+        SummaryRepository(session).upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="window",
+            summary_key="window:1:test",
+            start_at=observed_at,
+            end_at=observed_at + timedelta(hours=1),
+            content="兼容历史窗口摘要：冰美式",
+            source_count=1,
+            source_start_msg_id="layered-fact-source",
+            source_end_msg_id="layered-fact-source",
+        )
         session.flush()
         documents = RetrievalDocumentRepository(session)
         documents.upsert_document(
@@ -1199,6 +1211,11 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
     )
     assert any(
         "阿渣饮品偏好" in summary.text
+        and "layered-fact-source" in summary.source_msg_ids
+        for summary in packed.summaries
+    )
+    assert any(
+        "兼容历史窗口摘要" in summary.text
         and "layered-fact-source" in summary.source_msg_ids
         for summary in packed.summaries
     )

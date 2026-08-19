@@ -142,6 +142,55 @@ def test_upsert_summary_tracks_recursive_sources_without_duplicate_rows(sqlite_e
     ]
 
 
+def test_list_group_summaries_filters_by_overlapping_time_window(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        summaries = SummaryRepository(session)
+        summaries.upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="daily",
+            summary_key="old",
+            start_at=datetime(2026, 7, 1, tzinfo=UTC),
+            end_at=datetime(2026, 7, 2, tzinfo=UTC),
+            content="old",
+            source_count=1,
+            source_start_msg_id="old",
+            source_end_msg_id="old",
+        )
+        summaries.upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="daily",
+            summary_key="inside",
+            start_at=datetime(2026, 7, 10, 12, tzinfo=UTC),
+            end_at=datetime(2026, 7, 11, tzinfo=UTC),
+            content="inside",
+            source_count=1,
+            source_start_msg_id="inside",
+            source_end_msg_id="inside",
+        )
+        summaries.upsert_summary(
+            scope_type="group",
+            scope_id="10001",
+            summary_level="daily",
+            summary_key="new",
+            start_at=datetime(2026, 7, 20, tzinfo=UTC),
+            end_at=datetime(2026, 7, 21, tzinfo=UTC),
+            content="new",
+            source_count=1,
+            source_start_msg_id="new",
+            source_end_msg_id="new",
+        )
+        found = summaries.list_group_summaries(
+            scope_id="10001",
+            limit=10,
+            start_at=datetime(2026, 7, 10, tzinfo=UTC),
+            end_at=datetime(2026, 7, 12, tzinfo=UTC),
+        )
+
+    assert [item.summary_key for item in found] == ["inside"]
+
+
 def test_create_all_migrates_legacy_memory_and_summary_tables_without_rebuild(tmp_path) -> None:
     engine = build_engine(tmp_path / "legacy-memory.db")
     with engine.begin() as connection:
