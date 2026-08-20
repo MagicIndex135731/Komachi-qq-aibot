@@ -253,6 +253,7 @@ _SUBJECTLESS_GROUP_HISTORY_PATTERN = re.compile(
     r"(?:之前|以前|过去)\s*关于"
     r")"
 )
+_GROUP_SCOPE_QUERY_PATTERN = re.compile(r"^\s*(?:群里|群内|本群|大家)")
 _QUOTED_HISTORY_TOPIC_PATTERN = re.compile(
     r"“(?P<curly>[^”]{1,80})”|"
     r'"(?P<double>[^\"]{1,80})"|'
@@ -730,6 +731,9 @@ class MemoryQueryResolver:
             requester_id=normalized_requester_id,
             answer_mode=answer_mode,
             coverage_mode=coverage_mode,
+            subject_role=(
+                "group" if _GROUP_SCOPE_QUERY_PATTERN.search(original) else ""
+            ),
         )
         if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(original):
             return self._with_explicit_group_history_topic(plan)

@@ -15,6 +15,7 @@ def test_suite_parser_separates_offline_and_fullchain_channel_timeouts():
     args = build_argument_parser().parse_args(["--database", "snapshot.db"])
     assert args.channel_timeout == 0.5
     assert args.fullchain_channel_timeout == 4.0
+    assert args.offline_limit == 300
 
 
 def test_suite_main_routes_separate_channel_timeouts(monkeypatch, tmp_path):
@@ -34,26 +35,32 @@ def test_suite_main_routes_separate_channel_timeouts(monkeypatch, tmp_path):
     monkeypatch.setattr(suite, "stage_fullchain", fake_fullchain)
     database = tmp_path / "snapshot.db"
 
-    assert suite.main(
-        [
-            "--database",
-            str(database),
-            "--workdir",
-            str(tmp_path / "offline"),
-            "--stage",
-            "offline",
-        ]
-    ) == 0
-    assert suite.main(
-        [
-            "--database",
-            str(database),
-            "--workdir",
-            str(tmp_path / "fullchain"),
-            "--stage",
-            "fullchain",
-        ]
-    ) == 0
+    assert (
+        suite.main(
+            [
+                "--database",
+                str(database),
+                "--workdir",
+                str(tmp_path / "offline"),
+                "--stage",
+                "offline",
+            ]
+        )
+        == 0
+    )
+    assert (
+        suite.main(
+            [
+                "--database",
+                str(database),
+                "--workdir",
+                str(tmp_path / "fullchain"),
+                "--stage",
+                "fullchain",
+            ]
+        )
+        == 0
+    )
     assert captured == {"offline": 0.5, "fullchain": 4.0}
 
 
@@ -110,20 +117,17 @@ def test_stage_fullchain_recovers_interrupted_detail_rows(tmp_path, monkeypatch)
     workdir = tmp_path / "run"
     workdir.mkdir()
     (workdir / "cases.jsonl").write_text(
-        json.dumps({"category": "fact", "query": "q", "case_id": "case-a"})
-        + "\n",
+        json.dumps({"category": "fact", "query": "q", "case_id": "case-a"}) + "\n",
         encoding="utf-8",
     )
     detail = workdir / "fullchain-results.detail.jsonl"
     detail.write_text(
-        json.dumps({"case_id": "case-a", "answer": "ok"}, ensure_ascii=False)
-        + "\n",
+        json.dumps({"case_id": "case-a", "answer": "ok"}, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     output = workdir / "fullchain-results.jsonl"
     output.write_text(
-        json.dumps({"case_id": "old", "answer": "stale"}, ensure_ascii=False)
-        + "\n",
+        json.dumps({"case_id": "old", "answer": "stale"}, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     calls: dict[str, object] = {}
@@ -131,6 +135,7 @@ def test_stage_fullchain_recovers_interrupted_detail_rows(tmp_path, monkeypatch)
     def fake_run_cases(engine, cases, **kwargs):
         calls["resume"] = kwargs.get("resume")
         calls["detail_path"] = kwargs.get("detail_path")
+        calls["prewarm_embedding"] = kwargs.get("prewarm_embedding")
         return [], {"requested": 1, "executed": 0, "skipped_resumed": 1}
 
     monkeypatch.setattr(fullchain_module, "run_cases", fake_run_cases)
@@ -155,14 +160,14 @@ def test_stage_fullchain_recovers_interrupted_detail_rows(tmp_path, monkeypatch)
         aux_effort="low",
     )
     merged = [
-        json.loads(line)
-        for line in output.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
     ]
     merged_ids = {row["case_id"] for row in merged}
     assert "case-a" in merged_ids
     assert "old" in merged_ids
     assert calls["resume"] is True
     assert calls["detail_path"] == detail
+    assert calls["prewarm_embedding"] is True
 
 
 def test_report_aggregation(tmp_path):
@@ -212,7 +217,14 @@ def test_report_aggregation(tmp_path):
         ),
         encoding="utf-8",
     )
-    report = stage_report(workdir, baseline_dir=None, gate_grounded=0.5, gate_recall=None, gate_protocol_failures=1, gate_p95_ms=100)
+    report = stage_report(
+        workdir,
+        baseline_dir=None,
+        gate_grounded=0.5,
+        gate_recall=None,
+        gate_protocol_failures=1,
+        gate_p95_ms=100,
+    )
     assert report["offline"]["cases"] == 1
     assert report["fullchain"]["answer_accuracy"] == 1.0
     assert report["gate"]["grounded_answer_accuracy"]["passed"] is True

@@ -154,6 +154,39 @@ def _safe_provider_trace_metadata(headers: Mapping[str, str]) -> dict[str, str]:
     return result
 
 
+def _safe_provider_event_metadata(event: Mapping[str, Any]) -> dict[str, str]:
+    """Return bounded non-content SSE failure fields for private diagnostics."""
+
+    event_type = str(event.get("type") or "").strip()
+    result: dict[str, str] = {}
+    if event_type in {"error", "response.failed", "response.incomplete"}:
+        result["provider_event"] = event_type
+    candidates: list[Any] = []
+    response = event.get("response")
+    if isinstance(response, Mapping):
+        error = response.get("error")
+        if isinstance(error, Mapping):
+            candidates.extend((error.get("code"), error.get("type")))
+        incomplete = response.get("incomplete_details")
+        if isinstance(incomplete, Mapping):
+            candidates.append(incomplete.get("reason"))
+    error = event.get("error")
+    if isinstance(error, Mapping):
+        candidates.extend((error.get("code"), error.get("type")))
+    candidates.extend((event.get("code"), event.get("error_type")))
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if (
+            value
+            and len(value) <= 64
+            and value.isascii()
+            and all(character.isalnum() or character in "._:-" for character in value)
+        ):
+            result["provider_error_code"] = value
+            break
+    return result
+
+
 class AnswerContractError(ValueError):
     """Structurally valid answer that violates the answer replay contract."""
 
@@ -457,21 +490,57 @@ class ObservedResponsesTransport:
                                 )
                                 break
                         elif event_type in {"error", "response.failed", "response.incomplete"}:
+                            event_metadata = _safe_provider_event_metadata(event)
+                            safe_trace_metadata.update(event_metadata)
+                            # A provider can report a transient failure inside a
+                            # successful HTTP/SSE connection.  Retry error and
+                            # failed events within the same bounded transport
+                            # budget; incomplete responses are commonly a
+                            # deterministic output-limit condition and remain
+                            # fail-closed without a duplicate request.
                             raise QualityReplayError(
                                 "QUALITY_REPLAY_PROVIDER_FAILED",
-                                retryable=False,
+                                retryable=event_type in {"error", "response.failed"},
                                 failure_kind="provider_failed",
                                 safe_metadata=safe_trace_metadata,
                             )
                 break
-            except QualityReplayError:
-                raise
+            except QualityReplayError as exc:
+                if exc.retryable is not True:
+                    raise
+                logger.warning(
+                    "quality_replay_provider_event_failure attempt=%s "
+                    "max_attempts=%s prompt_chars=%s model=%s "
+                    "provider_event=%s provider_error_code=%s "
+                    "request_id=%s cf_ray=%s",
+                    attempt,
+                    self.max_attempts,
+                    prompt_chars,
+                    model,
+                    exc.safe_metadata.get("provider_event", "<none>"),
+                    exc.safe_metadata.get("provider_error_code", "<none>"),
+                    exc.safe_metadata.get("request_id", "<none>"),
+                    exc.safe_metadata.get("cf_ray", "<none>"),
+                )
+                if attempt < self.max_attempts:
+                    self.client._sleep_before_retry(
+                        attempt=attempt,
+                        max_attempts=self.max_attempts,
+                    )
+                    continue
+                raise QualityReplayError(
+                    "QUALITY_REPLAY_PROVIDER_FAILED",
+                    retryable=False,
+                    failure_kind=exc.failure_kind or "provider_failed",
+                    safe_metadata=exc.safe_metadata,
+                ) from exc
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
                 if exc.response is not None:
                     safe_trace_metadata = _safe_provider_trace_metadata(
                         exc.response.headers
                     )
+                safe_trace_metadata["status_code"] = str(status_code)
                 retryable = self.client._is_retryable_responses_status_code(status_code)
                 logger.warning(
                     "quality_replay_provider_http_failure status=%s attempt=%s "
@@ -811,20 +880,32 @@ def _generate_citation_repair_with_retry(
 
 
 def allowed_citation_ids_from_packed_context(packed: object) -> tuple[str, ...]:
-    """Return stable history-evidence IDs authorized by the packed context."""
+    """Return source IDs exposed by selected history layers, excluding recent fallback."""
 
     authoritative_ids = {
         str(source_id)
         for source_id in tuple(getattr(packed, "source_msg_ids", ()))
         if str(source_id)
     }
-    evidence_ids = {
+    layered_evidence_ids = {
         str(getattr(message, "source_msg_id"))
         for segment in tuple(getattr(packed, "evidence_segments", ()))
         for message in tuple(getattr(segment, "messages", ()))
         if str(getattr(message, "source_msg_id", ""))
     }
-    return tuple(sorted(authoritative_ids & evidence_ids))
+    layered_evidence_ids.update(
+        str(source_id)
+        for fact in tuple(getattr(packed, "facts", ()))
+        for source_id in tuple(getattr(fact, "source_msg_ids", ()))
+        if str(source_id)
+    )
+    layered_evidence_ids.update(
+        str(source_id)
+        for summary in tuple(getattr(packed, "summaries", ()))
+        for source_id in tuple(getattr(summary, "source_msg_ids", ()))
+        if str(source_id)
+    )
+    return tuple(sorted(authoritative_ids & layered_evidence_ids))
 
 
 def build_judge_prompt(

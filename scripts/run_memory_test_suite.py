@@ -154,8 +154,14 @@ def stage_offline(
     *,
     rewrite_enabled: bool,
     channel_timeout: float,
+    limit: int = 300,
+    seed: int = 20260811,
 ) -> dict[str, Any]:
-    cases = fullchain._load_cases(workdir / "cases.jsonl")
+    cases = fullchain._stratify(
+        fullchain._load_cases(workdir / "cases.jsonl"),
+        limit=limit,
+        seed=seed,
+    )
     settings = AppSettings().model_copy(
         update={
             "memory_query_rewrite_enabled": bool(rewrite_enabled),
@@ -170,8 +176,9 @@ def stage_offline(
         llm_client=llm_client,
         bot_display_name="小町",
     )
+    embedding_prewarm = fullchain._prewarm_embedding_runtime(runtime)
     rows: list[dict[str, Any]] = []
-    for case in cases:
+    for index, case in enumerate(cases, start=1):
         rows.append(
             _offline_case(
                 engine=engine,
@@ -180,15 +187,28 @@ def stage_offline(
                 settings=settings,
             )
         )
+        if index == 1 or index % 10 == 0 or index == len(cases):
+            print(
+                f"offline_progress completed={index} total={len(cases)}",
+                file=sys.stderr,
+                flush=True,
+            )
     output = workdir / "offline-results.jsonl"
     with output.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     metrics = classification_metrics(rows)
-    return {"cases": len(rows), "metrics": metrics, "output": str(output)}
+    return {
+        "cases": len(rows),
+        "metrics": metrics,
+        "embedding_prewarm": embedding_prewarm,
+        "output": str(output),
+    }
 
 
-def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSettings) -> dict[str, Any]:
+def _offline_case(
+    *, engine, runtime, case: Mapping[str, Any], settings: AppSettings
+) -> dict[str, Any]:
     group_id = int(case["group_id"])
     recent_ids = tuple(
         int(value)
@@ -241,7 +261,9 @@ def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSett
     cross_group_violation = False
     if "cross_group" in tags and packed_ids:
         placeholders = ",".join(f":pid_{index}" for index in range(len(packed_ids)))
-        parameters = {f"pid_{index}": str(value) for index, value in enumerate(packed_ids)}
+        parameters = {
+            f"pid_{index}": str(value) for index, value in enumerate(packed_ids)
+        }
         if placeholders:
             rows = list(
                 _iter_rows(
@@ -267,9 +289,7 @@ def _offline_case(*, engine, runtime, case: Mapping[str, Any], settings: AppSett
         "subject_expected": expected_subject,
         "subject_actual": actual_subject_tuple,
         "subject_match": actual_subject_tuple == expected_subject,
-        "rewrite_used": bool(
-            getattr(trace.resolved_query, "rewrite_used", False)
-        ),
+        "rewrite_used": bool(getattr(trace.resolved_query, "rewrite_used", False)),
         "memory_phase_timings_ms": {
             str(key): round(float(value), 3)
             for key, value in getattr(trace, "phase_timings_ms", ())
@@ -357,6 +377,7 @@ def stage_fullchain(
         aux_effort=aux_effort,
         progress_path=workdir / "progress-fullchain.jsonl",
         detail_path=detail_path,
+        prewarm_embedding=not dry_run,
     )
     if rows:
         fullchain._merge_results(output, rows)
@@ -458,7 +479,9 @@ def stage_report(
         }
     if gate_recall is not None:
         kind_recall = offline_metrics.get("kind_recall") or {}
-        values = [value for value in kind_recall.values() if isinstance(value, (int, float))]
+        values = [
+            value for value in kind_recall.values() if isinstance(value, (int, float))
+        ]
         average_recall = sum(values) / len(values) if values else 0.0
         gate_results["average_kind_recall"] = {
             "threshold": gate_recall,
@@ -518,11 +541,21 @@ def _render_report_markdown(report: Mapping[str, Any]) -> str:
     if offline:
         lines.append("## Offline retrieval")
         lines.append(f"- cases: {offline.get('cases')}")
-        lines.append(f"- kind recall: {json.dumps(offline.get('kind_recall'), ensure_ascii=False)}")
-        lines.append(f"- layer hit rate: {json.dumps(offline.get('layer_hit_rate'), ensure_ascii=False)}")
-        lines.append(f"- subject binding accuracy: {offline.get('subject_binding_accuracy')}")
-        lines.append(f"- cross-group violations: {offline.get('cross_group_violations')}")
-        lines.append(f"- retrieval latency p50/p95: {offline.get('retrieval_latency_ms')}")
+        lines.append(
+            f"- kind recall: {json.dumps(offline.get('kind_recall'), ensure_ascii=False)}"
+        )
+        lines.append(
+            f"- layer hit rate: {json.dumps(offline.get('layer_hit_rate'), ensure_ascii=False)}"
+        )
+        lines.append(
+            f"- subject binding accuracy: {offline.get('subject_binding_accuracy')}"
+        )
+        lines.append(
+            f"- cross-group violations: {offline.get('cross_group_violations')}"
+        )
+        lines.append(
+            f"- retrieval latency p50/p95: {offline.get('retrieval_latency_ms')}"
+        )
         lines.append("")
     fullchain_metrics_value = report.get("fullchain") or {}
     if fullchain_metrics_value:
@@ -545,19 +578,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     parser.add_argument(
         "--stage",
-        choices=("prepare", "dataset", "offline", "fullchain", "stress", "report", "all"),
+        choices=(
+            "prepare",
+            "dataset",
+            "offline",
+            "fullchain",
+            "stress",
+            "report",
+            "all",
+        ),
         default="all",
     )
     parser.add_argument("--count", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--group-ids", type=str, default="")
     parser.add_argument("--fullchain-limit", type=int, default=300)
+    parser.add_argument("--offline-limit", type=int, default=300)
     parser.add_argument("--model", default="")
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-rewrite", dest="rewrite_enabled", action="store_false")
-    parser.add_argument("--rewrite-enabled", dest="rewrite_enabled", action="store_true")
+    parser.add_argument(
+        "--rewrite-enabled", dest="rewrite_enabled", action="store_true"
+    )
     parser.set_defaults(rewrite_enabled=False)
     parser.add_argument("--channel-timeout", type=float, default=0.5)
     parser.add_argument(
@@ -566,10 +610,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=fullchain.DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS,
         help="Production-like retrieval timeout for the real-model fullchain stage.",
     )
-    parser.add_argument("--input-price-mtok", type=float, default=fullchain.DEFAULT_INPUT_PRICE_MT)
-    parser.add_argument("--output-price-mtok", type=float, default=fullchain.DEFAULT_OUTPUT_PRICE_MT)
-    parser.add_argument("--provider-attempts", type=int, default=fullchain.PROVIDER_ATTEMPTS)
-    parser.add_argument("--provider-backoff", type=float, default=fullchain.PROVIDER_BACKOFF_SECONDS)
+    parser.add_argument(
+        "--input-price-mtok", type=float, default=fullchain.DEFAULT_INPUT_PRICE_MT
+    )
+    parser.add_argument(
+        "--output-price-mtok", type=float, default=fullchain.DEFAULT_OUTPUT_PRICE_MT
+    )
+    parser.add_argument(
+        "--provider-attempts", type=int, default=fullchain.PROVIDER_ATTEMPTS
+    )
+    parser.add_argument(
+        "--provider-backoff", type=float, default=fullchain.PROVIDER_BACKOFF_SECONDS
+    )
     parser.add_argument("--answer-model", default=fullchain.DEFAULT_ANSWER_MODEL)
     parser.add_argument("--answer-effort", default=fullchain.DEFAULT_ANSWER_EFFORT)
     parser.add_argument("--aux-model", default=fullchain.DEFAULT_AUX_MODEL)
@@ -622,6 +674,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workdir,
                 rewrite_enabled=args.rewrite_enabled,
                 channel_timeout=args.channel_timeout,
+                limit=args.offline_limit,
+                seed=args.seed,
             )
         elif stage == "fullchain":
             result["fullchain"] = stage_fullchain(

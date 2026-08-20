@@ -17,6 +17,7 @@ import json
 import logging
 from pathlib import Path
 import random
+import sys
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -43,6 +44,17 @@ from scripts.run_memory_v3_quality_replay import (
 
 
 CONTRACT_VERSION = "memory-test-platform-v1"
+RESUME_SIGNATURE_VERSION = "memory-test-fullchain-resume-v2"
+RESUME_SELECTION_VERSION = "stratify-v1"
+RESUME_SOURCE_GLOBS = (
+    "app/config.py",
+    "app/main.py",
+    "app/core/**/*.py",
+    "app/providers/**/*.py",
+    "app/storage/**/*.py",
+    "scripts/memory_test_fullchain.py",
+    "scripts/run_memory_v3_quality_replay.py",
+)
 DEFAULT_INPUT_PRICE_MT = 1.25
 DEFAULT_OUTPUT_PRICE_MT = 5.00
 DEFAULT_ANSWER_MODEL = "gpt-5.6-luna"
@@ -75,6 +87,118 @@ CITATION_REASON_CODES = frozenset(
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _resume_source_fingerprint() -> str:
+    """Hash evaluation code so checkpoints cannot outlive behavior changes."""
+
+    repository_root = Path(__file__).resolve().parents[1]
+    source_paths = {
+        path
+        for pattern in RESUME_SOURCE_GLOBS
+        for path in repository_root.glob(pattern)
+        if path.is_file()
+    }
+    digest = hashlib.sha256()
+    for path in sorted(source_paths, key=lambda item: item.as_posix()):
+        relative = path.relative_to(repository_root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _database_resume_fingerprint(engine: Any) -> str:
+    """Hash the SQLite snapshot without exposing its path in progress files."""
+
+    database = getattr(getattr(engine, "url", None), "database", None)
+    if not database:
+        return "injected-runtime"
+    path = Path(str(database)).resolve()
+    if not path.is_file():
+        return _sha256(f"missing-database|{path.name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _settings_resume_projection(settings: Any) -> dict[str, Any]:
+    """Select behavior-affecting settings without persisting credentials."""
+
+    if hasattr(settings, "model_dump"):
+        values = settings.model_dump()
+    else:
+        values = vars(settings)
+    projection: dict[str, Any] = {}
+    for key, value in values.items():
+        name = str(key)
+        if name.endswith(("_api_key", "_key", "_token", "_secret", "_password")):
+            continue
+        if name.startswith("memory_") or name in {
+            "bot_qq",
+            "context_recent_limit",
+            "context_summary_limit",
+            "llm_base_url",
+            "llm_max_output_tokens",
+            "llm_timeout_seconds",
+        }:
+            projection[name] = value
+    return projection
+
+
+def _resume_base_signature(
+    *,
+    engine: Any,
+    settings: Any,
+    model: str,
+    judge_model: str,
+    answer_effort: str,
+    aux_effort: str,
+    rewrite_enabled: bool,
+    channel_timeout: float,
+    provider_attempts: int,
+    provider_backoff: float,
+    input_price_mtok: float,
+    output_price_mtok: float,
+    prewarm_embedding: bool,
+) -> str:
+    payload = {
+        "version": RESUME_SIGNATURE_VERSION,
+        "selection_version": RESUME_SELECTION_VERSION,
+        "contract_version": CONTRACT_VERSION,
+        "source_fingerprint": _resume_source_fingerprint(),
+        "database_fingerprint": _database_resume_fingerprint(engine),
+        "model": model,
+        "judge_model": judge_model,
+        "answer_effort": answer_effort,
+        "aux_effort": aux_effort,
+        "rewrite_enabled": bool(rewrite_enabled),
+        "channel_timeout": float(channel_timeout),
+        "provider_attempts": int(provider_attempts),
+        "provider_backoff": float(provider_backoff),
+        "input_price_mtok": float(input_price_mtok),
+        "output_price_mtok": float(output_price_mtok),
+        "prewarm_embedding": bool(prewarm_embedding),
+        "settings": _settings_resume_projection(settings),
+    }
+    return _sha256(_canonical_json(payload))
+
+
+def _case_input_signature(case: Mapping[str, Any], base_signature: str) -> str:
+    return _sha256(base_signature + "|" + _canonical_json(case))
 
 
 def _cache_path(cache_dir: Path, key: str) -> Path:
@@ -212,9 +336,8 @@ def _parse_answer_loose(value: str) -> SimpleNamespace:
     abstained = payload.get("abstained")
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError("generated answer is empty")
-    if (
-        not isinstance(citations, list)
-        or any(not isinstance(item, str) or not item for item in citations)
+    if not isinstance(citations, list) or any(
+        not isinstance(item, str) or not item for item in citations
     ):
         raise ValueError("generated citations are invalid")
     if not isinstance(abstained, bool):
@@ -309,7 +432,9 @@ def _packet_text(packed: Any) -> str:
             f"{getattr(fact, 'text', '')}"
         )
     for summary in tuple(getattr(packed, "summaries", ())):
-        sources = ",".join(str(value) for value in getattr(summary, "source_msg_ids", ()))
+        sources = ",".join(
+            str(value) for value in getattr(summary, "source_msg_ids", ())
+        )
         blocks.append(
             f"Summary ({getattr(summary, 'level', 'summary')}; source: {sources}): "
             f"{getattr(summary, 'text', '')}"
@@ -319,6 +444,28 @@ def _packet_text(packed: Any) -> str:
 
 def build_answer_prompt(case: Mapping[str, Any], packed: Any) -> list[str]:
     allowed = allowed_citation_ids_from_packed_context(packed)
+    category = str(case.get("category") or case.get("kind") or "")
+    category_policy = {
+        "profile": (
+            "Category contract (profile): list the directly supported attributes available in the "
+            "packet, including for a 'complete profile' request, but never fill missing attributes "
+            "or infer personality, occupation, age, location, motive, or current status."
+        ),
+        "running_joke": (
+            "Category contract (running_joke): an explicit running_joke fact, nickname, repeated "
+            "joke, or source event about the resolved member is relevant evidence and must be "
+            "answered concisely; do not invent the joke's origin, frequency, or personality meaning."
+        ),
+        "raw_history": (
+            "Category contract (raw_history): one directly relevant historical message is enough "
+            "for a concise answer. Preserve its concrete wording with minimal paraphrase and do "
+            "not abstain merely because surrounding context is incomplete."
+        ),
+        "summary": (
+            "Category contract (summary): report only the supported topics or events present in "
+            "the relevant summary; partial coverage is valid and must not be padded with guesses."
+        ),
+    }.get(category, "")
     return [
         "Speak only in allowlisted groups.",
         "Keep replies short in group chat.",
@@ -363,6 +510,7 @@ def build_answer_prompt(case: Mapping[str, Any], packed: Any) -> list[str]:
             "recommend X' or 'watch X'); inferred preferences alone are not "
             "enough. Do not treat casual chat as an answer to such requests."
         ),
+        *([category_policy] if category_policy else []),
         f"Question:\n{case['query']}",
         "Retrieved memory packet:\n" + _packet_text(packed),
     ]
@@ -387,7 +535,8 @@ def build_judge_prompt(
         "consistent with the human-reviewed reference evidence; a faithful "
         "rephrasing of supported evidence counts as correct even when the "
         "wording differs from the reference. For open-ended questions "
-        "(recent activity, plans, events, profiles, preferences, mentions), "
+        "(recent activity, plans, events, profiles, preferences, mentions, "
+        "raw history, running jokes, summaries), "
         "an answer is correct when it addresses the question, is grounded in "
         "the packet, and does not contradict the reference; it need not "
         "mention every reference item or match its wording, and a missing "
@@ -404,6 +553,11 @@ def build_judge_prompt(
         "for a 'recent' question) that does not contradict the reference, "
         "judge answer_correct=true with reason_code supported_alternative; "
         "that is not reference_mismatch. "
+        "For profiles, any unsupported inferred attribute makes the answer "
+        "not grounded, while omission of unavailable attributes is not an "
+        "error. For running jokes, judge only the explicit nickname, joke, "
+        "or source event in the packet; do not require an invented origin or "
+        "frequency. "
         "When the packet contains "
         "any relevant evidence and the answer abstains, judge the abstention "
         "incorrect (answer_correct=false) unless the evidence truly does not "
@@ -485,7 +639,9 @@ def _citation_precision_score(
     return 0.0
 
 
-def _stratify(cases: Sequence[dict[str, Any]], *, limit: int, seed: int) -> list[dict[str, Any]]:
+def _stratify(
+    cases: Sequence[dict[str, Any]], *, limit: int, seed: int
+) -> list[dict[str, Any]]:
     if limit <= 0 or len(cases) <= limit:
         return list(cases)
     by_category: dict[str, list[dict[str, Any]]] = {}
@@ -507,6 +663,17 @@ def _stratify(cases: Sequence[dict[str, Any]], *, limit: int, seed: int) -> list
         if not progressed:
             break
     return selected
+
+
+def _filter_categories(
+    cases: Sequence[dict[str, Any]], categories: str
+) -> list[dict[str, Any]]:
+    requested = {
+        value.strip() for value in str(categories or "").split(",") if value.strip()
+    }
+    if not requested:
+        return list(cases)
+    return [case for case in cases if str(case.get("category") or "") in requested]
 
 
 def run_cases(
@@ -541,15 +708,17 @@ def run_cases(
     selected = _stratify(cases, limit=limit, seed=seed)
     if dry_run:
         return _dry_run_estimate(selected, input_price_mtok, output_price_mtok)
-    done_ids: set[str] = set()
+    latest_progress: dict[str, dict[str, Any]] = {}
     if resume and progress_path is not None and progress_path.exists():
         for line in progress_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line:
                 try:
                     entry = json.loads(line)
-                    if bool(entry.get("ok")):
-                        done_ids.add(str(entry["case_id"]))
+                    if not isinstance(entry, dict):
+                        continue
+                    case_id = str(entry["case_id"])
+                    latest_progress[case_id] = entry
                 except (json.JSONDecodeError, KeyError):
                     continue
     if settings is None:
@@ -608,11 +777,48 @@ def run_cases(
         aux_transport = transport
     effective_model = model or answer_model
     effective_judge_model = judge_model or aux_model
+    resume_base_signature = _resume_base_signature(
+        engine=engine,
+        settings=settings,
+        model=effective_model,
+        judge_model=effective_judge_model,
+        answer_effort=answer_effort,
+        aux_effort=aux_effort,
+        rewrite_enabled=rewrite_enabled,
+        channel_timeout=channel_timeout,
+        provider_attempts=provider_attempts,
+        provider_backoff=provider_backoff,
+        input_price_mtok=input_price_mtok,
+        output_price_mtok=output_price_mtok,
+        prewarm_embedding=prewarm_embedding,
+    )
+    selected_with_signatures = [
+        (
+            case,
+            str(case.get("case_id") or _sha256(case["query"])[:16]),
+            _case_input_signature(case, resume_base_signature),
+        )
+        for case in selected
+    ]
+
+    def is_resumable(case_id: str, signature: str) -> bool:
+        entry = latest_progress.get(case_id)
+        return bool(
+            resume
+            and entry is not None
+            and entry.get("ok") is True
+            and entry.get("case_input_signature") == signature
+        )
+
     rows: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
-    for case in selected:
-        case_id = str(case.get("case_id") or _sha256(case["query"])[:16])
-        if resume and case_id in done_ids:
+    execution_total = sum(
+        1
+        for _, case_id, signature in selected_with_signatures
+        if not is_resumable(case_id, signature)
+    )
+    for case, case_id, case_signature in selected_with_signatures:
+        if is_resumable(case_id, case_signature):
             continue
         row = _run_case(
             engine=engine,
@@ -632,23 +838,43 @@ def run_cases(
             provider_attempts=provider_attempts,
             provider_backoff=provider_backoff,
         )
+        row["case_input_signature"] = case_signature
+        row["resume_base_signature"] = resume_base_signature
         rows.append(row)
         if detail_path is not None:
             detail_path.parent.mkdir(parents=True, exist_ok=True)
             with detail_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-        completed_ok = "provider_failed" not in (
-            row.get("protocol_failure_codes") or ()
-        )
+        completed_ok = not bool(row.get("protocol_failure_codes") or ())
         if progress_path is not None:
-            completed.append({"case_id": case_id, "ok": completed_ok})
+            progress_entry = {
+                "case_id": case_id,
+                "ok": completed_ok,
+                "case_input_signature": case_signature,
+            }
+            completed.append(progress_entry)
             progress_path.parent.mkdir(parents=True, exist_ok=True)
             with progress_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"case_id": case_id, "ok": completed_ok}) + "\n")
+                handle.write(json.dumps(progress_entry, sort_keys=True) + "\n")
+        print(
+            "fullchain_progress "
+            f"completed={len(rows)} total={execution_total} ok={str(completed_ok).lower()}",
+            file=sys.stderr,
+            flush=True,
+        )
     summary = {
         "requested": len(selected),
         "executed": len(rows),
         "skipped_resumed": len(selected) - len(rows),
+        "invalidated_resumed": sum(
+            1
+            for _, case_id, signature in selected_with_signatures
+            if resume
+            and case_id in latest_progress
+            and bool(latest_progress[case_id].get("ok"))
+            and not is_resumable(case_id, signature)
+        ),
+        "resume_signature_version": RESUME_SIGNATURE_VERSION,
         "cache_dir": str(cache_dir),
     }
     if embedding_prewarm is not None:
@@ -857,6 +1083,12 @@ def _run_case(
                 repair_prejudge_no_event_attempts += int(
                     getattr(outcome.observation, "no_event_attempts", 0)
                 )
+                if outcome.protocol_failure_codes:
+                    protocol_failures = tuple(
+                        dict.fromkeys(
+                            (*protocol_failures, *outcome.protocol_failure_codes)
+                        )
+                    )
     stage_timings_ms["citation_repair_prejudge"] = (
         (perf_counter() - repair_prejudge_started) * 1000
         if repair_prejudge_attempted
@@ -875,11 +1107,7 @@ def _run_case(
     if not protocol_failures:
         abstained_with_evidence = bool(
             abstained
-            and (
-                packed_fact_count
-                or packed_summary_count
-                or packed_segment_messages
-            )
+            and (packed_fact_count or packed_summary_count or packed_segment_messages)
         )
         judge_prompt = build_judge_prompt(
             case,
@@ -916,9 +1144,7 @@ def _run_case(
                 judge_provider_failure_kind = str(
                     getattr(exc, "failure_kind", None) or "provider_failed"
                 )
-                judge_provider_trace = dict(
-                    getattr(exc, "safe_metadata", {}) or {}
-                )
+                judge_provider_trace = dict(getattr(exc, "safe_metadata", {}) or {})
             else:
                 _cache_save(
                     cache_dir,
@@ -941,9 +1167,7 @@ def _run_case(
                     },
                 )
         if judge_observation is not None:
-            judge_attempt_count += int(
-                getattr(judge_observation, "attempt_count", 1)
-            )
+            judge_attempt_count += int(getattr(judge_observation, "attempt_count", 1))
             judge_no_event_attempts += int(
                 getattr(judge_observation, "no_event_attempts", 0)
             )
@@ -968,8 +1192,7 @@ def _run_case(
         and not repaired
         and not repair_prejudge_attempted
         and not abstained
-        and str(getattr(raw_decision, "reason_code", "") or "")
-        in CITATION_REASON_CODES
+        and str(getattr(raw_decision, "reason_code", "") or "") in CITATION_REASON_CODES
     ):
         repair_rejudge_attempted = True
         try:
@@ -1009,6 +1232,11 @@ def _run_case(
             repair_rejudge_no_event_attempts += int(
                 getattr(outcome.observation, "no_event_attempts", 0)
             )
+            if outcome.protocol_failure_codes:
+                protocol_failures = tuple(
+                    dict.fromkeys((*protocol_failures, *outcome.protocol_failure_codes))
+                )
+        if outcome is not None and not protocol_failures:
             try:
                 judge_observation = _generate_with_retries(
                     aux_transport,
@@ -1045,9 +1273,7 @@ def _run_case(
                 judge_provider_failure_kind = str(
                     getattr(exc, "failure_kind", None) or "provider_failed"
                 )
-                judge_provider_trace = dict(
-                    getattr(exc, "safe_metadata", {}) or {}
-                )
+                judge_provider_trace = dict(getattr(exc, "safe_metadata", {}) or {})
                 repair_rejudge_error = str(exc)
             except (ValueError, json.JSONDecodeError) as exc:
                 raw_decision = None
@@ -1063,15 +1289,15 @@ def _run_case(
     # (JSON shape) and citation-source integrity (citations must come from the
     # retrieved packet; violations are recorded, not fail-closed).
     citation_failures = tuple(
-        str(value)
-        for value in cited_ids
-        if str(value) not in set(packet_source_ids)
+        str(value) for value in cited_ids if str(value) not in set(packet_source_ids)
     )
     if protocol_failures:
         decision = None
     else:
         decision = raw_decision
-    gold = set(str(value) for value in (case.get("expected_evidence_message_ids") or ()))
+    gold = set(
+        str(value) for value in (case.get("expected_evidence_message_ids") or ())
+    )
     citations = set(cited_ids)
     citations_minimal = not citation_failures
     citation_precision = _citation_precision_score(
@@ -1107,6 +1333,7 @@ def _run_case(
         "answer_grounded": bool(decision and decision.answer_grounded),
         "answer_correct": bool(decision and decision.answer_correct),
         "abstained": bool(decision and decision.abstained),
+        "generated_abstained": bool(abstained),
         "expected_abstention": not gold,
         "citation_precision": citation_precision,
         "citation_recall": citation_recall,
@@ -1119,12 +1346,8 @@ def _run_case(
         "input_tokens": int(getattr(answer_observation, "input_tokens", 0)),
         "output_tokens": int(getattr(answer_observation, "output_tokens", 0)),
         "ttft_ms": float(getattr(answer_observation, "ttft_ms", 0.0)),
-        "usage_estimated": bool(
-            getattr(answer_observation, "usage_estimated", False)
-        ),
-        "answer_attempt_count": int(
-            getattr(answer_observation, "attempt_count", 0)
-        ),
+        "usage_estimated": bool(getattr(answer_observation, "usage_estimated", False)),
+        "answer_attempt_count": int(getattr(answer_observation, "attempt_count", 0)),
         "answer_no_event_attempts": int(
             getattr(answer_observation, "no_event_attempts", 0)
         ),
@@ -1133,9 +1356,7 @@ def _run_case(
         "citation_repair_prejudge_no_event_attempts": (
             repair_prejudge_no_event_attempts
         ),
-        "citation_repair_rejudge_no_event_attempts": (
-            repair_rejudge_no_event_attempts
-        ),
+        "citation_repair_rejudge_no_event_attempts": (repair_rejudge_no_event_attempts),
         "total_ms": total_ms,
         "stage_timings_ms": {
             key: round(value, 3) for key, value in stage_timings_ms.items()
@@ -1184,7 +1405,9 @@ def _provider_preflight_summary(
         "citation_repair_rejudge_error",
     )
     for row in rows:
-        failures = tuple(str(value) for value in row.get("protocol_failure_codes") or ())
+        failures = tuple(
+            str(value) for value in row.get("protocol_failure_codes") or ()
+        )
         if failures:
             protocol_failed += 1
         if "provider_failed" in failures:
@@ -1245,10 +1468,23 @@ def _dry_run_estimate(
     for case in cases:
         per_category[str(case.get("category") or "unknown")] += 1
         input_tokens += _estimate_tokens(
-            build_answer_prompt(case, SimpleNamespace(evidence_segments=(), facts=(), summaries=(), source_msg_ids=()))
+            build_answer_prompt(
+                case,
+                SimpleNamespace(
+                    evidence_segments=(), facts=(), summaries=(), source_msg_ids=()
+                ),
+            )
         )
         input_tokens += _estimate_tokens(
-            build_judge_prompt(case, "", (), False, SimpleNamespace(evidence_segments=(), facts=(), summaries=(), source_msg_ids=()))
+            build_judge_prompt(
+                case,
+                "",
+                (),
+                False,
+                SimpleNamespace(
+                    evidence_segments=(), facts=(), summaries=(), source_msg_ids=()
+                ),
+            )
         )
         output_tokens += 400
     estimate_cost = (
@@ -1272,9 +1508,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--cases", required=True, type=Path)
     parser.add_argument("--output-detail", required=True, type=Path)
-    parser.add_argument("--cache-dir", type=Path, default=Path("data/test-platform-cache"))
+    parser.add_argument(
+        "--cache-dir", type=Path, default=Path("data/test-platform-cache")
+    )
     parser.add_argument("--limit", type=int, default=300)
     parser.add_argument("--seed", type=int, default=20260811)
+    parser.add_argument(
+        "--categories",
+        default="",
+        help="Optional comma-separated category allowlist applied before stratification.",
+    )
     parser.add_argument("--model", default="")
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--answer-model", default=DEFAULT_ANSWER_MODEL)
@@ -1291,10 +1534,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FULLCHAIN_CHANNEL_TIMEOUT_SECONDS,
         help="Per-channel retrieval timeout; defaults to the production 4s contract.",
     )
-    parser.add_argument("--input-price-mtok", type=float, default=DEFAULT_INPUT_PRICE_MT)
-    parser.add_argument("--output-price-mtok", type=float, default=DEFAULT_OUTPUT_PRICE_MT)
+    parser.add_argument(
+        "--input-price-mtok", type=float, default=DEFAULT_INPUT_PRICE_MT
+    )
+    parser.add_argument(
+        "--output-price-mtok", type=float, default=DEFAULT_OUTPUT_PRICE_MT
+    )
     parser.add_argument("--provider-attempts", type=int, default=PROVIDER_ATTEMPTS)
-    parser.add_argument("--provider-backoff", type=float, default=PROVIDER_BACKOFF_SECONDS)
+    parser.add_argument(
+        "--provider-backoff", type=float, default=PROVIDER_BACKOFF_SECONDS
+    )
     parser.add_argument(
         "--prewarm-embedding",
         action="store_true",
@@ -1305,7 +1554,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a fail-closed 10-case online provider gate before a full replay.",
     )
-    parser.add_argument("--progress", type=Path, default=Path("data/test-platform/progress-fullchain.jsonl"))
+    parser.add_argument(
+        "--progress",
+        type=Path,
+        default=Path("data/test-platform/progress-fullchain.jsonl"),
+    )
     return parser
 
 
@@ -1313,9 +1566,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
     if args.provider_preflight and (args.dry_run or args.resume):
-        parser.error("--provider-preflight cannot be combined with --dry-run or --resume")
+        parser.error(
+            "--provider-preflight cannot be combined with --dry-run or --resume"
+        )
     engine = _build_engine(args.database)
-    cases = _load_cases(args.cases)
+    cases = _filter_categories(_load_cases(args.cases), args.categories)
+    if not cases:
+        parser.error("--categories did not match any cases")
     limit = PROVIDER_PREFLIGHT_CASES if args.provider_preflight else args.limit
     rows, summary = run_cases(
         engine,

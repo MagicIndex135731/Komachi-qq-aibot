@@ -35,7 +35,10 @@ MEMORY_GROUNDING_WITH_EVIDENCE = (
     "requested, state that memory evidence is insufficient. For a single-event dated question, "
     "state only one fact from the "
     "top direct source and preserve its wording with minimal paraphrase; later corrections or newer "
-    "evidence take precedence. If the "
+    "evidence take precedence. For open-ended history, profile, plan, event, running-joke, or "
+    "summary questions, answer any directly supported part; do not abstain because the "
+    "packet is incomplete. For profiles and running jokes, state only explicit attributes, "
+    "nicknames, jokes, or events; never infer missing traits or origins. If the "
     "retrieved evidence does not directly answer the question, state that memory evidence is insufficient."
 )
 MEMORY_GROUNDING_MINIMAL = (

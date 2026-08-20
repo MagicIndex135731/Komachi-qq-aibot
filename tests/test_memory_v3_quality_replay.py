@@ -122,6 +122,25 @@ class _NoEventTimeoutStream(httpx.SyncByteStream):
         yield b""  # pragma: no cover - keeps this function a generator
 
 
+class _ProviderFailedSseStream(httpx.SyncByteStream):
+    def __iter__(self):
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "server_error",
+                            "message": "private provider message marker",
+                        }
+                    },
+                }
+            )
+            + "\n\n"
+        ).encode()
+
+
 def _client(stream: httpx.SyncByteStream) -> LlmClient:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/responses"
@@ -428,6 +447,50 @@ def test_observed_transport_reports_no_event_attempt_before_success() -> None:
     assert attempts == 2
     assert result.attempt_count == 2
     assert result.no_event_attempts == 1
+
+
+def test_observed_transport_retries_sse_provider_failure_and_keeps_safe_metadata(caplog) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        stream: httpx.SyncByteStream = (
+            _ProviderFailedSseStream() if attempts == 1 else _TimedSseStream()
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={
+                "content-type": "text/event-stream",
+                "x-request-id": f"req-safe-{attempts}",
+            },
+            stream=stream,
+        )
+
+    client = LlmClient(
+        base_url="https://provider.invalid/v1",
+        api_key="private-api-key-marker",
+        model="answer-model",
+        responses_model="answer-model",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client._sleep_before_retry = lambda **kwargs: None
+    try:
+        with caplog.at_level(logging.WARNING, logger="scripts.run_memory_v3_quality_replay"):
+            result = ObservedResponsesTransport(client, max_attempts=2).generate(
+                ["Target message: private query marker"],
+                model="answer-model",
+            )
+    finally:
+        client.http_client.close()
+
+    assert attempts == 2
+    assert result.attempt_count == 2
+    assert "provider_event=response.failed" in caplog.text
+    assert "provider_error_code=server_error" in caplog.text
+    assert "private provider message marker" not in caplog.text
+    assert "private query marker" not in caplog.text
 
 
 def test_observed_transport_exhausts_xbai_403_and_logs_only_safe_metadata(caplog) -> None:
@@ -816,6 +879,21 @@ def test_answer_prompt_uses_empty_allowlist_when_there_is_no_evidence() -> None:
     contract_line = next(line for line in prompt if "Allowed citation IDs JSON list" in line)
     assert "Allowed citation IDs JSON list: []" in contract_line
     assert "orphan-source" not in contract_line
+
+
+def test_allowed_citations_include_fact_and_summary_but_exclude_recent_fallback() -> None:
+    packed = SimpleNamespace(
+        source_msg_ids=("fact-source", "summary-source", "recent-only"),
+        evidence_segments=(),
+        facts=(SimpleNamespace(source_msg_ids=("fact-source",)),),
+        summaries=(SimpleNamespace(source_msg_ids=("summary-source",)),),
+        recent_messages=(SimpleNamespace(source_msg_id="recent-only"),),
+    )
+
+    assert allowed_citation_ids_from_packed_context(packed) == (
+        "fact-source",
+        "summary-source",
+    )
 
 
 def test_interval_answer_prompt_binds_each_citation_to_a_separate_clause() -> None:

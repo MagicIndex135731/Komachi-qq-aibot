@@ -1,6 +1,12 @@
 import sqlite3
 
-from scripts.build_memory_test_dataset import build_cases
+from scripts.build_memory_test_dataset import (
+    _load_group_aliases,
+    _load_messages,
+    _load_retrievable_raw_message_ids,
+    _topic_keywords,
+    build_cases,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -169,3 +175,85 @@ def test_group_subject_alias_and_mention_expected_abstention(tmp_path):
         or len(case["allowed_subject_user_ids"]) == 1
         for case in distractor_cases
     )
+
+
+def test_group_aliases_prefer_real_sender_snapshot_and_do_not_leak_cards(tmp_path):
+    database = tmp_path / "snapshot.db"
+    _make_db(database)
+    connection = sqlite3.connect(database)
+    connection.execute("ALTER TABLE messages ADD COLUMN raw_json TEXT")
+    connection.execute(
+        "UPDATE messages SET raw_json = ? WHERE id = 1",
+        ('{"sender":{"nickname":"阿渣","card":"群一卡"}}',),
+    )
+    connection.execute(
+        "INSERT INTO messages (id, group_id, platform_msg_id, user_id, timestamp, "
+        "plain_text, reply_to_msg_id, mentioned_bot, raw_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            8,
+            1002,
+            "p8",
+            11,
+            "2026-08-06T10:00:00+08:00",
+            "同一个人在另一个群",
+            None,
+            0,
+            '{"sender":{"nickname":"阿渣","card":"群二卡"}}',
+        ),
+    )
+    connection.commit()
+    connection.close()
+    engine = create_engine(
+        f"sqlite:///{database}",
+        connect_args={"timeout": 60},
+        poolclass=NullPool,
+        future=True,
+    )
+
+    aliases = _load_group_aliases(engine, _load_messages(engine))
+
+    assert aliases[1001][11][0] == "群一卡"
+    assert aliases[1002][11][0] == "群二卡"
+    assert "群二卡" not in aliases[1001][11]
+
+
+def test_retrievable_raw_ids_require_active_raw_v3_projection(tmp_path):
+    database = tmp_path / "snapshot.db"
+    _make_db(database)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE retrieval_documents (
+            id INTEGER PRIMARY KEY, group_id INTEGER, document_kind TEXT,
+            source_table TEXT, status TEXT
+        );
+        CREATE TABLE retrieval_document_messages (
+            document_id INTEGER, message_id INTEGER, group_id INTEGER
+        );
+        INSERT INTO retrieval_documents VALUES
+            (1, 1001, 'raw_message_v3', 'messages', 'active'),
+            (2, 1001, 'raw_message_v3', 'messages', 'inactive'),
+            (3, 1001, 'episode_summary', 'summaries', 'active');
+        INSERT INTO retrieval_document_messages VALUES
+            (1, 1, 1001), (2, 2, 1001), (3, 3, 1001);
+        """
+    )
+    connection.commit()
+    connection.close()
+    engine = create_engine(
+        f"sqlite:///{database}",
+        connect_args={"timeout": 60},
+        poolclass=NullPool,
+        future=True,
+    )
+
+    assert _load_retrievable_raw_message_ids(engine) == {1}
+
+
+def test_topic_keywords_reject_generic_fragments_and_keep_specific_phrases():
+    assert _topic_keywords("我印象里你和thf是不是投了") == []
+    assert _topic_keywords("有没有把safe的tag改成nsfw") == []
+    candidates = _topic_keywords("日本球迷球队赛后爱清理看台和更衣室")
+    assert candidates
+    assert any("日本球" in candidate or "球迷球队" in candidate for candidate in candidates)

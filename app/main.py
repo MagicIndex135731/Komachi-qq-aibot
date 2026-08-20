@@ -882,6 +882,12 @@ def build_memory_runtime(
             boosted_fact_ids: set[int] = set()
             preferred_fact_ids: set[int] = set()
             semantic_scores_by_id: dict[int, float] = {}
+            preferred_kinds: tuple[str, ...] = tuple(
+                resolved_query.preferred_fact_kinds
+            ) or preferred_kinds_for_query(
+                query=str(resolved_query.original_query),
+                answer_mode=resolved_query.answer_mode,
+            )
             if subject_ids:
                 seen_ids = {row.id for row in rows}
                 query_features = memory_query_features(
@@ -901,12 +907,6 @@ def build_memory_runtime(
                 query_features = filter_member_query_features(
                     query_features,
                     aliases=member_aliases,
-                )
-                preferred_kinds: tuple[str, ...] = tuple(
-                    resolved_query.preferred_fact_kinds
-                ) or preferred_kinds_for_query(
-                    query=str(resolved_query.original_query),
-                    answer_mode=resolved_query.answer_mode,
                 )
                 for subject_id in subject_ids:
                     candidates = memories.list_group_memories_for_subject(
@@ -950,11 +950,24 @@ def build_memory_runtime(
                     query_features=query_features,
                 )
                 if preferred_kinds:
-                    preferred_fact_ids = {
+                    preferred_fact_ids.update(
                         row.id
                         for row in rows
                         if row.memory_kind in preferred_kinds
-                    }
+                    )
+            elif resolved_query.subject_role == "group" and preferred_kinds:
+                seen_ids = {row.id for row in rows}
+                for row in memories.list_group_memories_for_subject(
+                    scope_id=str(group_id),
+                    subject_id="group",
+                    limit=max(200, settings.memory_member_fact_supplement_limit),
+                ):
+                    if row.memory_kind not in preferred_kinds:
+                        continue
+                    preferred_fact_ids.add(row.id)
+                    if row.id not in seen_ids:
+                        rows.append(row)
+                        seen_ids.add(row.id)
             return tuple(
                 MemoryFact(
                     text=str(row.content),

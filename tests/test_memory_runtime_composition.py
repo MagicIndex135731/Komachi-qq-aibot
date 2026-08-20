@@ -553,6 +553,88 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
     assert garfield_trace.result.packed_context.facts == ()
 
 
+def test_runtime_v2_fact_loader_supplements_group_scoped_running_jokes(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(
+        update={
+            "memory_raw_v3_enabled": True,
+            "memory_layered_memory_enabled": True,
+        }
+    )
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=99, nickname="Questioner", group_card="提问者"
+        )
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="group-joke-source",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at,
+            plain_text="群里的固定梗是周一也叫小周末。",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        MemoryRepository(session).add_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="group",
+            subject_id="group",
+            memory_kind="running_joke",
+            content="群里的固定梗是周一也叫小周末。",
+            importance=4,
+            confidence=0.9,
+            source_msg_id="group-joke-source",
+            valid_from=observed_at,
+        )
+        query = messages.add_group_message(
+            platform_msg_id="group-joke-query",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at + timedelta(minutes=1),
+            plain_text="群里有什么梗？",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+
+    assert trace.resolved_query.subject_role == "group"
+    assert any(
+        fact.source_msg_ids == ("group-joke-source",)
+        for fact in trace.result.packed_context.facts
+    )
+
+
 def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queries(
     sqlite_engine,
     tmp_path,

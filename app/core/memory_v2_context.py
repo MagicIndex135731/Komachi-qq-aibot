@@ -503,6 +503,8 @@ class MemoryV2ContextProvider:
             return False
         if getattr(resolved, "preferred_fact_kinds", ()) or ():
             return False
+        if getattr(resolved, "subject_role", "") == "group":
+            return False
         if getattr(resolved, "subject_ids", None) is not None:
             return False
         return True

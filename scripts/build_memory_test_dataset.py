@@ -132,18 +132,19 @@ DISTRACTOR_QUERIES = (
     "最近有什么好看的电影",
 )
 
-_CJK_TRIGRAM = re.compile(r"[\u4e00-\u9fff]{3}")
+_CJK_SPAN = re.compile(r"[\u4e00-\u9fff]{3,}")
 _ALIAS_STOP = {"小町", "比企谷小町", "机器人", "bot", "Bot"}
 _KEYWORD_STOP = {
     "什么", "怎么", "一个", "我们", "你们", "他们", "这个", "那个", "没有",
     "不是", "就是", "知道", "可以", "现在", "今天", "昨天", "晚上", "时候",
     "真的", "感觉", "还是", "已经", "因为", "所以", "如果", "但是", "自己",
     "大家", "东西", "问题", "意思", "这样", "那样", "起来", "出来", "开始",
-    "以后", "之前", "然后", "最后", "现在", "觉得", "喜欢",
+    "以后", "之前", "然后", "最后", "现在", "觉得", "喜欢", "印象",
 }
 _LEGACY_NOISE = re.compile(
     r"（QQ昵称|\(QQ昵称| likes | dislikes |\bdis\b|（昵称|\(昵称"
 )
+_TOPIC_GENERIC_CHARS = frozenset("我你他她它这那谁啥哪的了呢吗吧呀啊哦哈嘛")
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
     with engine.connect() as connection:
         yield from connection.execute(text(statement), parameters or {})
@@ -164,8 +165,8 @@ def _parse_dt(value: Any) -> str | None:
         return None
 
 
-def _load_aliases(engine) -> dict[int, list[str]]:
-    """Member alias candidates per group from the users table when available."""
+def _load_user_aliases(engine) -> dict[int, list[str]]:
+    """Global fallback aliases from the users table."""
     columns = {
         str(row[1])
         for row in _iter_rows(engine, "PRAGMA table_info(users)")
@@ -176,21 +177,100 @@ def _load_aliases(engine) -> dict[int, list[str]]:
     select_columns = ["user_id", "nickname"]
     if "group_card" in columns:
         select_columns.append("group_card")
-    for row in _iter_rows(
-        engine,
-        f"SELECT user_id, nickname, group_card FROM users",
-    ):
-        user_id, nickname, group_card = row[0], row[1], row[2]
-        candidates = [
+    for row in _iter_rows(engine, f"SELECT {', '.join(select_columns)} FROM users"):
+        user_id, nickname = row[0], row[1]
+        group_card = row[2] if len(row) > 2 else None
+        raw_candidates = [
             value
             for value in (nickname, group_card)
-            if isinstance(value, str) and value.strip() and value.strip() not in _ALIAS_STOP
+            if isinstance(value, str) and value.strip()
         ]
-        if not candidates:
+        candidates = [
+            value for value in raw_candidates if value.strip() not in _ALIAS_STOP
+        ]
+        if not raw_candidates:
             candidates = [f"用户{user_id}"]
         for candidate in candidates:
             aliases[int(user_id)].append(candidate.strip())
     return aliases
+
+
+def _raw_payload(raw_json: object) -> Mapping[str, Any]:
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw_json, Mapping):
+        return {}
+    return raw_json
+
+
+def _sender_aliases(raw_json: object) -> tuple[str, ...]:
+    raw_json = _raw_payload(raw_json)
+    sender = raw_json.get("sender")
+    if not isinstance(sender, Mapping):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in (sender.get("card"), sender.get("nickname"))
+            if isinstance(value, str)
+            and value.strip()
+            and value.strip() not in _ALIAS_STOP
+        )
+    )
+
+
+def _is_bot_message(row: Mapping[str, Any]) -> bool:
+    raw_json = _raw_payload(row.get("raw_json"))
+    delivery_state = str(raw_json.get("delivery_state") or "").strip()
+    sender = raw_json.get("sender")
+    sender_names = (
+        tuple(
+            str(sender.get(key) or "").strip()
+            for key in ("nickname", "card")
+        )
+        if isinstance(sender, Mapping)
+        else ()
+    )
+    return bool(
+        delivery_state
+        or str(row.get("platform_msg_id") or "").startswith("bot-reply-")
+        or any(name in _ALIAS_STOP for name in sender_names if name)
+    )
+
+
+def _load_group_aliases(
+    engine,
+    messages: Sequence[Mapping[str, Any]],
+) -> dict[int, dict[int, list[str]]]:
+    """Resolve aliases from real per-group sender snapshots, newest first.
+
+    The users table is global and its group_card can be overwritten by traffic
+    from another group.  It is therefore only a compatibility fallback for
+    observed memberships whose message snapshot has no sender metadata.
+    """
+
+    aliases: dict[int, dict[int, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in sorted(messages, key=lambda value: int(value["id"]), reverse=True):
+        group_id = int(row["group_id"])
+        user_id = int(row["user_id"])
+        for alias in _sender_aliases(row.get("raw_json")):
+            if alias not in aliases[group_id][user_id]:
+                aliases[group_id][user_id].append(alias)
+    fallback = _load_user_aliases(engine)
+    for group_id, user_id in {
+        (int(row["group_id"]), int(row["user_id"])) for row in messages
+    }:
+        for alias in fallback.get(user_id, ()):
+            if alias not in aliases[group_id][user_id]:
+                aliases[group_id][user_id].append(alias)
+    return {
+        group_id: dict(members) for group_id, members in aliases.items()
+    }
 
 
 def _load_memory_items(engine) -> list[dict[str, Any]]:
@@ -331,10 +411,12 @@ def _sort_by_source_recency(
 
 def _load_messages(engine) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    columns = {str(row[1]) for row in _iter_rows(engine, "PRAGMA table_info(messages)")}
+    raw_json_select = ", raw_json" if "raw_json" in columns else ""
     for row in _iter_rows(
         engine,
         "SELECT id, group_id, platform_msg_id, user_id, timestamp, plain_text, "
-        "reply_to_msg_id, mentioned_bot FROM messages",
+        f"reply_to_msg_id, mentioned_bot{raw_json_select} FROM messages",
     ):
         if row[1] is None or row[2] is None:
             continue
@@ -353,9 +435,43 @@ def _load_messages(engine) -> list[dict[str, Any]]:
                     str(row[6]) if row[6] is not None else None
                 ),
                 "mentioned_bot": bool(row[7]),
+                "raw_json": row[8] if len(row) > 8 else None,
             }
         )
     return rows
+
+
+def _load_retrievable_raw_message_ids(engine) -> set[int] | None:
+    """Return active raw-v3 source IDs, or None for legacy snapshots.
+
+    A raw-history gold message absent from every retrieval document is not a
+    ranking test: no online channel can retrieve it.  Production snapshots
+    therefore sample raw-history cases only from the materialized raw index.
+    """
+
+    tables = {
+        str(row[0])
+        for row in _iter_rows(
+            engine,
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+        )
+    }
+    required = {"retrieval_documents", "retrieval_document_messages"}
+    if not required <= tables:
+        return None
+    return {
+        int(row[0])
+        for row in _iter_rows(
+            engine,
+            "SELECT DISTINCT rdm.message_id "
+            "FROM retrieval_document_messages AS rdm "
+            "JOIN retrieval_documents AS rd ON rd.id = rdm.document_id "
+            "AND rd.group_id = rdm.group_id "
+            "WHERE rd.status = 'active' "
+            "AND rd.document_kind = 'raw_message_v3' "
+            "AND rd.source_table = 'messages'",
+        )
+    }
 
 
 def _recent_window(
@@ -380,12 +496,20 @@ def _recent_window(
 
 
 def _topic_keywords(text_value: str) -> list[str]:
-    trigrams = [match.group(0) for match in _CJK_TRIGRAM.finditer(text_value)]
-    return [
-        trigram
-        for trigram in dict.fromkeys(trigrams)
-        if trigram not in _KEYWORD_STOP and trigram not in _ALIAS_STOP
-    ]
+    candidates: list[str] = []
+    for match in _CJK_SPAN.finditer(text_value):
+        span = match.group(0)
+        for size in range(min(6, len(span)), 2, -1):
+            for start in range(0, len(span) - size + 1):
+                candidate = span[start : start + size]
+                if len(set(candidate)) < 3:
+                    continue
+                if any(char in _TOPIC_GENERIC_CHARS for char in candidate):
+                    continue
+                if any(stop in candidate for stop in _KEYWORD_STOP | _ALIAS_STOP):
+                    continue
+                candidates.append(candidate)
+    return list(dict.fromkeys(candidates))[:8]
 
 
 def _build_fact_case(
@@ -816,11 +940,24 @@ def build_cases(
     if group_ids:
         allowed = set(int(value) for value in group_ids)
         messages = [row for row in messages if row["group_id"] in allowed]
-    aliases = _load_aliases(engine)
+    aliases_by_group = _load_group_aliases(engine, messages)
     items = _load_memory_items(engine)
+    summaries = _load_summaries(engine)
+    if group_ids:
+        items = [item for item in items if item["group_id"] in allowed]
+        summaries = [summary for summary in summaries if summary["group_id"] in allowed]
+    items = [
+        item
+        for item in items
+        if not item["subject_id"].isdigit()
+        or bool(
+            aliases_by_group.get(item["group_id"], {}).get(
+                int(item["subject_id"]), ()
+            )
+        )
+    ]
     recent_items = _recent_item_pool(items, messages)
     recent_item_ids = {item["id"] for item in recent_items}
-    summaries = _load_summaries(engine)
     groups = sorted({row["group_id"] for row in messages})
     if not groups:
         raise ValueError("snapshot has no messages; cannot build a dataset")
@@ -828,8 +965,15 @@ def build_cases(
         row for row in messages if row["mentioned_bot"] and row["plain_text"].strip()
     ]
     raw_rows = [
-        row for row in messages if len(row["plain_text"]) >= 8 and not row["mentioned_bot"]
+        row
+        for row in messages
+        if len(row["plain_text"]) >= 8
+        and not row["mentioned_bot"]
+        and not _is_bot_message(row)
     ]
+    retrievable_raw_ids = _load_retrievable_raw_message_ids(engine)
+    if retrievable_raw_ids is not None:
+        raw_rows = [row for row in raw_rows if row["id"] in retrievable_raw_ids]
     cases: list[dict[str, Any]] = []
     index = 0
     target_fact = int(count * 0.40)
@@ -843,7 +987,7 @@ def build_cases(
         by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in items:
             by_kind[item["kind"]].append(item)
-        temporal_index = 0
+        kind_offsets: dict[str, int] = defaultdict(int)
         while len(cases) < target_fact:
             made = False
             for kind, kind_items in by_kind.items():
@@ -861,12 +1005,17 @@ def build_cases(
                         messages,
                     )
                 )
-                if kind in TEMPORAL_KINDS:
-                    item = pool[temporal_index % len(pool)]
-                    temporal_index += 1
-                else:
-                    item = pool[index % len(pool)]
-                cases.append(_build_fact_case(item, aliases, rng, index))
+                kind_offset = kind_offsets[kind]
+                item = pool[kind_offset % len(pool)]
+                kind_offsets[kind] = kind_offset + 1
+                cases.append(
+                    _build_fact_case(
+                        item,
+                        aliases_by_group.get(item["group_id"], {}),
+                        rng,
+                        index,
+                    )
+                )
                 made = True
                 index += 1
                 if len(cases) >= target_fact:
@@ -887,7 +1036,13 @@ def build_cases(
                 else items
             )
             item = pool[first_index % len(pool)]
-            cases.append(_build_first_person_case(item, aliases, first_index))
+            cases.append(
+                _build_first_person_case(
+                    item,
+                    aliases_by_group.get(item["group_id"], {}),
+                    first_index,
+                )
+            )
             first_index += 1
             if first_index >= len(pool) * len(FIRST_PERSON_TEMPLATES):
                 break
@@ -913,17 +1068,13 @@ def build_cases(
         cases.append(_build_summary_case(summary, offset))
     # 4b) Ambiguous / cross-group / distractor families.
     misc_index = 0
-    if aliases:
-        membership = {
-            (row["group_id"], row["user_id"]) for row in messages
-        }
+    if aliases_by_group:
         for group_id in groups:
             group_aliases = list(
                 dict.fromkeys(
                     alias
-                    for user_id, candidates in aliases.items()
+                    for candidates in aliases_by_group.get(group_id, {}).values()
                     for alias in candidates
-                    if (group_id, int(user_id)) in membership
                 )
             )
             if len(group_aliases) >= 2:
@@ -931,12 +1082,15 @@ def build_cases(
                 misc_index += 1
     for group_id in groups:
         foreign_alias = None
-        for user_id, candidates in aliases.items():
-            if not any(
-                row["group_id"] == group_id and row["user_id"] == user_id
-                for row in messages
-            ) and candidates:
-                foreign_alias = candidates[0]
+        local_members = set(aliases_by_group.get(group_id, {}))
+        for foreign_group, members in aliases_by_group.items():
+            if foreign_group == group_id:
+                continue
+            for user_id, candidates in members.items():
+                if user_id not in local_members and candidates:
+                    foreign_alias = candidates[0]
+                    break
+            if foreign_alias is not None:
                 break
         if foreign_alias is not None:
             cases.append(_build_cross_group_case(group_id, foreign_alias, misc_index))
@@ -945,7 +1099,13 @@ def build_cases(
         for distractor_index, item in enumerate(items):
             if distractor_index >= target_misc:
                 break
-            cases.append(_build_distractor_case(item, aliases, distractor_index))
+            cases.append(
+                _build_distractor_case(
+                    item,
+                    aliases_by_group.get(item["group_id"], {}),
+                    distractor_index,
+                )
+            )
     # 5) Abstention / precision cases to reach the target.
     while len(cases) < count:
         group_id = groups[rng.randrange(len(groups))]

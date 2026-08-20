@@ -320,6 +320,18 @@ def test_explicit_group_history_prefixes_remain_subjectless(
         assert result.topic_terms == ("动画",)
 
 
+def test_group_running_joke_query_marks_group_subject_role() -> None:
+    result = MemoryQueryResolver().resolve(
+        "群里有什么梗",
+        recent_messages=(),
+        now=NOW,
+        group_id=10001,
+    )
+
+    assert result.subject_ids is None
+    assert result.subject_role == "group"
+
+
 @pytest.mark.parametrize(
     "query",
     (
