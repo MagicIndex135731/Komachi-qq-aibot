@@ -47,9 +47,11 @@ services:
       - NAPCAT_WS_URL=ws://127.0.0.1:3001
       - PYTHONUNBUFFERED=1
       - TZ=${TZ:-Asia/Shanghai}
-      - HTTP_PROXY=${DOCKER_HTTP_PROXY:-}
-      - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
-      - NO_PROXY=${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}
+      # Keep the QQ/OneBot gateway direct. These runtime proxy settings apply
+      # only to Xiaomachi's outbound providers (for example the LLM API).
+      - HTTP_PROXY=${XIAOMACHI_HTTP_PROXY:-${DOCKER_HTTP_PROXY:-}}
+      - HTTPS_PROXY=${XIAOMACHI_HTTPS_PROXY:-${DOCKER_HTTPS_PROXY:-}}
+      - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}}
     volumes:
       - xiaomachi_data:/workspace/data
     depends_on:

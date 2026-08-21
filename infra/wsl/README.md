@@ -46,6 +46,26 @@ bash infra/wsl/scripts/stop.sh
 
 文本模型使用 Responses 端点时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true` 启用主模型内置联网检索。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存到 `runtime/logs/responses-tool-events.jsonl`，不进入 Git。
 
+### Clash 上游代理
+
+需要让模型、搜索等小町出站请求走 Clash 时，只在 `.env` 设置
+`XIAOMACHI_HTTP_PROXY`、`XIAOMACHI_HTTPS_PROXY` 和
+`XIAOMACHI_NO_PROXY`。LLBot/NapCat 不读取这三项，QQ 与 OneBot 仍直连。
+
+WSL2 的 NAT 网络不能通过 `127.0.0.1` 访问 Windows 上的 Clash。先在 WSL
+获取当前宿主机网关，再使用该地址和 Clash 的 mixed port：
+
+```bash
+ip route show default
+# 例如默认网关为 172.24.96.1、Clash mixed port 为 7897：
+XIAOMACHI_HTTP_PROXY=http://172.24.96.1:7897
+XIAOMACHI_HTTPS_PROXY=http://172.24.96.1:7897
+```
+
+Clash 必须允许该 WSL 子网访问 mixed port，同时保留 `127.0.0.1/32` 与
+`::1/128`，否则 Windows 系统代理会失效。修改 `.env` 后只重建 `xiaomachi`
+容器，并在 `ENABLE_GPU=1` 时携带 GPU Compose 覆盖文件；不要重建 LLBot。
+
 LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发送过程中断线时，
 系统会将本次投递标记为“结果未确认”。由于 QQ 可能已经收到消息，机器人不会自动重试、
 切片补发或发送额外失败提示，以避免同一回复重复出现。该记录保留在近期上下文中以维持

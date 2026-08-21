@@ -355,8 +355,12 @@ def test_xiaomachi_container_uses_prebuilt_local_image() -> None:
     compose = (REPO_ROOT / "infra/wsl/docker-compose.yml").read_text(encoding="utf-8")
     assert "network_mode: host" in compose
     assert "NAPCAT_WS_URL=ws://127.0.0.1:3001" in compose
-    assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in compose
-    assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in compose
+    assert "HTTP_PROXY=${XIAOMACHI_HTTP_PROXY:-${DOCKER_HTTP_PROXY:-}}" in compose
+    assert "HTTPS_PROXY=${XIAOMACHI_HTTPS_PROXY:-${DOCKER_HTTPS_PROXY:-}}" in compose
+    assert (
+        "NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}}"
+        in compose
+    )
     assert "image: xiaomachi-bot:local" in compose
     assert "context: ../.." in compose
     assert "dockerfile: infra/wsl/Dockerfile.xiaomachi" in compose

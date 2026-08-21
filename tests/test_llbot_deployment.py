@@ -30,6 +30,7 @@ def test_llbot_compose_uses_pinned_image_host_network_and_persistent_data() -> N
     assert "xiaomachi_data:/workspace/data:ro" in llbot["volumes"]
     assert "HTTP_PROXY=${DOCKER_HTTP_PROXY:-}" in llbot["environment"]
     assert "HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}" in llbot["environment"]
+    assert all("XIAOMACHI_" not in value for value in llbot["environment"])
     assert "healthcheck" not in llbot
 
 
@@ -47,6 +48,18 @@ def test_llbot_compose_keeps_xiaomachi_business_mounts_and_uses_onebot() -> None
     assert xiaomachi["build"]["network"] == "host"
     assert xiaomachi["build"]["args"]["HTTP_PROXY"] == "${DOCKER_HTTP_PROXY:-}"
     assert xiaomachi["build"]["args"]["HTTPS_PROXY"] == "${DOCKER_HTTPS_PROXY:-}"
+    assert (
+        "HTTP_PROXY=${XIAOMACHI_HTTP_PROXY:-${DOCKER_HTTP_PROXY:-}}"
+        in xiaomachi["environment"]
+    )
+    assert (
+        "HTTPS_PROXY=${XIAOMACHI_HTTPS_PROXY:-${DOCKER_HTTPS_PROXY:-}}"
+        in xiaomachi["environment"]
+    )
+    assert (
+        "NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}}"
+        in xiaomachi["environment"]
+    )
     assert "../../:/workspace" not in xiaomachi["volumes"]
     assert "xiaomachi_data:/workspace/data" in xiaomachi["volumes"]
     assert "devices" not in xiaomachi
