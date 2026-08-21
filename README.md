@@ -4,6 +4,21 @@
 
 完整的系统架构、消息工作流、商用 API、QQ/OneBot 服务和 Memory V3 原理见 [小町工程设计与运行原理](docs/ARCHITECTURE.md)。
 
+## 当前生产基线（v10）
+
+截至 2026-08-21，生产运行的是已完成新签名全量验证的 v10：`raw_v3`、分层记忆、
+语义事实排序、记忆工具与自适应上下文均已启用；查询 rewrite 保持关闭，嵌入模型在
+GPU 上运行。生产发布使用 WSL immutable release，当前私有群策略、运行态和模型缓存
+由共享运行配置保存，不依赖 Windows 工作区中的未跟踪文件。
+
+该版本的冻结生产快照在线验证为 300/300 个唯一 case，最终
+3-judge majority grounded-and-correct 为 275/300（91.67%），provider、protocol 和
+channel failure 均为 0。检索阶段 clean p95 为 1.245 秒；端到端长尾主要来自上游答案
+与评测调用，不应把它误判为本地记忆检索变慢。
+
+此处的 judge 属于评测链路：它在离线/隔离的全链条测试中评价冻结答案，不会加入 QQ
+正常回复链路，也不会让每条群消息固定多一次上游请求。
+
 ## 核心优势
 
 ### 一个真正“记得住”的群聊 AI
@@ -53,7 +68,8 @@
 `docker compose up`；需要重新执行 Linux runtime 安装，让 `/opt/xiaomachi/current`、
 systemd 和三个 BAT 入口使用同一版本。正常的 `status-xiaomachi-wsl.bat` 必须同时显示
 `xiaomachi-stack.service` 与 `xiaomachi-watchdog.service` 为 active，并通过 OneBot、
-heartbeat 和 gateway-ready 检查。
+heartbeat、gateway-ready 与本地群策略检查。发布后的 `Local group policy probe` 必须
+显示至少一个可发言群；它只输出数量，不会打印真实群号。
 - `open-napcat-webui.bat`：手动打开 NapCat 登录页面，不启动或重启容器。
 - `open-llbot-webui.bat`：手动打开 LLBot WebUI，并把本地 WebUI 密码复制到剪贴板。
 
@@ -106,7 +122,9 @@ heartbeat 和 gateway-ready 检查。
 `recent_context_limit`（默认 100）条消息作为上下文，不生成、不检索、不产生任何记忆数据；
 `memory_enabled: true` 的群启用完整分层记忆；真实群号在本地
 `configs/groups.local.yaml` 中配置（该文件不提交仓库），仓库中的
-`configs/groups.yaml` 仅保留占位群号。
+`configs/groups.yaml` 仅保留占位群号。正式安装会把该私有策略保存到共享运行配置，
+再复制进每个 immutable release；若不存在有效私有策略，安装会在激活前失败，避免
+占位配置静默接管生产。
 
 ### 记忆系统（Memory V3）
 
@@ -121,6 +139,12 @@ heartbeat 和 gateway-ready 检查。
 - `MEMORY_EMBEDDING_DEVICE=cuda`：生产使用 CUDA 推理，Docker 通过 CDI 只把 GPU 分配给
   `xiaomachi`。模板默认 `auto`：有 NVIDIA GPU 自动用 CUDA，没有则自动回退 CPU，
   无 CUDA 机器可直接部署运行。
+
+通常一条群消息会先经过本地确定性解析、SQLite/FTS/向量检索和上下文打包，再由上游
+模型生成最终回复，因此正常路径只有一次上游文本请求。只有模型显式返回受约束的
+`memory_search`、`memory_read` 或 `memory_write` 工具调用时，运行时才在本地执行该
+工具并继续下一轮模型调用；工具最大轮数由 `MEMORY_MEMORY_TOOL_MAX_ROUNDS` 限制。它与
+测试用的 judge 是两件事。
 
 无 NVIDIA 环境部署：保持 `.env` 中 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`、
 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=false`（首次运行需联网下载嵌入模型）即可；
@@ -168,8 +192,9 @@ docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiao
 ### 记忆系统（Memory V3）发布与回滚
 
 Memory V3 是生产启用的历史查询路径（当前生产 `MEMORY_RAW_V3_ENABLED=true`，
-分层/记忆工具/语义排序/改写均开启，运行时日志 `route=raw_v3`）。
-`.env.example` 已按生产模板全部开启；代码默认值保持安全关闭，避免未配置环境误启用。
+分层/记忆工具/语义排序/自适应上下文开启，`MEMORY_QUERY_REWRITE_ENABLED=false`，
+运行时日志为 `route=raw_v3`）。
+`.env.example` 提供与生产一致的功能组合；代码默认值保持安全关闭，避免未配置环境误启用。
 完整的 V3 准备、评测、激活与回滚流程见
 [Memory V3 运维清单](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback)。
 
@@ -254,7 +279,16 @@ git restore --source f63efe1 -- path\to\file
 ## 记忆测试平台（Memory Test Platform）
 
 对 Memory V3 做全链条评估：解析 → 检索 → 打包 → 上游模型真实请求
-（生成回答 + 引用校验 + 模型判定）。统一驱动：
+（生成回答 + 引用校验 + 模型判定）。v10 的正式签核使用冻结快照、完整输入签名、
+GPU 嵌入预热和 300 个唯一 case；先做单 judge 的生成/协议门禁，再对冻结答案做
+3-judge majority 置信度复核。评测请求与生产 QQ 流量隔离，缓存、逐例原文和 judge
+输出均不进入 Git。
+
+当前默认评测档位是回答 `gpt-5.6-luna/high`、judge/修复
+`gpt-5.6-luna/medium`。这是历史挡位实验后在稳定性与成本间的平衡；生产 QQ 的回答
+模型仍由 `LLM_MODEL` 与 `LLM_REASONING_EFFORT` 控制，不能用评测档位替代生产配置。
+
+统一驱动：
 
 ```bash
 # 0) 前置：容器内生产快照（只读副本）+ 上游模型 API key（环境变量）
@@ -267,7 +301,7 @@ python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
   --count 3000 --fullchain-limit 300 --dry-run
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db --all
 
-# 当前全链条模型配置：最终回答 Luna high，judge/修复 Luna medium（默认）
+# 默认全链条模型配置：最终回答 Luna high，judge/修复 Luna medium
 python -m scripts.run_memory_test_suite --database /tmp/snapshot.db \
   --answer-model gpt-5.6-luna --answer-effort high \
   --aux-model gpt-5.6-luna --aux-effort medium --stage fullchain

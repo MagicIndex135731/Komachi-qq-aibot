@@ -46,6 +46,26 @@ def test_readme_documents_only_supported_wsl_launchers() -> None:
     assert "QQ_EXE_PATH" not in readme
 
 
+def test_readme_describes_the_current_v10_memory_and_release_baseline() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+
+    required = [
+        "当前生产基线（v10）",
+        "300/300",
+        "275/300（91.67%）",
+        "MEMORY_QUERY_REWRITE_ENABLED=false",
+        "configs/groups.local.yaml",
+        "共享运行配置",
+        "评测链路",
+        "不会加入 QQ 正常回复链路",
+    ]
+    for item in required:
+        assert item in normalized_readme
+
+    assert "分层/记忆工具/语义排序/改写均开启" not in normalized_readme
+
+
 def test_groups_manifest_enables_target_group() -> None:
     groups = yaml.safe_load((REPO_ROOT / "configs/groups.yaml").read_text(encoding="utf-8"))
     primary = groups["groups"]["100000001"]
