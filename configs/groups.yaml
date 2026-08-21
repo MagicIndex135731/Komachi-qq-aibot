@@ -4,6 +4,9 @@ default_group_behavior:
   speak: false
   proactive_reply: true
   proactive_interval_seconds: "180-480"
+  # Set a positive value to let a busy group use this local traffic gate
+  # instead of an upstream interjection judge.
+  proactive_local_traffic_threshold: 0
   image_generation: true
   memory_enabled: false
   recent_context_limit: 100

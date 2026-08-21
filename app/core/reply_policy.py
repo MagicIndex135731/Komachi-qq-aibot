@@ -17,6 +17,7 @@ class PolicyInput:
     proactive_enabled: bool
     group_traffic_last_minute: int
     proactive_judge_enabled: bool = False
+    proactive_local_traffic_threshold: int = 0
     addressed_without_at: bool = False
     proactive_interval_seconds: tuple[int, int] = (180, 480)
     event_id: str = ""
@@ -58,8 +59,13 @@ class ReplyPolicy:
         if not policy_input.proactive_enabled:
             return ReplyDecision(False, "proactive_disabled", 0)
 
-        if policy_input.group_traffic_last_minute < self.traffic_threshold:
+        local_traffic_threshold = max(0, int(policy_input.proactive_local_traffic_threshold))
+        traffic_threshold = local_traffic_threshold or self.traffic_threshold
+        if policy_input.group_traffic_last_minute < traffic_threshold:
             return ReplyDecision(False, "below_threshold", 0)
+
+        if local_traffic_threshold:
+            return ReplyDecision(True, "proactive_local_candidate", 1)
 
         if not policy_input.proactive_judge_enabled:
             return ReplyDecision(False, "proactive_judge_disabled", 0)

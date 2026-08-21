@@ -172,6 +172,32 @@ def test_reply_policy_judge_disabled_blocks_proactive_candidate() -> None:
     assert decision.reason == "proactive_judge_disabled"
 
 
+def test_reply_policy_local_traffic_threshold_bypasses_judge() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(
+        make_policy_input(
+            group_traffic_last_minute=10,
+            proactive_judge_enabled=False,
+            proactive_local_traffic_threshold=10,
+        )
+    )
+    assert decision.should_reply is True
+    assert decision.reason == "proactive_local_candidate"
+
+
+def test_reply_policy_local_traffic_threshold_requires_ten_messages() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(
+        make_policy_input(
+            group_traffic_last_minute=9,
+            proactive_judge_enabled=False,
+            proactive_local_traffic_threshold=10,
+        )
+    )
+    assert decision.should_reply is False
+    assert decision.reason == "below_threshold"
+
+
 def test_reply_policy_judge_enabled_emits_candidate_without_scoring() -> None:
     policy = ReplyPolicy()
     decision = policy.decide(

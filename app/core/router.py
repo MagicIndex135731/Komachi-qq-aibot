@@ -105,6 +105,9 @@ logger = logging.getLogger(__name__)
 ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 PROACTIVE_RESERVATION_TTL_SECONDS = 300
+_PROACTIVE_CANDIDATE_REASONS = frozenset(
+    {"proactive_candidate", "proactive_local_candidate"}
+)
 
 MEMORY_TOOL_EFFICIENCY_INSTRUCTION = (
     "If the injected memory context is already enough to answer, do not call "
@@ -1494,6 +1497,11 @@ class InboundRouter:
                     proactive_enabled=proactive_enabled,
                     group_traffic_last_minute=recent_minute_traffic,
                     proactive_judge_enabled=self.runtime.settings.proactive_model_judge_enabled,
+                    proactive_local_traffic_threshold=self._group_policy_int(
+                        group_id=event.group_id,
+                        key="proactive_local_traffic_threshold",
+                        default=0,
+                    ),
                     addressed_without_at=addressed_without_at,
                     proactive_interval_seconds=proactive_interval,
                     event_id=event.platform_msg_id,
@@ -1516,10 +1524,9 @@ class InboundRouter:
             reference_search_request = needs_reference_search(event.plain_text)
             external_lookup_search_request = needs_external_lookup_search(event.plain_text)
             general_search_candidate = is_general_search_decision_candidate(event.plain_text)
-            proactive_time_sensitive_turn = decision.reason in (
-                "proactive_score",
-                "proactive_candidate",
-            ) and time_sensitive
+            proactive_time_sensitive_turn = (
+                decision.reason in _PROACTIVE_CANDIDATE_REASONS and time_sensitive
+            )
             forced_search_request = addressed_turn and (
                 explicit_search_request or reference_search_request or external_lookup_search_request
             )
@@ -1532,9 +1539,7 @@ class InboundRouter:
             )
             if not decision.should_reply:
                 return PreparedGroupReply(False)
-            if decision.reason == "proactive_candidate":
-                if self.proactive_judge_client is None:
-                    return PreparedGroupReply(False)
+            if decision.reason in _PROACTIVE_CANDIDATE_REASONS:
                 interjection_group = event.group_id
                 if not self._reserve_proactive_slot(
                     group_id=interjection_group,
@@ -1550,35 +1555,38 @@ class InboundRouter:
                         ).total_seconds()
                         if elapsed < float(proactive_interval[0]):
                             return PreparedGroupReply(False)
-                    judge_images = self._collect_recent_images(
-                        event=event,
-                        messages=messages,
-                        recent_messages=recent_messages,
-                        limit_messages=self.runtime.settings.proactive_judge_context_messages,
-                        max_images=self.runtime.settings.proactive_image_max_count,
-                    )
-                    judge_prompt = build_proactive_judge_prompt(
-                        bot_name=persona_name,
-                        target_message=event.plain_text,
-                        recent_messages=recent_lines,
-                        now=event.timestamp,
-                        context_messages=self.runtime.settings.proactive_judge_context_messages,
-                        max_chars_per_message=self.runtime.settings.proactive_judge_max_chars_per_message,
-                    )
-                    judge_result = judge_proactive_interjection(
-                        client=self.proactive_judge_client,
-                        prompt_lines=judge_prompt,
-                        images=judge_images,
-                    )
-                    logger.info(
-                        "interjection_judge group_id=%s msg_id=%s should_interject=%s reason=%s",
-                        event.group_id,
-                        event.platform_msg_id,
-                        judge_result.should_interject,
-                        judge_result.reason or "none",
-                    )
-                    if not judge_result.should_interject:
-                        return PreparedGroupReply(False)
+                    if decision.reason == "proactive_candidate":
+                        if self.proactive_judge_client is None:
+                            return PreparedGroupReply(False)
+                        judge_images = self._collect_recent_images(
+                            event=event,
+                            messages=messages,
+                            recent_messages=recent_messages,
+                            limit_messages=self.runtime.settings.proactive_judge_context_messages,
+                            max_images=self.runtime.settings.proactive_image_max_count,
+                        )
+                        judge_prompt = build_proactive_judge_prompt(
+                            bot_name=persona_name,
+                            target_message=event.plain_text,
+                            recent_messages=recent_lines,
+                            now=event.timestamp,
+                            context_messages=self.runtime.settings.proactive_judge_context_messages,
+                            max_chars_per_message=self.runtime.settings.proactive_judge_max_chars_per_message,
+                        )
+                        judge_result = judge_proactive_interjection(
+                            client=self.proactive_judge_client,
+                            prompt_lines=judge_prompt,
+                            images=judge_images,
+                        )
+                        logger.info(
+                            "interjection_judge group_id=%s msg_id=%s should_interject=%s reason=%s",
+                            event.group_id,
+                            event.platform_msg_id,
+                            judge_result.should_interject,
+                            judge_result.reason or "none",
+                        )
+                        if not judge_result.should_interject:
+                            return PreparedGroupReply(False)
                     acceptance_rate = self._group_policy_float(
                         group_id=interjection_group,
                         key="proactive_acceptance_rate",
@@ -1637,7 +1645,7 @@ class InboundRouter:
             assert self.memory_orchestrator is not None
             interjection_memory_limit = (
                 self.runtime.settings.proactive_recent_messages_limit
-                if decision.reason == "proactive_candidate"
+                if decision.reason in _PROACTIVE_CANDIDATE_REASONS
                 else len(recent_messages)
             )
             recent_memory_messages = tuple(
@@ -1763,7 +1771,7 @@ class InboundRouter:
                 recent_limit=recent_context_limit,
             )
             if memory_enabled:
-                if decision.reason == "proactive_candidate":
+                if decision.reason in _PROACTIVE_CANDIDATE_REASONS:
                     # Interjections must stay grounded in the immediate chat:
                     # historical retrieval often drags in stale topics and makes
                     # the roast look random. Recent messages + images only.
@@ -1786,7 +1794,7 @@ class InboundRouter:
             relevant_history_lines = memory_context.relevant_history_messages
             relevant_memories = memory_context.memories
             history_detail = memory_context.history_detail
-            if decision.reason == "proactive_candidate":
+            if decision.reason in _PROACTIVE_CANDIDATE_REASONS:
                 group_policy_lines = [
                     *group_policy_lines,
                     "Proactive interjections must react only to the recent messages and any visible image above. Never invent details, plot, or context that is not actually present in them.",

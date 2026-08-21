@@ -4918,6 +4918,12 @@ class AlwaysCandidateReplyPolicy:
         return ReplyDecision(True, "proactive_candidate", 1)
 
 
+class AlwaysLocalCandidateReplyPolicy:
+    def decide(self, policy_input) -> ReplyDecision:
+        del policy_input
+        return ReplyDecision(True, "proactive_local_candidate", 1)
+
+
 def enable_proactive_model_judge(router) -> None:
     values = router.runtime.settings.model_dump()
     values["proactive_model_judge_enabled"] = True
@@ -5007,6 +5013,35 @@ async def test_router_proactive_candidate_without_judge_client_stays_silent(sqli
 
     assert sender.sent == []
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_local_proactive_candidate_skips_judge_and_replies(sqlite_engine, monkeypatch) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("就这点热闹，也值得我凑一句。")
+    judge = FakeProactiveJudgeLlm(decision=False)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysLocalCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="local-proactive-1",
+            plain_text="这也太贵了吧",
+        )
+    )
+
+    assert len(sender.sent) == 1
+    assert len(llm.calls) == 1
+    assert judge.calls == []
 
 
 @pytest.mark.asyncio
