@@ -150,6 +150,20 @@ def test_linux_runtime_installer_does_not_restart_production_on_preflight_failur
     assert image_build < activation < stop_runtime
 
 
+def test_linux_runtime_upgrade_recreates_only_bot_and_preserves_llbot() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "recreate_bot_only()" in script
+    assert 'up -d --no-deps --force-recreate xiaomachi' in script
+    assert 'recreate_bot_only "${INSTALL_ROOT}/current"' in script
+    upgrade_section = script.split('if [[ -n "${previous_release}" ]]; then', 1)[1]
+    upgrade_section = upgrade_section.split('else\n  systemctl start xiaomachi-stack.service', 1)[0]
+    assert "systemctl stop xiaomachi-stack.service" not in upgrade_section
+    assert "xiaomachi-llbot" not in upgrade_section
+
+
 def test_systemd_uses_persistent_supervision_without_windows_autostart() -> None:
     stack = (REPO_ROOT / "infra/wsl/systemd/xiaomachi-stack.service").read_text(
         encoding="utf-8"

@@ -49,6 +49,18 @@ install_succeeded=false
 activation_started=false
 legacy_names=()
 legacy_original_names=()
+
+recreate_bot_only() {
+  local target_release="${1:?release path required}"
+  local compose_dir="${target_release}/infra/wsl"
+  local -a compose_args=(-f "${compose_dir}/docker-compose.llbot.yml")
+
+  if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "${compose_dir}/.env"; then
+    compose_args+=(-f "${compose_dir}/docker-compose.gpu.yml")
+  fi
+  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate xiaomachi
+}
+
 restore_previous_runtime() {
   if [[ "${install_succeeded}" == true ]]; then
     return
@@ -57,13 +69,13 @@ restore_previous_runtime() {
     return
   fi
   systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
-  systemctl stop xiaomachi-stack.service >/dev/null 2>&1 || true
   if [[ -n "${previous_release}" && -d "${previous_release}" ]]; then
     ln -sfn "${previous_release}" "${INSTALL_ROOT}/current"
     systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl start xiaomachi-stack.service >/dev/null 2>&1 || true
+    recreate_bot_only "${previous_release}" >/dev/null 2>&1 || true
     systemctl start xiaomachi-watchdog.service >/dev/null 2>&1 || true
   elif (( ${#legacy_names[@]} > 0 )); then
+    systemctl stop xiaomachi-stack.service >/dev/null 2>&1 || true
     for original_name in "${legacy_original_names[@]}"; do
       docker rm -f "${original_name}" >/dev/null 2>&1 || true
     done
@@ -187,13 +199,13 @@ docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiao
 
 activation_started=true
 systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
-systemctl stop xiaomachi-stack.service >/dev/null 2>&1 || true
 
 # On the first migration there is no previous Linux release to recreate. Keep
 # the stopped Windows-bind containers intact under legacy names until the new
 # stack has passed the synchronous OneBot + heartbeat checks. The new Compose
 # project uses a different project name, so it cannot adopt these containers.
 if [[ -z "${previous_release}" ]]; then
+  systemctl stop xiaomachi-stack.service >/dev/null 2>&1 || true
   for original_name in "${previously_running[@]}"; do
     if docker inspect "${original_name}" >/dev/null 2>&1; then
       legacy_name="${original_name}-legacy-${release_id,,}"
@@ -215,7 +227,14 @@ install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-watchdog.se
 
 systemctl daemon-reload
 systemctl disable xiaomachi-watchdog.service xiaomachi-stack.service >/dev/null 2>&1 || true
-systemctl start xiaomachi-stack.service
+if [[ -n "${previous_release}" ]]; then
+  # An upgrade must retain LLBot's session and container identity.  The stack
+  # unit's ExecStop is intentionally a full manual shutdown, so do not stop it
+  # here; recreate only the application service under the new release.
+  recreate_bot_only "${INSTALL_ROOT}/current"
+else
+  systemctl start xiaomachi-stack.service
+fi
 systemctl start xiaomachi-watchdog.service
 
 # Keep the immediately previous release for rollback and discard older code.
