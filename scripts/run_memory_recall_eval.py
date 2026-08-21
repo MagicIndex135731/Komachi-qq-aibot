@@ -764,7 +764,7 @@ def _validate_v3_runtime_settings(settings: AppSettings) -> None:
     if settings.memory_adaptive_context_enabled:
         if settings.memory_adaptive_max_history_messages != 300:
             raise AcceptanceGateError(("AC_PACKET_MESSAGE_LIMIT_CONFIG",))
-        if settings.memory_adaptive_max_recent_messages != 120:
+        if settings.memory_adaptive_max_recent_messages != 60:
             raise AcceptanceGateError(("AC_RECENT_LIMIT_CONFIG",))
         if settings.memory_normal_context_budget_tokens != 32_000:
             raise AcceptanceGateError(("AC_PACKET_TOKEN_LIMIT_CONFIG",))

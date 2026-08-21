@@ -213,7 +213,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_HISTORY_PROTECTED_MIN_MESSAGES",
     )
     memory_adaptive_max_recent_messages: int = Field(
-        default=80,
+        default=60,
         gt=0,
         alias="MEMORY_ADAPTIVE_MAX_RECENT_MESSAGES",
     )
@@ -261,13 +261,13 @@ class AppSettings(BaseSettings):
         alias="PROACTIVE_JUDGE_MAX_CHARS_PER_MESSAGE",
     )
     proactive_recent_messages_limit: int = Field(
-        default=50,
+        default=60,
         ge=1,
         le=200,
         alias="PROACTIVE_RECENT_MESSAGES_LIMIT",
     )
     proactive_image_max_count: int = Field(
-        default=4,
+        default=2,
         ge=1,
         le=10,
         alias="PROACTIVE_IMAGE_MAX_COUNT",

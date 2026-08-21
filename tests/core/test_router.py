@@ -1680,6 +1680,64 @@ async def test_router_passes_images_for_addressed_turn_without_putting_them_in_r
 
 
 @pytest.mark.asyncio
+async def test_router_addressed_turn_without_explicit_image_uses_latest_two_recent_images(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages = MessageRepository(session)
+        for index in range(3):
+            image_id = f"addressed-recent-{index}"
+            messages.add_group_message(
+                platform_msg_id=image_id,
+                group_id=10001,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 11, 59, 40 + index, tzinfo=UTC),
+                plain_text="",
+                raw_json={
+                    "message": [{
+                        "type": "image",
+                        "data": {
+                            "file": f"{image_id}.png",
+                            "url": f"https://img.example.test/{image_id}.png",
+                        },
+                    }],
+                    "message_id": image_id,
+                },
+                msg_type="image",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="addressed-recent-target",
+            plain_text="@Mira 这两张图怎么样",
+        )
+    )
+
+    assert [image.url for image in llm.calls[-1]["images"]] == [
+        "https://img.example.test/addressed-recent-2.png",
+        "https://img.example.test/addressed-recent-1.png",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_router_caches_inbound_image_payload_before_persisting(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
@@ -2081,7 +2139,7 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
 
 
 @pytest.mark.asyncio
-async def test_router_does_not_fall_back_to_recent_image_when_quoted_remote_message_is_text_only(sqlite_engine) -> None:
+async def test_router_uses_recent_image_when_quoted_remote_message_has_no_image(sqlite_engine) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     sender.gateway = FakeGateway(
@@ -2146,7 +2204,9 @@ async def test_router_does_not_fall_back_to_recent_image_when_quoted_remote_mess
     )
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
-    assert llm.calls[0]["images"] is None
+    assert [image.url for image in llm.calls[0]["images"]] == [
+        "https://img.example.test/other-user.png"
+    ]
 
 
 @pytest.mark.asyncio
@@ -2317,7 +2377,7 @@ async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sql
 
 
 @pytest.mark.asyncio
-async def test_router_does_not_reuse_already_consumed_recent_image_after_intervening_user_text(sqlite_engine, monkeypatch) -> None:
+async def test_router_uses_latest_recent_image_after_intervening_user_text(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
@@ -2364,7 +2424,7 @@ async def test_router_does_not_reuse_already_consumed_recent_image_after_interve
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it.", "I can see it."]
     assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/consumed.png"]
-    assert llm.calls[-1]["images"] is None
+    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/consumed.png"]
 
 
 @pytest.mark.asyncio
@@ -5018,11 +5078,40 @@ async def test_router_proactive_candidate_without_judge_client_stays_silent(sqli
 @pytest.mark.asyncio
 async def test_router_local_proactive_candidate_skips_judge_and_replies(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
-    llm = LongReplyLlm("就这点热闹，也值得我凑一句。")
+    llm = ImageCapturingLlm()
     judge = FakeProactiveJudgeLlm(decision=False)
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
     router.reply_policy = AlwaysLocalCandidateReplyPolicy()
     router.proactive_judge_client = judge
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        messages = MessageRepository(session)
+        for index in range(3):
+            image_id = f"local-proactive-image-{index}"
+            messages.add_group_message(
+                platform_msg_id=image_id,
+                group_id=10001,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 11, 59, 40 + index, tzinfo=UTC),
+                plain_text="",
+                raw_json={
+                    "message": [{
+                        "type": "image",
+                        "data": {
+                            "file": f"{image_id}.png",
+                            "url": f"https://img.example.test/{image_id}.png",
+                        },
+                    }],
+                    "message_id": image_id,
+                },
+                msg_type="image",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
 
     monkeypatch.setattr(
         router_module,
@@ -5042,6 +5131,10 @@ async def test_router_local_proactive_candidate_skips_judge_and_replies(sqlite_e
     assert len(sender.sent) == 1
     assert len(llm.calls) == 1
     assert judge.calls == []
+    assert [image.url for image in llm.calls[0]["images"]] == [
+        "https://img.example.test/local-proactive-image-2.png",
+        "https://img.example.test/local-proactive-image-1.png",
+    ]
 
 
 @pytest.mark.asyncio
@@ -5268,7 +5361,7 @@ async def test_router_proactive_acceptance_rate_is_deterministic_per_message(sql
 
 
 @pytest.mark.asyncio
-async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, monkeypatch) -> None:
+async def test_router_proactive_turn_uses_full_memory_build_context(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = LongReplyLlm("就这？")
     judge = FakeProactiveJudgeLlm(decision=True)
@@ -5276,11 +5369,14 @@ async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, 
     router.reply_policy = AlwaysCandidateReplyPolicy()
     router.proactive_judge_client = judge
 
-    def fail_build_context(request):
-        del request
-        raise AssertionError("proactive turns must not call build_context")
+    build_requests = []
+    original_build_context = router.memory_orchestrator.build_context
 
-    router.memory_orchestrator.build_context = fail_build_context
+    def capture_build_context(request):
+        build_requests.append(request)
+        return original_build_context(request)
+
+    router.memory_orchestrator.build_context = capture_build_context
 
     monkeypatch.setattr(
         router_module,
@@ -5298,7 +5394,8 @@ async def test_router_proactive_turn_skips_history_build_context(sqlite_engine, 
     )
 
     assert len(sender.sent) == 1
-    assert "Proactive interjections must react only to the recent messages" in "\n".join(
+    assert len(build_requests) == 1
+    assert "Proactive interjections should stay relevant to the current conversation" in "\n".join(
         llm.calls[0]
     )
 

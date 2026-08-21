@@ -1605,27 +1605,6 @@ class InboundRouter:
                         )
                         if not accepted:
                             return PreparedGroupReply(False)
-                    recent_image_pool = self._collect_recent_images(
-                        event=event,
-                        messages=messages,
-                        recent_messages=recent_messages,
-                        limit_messages=self.runtime.settings.proactive_recent_messages_limit,
-                        max_images=self.runtime.settings.proactive_image_max_count,
-                    )
-                    if group_image_resolved_turn is None:
-                        group_image_resolved_turn = ResolvedImageTurn(
-                            images=recent_image_pool,
-                            source_msg_id=event.platform_msg_id,
-                            source_kind="recent",
-                        )
-                    elif recent_image_pool:
-                        merged_images = list(group_image_resolved_turn.images)
-                        for image in recent_image_pool:
-                            if len(merged_images) >= self.runtime.settings.proactive_image_max_count:
-                                break
-                            if image not in merged_images:
-                                merged_images.append(image)
-                        group_image_resolved_turn.images = merged_images
                     keep_reservation = True
                 finally:
                     if not keep_reservation:
@@ -1643,11 +1622,6 @@ class InboundRouter:
                 )
 
             assert self.memory_orchestrator is not None
-            interjection_memory_limit = (
-                self.runtime.settings.proactive_recent_messages_limit
-                if decision.reason in _PROACTIVE_CANDIDATE_REASONS
-                else len(recent_messages)
-            )
             recent_memory_messages = tuple(
                 EvidenceMessage(
                     source_msg_id=message.platform_msg_id,
@@ -1663,7 +1637,7 @@ class InboundRouter:
                     is_bot=message.user_id == self.runtime.settings.bot_qq,
                     user_id=message.user_id,
                 )
-                for message in recent_messages[-interjection_memory_limit:]
+                for message in recent_messages
             )
             quoted_memory_message: EvidenceMessage | None = None
             if event.reply_to_msg_id is not None:
@@ -1771,17 +1745,7 @@ class InboundRouter:
                 recent_limit=recent_context_limit,
             )
             if memory_enabled:
-                if decision.reason in _PROACTIVE_CANDIDATE_REASONS:
-                    # Interjections must stay grounded in the immediate chat:
-                    # historical retrieval often drags in stale topics and makes
-                    # the roast look random. Recent messages + images only.
-                    memory_result = self.memory_orchestrator.recent_provider(
-                        memory_request
-                    )
-                else:
-                    memory_result = self.memory_orchestrator.build_context(
-                        memory_request
-                    )
+                memory_result = self.memory_orchestrator.build_context(memory_request)
             else:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
@@ -1797,7 +1761,7 @@ class InboundRouter:
             if decision.reason in _PROACTIVE_CANDIDATE_REASONS:
                 group_policy_lines = [
                     *group_policy_lines,
-                    "Proactive interjections must react only to the recent messages and any visible image above. Never invent details, plot, or context that is not actually present in them.",
+                    "Proactive interjections should stay relevant to the current conversation and may use retrieved memory only when it clearly helps. Never invent details, plot, or context.",
                 ]
             if full_history_enabled or relevant_history_lines or packed_memory_context is not None:
                 group_policy_lines = [
@@ -1841,9 +1805,26 @@ class InboundRouter:
             web_pages: list[str] = []
             search_hits = []
             page_reads = []
+            has_explicit_image_context = bool(
+                resolved_image_turn is not None
+                and resolved_image_turn.images
+                and resolved_image_turn.source_kind in {"current", "quoted", "quoted_remote"}
+            )
+            needs_recent_image_context = (
+                decision.reason in _PROACTIVE_CANDIDATE_REASONS
+                or (addressed_turn and not has_explicit_image_context)
+            )
             target_images = (
-                group_image_resolved_turn.images
-                if group_image_resolved_turn is not None
+                self._collect_recent_images(
+                    event=event,
+                    messages=messages,
+                    recent_messages=recent_messages,
+                    limit_messages=self.runtime.settings.proactive_recent_messages_limit,
+                    max_images=self.runtime.settings.proactive_image_max_count,
+                )
+                if needs_recent_image_context
+                else list(resolved_image_turn.images)
+                if has_explicit_image_context
                 else []
             )
             if target_images and not self.runtime.settings.llm_supports_vision_input:
