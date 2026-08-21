@@ -72,6 +72,36 @@ if [[ -z "${bot_started_at}" ]]; then
   exit 1
 fi
 
+echo "Local group policy probe:"
+if ! docker exec -i "${bot_container_name}" python - <<'PY'
+from pathlib import Path
+
+import yaml
+
+path = Path("/workspace/configs/groups.local.yaml")
+if not path.is_file() or not path.stat().st_size:
+    raise SystemExit("local group policy is missing or empty")
+payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+groups = payload.get("groups") or {}
+speaking_groups = [
+    entry
+    for entry in groups.values()
+    if isinstance(entry, dict)
+    and bool(entry.get("enabled", True))
+    and bool(entry.get("speak", False))
+]
+print(
+    f"local_group_policy=ok configured_groups={len(groups)} "
+    f"speaking_groups={len(speaking_groups)}"
+)
+if not speaking_groups:
+    raise SystemExit("local group policy has no enabled speaking groups")
+PY
+then
+  echo "Xiaomachi local group policy is missing or does not allow any group to speak."
+  exit 1
+fi
+
 if [[ "${platform}" == "llbot" ]]; then
   echo "LLBot WebUI probe:"
   webui_ok=false

@@ -34,6 +34,8 @@ releases_dir="${INSTALL_ROOT}/releases"
 shared_dir="${INSTALL_ROOT}/shared"
 release_dir="${releases_dir}/${release_id}"
 shared_runtime="${shared_dir}/runtime"
+shared_config_dir="${shared_dir}/configs"
+shared_groups_config="${shared_config_dir}/groups.local.yaml"
 previous_release="$(readlink -f "${INSTALL_ROOT}/current" 2>/dev/null || true)"
 if [[ ! -e "${shared_dir}/.install-complete" ]]; then
   previous_release=""
@@ -44,10 +46,14 @@ mapfile -t previously_running < <(
     | grep -E '^(xiaomachi-bot|xiaomachi-llbot|xiaomachi-napcat)$' || true
 )
 install_succeeded=false
+activation_started=false
 legacy_names=()
 legacy_original_names=()
 restore_previous_runtime() {
   if [[ "${install_succeeded}" == true ]]; then
+    return
+  fi
+  if [[ "${activation_started}" != true ]]; then
     return
   fi
   systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
@@ -72,7 +78,7 @@ restore_previous_runtime() {
 trap restore_previous_runtime EXIT
 
 install -d -m 0755 "${releases_dir}" "${shared_dir}" "${release_dir}"
-install -d -m 0755 "${shared_runtime}"
+install -d -m 0755 "${shared_runtime}" "${shared_config_dir}"
 
 # This is the only phase allowed to read the old Windows-backed runtime.  It
 # stops writers, creates Linux-side backups, copies named volumes, and validates
@@ -85,11 +91,35 @@ fi
 # Copy only the runtime allowlist.  Besides being smaller than a repository
 # mirror, this avoids touching unrelated or inaccessible generated directories.
 tar -C "${SOURCE_ROOT}" \
+  --exclude='configs/groups.local.yaml' \
   --exclude='infra/wsl/.env' \
   --exclude='infra/wsl/runtime' \
   -cf - \
   app configs infra/wsl scripts .dockerignore pyproject.toml README.md LICENSE \
   | tar -C "${release_dir}" -xf -
+
+# Production group IDs and policy overrides are intentionally gitignored. Keep
+# one private shared copy and materialize it into every release before the image
+# build. On the first upgrade from the older layout, import the previous
+# release's local policy so a clean git archive cannot silently disable all
+# real groups and fall back to the placeholder manifest.
+if [[ -f "${SOURCE_ROOT}/configs/groups.local.yaml" ]]; then
+  install -m 0600 "${SOURCE_ROOT}/configs/groups.local.yaml" "${shared_groups_config}.next"
+  mv -f "${shared_groups_config}.next" "${shared_groups_config}"
+elif [[ ! -f "${shared_groups_config}" \
+    && -n "${previous_release}" \
+    && -f "${previous_release}/configs/groups.local.yaml" ]]; then
+  install -m 0600 \
+    "${previous_release}/configs/groups.local.yaml" \
+    "${shared_groups_config}.next"
+  mv -f "${shared_groups_config}.next" "${shared_groups_config}"
+fi
+if [[ -f "${shared_groups_config}" ]]; then
+  install -m 0600 "${shared_groups_config}" "${release_dir}/configs/groups.local.yaml"
+else
+  echo "Missing private configs/groups.local.yaml; refusing to activate placeholder-only group policy." >&2
+  exit 1
+fi
 
 if [[ -f "${SOURCE_ROOT}/infra/wsl/.env" ]]; then
   install -m 0600 "${SOURCE_ROOT}/infra/wsl/.env" "${shared_dir}/.env.next"
@@ -155,6 +185,7 @@ fi
 # broken build from replacing the current symlink.
 docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi
 
+activation_started=true
 systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
 systemctl stop xiaomachi-stack.service >/dev/null 2>&1 || true
 

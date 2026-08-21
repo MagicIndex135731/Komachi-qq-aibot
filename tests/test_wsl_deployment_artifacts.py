@@ -116,6 +116,40 @@ def test_linux_runtime_installer_copies_allowlist_to_ext4_release_tree() -> None
     assert 'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi' in script
 
 
+def test_linux_runtime_installer_preserves_local_group_policy_before_image_build() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--exclude='configs/groups.local.yaml'" in script
+    assert 'shared_groups_config="${shared_config_dir}/groups.local.yaml"' in script
+    assert '"${SOURCE_ROOT}/configs/groups.local.yaml"' in script
+    assert '"${previous_release}/configs/groups.local.yaml"' in script
+    assert '"${release_dir}/configs/groups.local.yaml"' in script
+    assert "refusing to activate placeholder-only group policy" in script
+    persist_policy = script.index('shared_groups_config="${shared_config_dir}/groups.local.yaml"')
+    release_policy = script.index('"${release_dir}/configs/groups.local.yaml"')
+    image_build = script.index(
+        'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi'
+    )
+    assert persist_policy < release_policy < image_build
+
+
+def test_linux_runtime_installer_does_not_restart_production_on_preflight_failure() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "activation_started=false" in script
+    assert 'if [[ "${activation_started}" != true ]]; then' in script
+    image_build = script.index(
+        'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi'
+    )
+    activation = script.index("activation_started=true")
+    stop_runtime = script.index("systemctl stop xiaomachi-watchdog.service", activation)
+    assert image_build < activation < stop_runtime
+
+
 def test_systemd_uses_persistent_supervision_without_windows_autostart() -> None:
     stack = (REPO_ROOT / "infra/wsl/systemd/xiaomachi-stack.service").read_text(
         encoding="utf-8"
@@ -407,6 +441,9 @@ def test_status_script_uses_on_demand_probes_before_logs() -> None:
     assert "quick login and QR login cannot proceed yet" in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 "${service_name}"' in script
     assert 'docker compose -f "${compose_file}" logs --tail=80 xiaomachi' in script
+    assert "Local group policy probe:" in script
+    assert "/workspace/configs/groups.local.yaml" in script
+    assert "local group policy is missing" in script
 
 
 def test_status_script_waits_for_gateway_ready_marker() -> None:
