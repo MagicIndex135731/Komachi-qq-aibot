@@ -215,6 +215,30 @@ def test_memory_write_persists_source_backed_fact(sqlite_engine) -> None:
     assert any("提问者喜欢喝冰美式" in row.content for row in rows)
 
 
+def test_memory_write_accepts_source_backed_self_relationship(sqlite_engine) -> None:
+    _seed(sqlite_engine)
+    output = _executor(sqlite_engine).execute(
+        "memory_write",
+        {
+            "kind": "relationship",
+            "subject": "99",
+            "predicate": "identity relation",
+            "object_text": "bot owner",
+            "content": "提问者是机器人的主人",
+            "source_msg_ids": ["tool-query"],
+        },
+    )
+
+    assert output.startswith('{"memory_id":')
+    with session_scope(sqlite_engine) as session:
+        rows = MemoryRepository(session).list_group_memories_for_subject(
+            scope_id="100",
+            subject_id="99",
+            limit=10,
+        )
+    assert any(row.memory_kind == "relationship" for row in rows)
+
+
 def test_memory_write_rejects_scope_and_source_violations(sqlite_engine) -> None:
     _seed(sqlite_engine)
     executor = _executor(

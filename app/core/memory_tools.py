@@ -6,7 +6,7 @@ from typing import Any
 
 
 MEMORY_TOOL_KINDS = frozenset(
-    {"fact", "preference", "taboo", "plan", "decision", "profile"}
+    {"fact", "preference", "taboo", "plan", "decision", "profile", "relationship"}
 )
 MEMORY_TOOL_LAYERS = frozenset({"raw", "facts", "summaries", "all"})
 MEMORY_TOOL_CONTENT_LIMIT = 400
@@ -77,7 +77,8 @@ def memory_tool_schemas() -> list[dict[str, Any]]:
             "description": (
                 "Persist a source-backed fact about the current user or the "
                 "group. Only facts explicitly stated in the current "
-                "conversation may be written; every source message must be a "
+                "conversation may be written, including a relationship stated "
+                "by the current user; every source message must be a "
                 "real message from this group in this conversation."
             ),
             "parameters": {

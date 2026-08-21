@@ -26,6 +26,23 @@ class Recent:
 NOW = datetime(2026, 7, 23, 0, 10)
 
 
+@pytest.mark.parametrize("query", ("我是你的谁", "我是谁", "你应该怎么称呼我"))
+def test_self_relationship_queries_bind_requester_and_load_history(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.speaker_ids == ("10001",)
+    assert result.subject_binding == "requester"
+    assert result.answer_mode == "current_fact"
+    assert result.needs_history is True
+    assert result.retrieval_query == "称呼 身份 关系"
+
+
 def test_deterministic_follow_up_uses_quoted_message_without_rewrite() -> None:
     resolver = MemoryQueryResolver()
     quoted = Recent("42", "小王", "服务器迁移已经完成，但还要观察。", datetime(2026, 7, 22, 23, 55))

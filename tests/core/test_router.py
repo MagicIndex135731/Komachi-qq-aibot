@@ -5300,3 +5300,74 @@ def test_router_injects_active_addressing_rule_for_user(sqlite_engine) -> None:
     prompt = "\n".join(prepared.prompt_lines or [])
     assert "Active addressing rule for this user" in prompt
     assert "称呼统一改为主人" in prompt
+
+
+@pytest.mark.asyncio
+async def test_router_persists_and_replaces_explicit_addressing_rules(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    now = datetime.now(UTC)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="addressing-owner",
+            user_id=20001,
+            plain_text="我是主人",
+            timestamp=now,
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="addressing-father",
+            user_id=20001,
+            plain_text="以后叫我爸爸",
+            timestamp=now + timedelta(seconds=1),
+        )
+    )
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="addressing-unaddressed",
+            user_id=20002,
+            plain_text="我是主人",
+            timestamp=now + timedelta(seconds=2),
+        )
+    )
+
+    with session_scope(sqlite_engine) as session:
+        rows = MemoryRepository(session).list_group_memories("10001", limit=20)
+    rules = [row for row in rows if row.predicate == "称呼规则"]
+    active = [row for row in rules if row.status == "active"]
+    superseded = [row for row in rules if row.status == "superseded"]
+
+    assert len(active) == 1
+    assert active[0].subject_id == "20001"
+    assert active[0].object_text == "爸爸"
+    assert len(superseded) == 1
+    assert superseded[0].object_text == "主人"
+    assert all(row.subject_id != "20002" for row in rules)
+
+    prepared = router._prepare_group_reply(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="addressing-question",
+            user_id=20001,
+            plain_text="我是你的谁",
+            timestamp=now + timedelta(seconds=3),
+        ),
+        quoted_raw_payload=None,
+    )
+    prompt = "\n".join(prepared.prompt_lines or [])
+    assert "称呼该用户为爸爸" in prompt
+    assert "称呼该用户为主人" not in prompt

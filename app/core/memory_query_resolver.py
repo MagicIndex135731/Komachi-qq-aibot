@@ -170,6 +170,11 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
 _FIRST_PERSON_OWNERSHIP_PATTERN = re.compile(
     r"(?:我|我的).{0,24}?(?:主人|爹爹|爸爸|妈妈|称呼)"
 )
+_SELF_RELATIONSHIP_QUERY_PATTERN = re.compile(
+    r"^\s*(?:我(?:是|算)?(?:你(?:的)?)?(?:谁|什么人)|"
+    r"你(?:觉得|认为)?我(?:是|算)?你(?:的)?(?:谁|什么人)|"
+    r"(?:你|您).{0,16}?(?:该|应该)?(?:怎么)?(?:称呼|叫).{0,8}?(?:我|本人))\s*[？?]?\s*$"
+)
 _ASSESSMENT_PATTERN = re.compile(
     r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
     r"|(?:觉得|感觉|认为|以为|看来|听起来|看起来|咋看|啥看法)"
@@ -449,6 +454,27 @@ class MemoryQueryResolver:
             or _HISTORY_PATTERN.search(original)
             or answer_mode in {"mention", "summary", "assessment"}
         )
+
+        if (
+            normalized_requester_id is not None
+            and _SELF_RELATIONSHIP_QUERY_PATTERN.search(original)
+        ):
+            requester_subject = (normalized_requester_id,)
+            return ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query="称呼 身份 关系",
+                speaker_ids=requester_subject,
+                subject_ids=requester_subject,
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=True,
+                needs_detail=needs_detail,
+                group_id=normalized_group_id,
+                requester_id=normalized_requester_id,
+                subject_binding="requester",
+                answer_mode="current_fact",
+                coverage_mode="relevance",
+            )
 
         if (
             normalized_requester_id is not None

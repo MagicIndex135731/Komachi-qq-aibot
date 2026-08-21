@@ -8,7 +8,7 @@ import logging
 import re
 from typing import Any, Mapping, Sequence
 
-from app.core.memory_compaction import canonical_key
+from app.core.memory_compaction import canonical_key, is_addressing_rule
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.memory_tools import (
     MEMORY_TOOL_KINDS,
@@ -298,6 +298,10 @@ class MemoryToolExecutor:
                 source_msg_ids=source_ids,
                 valid_from=self._now,
                 valid_until=None,
+                replace_previous=(
+                    kind == "preference"
+                    and is_addressing_rule(predicate, object_text, content)
+                ),
             )
             memory_id = int(memory.id)
         return f'{{"memory_id":{memory_id}}}'

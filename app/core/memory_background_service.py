@@ -27,6 +27,7 @@ from app.core.time_utils import ASIA_SHANGHAI, shanghai_naive
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
+    is_addressing_rule,
     parse_memory_compaction_response,
 )
 from app.core.summarizer import summarize_window
@@ -1375,6 +1376,14 @@ class SqlAlchemyMemoryBackgroundStore:
                         source_msg_ids=source_ids,
                         valid_from=episode.ended_at or now,
                         valid_until=_parse_timestamp(fact.valid_until),
+                        replace_previous=(
+                            fact.kind == "preference"
+                            and is_addressing_rule(
+                                fact.predicate,
+                                fact.object_text,
+                                fact.content,
+                            )
+                        ),
                     )
                     session.flush()
                     documents.upsert_document(

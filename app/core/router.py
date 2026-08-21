@@ -49,6 +49,7 @@ from app.core.message_content import ImageAttachment, extract_images_from_raw_pa
 from app.core.memory_context_packer import EvidenceMessage, PackedMemoryContext
 from app.core.memory_engine import (
     extract_structured_memory_candidates,
+    parse_addressing_rule_claim,
     parse_personal_claim,
 )
 from app.core.memory_compaction import canonical_key
@@ -1164,6 +1165,40 @@ class InboundRouter:
                                 )
                                 memory.supersedes_id = previous.id
                                 session.add(memory)
+
+            addressing_rule = (
+                parse_addressing_rule_claim(event.plain_text)
+                if event.mentioned_bot and event.user_id != self.runtime.settings.bot_qq
+                else None
+            )
+            if addressing_rule is not None:
+                memories.upsert_canonical_memory(
+                    scope_type="group",
+                    scope_id=str(event.group_id),
+                    subject_type="user",
+                    subject_id=str(event.user_id),
+                    memory_kind="preference",
+                    canonical_key=canonical_key(
+                        "preference",
+                        str(event.user_id),
+                        addressing_rule.predicate,
+                        addressing_rule.role,
+                    ),
+                    predicate=addressing_rule.predicate,
+                    object_text=addressing_rule.role,
+                    content=addressing_rule.content,
+                    importance=5,
+                    confidence=1.0,
+                    source_msg_ids=[event.platform_msg_id],
+                    valid_from=self._normalize_timestamp(event.timestamp),
+                    replace_previous=True,
+                )
+                logger.info(
+                    "addressing_rule_persisted group_id=%s msg_id=%s user_id=%s",
+                    event.group_id,
+                    event.platform_msg_id,
+                    event.user_id,
+                )
 
             for candidate in extract_structured_memory_candidates(
                 scope_id=str(event.group_id),

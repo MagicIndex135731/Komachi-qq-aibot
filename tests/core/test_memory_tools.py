@@ -34,6 +34,7 @@ def test_memory_tool_schemas_expose_three_strict_functions() -> None:
         "source_msg_ids",
     }
     assert write_params["properties"]["kind"]["enum"] == sorted(MEMORY_TOOL_KINDS)
+    assert "relationship" in MEMORY_TOOL_KINDS
 
 
 @pytest.mark.parametrize(

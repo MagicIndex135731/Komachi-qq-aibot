@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
+    is_addressing_rule,
     parse_memory_compaction_response,
     structured_digest,
 )
@@ -458,6 +459,14 @@ class MemoryCompactionService:
                     source_msg_ids=list(fact.source_msg_ids),
                     valid_from=end_at,
                     valid_until=valid_until,
+                    replace_previous=(
+                        fact.kind == "preference"
+                        and is_addressing_rule(
+                            fact.predicate,
+                            fact.object_text,
+                            fact.content,
+                        )
+                    ),
                 )
             existing_daily = summaries.list_group_summaries(
                 scope_id=str(group_id),

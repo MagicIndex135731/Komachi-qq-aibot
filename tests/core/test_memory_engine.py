@@ -1,6 +1,7 @@
 from app.core.memory_engine import (
     extract_memory_candidates,
     extract_structured_memory_candidates,
+    parse_addressing_rule_claim,
     parse_personal_claim,
     is_history_detail_query,
     history_recall_limits,
@@ -185,6 +186,19 @@ def test_parse_personal_claim_rejects_ambiguous_pronouns_and_general_discussion(
     assert parse_personal_claim("阿渣喜欢动画吗？") is None
     assert parse_personal_claim("我喜欢什么动画？") is None
     assert parse_personal_claim("阿渣喜欢动画吧。") is None
+
+
+def test_parse_addressing_rule_claim_accepts_explicit_self_declarations_only() -> None:
+    assert parse_addressing_rule_claim("我是主人") is not None
+    assert parse_addressing_rule_claim("请记住：我是你的爸爸") is not None
+    claim = parse_addressing_rule_claim("以后叫我主人")
+
+    assert claim is not None
+    assert claim.role == "主人"
+    assert claim.predicate == "称呼规则"
+    assert claim.content == "称呼该用户为主人。"
+    assert parse_addressing_rule_claim("他是主人") is None
+    assert parse_addressing_rule_claim("我是主人吗？") is None
 
 
 def test_is_history_detail_query_detects_temporal_followup() -> None:

@@ -84,6 +84,14 @@ class MemoryCompaction:
     rejected_fact_count: int = 0
 
 
+def is_addressing_rule(*values: object) -> bool:
+    """Return whether persisted fact fields describe a bot-addressing rule."""
+
+    return _ADDRESSING_RULE_MARKERS.search(
+        " ".join(str(value or "") for value in values)
+    ) is not None
+
+
 def canonical_key(kind: str, subject_id: str, predicate: str, object_text: str) -> str:
     """Return a stable fact identity insensitive to case, spacing and Unicode form."""
 
@@ -315,9 +323,7 @@ def _parse_fact(
     sources_raw = candidate.get("source_msg_ids")
     valid_until = _parse_valid_until(candidate.get("valid_until"))
 
-    addressing_rule = _ADDRESSING_RULE_MARKERS.search(
-        f"{content} {object_text} {predicate}"
-    ) is not None
+    addressing_rule = is_addressing_rule(content, object_text, predicate)
     if addressing_rule and kind == "decision":
         # 称呼/行为规则是 preference，不是 decision；模型误分类时纠正。
         kind = "preference"

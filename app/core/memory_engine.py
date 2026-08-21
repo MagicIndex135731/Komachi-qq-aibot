@@ -21,6 +21,21 @@ class PersonalClaim:
     display_content: str
 
 
+@dataclass(frozen=True, slots=True)
+class AddressingRuleClaim:
+    """An explicit first-person rule for how the bot addresses its sender."""
+
+    role: str
+
+    @property
+    def predicate(self) -> str:
+        return "称呼规则"
+
+    @property
+    def content(self) -> str:
+        return f"称呼该用户为{self.role}。"
+
+
 _CHINESE_RELATION = r"(?P<relation>最喜欢|不喜欢|讨厌|喜欢)"
 _FIRST_PERSON_CLAIM = re.compile(rf"^我{_CHINESE_RELATION}(?P<object>.+)$")
 _NAMED_CLAIM = re.compile(
@@ -48,6 +63,13 @@ _UNSUPPORTED_OBJECT_QUESTION = re.compile(
 _ADDITIONAL_CLAIM = re.compile(
     r"(?:[，,；;]|但是|但|而且|然后|\bbut\b).*(?:最喜欢|不喜欢|讨厌|喜欢|likes?|dislikes?|hates?)",
     re.IGNORECASE,
+)
+_ADDRESSING_ROLE = r"(?:主人|爸爸|妈妈|爹爹)"
+_EXPLICIT_ADDRESSING_RULE = re.compile(
+    r"^(?:请|麻烦)?(?:记住[，,:：\s]*)?"
+    r"(?:我是(?:你(?:的)?)?|以后(?:请)?(?:你)?(?:要)?(?:称呼|叫)我(?:为)?|"
+    r"(?:请)?(?:称呼|叫)我(?:为)?|你以后(?:称呼|叫)我(?:为)?)"
+    rf"(?P<role>{_ADDRESSING_ROLE})[。！.!]?$"
 )
 
 
@@ -118,6 +140,22 @@ def parse_personal_claim(text: str) -> PersonalClaim | None:
         is_correction=is_correction,
         display_content=f"{display_subject} {predicate} {object_text}.",
     )
+
+
+def parse_addressing_rule_claim(text: str) -> AddressingRuleClaim | None:
+    """Recognize an explicit self-declared addressing rule without guessing.
+
+    The router adds the boundary that the message must directly mention the
+    bot. This parser remains pure so accepted wording is independently tested.
+    """
+
+    raw_text = str(text or "").strip()
+    if not raw_text or raw_text.endswith(("?", "？")):
+        return None
+    match = _EXPLICIT_ADDRESSING_RULE.fullmatch(raw_text)
+    if match is None:
+        return None
+    return AddressingRuleClaim(role=match.group("role"))
 
 
 LIKE_PATTERNS = (
