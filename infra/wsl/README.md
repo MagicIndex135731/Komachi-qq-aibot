@@ -25,8 +25,10 @@ powershell -ExecutionPolicy Bypass -File `
 ```
 
 任务名为 `Xiaomachi WSL Runtime`，不会修改 Windows 系统代理。需要卸载时传入
-`-Action Remove`。BAT 仍是人工启动、停止和状态检查入口；重复启动不会创建第二个
-任务实例。
+`-Action Remove`。BAT 仍是人工启动、停止和状态检查入口；start 会优先启动已安装
+的任务实例，stop 会先停止任务再关闭 systemd 服务。任务启动器会在发布期间 anchor
+短暂退出后立即重建它，避免 WSL 在重建间隙关机；但明确执行 stop 后不会把小町
+重新拉起。
 
 ## 初始化
 

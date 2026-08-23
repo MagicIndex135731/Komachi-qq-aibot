@@ -59,7 +59,7 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
         for line in bat_file.read_text(encoding="utf-8").splitlines()
         if line.startswith("echo WSL BAT VERSION ")
     }
-    assert bat_versions == {"echo WSL BAT VERSION 20260815-LINUX-RUNTIME"}
+    assert bat_versions == {"echo WSL BAT VERSION 20260823-WSL-MIHOMO"}
     for bat_file in bat_files:
         content = bat_file.read_text(encoding="utf-8")
         assert content.isascii()
@@ -69,8 +69,11 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
         if bat_file.name == "start-xiaomachi-wsl.bat":
             assert '--user root --cd "%~dp0" --exec bash infra/wsl/scripts/xiaomachi-wsl-entry.sh install' in content
             assert "Start-Process" in content
+            assert "Start-ScheduledTask" in content
             assert "'/usr/local/bin/xiaomachi-wsl-entry','anchor'" in content
             assert "Xiaomachi started successfully." in content
+        if bat_file.name == "stop-xiaomachi-wsl.bat":
+            assert "Stop-ScheduledTask" in content
         assert "schtasks.exe" not in content
 
     status_entry = (REPO_ROOT / "status-xiaomachi-wsl.bat").read_text(encoding="utf-8")

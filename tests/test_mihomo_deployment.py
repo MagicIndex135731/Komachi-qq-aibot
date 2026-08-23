@@ -117,5 +117,8 @@ def test_windows_runtime_task_owns_a_persistent_wsl_anchor() -> None:
     assert "wsl-runtime-task.log" in runner
     assert "Start-Process" in runner
     assert "-RedirectStandardError $stderrPath" in runner
+    assert "while ($true)" in runner
+    assert "anchor_stopped exit_code=$exitCode restarting_in_milliseconds=200" in runner
+    assert "Start-Sleep -Milliseconds 200" in runner
     assert "/bin/bash -lc" not in script + runner
     assert "Start-ScheduledTask -TaskName $TaskName" in script

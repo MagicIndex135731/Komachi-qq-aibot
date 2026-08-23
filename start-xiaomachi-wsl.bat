@@ -1,6 +1,6 @@
 @echo off
 setlocal
-echo WSL BAT VERSION 20260815-LINUX-RUNTIME
+echo WSL BAT VERSION 20260823-WSL-MIHOMO
 set "ENTRY=/usr/local/bin/xiaomachi-wsl-entry"
 wsl.exe --user root --exec test -x "%ENTRY%"
 if errorlevel 1 (
@@ -9,7 +9,7 @@ if errorlevel 1 (
   if errorlevel 1 goto :failed
 )
 echo Starting Xiaomachi. This may take 1-2 minutes...
-powershell.exe -NoProfile -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath 'wsl.exe' -ArgumentList '--user','root','--exec','/usr/local/bin/xiaomachi-wsl-entry','anchor'"
+powershell.exe -NoProfile -WindowStyle Hidden -Command "$task = Get-ScheduledTask -TaskName 'Xiaomachi WSL Runtime' -ErrorAction SilentlyContinue; if ($task) { Start-ScheduledTask -TaskName 'Xiaomachi WSL Runtime' } else { Start-Process -WindowStyle Hidden -FilePath 'wsl.exe' -ArgumentList '--user','root','--exec','/usr/local/bin/xiaomachi-wsl-entry','anchor' }"
 wsl.exe --user root --exec "%ENTRY%" start
 if errorlevel 1 goto :failed
 echo Xiaomachi started successfully.
