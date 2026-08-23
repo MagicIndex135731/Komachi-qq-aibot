@@ -16,6 +16,18 @@ start-xiaomachi-wsl.bat
 
 停止和状态入口使用同一个固定脚本，分别调用 `stop.sh` 和 `status.sh`。
 
+Windows 可能在最后一个交互式 `wsl.exe` 退出后回收 WSL VM。生产机应安装登录级
+任务计划，让独立进程持有运行锚点并在登录后恢复 systemd 服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  infra/wsl/scripts/install_windows_runtime_task.ps1
+```
+
+任务名为 `Xiaomachi WSL Runtime`，不会修改 Windows 系统代理。需要卸载时传入
+`-Action Remove`。BAT 仍是人工启动、停止和状态检查入口；重复启动不会创建第二个
+任务实例。
+
 ## 初始化
 
 在 WSL 中执行：

@@ -95,3 +95,27 @@ def test_linux_runtime_exports_force_lf_line_endings() -> None:
 
     assert "*.sh text eol=lf" in attributes
     assert "*.service text eol=lf" in attributes
+
+
+def test_windows_runtime_task_owns_a_persistent_wsl_anchor() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/install_windows_runtime_task.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'ValidateSet("Install", "Remove")' in script
+    assert 'New-ScheduledTaskTrigger -AtLogOn' in script
+    assert "-RunLevel Limited" in script
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in script
+    assert "-MultipleInstances IgnoreNew" in script
+    runner = (REPO_ROOT / "infra/wsl/scripts/run_windows_runtime_task.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "run_windows_runtime_task.ps1" in script
+    assert "WindowsPowerShell\\v1.0\\powershell.exe" in script
+    assert "-WindowStyle Hidden" in script
+    assert '"--exec", $entry, "anchor"' in runner
+    assert "wsl-runtime-task.log" in runner
+    assert "Start-Process" in runner
+    assert "-RedirectStandardError $stderrPath" in runner
+    assert "/bin/bash -lc" not in script + runner
+    assert "Start-ScheduledTask -TaskName $TaskName" in script
