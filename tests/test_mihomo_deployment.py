@@ -107,18 +107,24 @@ def test_windows_runtime_task_owns_a_persistent_wsl_anchor() -> None:
     assert "-RunLevel Limited" in script
     assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in script
     assert "-MultipleInstances IgnoreNew" in script
-    runner = (REPO_ROOT / "infra/wsl/scripts/run_windows_runtime_task.ps1").read_text(
+    runner = (REPO_ROOT / "infra/wsl/scripts/run_windows_runtime_task.vbs").read_text(
         encoding="utf-8"
     )
-    assert "run_windows_runtime_task.ps1" in script
-    assert "WindowsPowerShell\\v1.0\\powershell.exe" in script
-    assert "-WindowStyle Hidden" in script
-    assert '"--exec", $entry, "anchor"' in runner
+    assert "run_windows_runtime_task.vbs" in script
+    assert "System32\\wscript.exe" in script
+    assert "//B //Nologo" in script
+    assert "WScript.Shell" in runner
+    assert "xiaomachi-wsl-entry anchor" in runner
     assert "wsl-runtime-task.log" in runner
-    assert "Start-Process" in runner
-    assert "-RedirectStandardError $stderrPath" in runner
-    assert "while ($true)" in runner
-    assert "anchor_stopped exit_code=$exitCode restarting_in_milliseconds=200" in runner
-    assert "Start-Sleep -Milliseconds 200" in runner
-    assert "/bin/bash -lc" not in script + runner
+    assert "shell.Run(command, 0, True)" in runner
+    assert 'ExpandEnvironmentStrings("%ComSpec%")' not in runner
+    assert "wscript-direct" in runner
+    assert "Do" in runner
+    assert "Loop" in runner
+    assert "anchor_stopped exit_code=" in runner
+    assert 'DateDiff("s", startedAt, Now)' in runner
+    assert "quick_exit_count=" in runner
+    assert "restartDelayMilliseconds = 15000" in runner
+    assert "WScript.Sleep restartDelayMilliseconds" in runner
+    assert "/bin/bash -lc" not in script
     assert "Start-ScheduledTask -TaskName $TaskName" in script

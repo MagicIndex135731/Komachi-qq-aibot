@@ -20,13 +20,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Xiaomachi Linux runtime is not installed in WSL distro '$Distro'."
 }
 
-# The repository-owned runner supplies the interactive user's environment and
-# records unexpected WSL exits. Task Scheduler invoking wsl.exe directly returns
-# 0xFFFFFFFF on some WSL Store builds even though the same command works in a
-# terminal.
-$runner = (Resolve-Path (Join-Path $PSScriptRoot "run_windows_runtime_task.ps1")).Path
-$taskArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -Distro `"$Distro`""
-$taskAction = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $taskArguments
+# The repository-owned WScript runner launches wsl.exe directly without a cmd
+# or PowerShell console host. Store WSL can delegate an intermediate console to
+# Windows Terminal even when callers request a hidden window, so adding cmd.exe
+# for output redirection would reintroduce a visible blank terminal. The runner
+# keeps its own lifecycle log and applies backoff to short-lived anchor exits.
+$runner = (Resolve-Path (Join-Path $PSScriptRoot "run_windows_runtime_task.vbs")).Path
+$taskArguments = "//B //Nologo `"$runner`" `"$Distro`""
+$taskAction = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\wscript.exe" -Argument $taskArguments
 $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $taskPrincipal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
