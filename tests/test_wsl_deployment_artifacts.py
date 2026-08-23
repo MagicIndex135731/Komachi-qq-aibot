@@ -156,7 +156,7 @@ def test_linux_runtime_upgrade_recreates_only_bot_and_preserves_llbot() -> None:
     )
 
     assert "recreate_bot_only()" in script
-    assert 'up -d --no-deps --force-recreate xiaomachi' in script
+    assert 'up -d --no-deps --force-recreate --no-build xiaomachi' in script
     assert 'recreate_bot_only "${INSTALL_ROOT}/current"' in script
     upgrade_section = script.split('if [[ -n "${previous_release}" ]]; then', 1)[1]
     upgrade_section = upgrade_section.split('else\n  systemctl start xiaomachi-stack.service', 1)[0]

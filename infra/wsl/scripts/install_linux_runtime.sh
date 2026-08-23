@@ -58,7 +58,7 @@ recreate_bot_only() {
   if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "${compose_dir}/.env"; then
     compose_args+=(-f "${compose_dir}/docker-compose.gpu.yml")
   fi
-  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate xiaomachi
+  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --no-build xiaomachi
 }
 
 restore_previous_runtime() {
