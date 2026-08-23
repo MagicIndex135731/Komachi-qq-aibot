@@ -224,9 +224,15 @@ install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-stack.servi
   "${SYSTEMD_DIR}/xiaomachi-stack.service"
 install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-watchdog.service" \
   "${SYSTEMD_DIR}/xiaomachi-watchdog.service"
+install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-mihomo.service" \
+  "${SYSTEMD_DIR}/xiaomachi-mihomo.service"
 
 systemctl daemon-reload
 systemctl disable xiaomachi-watchdog.service xiaomachi-stack.service >/dev/null 2>&1 || true
+if [[ -x /usr/local/bin/mihomo && -s "${shared_dir}/mihomo/config.yaml" ]]; then
+  /usr/local/bin/mihomo -t -d "${shared_dir}/mihomo"
+  systemctl enable --now xiaomachi-mihomo.service
+fi
 if [[ -n "${previous_release}" ]]; then
   # An upgrade must retain LLBot's session and container identity.  The stack
   # unit's ExecStop is intentionally a full manual shutdown, so do not stop it

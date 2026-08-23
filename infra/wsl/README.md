@@ -46,25 +46,35 @@ bash infra/wsl/scripts/stop.sh
 
 文本模型使用 Responses 端点时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true` 启用主模型内置联网检索。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存到 `runtime/logs/responses-tool-events.jsonl`，不进入 Git。
 
-### Clash 上游代理
+### WSL 内置 Mihomo 上游代理
 
-需要让模型、搜索等小町出站请求走 Clash 时，只在 `.env` 设置
-`XIAOMACHI_HTTP_PROXY`、`XIAOMACHI_HTTPS_PROXY` 和
-`XIAOMACHI_NO_PROXY`。LLBot/NapCat 不读取这三项，QQ 与 OneBot 仍直连。
+生产使用 WSL 内独立的 Mihomo 规则实例，不再依赖 Windows Clash、WSL NAT
+网关或反向 TCP 中继。配置由 Windows Clash Verge 当前合并配置生成，但私有
+节点、订阅和规则数据库只写入 `/opt/xiaomachi/shared/mihomo/`，不会进入 Git。
 
-WSL2 的 NAT 网络不能通过 `127.0.0.1` 访问 Windows 上的 Clash。先在 WSL
-获取当前宿主机网关，再使用该地址和 Clash 的 mixed port：
+在 Windows 仓库根目录同步当前 Clash Verge 配置并安装服务：
 
-```bash
-ip route show default
-# 例如默认网关为 172.24.96.1、Clash mixed port 为 7897：
-XIAOMACHI_HTTP_PROXY=http://172.24.96.1:7897
-XIAOMACHI_HTTPS_PROXY=http://172.24.96.1:7897
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  infra/wsl/scripts/sync_mihomo_from_clash_verge.ps1
 ```
 
-Clash 必须允许该 WSL 子网访问 mixed port，同时保留 `127.0.0.1/32` 与
-`::1/128`，否则 Windows 系统代理会失效。修改 `.env` 后只重建 `xiaomachi`
-容器，并在 `ENABLE_GPU=1` 时携带 GPU Compose 覆盖文件；不要重建 LLBot。
+生成器会创建 `XIAOMACHI-NOVA-HK` 健康选择组，只包含当前配置里的香港节点；
+`ai.novacode.top` 优先走该组，QQ、本地与私网规则优先 `DIRECT`，其余规则继承
+当前机场配置。Mihomo 仅监听 WSL 回环地址，不启用 TUN，也不接管 Windows 系统
+代理。运行配置使用：
+
+```dotenv
+XIAOMACHI_HTTP_PROXY=http://127.0.0.1:7897
+XIAOMACHI_HTTPS_PROXY=http://127.0.0.1:7897
+DOCKER_HTTP_PROXY=
+DOCKER_HTTPS_PROXY=
+```
+
+LLBot/NapCat 不读取 `XIAOMACHI_*`，QQ 与 OneBot 始终直连。修改 `.env` 后只
+重建 `xiaomachi` 容器，并在 `ENABLE_GPU=1` 时携带 GPU Compose 覆盖文件；不要
+重建 LLBot。订阅更新后重新运行同步脚本即可，脚本会先渲染和校验新配置，再
+重启 Mihomo。
 
 LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发送过程中断线时，
 系统会将本次投递标记为“结果未确认”。由于 QQ 可能已经收到消息，机器人不会自动重试、

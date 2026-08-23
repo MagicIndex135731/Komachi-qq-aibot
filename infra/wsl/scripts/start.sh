@@ -17,6 +17,19 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
+xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:7897" ]]; then
+  if ! systemctl is-active --quiet xiaomachi-mihomo.service \
+      && ! systemctl start xiaomachi-mihomo.service; then
+    echo "Xiaomachi requires the local Mihomo proxy, but its service is unavailable." >&2
+    exit 1
+  fi
+  if ! systemctl is-active --quiet xiaomachi-mihomo.service; then
+    echo "Xiaomachi requires the local Mihomo proxy, but its service is unavailable." >&2
+    exit 1
+  fi
+fi
+
 platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 platform="${platform:-napcat}"
 if [[ "${platform}" != "napcat" && "${platform}" != "llbot" ]]; then

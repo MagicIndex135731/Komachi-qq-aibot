@@ -1,7 +1,7 @@
 [Unit]
 Description=Xiaomachi QQ bot stack
-Wants=network-online.target
-After=network-online.target docker.service
+Wants=network-online.target xiaomachi-mihomo.service
+After=network-online.target docker.service xiaomachi-mihomo.service
 Requires=docker.service
 
 [Service]

@@ -1,0 +1,21 @@
+[Unit]
+Description=Xiaomachi private Mihomo egress proxy
+Wants=network-online.target
+After=network-online.target
+Before=xiaomachi-stack.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mihomo -d /opt/xiaomachi/shared/mihomo
+ExecStartPost=/bin/bash -c 'for _ in {1..40}; do (echo > /dev/tcp/127.0.0.1/7897) >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1'
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/xiaomachi/shared/mihomo
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

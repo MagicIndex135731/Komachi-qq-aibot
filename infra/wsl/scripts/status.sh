@@ -6,6 +6,22 @@ WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${WSL_DIR}/../.." && pwd)"
 cd "${WSL_DIR}"
 
+xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:7897" ]]; then
+  echo "Mihomo provider proxy probe:"
+  systemctl is-active --quiet xiaomachi-mihomo.service || {
+    echo "xiaomachi-mihomo.service is not active."
+    exit 1
+  }
+  proxy_status="$(curl -x "${xiaomachi_proxy}" -sS -o /dev/null \
+    --connect-timeout 5 --max-time 15 -w '%{http_code}' https://ai.novacode.top/ || true)"
+  if [[ "${proxy_status}" == "000" || -z "${proxy_status}" ]]; then
+    echo "Nova is unreachable through local Mihomo."
+    exit 1
+  fi
+  echo "service=active nova_route=reachable http_status=${proxy_status}"
+fi
+
 platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 platform="${platform:-napcat}"
 if [[ "${platform}" == "llbot" ]]; then

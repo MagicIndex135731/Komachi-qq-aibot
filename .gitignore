@@ -49,6 +49,7 @@ configs/groups.local.yaml
 infra/wsl/.env
 infra/wsl/runtime/
 infra/wsl/.cache/
+infra/wsl/mihomo/
 
 # Trellis 仅本地维护，永不推送到 GitHub（含历史 journal、任务、spec）
 .trellis/
