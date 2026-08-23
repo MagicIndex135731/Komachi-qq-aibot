@@ -6,6 +6,15 @@ WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${WSL_DIR}/../.." && pwd)"
 cd "${WSL_DIR}"
 
+strip_optional_env_quotes() {
+  local value="${1:-}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  printf '%s' "${value}"
+}
+
 xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
 if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:7897" ]]; then
   echo "Mihomo provider proxy probe:"
@@ -25,8 +34,10 @@ fi
 platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 platform="${platform:-napcat}"
 memory_embedding_provider="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_PROVIDER[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+memory_embedding_provider="$(strip_optional_env_quotes "${memory_embedding_provider}")"
 memory_embedding_provider="${memory_embedding_provider:-local}"
 memory_embedding_device="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_DEVICE[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+memory_embedding_device="$(strip_optional_env_quotes "${memory_embedding_device}")"
 memory_embedding_device="${memory_embedding_device:-cpu}"
 if [[ "${platform}" == "llbot" ]]; then
   compose_file="docker-compose.llbot.yml"

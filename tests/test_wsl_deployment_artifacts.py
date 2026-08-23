@@ -501,6 +501,9 @@ def test_status_script_waits_for_current_process_embedding_prewarm() -> None:
     assert '"${bot_started_at}"' in prewarm_block
     assert '"${memory_embedding_provider}"' in prewarm_block
     assert '"${memory_embedding_device}"' in prewarm_block
+    assert 'strip_optional_env_quotes "${memory_embedding_provider}"' in script
+    assert 'strip_optional_env_quotes "${memory_embedding_device}"' in script
+    assert 'value="${value#\\\"}"' in script
     assert "prewarm_after_container_start_seconds=" in prewarm_block
     assert 'state != "ready"' in prewarm_block
     assert 'expected_device == "cuda" and accelerator != "cuda"' in prewarm_block
