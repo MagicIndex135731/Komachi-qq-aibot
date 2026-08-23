@@ -88,3 +88,10 @@ def test_mihomo_service_is_local_only_and_precedes_stack() -> None:
     assert "systemctl is-active --quiet xiaomachi-mihomo.service" in start
     assert "Mihomo provider proxy probe:" in status
     assert "https://ai.novacode.top/" in status
+
+
+def test_linux_runtime_exports_force_lf_line_endings() -> None:
+    attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+    assert "*.sh text eol=lf" in attributes
+    assert "*.service text eol=lf" in attributes

@@ -7,3 +7,8 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# Linux runtime artifacts must remain executable when exported by Windows Git
+# with a global core.autocrlf=true setting.
+*.sh text eol=lf
+*.service text eol=lf
