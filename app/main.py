@@ -882,6 +882,10 @@ def build_memory_runtime(
             boosted_fact_ids: set[int] = set()
             preferred_fact_ids: set[int] = set()
             semantic_scores_by_id: dict[int, float] = {}
+            selection_priority_by_id: dict[int, int] = {}
+            recency_boost = temporal_recency_required(
+                query=str(resolved_query.original_query)
+            )
             preferred_kinds: tuple[str, ...] = tuple(
                 resolved_query.preferred_fact_kinds
             ) or preferred_kinds_for_query(
@@ -894,6 +898,7 @@ def build_memory_runtime(
                     query=str(resolved_query.retrieval_query),
                     entities=resolved_query.entities,
                     topic_terms=resolved_query.topic_terms,
+                    intent_query=str(resolved_query.original_query),
                 )
                 member_aliases: list[str] = []
                 for member in UserRepository(session).get_users_by_ids(
@@ -931,16 +936,22 @@ def build_memory_runtime(
                             semantic_candidates,
                         )
                         semantic_scores_by_id.update(semantic_scores)
-                    for row in rank_member_facts(
+                    ranked_rows = rank_member_facts(
                         candidates,
                         query_features=query_features,
                         limit=settings.memory_member_fact_supplement_limit,
                         preferred_kinds=preferred_kinds,
                         semantic_scores=semantic_scores,
-                        recency_boost=temporal_recency_required(
-                            query=str(resolved_query.original_query)
-                        ),
-                    ):
+                        recency_boost=recency_boost,
+                    )
+                    if recency_boost:
+                        selection_priority_by_id.update(
+                            {
+                                row.id: len(ranked_rows) - index
+                                for index, row in enumerate(ranked_rows)
+                            }
+                        )
+                    for row in ranked_rows:
                         if row.id in seen_ids:
                             continue
                         rows.append(row)
@@ -983,6 +994,7 @@ def build_memory_runtime(
                     + (1.0 if row.id in boosted_fact_ids else 0.0)
                     + (0.5 if row.id in preferred_fact_ids else 0.0)
                     + (0.8 * semantic_scores_by_id.get(row.id, 0.0)),
+                    selection_priority=selection_priority_by_id.get(row.id, 0),
                     valid_until=row.valid_until,
                     group_id=group_id,
                 )

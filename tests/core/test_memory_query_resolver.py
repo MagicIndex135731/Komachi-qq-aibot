@@ -2247,7 +2247,8 @@ def test_bare_first_person_viewing_question_binds_requester_without_whitelist() 
 
     assert result.subject_ids == ("10001",)
     assert result.subject_binding == "requester"
-    assert result.topic_query == "最近在看什么动画"
+    assert result.answer_mode == "current_fact"
+    assert result.topic_query == "动画"
 
 
 def test_first_person_profile_portrait_binds_requester() -> None:
@@ -2341,6 +2342,27 @@ def test_current_viewing_question_variants_bind_requester_without_whitelist(
     )
 
     assert result.subject_ids == ("10001",)
+    assert result.answer_mode == "current_fact"
+
+
+def test_member_current_viewing_question_is_deterministic_without_rewrite() -> None:
+    resolver = MemoryQueryResolver()
+    members = (
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
+    )
+
+    result = resolver.resolve(
+        "阿渣最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "explicit"
+    assert result.answer_mode == "current_fact"
+    assert result.topic_query == "动画"
+    assert result.rewrite_used is False
 
 
 def test_semantic_rewrite_sets_current_fact_intent_for_viewing_question() -> None:

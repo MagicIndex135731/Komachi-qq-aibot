@@ -48,6 +48,8 @@ def test_preferred_kinds_for_query_intent_mapping() -> None:
         ("阿渣打算做什么？", ("plan",)),
         ("阿渣决定了什么？", ("decision",)),
         ("阿渣最近在做什么？", ("current",)),
+        ("阿渣最近在看什么动画？", ("current", "event")),
+        ("阿渣现在在追什么番？", ("current", "event")),
         ("阿渣最近发生了什么？", ("event",)),
         ("介绍一下阿渣", ("profile",)),
         ("阿渣是什么样的人？", ("profile",)),
@@ -81,6 +83,15 @@ def test_memory_query_features_extract_entities_and_cjk_grams() -> None:
     assert "动画" in features
     assert "喜欢" in features
     assert "什么" in features
+
+
+def test_memory_query_features_expands_current_viewing_synonyms() -> None:
+    features = memory_query_features(
+        query="阿渣最近在看什么动画？",
+        topic_terms=("动画",),
+    )
+
+    assert {"在看", "观看", "追看", "追番", "补番"}.issubset(features)
 
 
 def test_filter_member_query_features_drops_alias_echoes() -> None:
@@ -234,3 +245,45 @@ def test_rank_member_facts_recency_boost_prefers_fresh_facts() -> None:
         limit=6,
     )
     assert [fact.id for fact in ranked_plain] == [1, 2]
+
+
+def test_recent_viewing_ranking_prefers_fresh_equivalent_activity() -> None:
+    old_explicit_current = _fact(
+        1,
+        "用户正在看《向阳素描》",
+        confidence=0.99,
+        memory_kind="current",
+        last_seen_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    recent_viewing_event = _fact(
+        2,
+        "用户与朋友共同观看并讨论《结城友奈是勇者》",
+        confidence=0.90,
+        memory_kind="event",
+        last_seen_at=datetime(2026, 8, 20, tzinfo=UTC),
+    )
+    old_preference = _fact(
+        3,
+        "用户一直在看《海贼王》最新内容",
+        confidence=0.99,
+        memory_kind="preference",
+        last_seen_at=datetime(2026, 7, 21, tzinfo=UTC),
+    )
+    query = "阿渣最近在看什么动画？"
+    features = filter_member_query_features(
+        memory_query_features(query=query, topic_terms=("动画",)),
+        aliases=("阿渣",),
+    )
+
+    ranked = rank_member_facts(
+        (old_explicit_current, recent_viewing_event, old_preference),
+        query_features=features,
+        limit=3,
+        preferred_kinds=preferred_kinds_for_query(
+            query=query,
+            answer_mode="current_fact",
+        ),
+        recency_boost=True,
+    )
+
+    assert [fact.id for fact in ranked] == [2, 1, 3]

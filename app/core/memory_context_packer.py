@@ -81,6 +81,7 @@ class MemoryFact:
     text: str
     source_msg_ids: tuple[str, ...]
     score: float = 0.0
+    selection_priority: int = 0
     valid_until: datetime | None = None
     group_id: int | None = None
 
@@ -328,7 +329,10 @@ class MemoryContextPacker:
 
         selected_facts: list[MemoryFact] = []
         fact_blocks: list[str] = []
-        for fact in sorted(facts, key=lambda item: (-item.score, item.text)):
+        for fact in sorted(
+            facts,
+            key=lambda item: (-item.selection_priority, -item.score, item.text),
+        ):
             block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
             if fits_history(
                 [
@@ -639,7 +643,10 @@ class MemoryContextPacker:
                 "\n\n".join([*history_blocks, *summary_blocks])
             )
 
-        ordered_facts = sorted(facts, key=lambda item: (-item.score, item.text))
+        ordered_facts = sorted(
+            facts,
+            key=lambda item: (-item.selection_priority, -item.score, item.text),
+        )
         remaining_segments = [item for item in evidence_segments if not item.pinned]
 
         def add_fact(fact: MemoryFact) -> bool:

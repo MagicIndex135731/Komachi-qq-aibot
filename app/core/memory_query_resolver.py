@@ -202,10 +202,16 @@ _MENTION_PATTERN = re.compile(
 _REQUESTER_MENTION_PATTERN = re.compile(
     r"(?:谁|哪些人|有人|他们|她们|大家|群里).*(?:叫|提到|说到|@)\s*我"
 )
+_CURRENT_VIEWING_QUERY_PATTERN = (
+    r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
+    r"(?:看|追|补)(?:着)?(?:什么|啥)|"
+    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
+)
 _CURRENT_FACT_PATTERN = re.compile(
     r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"讨厌什么|不喜欢什么|还记得|记得|"
-    r"画像|是什么样的人|哪里人|做什么的|介绍一下|主人|称呼我|叫我"
+    r"画像|是什么样的人|哪里人|做什么的|介绍一下|主人|称呼我|叫我|"
+    + _CURRENT_VIEWING_QUERY_PATTERN
 )
 _TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
 _TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
@@ -228,7 +234,9 @@ _ASSESSMENT_SCAFFOLD_PATTERN = re.compile(
 )
 _CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
     r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么|还记得|记得|给出|完整|个人|介绍一下"
+    r"讨厌什么|不喜欢什么|还记得|记得|给出|完整|个人|介绍一下|"
+    r"(?:我|我的)?(?:最近|现在|目前|近期|当下)?(?:我|我的)?"
+    r"(?:正在|在)?(?:看|追|补)(?:着)?(?:什么|啥)"
 )
 _HISTORY_SCAFFOLD_PATTERN = re.compile(
     r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
@@ -274,8 +282,10 @@ _EXPLICIT_GROUP_HISTORY_TOPIC_PATTERN = re.compile(
 )
 _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
     r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
-    r"(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么"
+    r"(?:(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
+    r"讨厌什么|不喜欢什么|"
+    r"(?:最近|现在|目前|近期|当下)?(?:正在|在)?"
+    r"(?:看|追|补)(?:着)?(?:什么|啥))"
 )
 _REMEMBER_PERSON_PATTERN = re.compile(
     r"^\s*(?:还)?记得\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:吗|么|的|曾经|以前|喜欢|讨厌|[？?]|$)"

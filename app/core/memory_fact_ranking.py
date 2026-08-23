@@ -9,6 +9,12 @@ from app.core.time_utils import stored_as_utc
 
 
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
+_CURRENT_VIEWING_INTENT_PATTERN = re.compile(
+    r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
+    r"(?:看|追|补)(?:着)?(?:什么|啥)|"
+    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
+)
+_CURRENT_VIEWING_FEATURES = ("在看", "观看", "追看", "追番", "补番", "补剧")
 
 _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("taboo", "preference"), re.compile(r"讨厌|不喜欢|反感")),
@@ -17,6 +23,7 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("relationship",), re.compile(r"什么关系|和谁|和什么人|关系")),
     (("plan",), re.compile(r"打算|计划|准备做")),
     (("decision",), re.compile(r"决定")),
+    (("current", "event"), _CURRENT_VIEWING_INTENT_PATTERN),
     (("current",), re.compile(r"最近在做什么|在做什么|在干嘛|干什么")),
     (("event",), re.compile(r"最近发生|发生了什么|发生什么")),
     (("profile",), re.compile(r"介绍|是什么样的人|画像|哪里人|做什么的")),
@@ -78,6 +85,7 @@ def memory_query_features(
     query: str,
     entities: Sequence[str] = (),
     topic_terms: Sequence[str] = (),
+    intent_query: str | None = None,
 ) -> tuple[str, ...]:
     """Extract matching features from a memory query.
 
@@ -96,6 +104,10 @@ def memory_query_features(
                 piece = text[index : index + size]
                 if _CJK.fullmatch(piece):
                     features.add(piece)
+    if _CURRENT_VIEWING_INTENT_PATTERN.search(
+        str(intent_query if intent_query is not None else query)
+    ):
+        features.update(_CURRENT_VIEWING_FEATURES)
     return tuple(sorted(features))
 
 

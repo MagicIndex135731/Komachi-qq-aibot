@@ -29,6 +29,9 @@ KIND_SEMANTIC_GUIDANCE_EN = (
     "- plan: intended future action. current: what someone is doing now. event: what happened. "
     "profile: what kind of person. taboo: must-not topics. relationship: who is who to whom. "
     "running_joke: recurring in-group joke. fact: durable plain fact.\n"
+    "When a user explicitly says they are currently watching, following, or catching up on a work, "
+    "record it as current even if the sentence describes watching it with someone. "
+    "Merely discussing a plot, character, or season is not enough to infer current viewing or preference.\n"
     "Addressing rules may only be recorded when the requester is the person the rule applies to; "
     "never record one member changing how the bot addresses another member.\n"
 )
@@ -39,6 +42,8 @@ KIND_SEMANTIC_GUIDANCE_ZH = (
     "- preference：喜欢/讨厌/观点，以及针对机器人的行为约定；称呼规则放这里，predicate 以“称呼规则”开头。\n"
     "- plan：打算做的未来事项；current：正在做的事；event：发生过的事；profile：是什么样的人；"
     "taboo：禁区；relationship：人物关系；running_joke：群内固定梗；fact：普通持久事实。\n"
+    "用户明确说正在看、追或补某部作品时，应记录为 current；即使句子同时说和某人一起观看，也仍是 current。"
+    "只讨论剧情、角色或季度不足以推断其正在观看或喜欢该作品。\n"
     "称呼规则只能记录提出者本人适用的（subject=提出者=被称呼对象）；禁止记录帮别人改称呼的规则。\n"
 )
 

@@ -301,6 +301,35 @@ def test_facts_keep_provenance_and_untrusted_evidence_label() -> None:
     assert "quoted chat data" in packed.text
 
 
+def test_fact_selection_priority_preserves_temporal_member_ranking() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100,
+        detail_budget=100,
+        token_counter=lambda value: 1,
+    )
+    stale_literal_match = MemoryFact(
+        "旧但字面匹配的观看事实",
+        ("old",),
+        score=3.0,
+        selection_priority=1,
+    )
+    recent_equivalent_activity = MemoryFact(
+        "最近共同观看并讨论的作品",
+        ("recent",),
+        score=2.0,
+        selection_priority=2,
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100,
+        target_message_id=None,
+        facts=(stale_literal_match, recent_equivalent_activity),
+    )
+
+    assert packed.facts == (recent_equivalent_activity, stale_literal_match)
+
+
 def test_packed_context_puts_recent_messages_last_and_labels_history_first() -> None:
     packer = MemoryContextPacker(normal_budget=8000, detail_budget=8000)
     packed = packer.pack(
