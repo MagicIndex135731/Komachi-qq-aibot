@@ -31,6 +31,14 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
 
 
 _RECENCY_INTENT_PATTERN = re.compile(r"最近|现在|目前|近期|当下|刚刚|刚")
+_TEMPORAL_FACT_KINDS = (
+    "current",
+    "event",
+    "plan",
+    "decision",
+    "relationship",
+    "profile",
+)
 
 
 def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...]:
@@ -44,6 +52,11 @@ def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...
     for kinds, pattern in _KIND_INTENT_PATTERNS:
         if pattern.search(text):
             return kinds
+    if _RECENCY_INTENT_PATTERN.search(text):
+        # Temporal questions are not limited to one activity vocabulary.
+        # Location, employment, study, relationship and other state changes
+        # may be stored under several time-bearing fact kinds.
+        return _TEMPORAL_FACT_KINDS
     if answer_mode == "current_fact":
         return ("preference", "taboo", "profile")
     return ()
@@ -219,6 +232,37 @@ def rank_member_facts(
         reverse=True,
     )
     return [item[7] for item in scored[: int(limit)]]
+
+
+def select_temporal_current_facts(
+    facts: Sequence[RankableMemoryFact],
+    *,
+    matching_fact_ids: set[int],
+    topic_specific: bool,
+    broad_limit: int = 5,
+    broad_horizon_days: int = 14,
+) -> list[RankableMemoryFact]:
+    """Reduce a current-state query to the freshest relevant fact set.
+
+    A topic-specific question (watching, work, location, study, and so on)
+    should not expose stale alternatives to the answer model. A broad
+    "recently doing what" question may need several activities, but only from
+    the same recent window as the freshest matching evidence.
+    """
+    if not facts:
+        return []
+    matched = [fact for fact in facts if int(fact.id or 0) in matching_fact_ids]
+    candidates = matched or list(facts)
+    if topic_specific:
+        return candidates[:1]
+    newest = max((_recency_value(fact) for fact in candidates), default=0.0)
+    cutoff = newest - max(1, int(broad_horizon_days)) * 86_400 if newest else 0.0
+    selected = [
+        fact
+        for fact in candidates
+        if not newest or _recency_value(fact) >= cutoff
+    ]
+    return selected[: max(1, int(broad_limit))]
 
 
 def matching_member_fact_ids(

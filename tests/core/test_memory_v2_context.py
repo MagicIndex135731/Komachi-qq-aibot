@@ -542,6 +542,66 @@ def test_profile_intent_queries_cap_expansion_candidates() -> None:
     assert len(expander.candidate_ids[0]) == 2
 
 
+def test_temporal_current_fact_excludes_prior_bot_answers_from_recent_evidence() -> None:
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(
+            needs_history=True,
+            answer_mode="current_fact",
+            subject_ids=("20001",),
+            original_query="阿渣最近在做什么？",
+        ),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+    base_request = request()
+    user_message = base_request.recent_messages[0]
+    stale_bot_answer = replace(
+        user_message,
+        source_msg_id="bot-old",
+        speaker="bot",
+        content="阿渣仍在做旧项目",
+        is_bot=True,
+    )
+
+    provider(replace(base_request, recent_messages=(user_message, stale_bot_answer)))
+
+    assert packer.recent_messages == (user_message,)
+
+
+def test_non_temporal_query_keeps_prior_bot_messages_for_conversation_continuity() -> None:
+    packer = CapturingPacker()
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(
+            needs_history=True,
+            answer_mode="current_fact",
+            subject_ids=("20001",),
+            original_query="阿渣喜欢什么？",
+        ),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=packer,
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+    base_request = request()
+    stale_bot_answer = replace(
+        base_request.recent_messages[0],
+        source_msg_id="bot-old",
+        is_bot=True,
+    )
+
+    provider(
+        replace(
+            base_request,
+            recent_messages=(*base_request.recent_messages, stale_bot_answer),
+        )
+    )
+
+    assert packer.recent_messages == (*base_request.recent_messages, stale_bot_answer)
+
+
 def test_v2_evaluation_trace_exposes_only_ids_and_resolver_metrics() -> None:
     provider = MemoryV2ContextProvider(
         resolver=Resolver(),

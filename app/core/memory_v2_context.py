@@ -266,6 +266,21 @@ class MemoryV2ContextProvider:
         )
         derived_ms = (perf_counter() - derived_started) * 1000
         packing_started = perf_counter()
+        recent_messages = request.recent_messages
+        if (
+            resolved.answer_mode == "current_fact"
+            and resolved.subject_ids
+            and temporal_recency_required(
+                query=str(resolved.original_query or "")
+            )
+        ):
+            # Prior bot answers are useful conversational context but are not
+            # primary evidence about a member's current state. Keeping them on
+            # a temporal fact turn creates a feedback loop where one stale bot
+            # answer can override newer structured evidence indefinitely.
+            recent_messages = tuple(
+                message for message in recent_messages if not message.is_bot
+            )
         packed = self._packer.pack(
             mode,
             available_input=request.available_input,
@@ -276,7 +291,7 @@ class MemoryV2ContextProvider:
                 and resolved.needs_history
                 and resolved.time_range is not None
                 and not segments
-                else request.recent_messages
+                else recent_messages
             ),
             evidence_segments=segments,
             facts=facts,

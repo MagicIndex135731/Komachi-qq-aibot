@@ -99,7 +99,7 @@ def _packed_memory_blocks(context: PackedMemoryContext) -> list[_PackedMemoryBlo
         blocks.append(
             _PackedMemoryBlock(
                 "fact",
-                f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}",
+                MemoryContextPacker._render_fact(fact),
                 fact.score,
             )
         )

@@ -9,6 +9,7 @@ from app.core.memory_fact_ranking import (
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    select_temporal_current_facts,
     temporal_recency_required,
 )
 
@@ -51,6 +52,10 @@ def test_preferred_kinds_for_query_intent_mapping() -> None:
         ("阿渣最近在看什么动画？", ("current", "event")),
         ("阿渣现在在追什么番？", ("current", "event")),
         ("阿渣最近发生了什么？", ("event",)),
+        (
+            "阿渣目前在哪里工作？",
+            ("current", "event", "plan", "decision", "relationship", "profile"),
+        ),
         ("介绍一下阿渣", ("profile",)),
         ("阿渣是什么样的人？", ("profile",)),
         ("今天天气怎么样", ()),
@@ -207,9 +212,15 @@ def test_rank_member_facts_recency_breaks_ties() -> None:
     assert [fact.id for fact in ranked] == [2, 1, 3]
 
 def test_temporal_recency_required_detects_recent_intent() -> None:
-    assert temporal_recency_required(query="阿渣最近有什么计划")
-    assert temporal_recency_required(query="茔草现在在忙什么")
-    assert temporal_recency_required(query="最近聊过什么")
+    temporal_queries = (
+        "阿渣最近有什么计划",
+        "茔草现在在忙什么",
+        "阿渣目前在哪里工作",
+        "阿渣近期决定了什么",
+        "阿渣刚刚和谁建立了关系",
+        "最近聊过什么",
+    )
+    assert all(temporal_recency_required(query=query) for query in temporal_queries)
     assert not temporal_recency_required(query="阿渣喜欢什么动画")
     assert not temporal_recency_required(query="介绍一下阿渣")
 
@@ -287,3 +298,55 @@ def test_recent_viewing_ranking_prefers_fresh_equivalent_activity() -> None:
     )
 
     assert [fact.id for fact in ranked] == [2, 1, 3]
+
+
+def test_topic_specific_temporal_current_fact_keeps_only_the_newest_match() -> None:
+    recent_match = _fact(
+        2,
+        "用户最近在北京工作",
+        last_seen_at=datetime(2026, 8, 20, tzinfo=UTC),
+    )
+    stale_match = _fact(
+        1,
+        "用户之前在西安工作",
+        last_seen_at=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    newer_unrelated = _fact(
+        3,
+        "用户今天买了饮料",
+        last_seen_at=datetime(2026, 8, 22, tzinfo=UTC),
+    )
+
+    selected = select_temporal_current_facts(
+        (recent_match, newer_unrelated, stale_match),
+        matching_fact_ids={1, 2},
+        topic_specific=True,
+    )
+
+    assert [fact.id for fact in selected] == [2]
+
+
+def test_broad_temporal_current_fact_keeps_multiple_recent_activities() -> None:
+    newest = _fact(
+        3,
+        "用户最近在学日语",
+        last_seen_at=datetime(2026, 8, 22, tzinfo=UTC),
+    )
+    recent = _fact(
+        2,
+        "用户最近在做机器人",
+        last_seen_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+    stale = _fact(
+        1,
+        "用户之前在准备考试",
+        last_seen_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+
+    selected = select_temporal_current_facts(
+        (newest, recent, stale),
+        matching_fact_ids={1, 2, 3},
+        topic_specific=False,
+    )
+
+    assert [fact.id for fact in selected] == [3, 2]

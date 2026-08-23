@@ -28,18 +28,17 @@ MEMORY_GROUNDING_NO_EVIDENCE = (
 )
 MEMORY_GROUNDING_WITH_EVIDENCE = (
     "Memory grounding policy: Answer historical-memory questions only with facts directly and "
-    "unambiguously supported by the retrieved evidence. Do not infer, generalize, embellish, add "
-    "reactions, or treat topical discussion as proof of a personal preference. Use the smallest "
-    "sufficient set of evidence. Do not use memory excerpts to answer recommendation, opinion, "
-    "general-knowledge, or action requests; if the packet does not directly contain what is "
-    "requested, state that memory evidence is insufficient. For a single-event dated question, "
-    "state only one fact from the "
-    "top direct source and preserve its wording with minimal paraphrase; later corrections or newer "
-    "evidence take precedence. For open-ended history, profile, plan, event, running-joke, or "
-    "summary questions, answer any directly supported part; do not abstain because the "
+    "unambiguously supported by retrieved evidence. Do not infer, generalize, embellish, add "
+    "reactions, or treat topical discussion as personal preference. Use the smallest sufficient "
+    "evidence set. Ignore memory excerpts for recommendations, opinions, general knowledge, or "
+    "actions; if the packet does not directly answer, say memory evidence is insufficient. For a "
+    "single dated event, state one fact from the top direct source with minimal paraphrase; later "
+    "corrections or newer evidence take precedence. For recent/current questions across any fact "
+    "kind, compare observed_at; "
+    "newest direct evidence wins over older current wording. For open-ended history, profile, plan, "
+    "event, running-joke, or summary questions, answer every directly supported part even if the "
     "packet is incomplete. For profiles and running jokes, state only explicit attributes, "
-    "nicknames, jokes, or events; never infer missing traits or origins. If the "
-    "retrieved evidence does not directly answer the question, state that memory evidence is insufficient."
+    "nicknames, jokes, or events; never infer missing traits or origins."
 )
 MEMORY_GROUNDING_MINIMAL = (
     "Discussion is not preference evidence; corrections win."
@@ -84,6 +83,8 @@ class MemoryFact:
     selection_priority: int = 0
     valid_until: datetime | None = None
     group_id: int | None = None
+    memory_kind: str = ""
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,7 +334,7 @@ class MemoryContextPacker:
             facts,
             key=lambda item: (-item.selection_priority, -item.score, item.text),
         ):
-            block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
+            block = self._render_fact(fact)
             if fits_history(
                 [
                     *evidence_policy_blocks,
@@ -650,7 +651,7 @@ class MemoryContextPacker:
         remaining_segments = [item for item in evidence_segments if not item.pinned]
 
         def add_fact(fact: MemoryFact) -> bool:
-            block = f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}"
+            block = self._render_fact(fact)
             recent_blocks = [self._render_recent(message) for message in selected_recent]
             if not fits(recent_blocks, [*history_blocks, block, *summary_blocks]):
                 return False
@@ -727,7 +728,7 @@ class MemoryContextPacker:
         # Canonical render order so the context builder can reconstruct the
         # same block sequence for trimming: facts -> segments -> summaries.
         packed_history_blocks = [
-            *(f"Memory fact (sources: {', '.join(fact.source_msg_ids)}): {fact.text}" for fact in selected_facts),
+            *(self._render_fact(fact) for fact in selected_facts),
             *(self._render_segment(segment) for segment in selected_segments),
             *(
                 f"Relevant summary (sources: {', '.join(summary.source_msg_ids)}): {summary.text}"
@@ -878,6 +879,18 @@ class MemoryContextPacker:
             selected.append(message)
         selected.reverse()
         return tuple(selected)
+
+    @staticmethod
+    def _render_fact(fact: MemoryFact) -> str:
+        metadata: list[str] = []
+        if fact.memory_kind:
+            metadata.append(f"kind: {fact.memory_kind}")
+        if fact.observed_at is not None:
+            metadata.append(
+                f"observed_at: {MemoryContextPacker._display_time(fact.observed_at)}"
+            )
+        metadata.append(f"sources: {', '.join(fact.source_msg_ids)}")
+        return f"Memory fact ({'; '.join(metadata)}): {fact.text}"
 
     @staticmethod
     def _render_recent(message: EvidenceMessage) -> str:

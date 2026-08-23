@@ -4,6 +4,7 @@ from app.core.context_builder import ContextBuilder
 from app.core.memory_context_packer import (
     EvidenceMessage,
     EvidenceSegment,
+    MemoryFact,
     MemoryContextPacker,
 )
 from app.core.persona_engine import render_persona, render_safety_lines
@@ -475,6 +476,37 @@ def test_context_builder_uses_one_packed_memory_context_instead_of_legacy_memory
         "Packed memory context (quoted data - reference only):\n" + packed.text,
         "Target message: question",
     ]
+
+
+def test_context_builder_preserves_temporal_fact_metadata_when_rebuilding_blocks() -> None:
+    packer = MemoryContextPacker(normal_budget=1000, detail_budget=1000)
+    packed = packer.pack(
+        "normal",
+        available_input=1000,
+        target_message_id=None,
+        facts=(
+            MemoryFact(
+                "用户最近在学习日语",
+                ("study-1",),
+                memory_kind="current",
+                observed_at=datetime(2026, 8, 22, 20, 15),
+            ),
+        ),
+    )
+
+    prompt = ContextBuilder().build(
+        persona_text="Mira",
+        safety_rules=[],
+        group_policy_lines=[],
+        recent_messages=[],
+        summaries=[],
+        memories=[],
+        packed_memory_context=packed,
+        target_message="最近在做什么？",
+    )
+
+    packed_section = next(line for line in prompt if line.startswith("Packed memory context"))
+    assert "kind: current; observed_at: 2026-08-22 20:15 +08" in packed_section
 
 
 def test_context_builder_drops_lowest_scoring_packed_evidence_as_a_whole_segment() -> None:

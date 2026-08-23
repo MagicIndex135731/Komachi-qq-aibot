@@ -38,6 +38,7 @@ from app.core.memory_fact_ranking import (
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    select_temporal_current_facts,
     temporal_recency_required,
 )
 from app.core.memory_fact_semantics import SemanticFactRanker
@@ -883,6 +884,7 @@ def build_memory_runtime(
             preferred_fact_ids: set[int] = set()
             semantic_scores_by_id: dict[int, float] = {}
             selection_priority_by_id: dict[int, int] = {}
+            temporal_current_fact_ids: set[int] | None = None
             recency_boost = temporal_recency_required(
                 query=str(resolved_query.original_query)
             )
@@ -944,6 +946,34 @@ def build_memory_runtime(
                         semantic_scores=semantic_scores,
                         recency_boost=recency_boost,
                     )
+                    if (
+                        recency_boost
+                        and resolved_query.answer_mode == "current_fact"
+                    ):
+                        temporal_match_features = query_features
+                        if resolved_query.topic_terms:
+                            temporal_match_features = filter_member_query_features(
+                                memory_query_features(
+                                    query="",
+                                    topic_terms=resolved_query.topic_terms,
+                                    intent_query=str(resolved_query.original_query),
+                                ),
+                                aliases=member_aliases,
+                            )
+                        matching_ids = matching_member_fact_ids(
+                            ranked_rows,
+                            query_features=temporal_match_features,
+                        )
+                        ranked_rows = select_temporal_current_facts(
+                            ranked_rows,
+                            matching_fact_ids=matching_ids,
+                            topic_specific=bool(resolved_query.topic_terms),
+                        )
+                        if temporal_current_fact_ids is None:
+                            temporal_current_fact_ids = set()
+                        temporal_current_fact_ids.update(
+                            int(row.id) for row in ranked_rows
+                        )
                     if recency_boost:
                         selection_priority_by_id.update(
                             {
@@ -997,9 +1027,13 @@ def build_memory_runtime(
                     selection_priority=selection_priority_by_id.get(row.id, 0),
                     valid_until=row.valid_until,
                     group_id=group_id,
+                    memory_kind=str(row.memory_kind or ""),
+                    observed_at=row.last_seen_at or row.valid_from,
                 )
                 for row in rows
                 if row.source_msg_id or row.source_msg_ids
+                if temporal_current_fact_ids is None
+                or int(row.id) in temporal_current_fact_ids
             )
 
     def load_summaries(*, group_id: int, resolved_query):

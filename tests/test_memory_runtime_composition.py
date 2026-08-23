@@ -1523,6 +1523,10 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
     assert texts.index(next(t for t in texts if "海贼王" in t)) < texts.index(
         next(t for t in texts if "前后端" in t)
     )
+    anime_fact = next(fact for fact in packed.facts if "海贼王" in fact.text)
+    assert anime_fact.memory_kind == "preference"
+    assert anime_fact.observed_at is not None
+    assert "kind: preference; observed_at:" in packed.text
 
 
 def test_preference_question_prefers_preference_kind_over_current(

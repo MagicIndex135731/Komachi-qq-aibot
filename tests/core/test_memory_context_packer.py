@@ -330,6 +330,64 @@ def test_fact_selection_priority_preserves_temporal_member_ranking() -> None:
     assert packed.facts == (recent_equivalent_activity, stale_literal_match)
 
 
+def test_fact_rendering_exposes_kind_and_observation_time_for_temporal_comparison() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100,
+        detail_budget=100,
+        token_counter=lambda value: 1,
+    )
+    fact = MemoryFact(
+        "用户最近在西安工作",
+        ("work-1",),
+        memory_kind="current",
+        observed_at=datetime(2026, 8, 20, 13, 45),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100,
+        target_message_id=None,
+        facts=(fact,),
+    )
+
+    assert (
+        "Memory fact (kind: current; observed_at: 2026-08-20 13:45 +08; "
+        "sources: work-1): 用户最近在西安工作"
+    ) in packed.text
+    assert "For recent/current questions across any fact kind" in packed.grounding_policy
+
+
+def test_adaptive_fact_rendering_uses_the_same_temporal_metadata_contract() -> None:
+    packer = MemoryContextPacker(
+        normal_budget=100,
+        detail_budget=100,
+        adaptive_enabled=True,
+        recent_protected_min_tokens=0,
+        history_protected_min_tokens=0,
+        recent_protected_min_messages=0,
+        history_protected_min_messages=0,
+        token_counter=lambda value: 1,
+    )
+    fact = MemoryFact(
+        "用户近期决定换工作",
+        ("decision-1",),
+        memory_kind="decision",
+        observed_at=datetime(2026, 8, 21, 9, 30),
+    )
+
+    packed = packer.pack(
+        "normal",
+        available_input=100,
+        target_message_id=None,
+        facts=(fact,),
+    )
+
+    assert (
+        "Memory fact (kind: decision; observed_at: 2026-08-21 09:30 +08; "
+        "sources: decision-1): 用户近期决定换工作"
+    ) in packed.text
+
+
 def test_packed_context_puts_recent_messages_last_and_labels_history_first() -> None:
     packer = MemoryContextPacker(normal_budget=8000, detail_budget=8000)
     packed = packer.pack(
