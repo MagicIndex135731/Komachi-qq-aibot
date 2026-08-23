@@ -11,6 +11,7 @@ import app.group_main as group_main
 import app.main as app_main
 import app.private_main as private_main
 from app.config import AppSettings
+from app.providers.semantic_embeddings import DisabledEmbeddingProvider
 
 
 def _settings(tmp_path: Path) -> AppSettings:
@@ -111,6 +112,7 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
         lambda **_kwargs: SimpleNamespace(
             memory_compaction_service=FakeMemoryCompactionService(),
             memory_orchestrator=built_memory_orchestrator,
+            embedding_provider=DisabledEmbeddingProvider(),
         ),
     )
     monkeypatch.setattr(group_main, "InboundRouter", lambda **kwargs: captured.update(kwargs) or object())

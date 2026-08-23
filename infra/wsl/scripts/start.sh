@@ -8,8 +8,9 @@ cd "${WSL_DIR}"
 mkdir -p "${WSL_DIR}/runtime"
 exec 8>"${WSL_DIR}/runtime/start.lock"
 if ! flock -n 8; then
-  echo "Xiaomachi startup is already in progress."
-  exit 0
+  echo "Xiaomachi startup is already in progress; waiting for readiness."
+  bash "${SCRIPT_DIR}/status.sh"
+  exit $?
 fi
 
 if [[ ! -f .env ]]; then

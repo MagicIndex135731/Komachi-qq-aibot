@@ -5,7 +5,10 @@ from datetime import UTC, datetime
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import app.group_main as group_main
+from app.providers.semantic_embeddings import EmbeddingIdentity
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupRepository,
@@ -109,6 +112,73 @@ def test_write_group_ready_marker_refreshes_connected_state(tmp_path) -> None:
     assert first["state"] == "connected"
     assert second["state"] == "ready"
     assert second["updated_at"] >= first["updated_at"]
+
+
+class _StartupEmbeddingProvider:
+    def __init__(self, *, provider: str = "local", accelerator: str = "cuda") -> None:
+        self.identity = EmbeddingIdentity(
+            provider=provider,
+            model="startup-model",
+            version="v1",
+            dimensions=4,
+        )
+        self.available = provider != "disabled"
+        self.active_accelerator = accelerator
+        self.queries: list[str] = []
+
+    def embed_query(self, query: str):
+        self.queries.append(query)
+        return [0.0] * self.identity.dimensions if self.available else None
+
+
+def test_memory_embedding_prewarm_writes_cuda_ready_marker(tmp_path) -> None:
+    provider = _StartupEmbeddingProvider()
+
+    group_main._prewarm_memory_embedding(
+        log_dir=tmp_path,
+        provider=provider,
+        requested_device="cuda",
+    )
+
+    payload = json.loads(
+        (tmp_path / "memory.embedding.ready.json").read_text(encoding="utf-8")
+    )
+    assert provider.queries == ["小町记忆检索启动预热"]
+    assert payload["state"] == "ready"
+    assert payload["provider"] == "local"
+    assert payload["model"] == "startup-model"
+    assert payload["dimensions"] == 4
+    assert payload["accelerator"] == "cuda"
+    assert payload["pid"] > 0
+
+
+def test_memory_embedding_prewarm_marks_disabled_provider(tmp_path) -> None:
+    provider = _StartupEmbeddingProvider(provider="disabled", accelerator="disabled")
+
+    group_main._prewarm_memory_embedding(
+        log_dir=tmp_path,
+        provider=provider,
+        requested_device="cpu",
+    )
+
+    payload = json.loads(
+        (tmp_path / "memory.embedding.ready.json").read_text(encoding="utf-8")
+    )
+    assert payload["state"] == "disabled"
+    assert provider.queries == []
+
+
+def test_memory_embedding_prewarm_rejects_cuda_fallback(tmp_path) -> None:
+    provider = _StartupEmbeddingProvider(accelerator="cpu")
+
+    with pytest.raises(RuntimeError, match="CUDA"):
+        group_main._prewarm_memory_embedding(
+            log_dir=tmp_path,
+            provider=provider,
+            requested_device="cuda",
+        )
+
+    assert not (tmp_path / "memory.embedding.ready.json").exists()
 
 
 def test_startup_window_mention_rows_filters(sqlite_engine) -> None:

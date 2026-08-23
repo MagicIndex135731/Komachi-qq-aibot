@@ -1,6 +1,6 @@
 @echo off
 setlocal
-echo WSL BAT VERSION 20260823-WSL-MIHOMO
+echo WSL BAT VERSION 20260824-WSL-READY-GATE
 set "ENTRY=/usr/local/bin/xiaomachi-wsl-entry"
 powershell.exe -NoProfile -Command "$task = Get-ScheduledTask -TaskName 'Xiaomachi WSL Runtime' -ErrorAction SilentlyContinue; if ($task) { Stop-ScheduledTask -TaskName 'Xiaomachi WSL Runtime' }"
 wsl.exe --user root --exec test -x "%ENTRY%"

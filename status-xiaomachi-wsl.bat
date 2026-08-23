@@ -1,6 +1,6 @@
 @echo off
 setlocal
-echo WSL BAT VERSION 20260823-WSL-MIHOMO
+echo WSL BAT VERSION 20260824-WSL-READY-GATE
 set "ENTRY=/usr/local/bin/xiaomachi-wsl-entry"
 wsl.exe --user root --exec test -x "%ENTRY%"
 if errorlevel 1 (

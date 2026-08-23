@@ -59,7 +59,7 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
         for line in bat_file.read_text(encoding="utf-8").splitlines()
         if line.startswith("echo WSL BAT VERSION ")
     }
-    assert bat_versions == {"echo WSL BAT VERSION 20260823-WSL-MIHOMO"}
+    assert bat_versions == {"echo WSL BAT VERSION 20260824-WSL-READY-GATE"}
     for bat_file in bat_files:
         content = bat_file.read_text(encoding="utf-8")
         assert content.isascii()
@@ -68,10 +68,13 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
         assert "wsl.exe bash -lc" not in content
         if bat_file.name == "start-xiaomachi-wsl.bat":
             assert '--user root --cd "%~dp0" --exec bash infra/wsl/scripts/xiaomachi-wsl-entry.sh install' in content
-            assert "Start-Process" in content
+            assert 'set "TASK_INSTALLER=%~dp0infra\\wsl\\scripts\\install_windows_runtime_task.ps1"' in content
+            assert ". $env:TASK_INSTALLER" in content
+            assert "Start-Process" not in content
             assert "Start-ScheduledTask" in content
-            assert "'/usr/local/bin/xiaomachi-wsl-entry','anchor'" in content
+            assert "Starting Xiaomachi. The window closes only after all readiness checks pass." in content
             assert "Xiaomachi started successfully." in content
+            assert "pause" in content.lower()
         if bat_file.name == "stop-xiaomachi-wsl.bat":
             assert "Stop-ScheduledTask" in content
         assert "schtasks.exe" not in content
@@ -225,7 +228,7 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     image_build = start_script.index('docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi')
     conditional_open = start_script.index("\nopen_login_page\n")
     bot_up = start_script.index('docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi')
-    status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"')
+    status_probe = start_script.index('bash "${SCRIPT_DIR}/status.sh"', bot_up)
     assert image_build < compose_up < conditional_open < bot_up < status_probe
     assert 'docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi' in start_script
     assert 'gpu_flag="-f docker-compose.gpu.yml"' in start_script
@@ -488,6 +491,22 @@ def test_status_script_waits_for_gateway_ready_marker() -> None:
     assert "Xiaomachi bot is up and accepting messages." in script
 
 
+def test_status_script_waits_for_current_process_embedding_prewarm() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    prewarm_block = script.split(
+        "Waiting for memory embedding prewarm...", 1
+    )[1].split("OneBot probe", 1)[0]
+
+    assert "memory.embedding.ready.json" in prewarm_block
+    assert '"${bot_started_at}"' in prewarm_block
+    assert '"${memory_embedding_provider}"' in prewarm_block
+    assert '"${memory_embedding_device}"' in prewarm_block
+    assert "prewarm_after_container_start_seconds=" in prewarm_block
+    assert 'state != "ready"' in prewarm_block
+    assert 'expected_device == "cuda" and accelerator != "cuda"' in prewarm_block
+    assert "Memory embedding prewarm did not become ready." in prewarm_block
+
+
 def test_status_ready_probe_accepts_docker_nanoseconds_and_rejects_old_instance(
     capsys,
 ) -> None:
@@ -531,6 +550,8 @@ def test_status_ready_probe_accepts_docker_nanoseconds_and_rejects_old_instance(
 
 def test_start_script_waits_for_status_readiness() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
+    locked_branch = script.split('if ! flock -n 8; then', 1)[1].split("fi", 1)[0]
+    assert 'bash "${SCRIPT_DIR}/status.sh"' in locked_branch
     assert 'bash "${SCRIPT_DIR}/status.sh"' in script
     assert "Xiaomachi startup complete: bot is up and accepting messages." in script
 

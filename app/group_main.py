@@ -31,6 +31,7 @@ from app.main import (
     should_ingest_group_message,
     sync_history_archives,
 )
+from app.providers.semantic_embeddings import EmbeddingProvider
 from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all, session_scope
 from app.storage.repositories import MessageRepository, RetrievalDocumentRepository
@@ -54,6 +55,81 @@ def _write_group_ready_marker(*, log_dir: Path, state: str) -> None:
     (log_dir / "group.ready.json").write_text(
         json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
+    )
+
+
+def _prewarm_memory_embedding(
+    *,
+    log_dir: Path,
+    provider: EmbeddingProvider | None,
+    requested_device: str,
+) -> None:
+    """Load and verify the reply process' embedding runtime before readiness."""
+    marker_path = log_dir / "memory.embedding.ready.json"
+    marker_path.unlink(missing_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if provider is None:
+        raise RuntimeError("memory embedding provider is missing")
+    identity = provider.identity
+    if identity.provider == "disabled":
+        payload = {
+            "pid": os.getpid(),
+            "state": "disabled",
+            "provider": identity.provider,
+            "model": identity.model,
+            "dimensions": identity.dimensions,
+            "accelerator": "disabled",
+            "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
+        }
+    else:
+        if not provider.available:
+            raise RuntimeError("memory embedding provider is unavailable")
+        logging.info(
+            "memory_embedding_prewarm state=starting provider=%s model=%s requested_device=%s",
+            identity.provider,
+            identity.model,
+            requested_device,
+        )
+        vector = provider.embed_query("小町记忆检索启动预热")
+        if vector is None or len(vector) != identity.dimensions:
+            raise RuntimeError("memory embedding prewarm returned an invalid vector")
+        accelerator = str(
+            getattr(
+                provider,
+                "active_accelerator",
+                "remote" if identity.provider == "openai_compatible" else "unknown",
+            )
+        )
+        if (
+            identity.provider == "local"
+            and requested_device.strip().lower() == "cuda"
+            and accelerator != "cuda"
+        ):
+            raise RuntimeError("memory embedding prewarm did not activate CUDA")
+        payload = {
+            "pid": os.getpid(),
+            "state": "ready",
+            "provider": identity.provider,
+            "model": identity.model,
+            "dimensions": identity.dimensions,
+            "accelerator": accelerator,
+            "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
+        }
+
+    temporary_path = marker_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary_path.replace(marker_path)
+    logging.info(
+        "memory_embedding_prewarm state=%s provider=%s model=%s dimensions=%s accelerator=%s",
+        payload["state"],
+        payload["provider"],
+        payload["model"],
+        payload["dimensions"],
+        payload["accelerator"],
     )
 
 
@@ -268,6 +344,12 @@ async def run() -> None:
                     group_policy=runtime.group_policy,
                 )
             ),
+        )
+        await asyncio.to_thread(
+            _prewarm_memory_embedding,
+            log_dir=settings.log_dir,
+            provider=memory_runtime.embedding_provider,
+            requested_device=settings.memory_embedding_device,
         )
         memory_compaction_service = memory_runtime.memory_compaction_service
         persistent_group_engine = engine if hasattr(engine, "connect") else None

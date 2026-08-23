@@ -24,6 +24,10 @@ fi
 
 platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 platform="${platform:-napcat}"
+memory_embedding_provider="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_PROVIDER[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+memory_embedding_provider="${memory_embedding_provider:-local}"
+memory_embedding_device="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_DEVICE[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+memory_embedding_device="${memory_embedding_device:-cpu}"
 if [[ "${platform}" == "llbot" ]]; then
   compose_file="docker-compose.llbot.yml"
   service_name="llbot"
@@ -85,6 +89,52 @@ fi
 bot_started_at="$(docker inspect --format '{{.State.StartedAt}}' "${bot_container_name}" 2>/dev/null || true)"
 if [[ -z "${bot_started_at}" ]]; then
   echo "Cannot determine ${bot_container_name} start time."
+  exit 1
+fi
+
+echo "Waiting for memory embedding prewarm..."
+embedding_prewarm_ok=false
+for attempt in $(seq 1 60); do
+  embedding_prewarm_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/memory.embedding.ready.json 2>/dev/null || true)"
+  if python3 - "${embedding_prewarm_payload}" "${bot_started_at}" "${memory_embedding_provider}" "${memory_embedding_device}" <<'PY'
+import json, re, sys
+from datetime import datetime, timezone
+if not sys.argv[1]: raise SystemExit(1)
+d = json.loads(sys.argv[1])
+started_text = re.sub(r"(\.\d{6})\d+", r"\1", str(sys.argv[2]))
+started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+if started.tzinfo is None: started = started.replace(tzinfo=timezone.utc)
+t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
+if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+after_start = (t.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()
+state = str(d.get("state", ""))
+provider = str(d.get("provider", ""))
+accelerator = str(d.get("accelerator", ""))
+expected_provider = str(sys.argv[3])
+expected_device = str(sys.argv[4])
+if after_start < -5: raise SystemExit(1)
+if expected_provider == "disabled":
+    if state != "disabled" or provider != "disabled": raise SystemExit(1)
+else:
+    if state != "ready" or provider != expected_provider: raise SystemExit(1)
+    if int(d.get("dimensions", 0)) <= 0: raise SystemExit(1)
+    if expected_provider == "local" and expected_device == "cuda" and accelerator != "cuda":
+        raise SystemExit(1)
+print(
+    f"state={state} provider={provider} accelerator={accelerator} "
+    f"dimensions={d.get('dimensions')} prewarm_after_container_start_seconds={after_start:.1f}"
+)
+PY
+  then
+    embedding_prewarm_ok=true
+    break
+  fi
+  echo "  waiting for memory embedding prewarm (${attempt}/60)"
+  sleep 5
+done
+if [[ "${embedding_prewarm_ok}" != true ]]; then
+  echo "Memory embedding prewarm did not become ready."
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi
   exit 1
 fi
 
