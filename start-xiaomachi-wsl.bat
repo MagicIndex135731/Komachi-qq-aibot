@@ -15,7 +15,8 @@ if errorlevel 1 goto :failed
 wsl.exe --user root --exec "%ENTRY%" start
 if errorlevel 1 goto :failed
 echo Xiaomachi started successfully.
-wsl.exe --user root --exec systemctl is-active xiaomachi-stack.service xiaomachi-watchdog.service
+echo Verifying Xiaomachi readiness...
+wsl.exe --user root --exec "%ENTRY%" status
 if errorlevel 1 goto :failed
 timeout /t 2 /nobreak >nul
 exit /b 0

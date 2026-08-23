@@ -74,6 +74,8 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
             assert "Start-ScheduledTask" in content
             assert "Starting Xiaomachi. The window closes only after all readiness checks pass." in content
             assert "Xiaomachi started successfully." in content
+            assert "Verifying Xiaomachi readiness..." in content
+            assert 'wsl.exe --user root --exec "%ENTRY%" status' in content
             assert "pause" in content.lower()
         if bat_file.name == "stop-xiaomachi-wsl.bat":
             assert "Stop-ScheduledTask" in content
