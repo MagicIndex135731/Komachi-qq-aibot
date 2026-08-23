@@ -29,6 +29,7 @@ class Resolver:
     answer_mode: str = "general_history"
     needs_history: bool = True
     subject_ids: tuple[str, ...] | None = None
+    subject_binding: str = "unbound"
     preferred_fact_kinds: tuple[str, ...] = ()
     original_query: str | None = None
 
@@ -42,6 +43,7 @@ class Resolver:
             time_range=self.time_range,
             answer_mode=self.answer_mode,
             subject_ids=self.subject_ids,
+            subject_binding=self.subject_binding,
             preferred_fact_kinds=self.preferred_fact_kinds,
         )
 
@@ -223,7 +225,12 @@ def request(*, group_id: int = 100) -> MemoryV2Request:
 def test_v2_provider_runs_resolve_retrieve_expand_pack_and_returns_common_contract() -> None:
     expander = Expander()
     provider = MemoryV2ContextProvider(
-        resolver=Resolver(detail=True),
+        resolver=Resolver(
+            detail=True,
+            answer_mode="current_fact",
+            subject_ids=("20001",),
+            subject_binding="explicit",
+        ),
         retriever=Retriever(),
         expander=expander,
         packer=Packer(),
@@ -237,6 +244,9 @@ def test_v2_provider_runs_resolve_retrieve_expand_pack_and_returns_common_contra
     assert result.mode == "v2"
     assert result.packed_context.text == "packed"
     assert result.selected_source_msg_ids == ("m-1",)
+    assert result.resolved_answer_mode == "current_fact"
+    assert result.resolved_subject_ids == ("20001",)
+    assert result.resolved_subject_binding == "explicit"
     assert expander.modes == ["detail"]
 
 

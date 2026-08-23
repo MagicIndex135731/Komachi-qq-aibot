@@ -1735,6 +1735,148 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
         "https://img.example.test/addressed-recent-2.png",
         "https://img.example.test/addressed-recent-1.png",
     ]
+    assert router_module.AMBIENT_IMAGE_GROUNDING_INSTRUCTION in "\n".join(
+        llm.calls[-1]["prompt_lines"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambient_user_id", (20002, 30001))
+async def test_router_subject_bound_memory_query_excludes_ambient_recent_images(
+    sqlite_engine,
+    monkeypatch,
+    caplog,
+    ambient_user_id,
+) -> None:
+    class SubjectBoundMemoryOrchestrator:
+        def build_context(self, request):
+            return MemoryContextResult(
+                group_id=request.group_id,
+                packed_context=PackedMemoryContext(
+                    mode="normal",
+                    budget=100,
+                    estimated_tokens=4,
+                    text="Memory fact (kind: event): target recently watched supported-title.",
+                ),
+                selected_source_msg_ids=("fact-source",),
+                estimated_tokens=4,
+                mode="v2",
+                resolved_answer_mode="current_fact",
+                resolved_subject_ids=("30001",),
+                resolved_subject_binding="explicit",
+            )
+
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        memory_orchestrator=SubjectBoundMemoryOrchestrator(),
+    )
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
+        users.upsert_user(user_id=20002, nickname="Other", group_card="")
+        users.upsert_user(user_id=30001, nickname="Target", group_card="")
+        messages.add_group_message(
+            platform_msg_id="unrelated-ambient-image",
+            group_id=10001,
+            user_id=ambient_user_id,
+            timestamp=datetime(2026, 5, 9, 11, 59, 50, tzinfo=UTC),
+            plain_text="",
+            raw_json={
+                "message": [{
+                    "type": "image",
+                    "data": {
+                        "file": "unrelated-title.png",
+                        "url": "https://img.example.test/unrelated-title.png",
+                    },
+                }],
+                "message_id": "unrelated-ambient-image",
+            },
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+    caplog.set_level(logging.INFO)
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="subject-bound-image-pollution-target",
+            plain_text="@Mira target 最近在看什么动画",
+        )
+    )
+
+    assert llm.calls[-1]["images"] is None
+    assert "unrelated-title.png" not in "\n".join(llm.calls[-1]["prompt_lines"])
+    assert "reason=personal_fact_grounding" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_router_subject_bound_query_keeps_explicit_current_image(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    class SubjectBoundMemoryOrchestrator:
+        def build_context(self, request):
+            return MemoryContextResult(
+                group_id=request.group_id,
+                packed_context=PackedMemoryContext(
+                    mode="normal",
+                    budget=100,
+                    estimated_tokens=1,
+                    text="No stored fact.",
+                ),
+                selected_source_msg_ids=(),
+                estimated_tokens=1,
+                mode="v2",
+                resolved_answer_mode="current_fact",
+                resolved_subject_ids=("30001",),
+                resolved_subject_binding="explicit",
+            )
+
+    llm = ImageCapturingLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=llm,
+        memory_orchestrator=SubjectBoundMemoryOrchestrator(),
+    )
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="subject-bound-explicit-image-target",
+            plain_text="@Mira target 在这张图里做什么",
+            images=[
+                ImageAttachment(
+                    url="https://img.example.test/explicit.png",
+                    file_id="explicit.png",
+                )
+            ],
+        )
+    )
+
+    assert [image.url for image in llm.calls[-1]["images"]] == [
+        "https://img.example.test/explicit.png"
+    ]
 
 
 @pytest.mark.asyncio

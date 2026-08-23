@@ -325,6 +325,9 @@ class MemoryV2ContextProvider:
             selected_source_msg_ids=packed.source_msg_ids,
             estimated_tokens=packed.estimated_tokens,
             mode="v2",
+            resolved_answer_mode=resolved.answer_mode,
+            resolved_subject_ids=resolved.subject_ids,
+            resolved_subject_binding=resolved.subject_binding,
         )
         total_ms = (perf_counter() - evaluation_started) * 1000
         if self._observability_route:

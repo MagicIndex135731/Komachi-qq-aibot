@@ -23,6 +23,9 @@ class MemoryContextResult:
     selected_source_msg_ids: tuple[str, ...]
     estimated_tokens: int
     mode: str
+    resolved_answer_mode: str = ""
+    resolved_subject_ids: tuple[str, ...] | None = None
+    resolved_subject_binding: str = ""
 
 
 @dataclass(frozen=True, slots=True)

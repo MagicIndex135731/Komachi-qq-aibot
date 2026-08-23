@@ -114,6 +114,14 @@ MEMORY_TOOL_EFFICIENCY_INSTRUCTION = (
     "memory_search again; only search when information is clearly missing."
 )
 
+AMBIENT_IMAGE_GROUNDING_INSTRUCTION = (
+    "Recent fallback images are ambient group-chat context, not attributed "
+    "evidence about any member. Do not infer a member's activity, preference, "
+    "identity, relationship, location, work, or other personal fact from those "
+    "images. Use them only when the user is directly asking about the visible "
+    "image or the current visual discussion."
+)
+
 
 _QUOTED_PRONOUN_PATTERN = re.compile(r"他|她|那位|这位|这个人|那家伙")
 _QUOTED_REFERENT_ASK_PATTERN = re.compile(
@@ -834,6 +842,13 @@ class InboundRouter:
                 break
             add_images(extract_images_from_raw_payload(message.raw_json))
         return collected
+
+    @staticmethod
+    def _should_suppress_ambient_images(memory_result: MemoryContextResult) -> bool:
+        """Whether ambient media could be misattributed as a personal fact."""
+        return bool(memory_result.resolved_subject_ids) and (
+            memory_result.resolved_answer_mode in {"current_fact", "assessment"}
+        )
 
 
     def _looks_like_reference_image_generation_request(
@@ -1814,6 +1829,21 @@ class InboundRouter:
                 decision.reason in _PROACTIVE_CANDIDATE_REASONS
                 or (addressed_turn and not has_explicit_image_context)
             )
+            suppress_ambient_images = self._should_suppress_ambient_images(
+                memory_result
+            )
+            use_recent_image_fallback = (
+                needs_recent_image_context and not suppress_ambient_images
+            )
+            if needs_recent_image_context and suppress_ambient_images:
+                logger.info(
+                    "recent_image_fallback_suppressed group_id=%s msg_id=%s "
+                    "answer_mode=%s subject_count=%s reason=personal_fact_grounding",
+                    event.group_id,
+                    event.platform_msg_id,
+                    memory_result.resolved_answer_mode,
+                    len(memory_result.resolved_subject_ids or ()),
+                )
             target_images = (
                 self._collect_recent_images(
                     event=event,
@@ -1822,11 +1852,16 @@ class InboundRouter:
                     limit_messages=self.runtime.settings.proactive_recent_messages_limit,
                     max_images=self.runtime.settings.proactive_image_max_count,
                 )
-                if needs_recent_image_context
+                if use_recent_image_fallback
                 else list(resolved_image_turn.images)
                 if has_explicit_image_context
                 else []
             )
+            if use_recent_image_fallback and target_images:
+                group_policy_lines = [
+                    *group_policy_lines,
+                    AMBIENT_IMAGE_GROUNDING_INSTRUCTION,
+                ]
             if target_images and not self.runtime.settings.llm_supports_vision_input:
                 return PreparedGroupReply(
                     should_reply=True,
