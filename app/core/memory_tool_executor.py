@@ -9,13 +9,14 @@ import re
 from typing import Any, Mapping, Sequence
 
 from app.core.memory_compaction import canonical_key, is_addressing_rule
-from app.core.time_utils import ASIA_SHANGHAI
+from app.core.memory_fact_ranking import select_diverse_portrait_facts
 from app.core.memory_tools import (
     MEMORY_TOOL_KINDS,
     MEMORY_TOOL_LIMIT_MAX,
     validate_memory_search_args,
     validate_memory_write_args,
 )
+from app.core.time_utils import ASIA_SHANGHAI
 from app.storage.db import session_scope
 from app.storage.models import Message
 from app.storage.repositories import (
@@ -28,7 +29,6 @@ from app.storage.repositories import (
 
 logger = logging.getLogger(__name__)
 
-PROFILE_KINDS = frozenset({"profile", "fact", "preference", "taboo", "relationship"})
 SUMMARY_LEVELS = ("episode", "semantic_window", "semantic_daily")
 MAX_ITEM_CHARS = 500
 _RELATIVE_DAY_PATTERN = re.compile(r"昨天|今天|前天|上周")
@@ -227,12 +227,13 @@ class MemoryToolExecutor:
             rows = memories.list_group_memories_for_subject(
                 scope_id=str(self._group_id),
                 subject_id=str(member_id),
-                limit=self._max_results * 2,
+                limit=max(200, self._max_results),
             )
-            profile_rows = [
-                row for row in rows if row.memory_kind in PROFILE_KINDS
-            ]
-            for row in profile_rows[: self._max_results]:
+            profile_rows = select_diverse_portrait_facts(
+                rows,
+                limit=self._max_results,
+            )
+            for row in profile_rows:
                 sources = ",".join(str(value) for value in (row.source_msg_ids or []))
                 if not sources and row.source_msg_id:
                     sources = str(row.source_msg_id)
@@ -249,11 +250,11 @@ class MemoryToolExecutor:
             )
         if not lines:
             return (
-                f"No profile facts found for member {member} in this group. "
+                f"No stable portrait facts found for member {member} in this group. "
                 "Recent messages are not preference evidence."
             )
         return (
-            f"Profile facts for {member} (recent messages: {recent_count}):\n"
+            f"Stable portrait for {member} (recent messages: {recent_count}):\n"
             + "\n".join(lines)
         )
 

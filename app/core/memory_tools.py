@@ -56,8 +56,9 @@ def memory_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "name": "memory_read",
             "description": (
-                "Read a member's profile facts (preferences, taboos, "
-                "relationships) and recent activity in this group."
+                "Read a member's stable portrait in this group, including "
+                "profile facts, preferences, taboos, relationships, and "
+                "durable facts."
             ),
             "parameters": {
                 "type": "object",

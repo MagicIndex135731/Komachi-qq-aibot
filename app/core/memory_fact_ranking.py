@@ -16,6 +16,17 @@ _CURRENT_VIEWING_INTENT_PATTERN = re.compile(
 )
 _CURRENT_VIEWING_FEATURES = ("在看", "观看", "追看", "追番", "补番", "补剧")
 
+# Storage kinds stay separate so each fact keeps one lifecycle and canonical
+# identity.  A portrait is a read-time view over these stable personal kinds.
+PERSON_PORTRAIT_KINDS = (
+    "profile",
+    "preference",
+    "taboo",
+    "relationship",
+    "fact",
+)
+_COMPOSITE_PORTRAIT_PATTERN = re.compile(r"完整.{0,4}画像|个人画像|画像|介绍|是什么样的人")
+
 _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("taboo", "preference"), re.compile(r"讨厌|不喜欢|反感")),
     (("preference",), re.compile(r"喜欢|偏好|最爱|爱看|爱听|爱吃|爱喝|爱玩|主人|称呼")),
@@ -26,7 +37,8 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("current", "event"), _CURRENT_VIEWING_INTENT_PATTERN),
     (("current",), re.compile(r"最近在做什么|在做什么|在干嘛|干什么")),
     (("event",), re.compile(r"最近发生|发生了什么|发生什么")),
-    (("profile",), re.compile(r"介绍|是什么样的人|画像|哪里人|做什么的")),
+    (PERSON_PORTRAIT_KINDS, _COMPOSITE_PORTRAIT_PATTERN),
+    (("profile",), re.compile(r"哪里人|做什么的")),
 )
 
 
@@ -60,6 +72,58 @@ def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...
     if answer_mode == "current_fact":
         return ("preference", "taboo", "profile")
     return ()
+
+
+def is_composite_portrait_query(query: str) -> bool:
+    """Whether a question asks for a broad portrait rather than one attribute."""
+    return bool(_COMPOSITE_PORTRAIT_PATTERN.search(str(query or "").strip()))
+
+
+def select_diverse_portrait_facts(
+    facts: Sequence[RankableMemoryFact],
+    *,
+    limit: int,
+) -> list[RankableMemoryFact]:
+    """Keep a bounded, category-diverse stable portrait.
+
+    The input is already relevance-ranked.  Reserve one slot for every
+    available portrait section, then fill remaining slots in the original
+    order.  Temporary activity kinds are intentionally excluded.
+    """
+    if limit <= 0:
+        return []
+    eligible = [
+        fact
+        for fact in facts
+        if str(getattr(fact, "memory_kind", "") or "") in PERSON_PORTRAIT_KINDS
+    ]
+    selected: list[RankableMemoryFact] = []
+    selected_ids: set[int] = set()
+    for kind in PERSON_PORTRAIT_KINDS:
+        match = next(
+            (
+                fact
+                for fact in eligible
+                if str(getattr(fact, "memory_kind", "") or "") == kind
+                and int(fact.id or 0) not in selected_ids
+            ),
+            None,
+        )
+        if match is None:
+            continue
+        selected.append(match)
+        selected_ids.add(int(match.id or 0))
+        if len(selected) >= limit:
+            return selected
+    for fact in eligible:
+        fact_id = int(fact.id or 0)
+        if fact_id in selected_ids:
+            continue
+        selected.append(fact)
+        selected_ids.add(fact_id)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def temporal_recency_required(*, query: str) -> bool:

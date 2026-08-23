@@ -4,11 +4,14 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from app.core.memory_fact_ranking import (
+    PERSON_PORTRAIT_KINDS,
     filter_member_query_features,
+    is_composite_portrait_query,
     matching_member_fact_ids,
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
 )
@@ -56,8 +59,13 @@ def test_preferred_kinds_for_query_intent_mapping() -> None:
             "阿渣目前在哪里工作？",
             ("current", "event", "plan", "decision", "relationship", "profile"),
         ),
-        ("介绍一下阿渣", ("profile",)),
-        ("阿渣是什么样的人？", ("profile",)),
+        ("介绍一下阿渣", PERSON_PORTRAIT_KINDS),
+        ("阿渣是什么样的人？", PERSON_PORTRAIT_KINDS),
+        ("阿渣的完整个人画像", PERSON_PORTRAIT_KINDS),
+        ("阿渣是哪里人？", ("profile",)),
+        ("阿渣是做什么的？", ("profile",)),
+        ("介绍一下阿渣最近在做什么", ("current",)),
+        ("介绍一下阿渣喜欢什么", ("preference",)),
         ("今天天气怎么样", ()),
     )
     for query, expected in cases:
@@ -76,6 +84,31 @@ def test_preferred_kinds_for_query_current_fact_fallback() -> None:
         query="还记得阿渣吗？",
         answer_mode="general_history",
     ) == ()
+
+
+def test_composite_portrait_query_is_distinct_from_single_attribute_query() -> None:
+    assert is_composite_portrait_query("给出阿渣的完整个人画像")
+    assert is_composite_portrait_query("介绍一下阿渣")
+    assert is_composite_portrait_query("阿渣是什么样的人")
+    assert not is_composite_portrait_query("阿渣是哪里人")
+    assert not is_composite_portrait_query("阿渣是做什么的")
+
+
+def test_select_diverse_portrait_facts_keeps_each_available_section() -> None:
+    facts = (
+        _fact(1, "高权重偏好一", importance=5, memory_kind="preference"),
+        _fact(2, "高权重偏好二", importance=5, memory_kind="preference"),
+        _fact(3, "稳定身份", importance=2, memory_kind="profile"),
+        _fact(4, "人物关系", importance=2, memory_kind="relationship"),
+        _fact(5, "明确禁区", importance=2, memory_kind="taboo"),
+        _fact(6, "长期事实", importance=2, memory_kind="fact"),
+        _fact(7, "近期活动", importance=5, memory_kind="current"),
+    )
+
+    selected = select_diverse_portrait_facts(facts, limit=5)
+
+    assert [fact.memory_kind for fact in selected] == list(PERSON_PORTRAIT_KINDS)
+    assert all(fact.memory_kind != "current" for fact in selected)
 
 
 def test_memory_query_features_extract_entities_and_cjk_grams() -> None:

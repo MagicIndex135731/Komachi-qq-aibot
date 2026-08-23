@@ -192,6 +192,41 @@ def test_memory_read_returns_profile_and_recent_count(sqlite_engine) -> None:
     assert "recent messages: 1" in output
 
 
+def test_memory_read_returns_a_diverse_stable_portrait(sqlite_engine) -> None:
+    _seed(sqlite_engine)
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        for index, (kind, content) in enumerate(
+            (
+                ("profile", "阿渣长期从事软件开发"),
+                ("fact", "阿渣养了一只猫"),
+                ("taboo", "阿渣不接受剧透"),
+                ("relationship", "阿渣是提问者的朋友"),
+                ("current", "阿渣最近在看某部动画"),
+            ),
+            start=1,
+        ):
+            memories.add_memory(
+                scope_type="group",
+                scope_id="100",
+                subject_type="user",
+                subject_id="20001",
+                memory_kind=kind,
+                content=content,
+                importance=5 if kind == "current" else 2,
+                confidence=0.9,
+                source_msg_id="tool-source",
+                valid_from=observed_at + timedelta(seconds=index),
+            )
+
+    output = _executor(sqlite_engine).execute("memory_read", {"member": "阿渣"})
+
+    for kind in ("profile", "fact", "preference", "taboo", "relationship"):
+        assert f"{kind} (source:" in output
+    assert "current (source:" not in output
+
+
 def test_memory_write_persists_source_backed_fact(sqlite_engine) -> None:
     _seed(sqlite_engine)
     output = _executor(sqlite_engine).execute(

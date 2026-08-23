@@ -35,6 +35,8 @@ def test_memory_tool_schemas_expose_three_strict_functions() -> None:
     }
     assert write_params["properties"]["kind"]["enum"] == sorted(MEMORY_TOOL_KINDS)
     assert "relationship" in MEMORY_TOOL_KINDS
+    assert "stable portrait" in schemas[1]["description"]
+    assert "recent activity" not in schemas[1]["description"]
 
 
 @pytest.mark.parametrize(

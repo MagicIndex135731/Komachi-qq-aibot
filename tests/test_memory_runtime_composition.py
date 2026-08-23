@@ -1529,6 +1529,107 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
     assert "kind: preference; observed_at:" in packed.text
 
 
+def test_complete_portrait_composes_diverse_stable_memory_kinds(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(
+        update={
+            "memory_raw_v3_enabled": True,
+            "memory_layered_memory_enabled": True,
+            "memory_member_fact_supplement_limit": 5,
+        }
+    )
+    observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    portrait_facts = (
+        ("profile", "阿渣长期从事软件开发"),
+        ("preference", "阿渣喜欢冰美式"),
+        ("taboo", "阿渣不接受剧透"),
+        ("relationship", "阿渣是提问者的朋友"),
+        ("fact", "阿渣养了一只猫"),
+        ("current", "阿渣最近在看某部动画"),
+    )
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="group",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="A-Zha",
+            group_card="阿渣",
+        )
+        UserRepository(session).upsert_user(
+            user_id=99,
+            nickname="Questioner",
+            group_card="提问者",
+        )
+        messages = MessageRepository(session)
+        for index, (_kind, content) in enumerate(portrait_facts):
+            messages.add_group_message(
+                platform_msg_id=f"portrait-src-{index}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=observed_at + timedelta(minutes=index),
+                plain_text=content,
+                raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+        query = messages.add_group_message(
+            platform_msg_id="portrait-query",
+            group_id=10001,
+            user_id=99,
+            timestamp=observed_at + timedelta(minutes=10),
+            plain_text="给出阿渣的完整个人画像",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.flush()
+        memories = MemoryRepository(session)
+        for index, (kind, content) in enumerate(portrait_facts):
+            memories.add_memory(
+                scope_type="group",
+                scope_id="10001",
+                subject_type="user",
+                subject_id="20001",
+                memory_kind=kind,
+                content=content,
+                importance=5 if kind == "current" else 2,
+                confidence=0.9,
+                source_msg_id=f"portrait-src-{index}",
+                valid_from=observed_at + timedelta(minutes=index),
+            )
+        session.flush()
+        documents = RetrievalDocumentRepository(session)
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(group_id=10001, message_id=int(row.id))
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings,
+        engine=sqlite_engine,
+        llm_client=_NoopLlmClient(),
+        bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+
+    kinds = {fact.memory_kind for fact in trace.result.packed_context.facts}
+    assert kinds == {"profile", "preference", "taboo", "relationship", "fact"}
+
+
 def test_preference_question_prefers_preference_kind_over_current(
     sqlite_engine,
     tmp_path,

@@ -288,10 +288,13 @@ def test_prompt_builder_includes_kind_semantic_guidance() -> None:
     assert "称呼规则只能记录提出者本人适用" in chinese
     assert "明确说正在看、追或补某部作品" in chinese
     assert "只讨论剧情、角色或季度" in chinese
+    assert "profile 不是兜底分类" in chinese
+    assert "喜好、厌恶、观点" in chinese
     assert "Kind semantics" in english
     assert "Addressing rules may only be recorded when the requester" in english
     assert "explicitly says they are currently watching" in english
     assert "Merely discussing a plot, character, or season" in english
+    assert "profile is not a fallback category" in english
 
 
 def test_addressing_rule_decision_is_remapped_to_preference() -> None:

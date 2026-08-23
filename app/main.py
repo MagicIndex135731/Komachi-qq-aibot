@@ -33,11 +33,14 @@ from app.core.memory_background_service import (
 )
 from app.core.memory_compaction_service import MemoryCompactionService
 from app.core.memory_fact_ranking import (
+    PERSON_PORTRAIT_KINDS,
     filter_member_query_features,
+    is_composite_portrait_query,
     matching_member_fact_ids,
     memory_query_features,
     preferred_kinds_for_query,
     rank_member_facts,
+    select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
 )
@@ -888,11 +891,19 @@ def build_memory_runtime(
             recency_boost = temporal_recency_required(
                 query=str(resolved_query.original_query)
             )
-            preferred_kinds: tuple[str, ...] = tuple(
-                resolved_query.preferred_fact_kinds
-            ) or preferred_kinds_for_query(
+            inferred_preferred_kinds = preferred_kinds_for_query(
                 query=str(resolved_query.original_query),
                 answer_mode=resolved_query.answer_mode,
+            )
+            composite_portrait = (
+                inferred_preferred_kinds == PERSON_PORTRAIT_KINDS
+                and is_composite_portrait_query(str(resolved_query.original_query))
+            )
+            preferred_kinds: tuple[str, ...] = (
+                PERSON_PORTRAIT_KINDS
+                if composite_portrait
+                else tuple(resolved_query.preferred_fact_kinds)
+                or inferred_preferred_kinds
             )
             if subject_ids:
                 seen_ids = {row.id for row in rows}
@@ -941,11 +952,20 @@ def build_memory_runtime(
                     ranked_rows = rank_member_facts(
                         candidates,
                         query_features=query_features,
-                        limit=settings.memory_member_fact_supplement_limit,
+                        limit=(
+                            len(candidates)
+                            if composite_portrait
+                            else settings.memory_member_fact_supplement_limit
+                        ),
                         preferred_kinds=preferred_kinds,
                         semantic_scores=semantic_scores,
                         recency_boost=recency_boost,
                     )
+                    if composite_portrait:
+                        ranked_rows = select_diverse_portrait_facts(
+                            ranked_rows,
+                            limit=settings.memory_member_fact_supplement_limit,
+                        )
                     if (
                         recency_boost
                         and resolved_query.answer_mode == "current_fact"
