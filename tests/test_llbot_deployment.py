@@ -155,6 +155,9 @@ def test_open_llbot_webui_shortcut_uses_the_current_wsl_address_without_starting
     assert "WebUiUrl" in launcher
     assert "Invalid LLBot WebUI URL" in launcher
     assert "webui_token.txt" in launcher
+    assert "Get-LLBotWebUiToken" in launcher
+    assert "/opt/xiaomachi/shared/runtime/llbot/data/webui_token.txt" in launcher
+    assert "wsl.exe --user root --exec bash" in launcher
     assert "Could not copy the LLBot WebUI password" in launcher
     assert "Start-Process" in launcher
 
