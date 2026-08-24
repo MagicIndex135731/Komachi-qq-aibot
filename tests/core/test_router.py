@@ -1669,6 +1669,8 @@ async def test_router_passes_images_for_addressed_turn_without_putting_them_in_r
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
     assert len(llm.calls) == 1
     assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/cat.png"]
+    prompt_text = "\n".join(llm.calls[0]["prompt_lines"])
+    assert "Attached image 1 was sent by Alice." in prompt_text
     assert not any("img.example.test" in line for line in llm.calls[0]["prompt_lines"])
 
     with session_scope(sqlite_engine) as session:
@@ -1692,17 +1694,27 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
         groups = GroupRepository(session)
         users = UserRepository(session)
         groups.upsert_group(group_id=10001, group_name="10001", enabled=True, speak_enabled=True)
-        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        image_senders = (
+            (20001, "Alice"),
+            (20002, "Bob"),
+            (20003, "Carol"),
+        )
+        for user_id, nickname in image_senders:
+            users.upsert_user(user_id=user_id, nickname=nickname, group_card="")
         messages = MessageRepository(session)
         for index in range(3):
             image_id = f"addressed-recent-{index}"
+            user_id, nickname = image_senders[index]
             messages.add_group_message(
                 platform_msg_id=image_id,
                 group_id=10001,
-                user_id=20001,
+                user_id=user_id,
                 timestamp=datetime(2026, 5, 9, 11, 59, 40 + index, tzinfo=UTC),
                 plain_text="",
                 raw_json={
+                    "message_id": image_id,
+                    "user_id": user_id,
+                    "sender": {"nickname": nickname, "card": ""},
                     "message": [{
                         "type": "image",
                         "data": {
@@ -1710,7 +1722,6 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
                             "url": f"https://img.example.test/{image_id}.png",
                         },
                     }],
-                    "message_id": image_id,
                 },
                 msg_type="image",
                 reply_to_msg_id=None,
@@ -1735,9 +1746,10 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
         "https://img.example.test/addressed-recent-2.png",
         "https://img.example.test/addressed-recent-1.png",
     ]
-    assert router_module.AMBIENT_IMAGE_GROUNDING_INSTRUCTION in "\n".join(
-        llm.calls[-1]["prompt_lines"]
-    )
+    prompt_text = "\n".join(llm.calls[-1]["prompt_lines"])
+    assert router_module.AMBIENT_IMAGE_GROUNDING_INSTRUCTION in prompt_text
+    assert "Attached image 1 was sent by Carol." in prompt_text
+    assert "Attached image 2 was sent by Bob." in prompt_text
 
 
 @pytest.mark.asyncio
@@ -2059,6 +2071,9 @@ async def test_router_uses_referenced_image_when_addressed_turn_quotes_image(sql
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
     assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/quoted.png"]
+    prompt_text = "\n".join(llm.calls[0]["prompt_lines"])
+    assert "Attached image 1 was sent by Bob." in prompt_text
+    assert router_module.IMAGE_SENDER_GROUNDING_INSTRUCTION in prompt_text
 
 
 @pytest.mark.asyncio
@@ -2278,6 +2293,9 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
     assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/remote-quoted.png"]
+    prompt_text = "\n".join(llm.calls[0]["prompt_lines"])
+    assert "Attached image 1 was sent by Bob." in prompt_text
+    assert router_module.IMAGE_SENDER_GROUNDING_INSTRUCTION in prompt_text
 
 
 @pytest.mark.asyncio

@@ -109,3 +109,6 @@ def test_fresh_image_within_window_is_attached(tmp_path) -> None:
 
     assert result is not None
     assert result.images[0].file_id == "fresh-image.png"
+    assert result.images[0].source_message_id == "fresh-image"
+    assert result.images[0].source_user_id == USER_ID
+    assert result.images[0].source_nickname == "Maple"

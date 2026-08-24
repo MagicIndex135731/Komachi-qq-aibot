@@ -115,11 +115,20 @@ MEMORY_TOOL_EFFICIENCY_INSTRUCTION = (
 )
 
 AMBIENT_IMAGE_GROUNDING_INSTRUCTION = (
-    "Recent fallback images are ambient group-chat context, not attributed "
-    "evidence about any member. Do not infer a member's activity, preference, "
-    "identity, relationship, location, work, or other personal fact from those "
-    "images. Use them only when the user is directly asking about the visible "
-    "image or the current visual discussion."
+    "Recent fallback images are ambient group-chat context. Their sender "
+    "metadata identifies only who posted each image; it is not evidence that "
+    "the sender is depicted in it or performed the visible activity. Do not "
+    "infer a member's preference, identity, relationship, location, work, or "
+    "other personal fact from those images. Use them only when the user is "
+    "directly asking about the visible image or the current visual discussion."
+)
+
+IMAGE_SENDER_GROUNDING_INSTRUCTION = (
+    "Image sender metadata identifies who posted each attached image in this "
+    "group. If the user asks who sent or posted an image, use that metadata. "
+    "Do not claim that the sender is the person shown, owns an item, ate a meal, "
+    "or performed another visible activity unless the image or chat establishes "
+    "it; distinguish the known sender from any uncertain real-world actor."
 )
 
 
@@ -843,6 +852,31 @@ class InboundRouter:
             add_images(extract_images_from_raw_payload(message.raw_json))
         return collected
 
+    def _build_image_attribution_lines(
+        self,
+        *,
+        images: list[ImageAttachment],
+        users_by_id: dict[int, object],
+    ) -> list[str]:
+        lines: list[str] = []
+        for index, image in enumerate(images, start=1):
+            source_user_id = image.source_user_id
+            if source_user_id is not None and source_user_id in users_by_id:
+                sender_label = self._member_label_for_user(
+                    user_id=source_user_id,
+                    users_by_id=users_by_id,
+                )
+            else:
+                sender_label = self._format_member_label(
+                    nickname=image.source_nickname or "",
+                    group_card=image.source_group_card or "",
+                    fallback="an unidentified group member",
+                )
+            lines.append(f"Attached image {index} was sent by {sender_label}.")
+        if lines:
+            lines.append(IMAGE_SENDER_GROUNDING_INSTRUCTION)
+        return lines
+
     @staticmethod
     def _should_suppress_ambient_images(memory_result: MemoryContextResult) -> bool:
         """Whether ambient media could be misattributed as a personal fact."""
@@ -1084,11 +1118,12 @@ class InboundRouter:
                 groups.session.add(group)
             current_user = users.upsert_user(user_id=event.user_id, nickname=event.nickname, group_card=event.group_card)
             current_users_by_id = {event.user_id: current_user}
-            if cache_images and event.images:
-                cache_images_in_raw_payload(
-                    event.raw_payload,
-                    cache_dir=self.runtime.settings.data_dir / "image_cache",
-                )
+            if event.images:
+                if cache_images:
+                    cache_images_in_raw_payload(
+                        event.raw_payload,
+                        cache_dir=self.runtime.settings.data_dir / "image_cache",
+                    )
                 event.images = extract_images_from_raw_payload(event.raw_payload)
             inbound_message = messages.add_group_message(
                 platform_msg_id=event.platform_msg_id,
@@ -1861,6 +1896,14 @@ class InboundRouter:
                 group_policy_lines = [
                     *group_policy_lines,
                     AMBIENT_IMAGE_GROUNDING_INSTRUCTION,
+                ]
+            if target_images:
+                group_policy_lines = [
+                    *group_policy_lines,
+                    *self._build_image_attribution_lines(
+                        images=target_images,
+                        users_by_id=users_by_id,
+                    ),
                 ]
             if target_images and not self.runtime.settings.llm_supports_vision_input:
                 return PreparedGroupReply(
