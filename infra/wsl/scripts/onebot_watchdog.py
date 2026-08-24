@@ -23,6 +23,7 @@ ACTION_RESTART = "restart"
 ACTION_NOTIFY = "notify"
 OFFLINE_THRESHOLD = 3
 RECOVERY_GRACE_SECONDS = 120
+LLBOT_MAX_RECOVERY_RESTARTS = 2
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -54,6 +55,7 @@ def _is_allowed_webui_url(webui_url: str) -> bool:
 class WatchdogState:
     offline_checks: int = 0
     restart_used: bool = False
+    restart_attempts: int = 0
     restart_requested_at: float = 0.0
     alerted: bool = False
     webui_alerted: bool = False
@@ -114,6 +116,7 @@ def evaluate_state(
     now: float,
     offline_threshold: int = OFFLINE_THRESHOLD,
     recovery_grace_seconds: int = RECOVERY_GRACE_SECONDS,
+    max_recovery_restarts: int = 1,
 ) -> tuple[WatchdogState, str]:
     unhealthy = online is False or active_session_ok is False
     recovered = online is True and active_session_ok is True
@@ -124,13 +127,23 @@ def evaluate_state(
     else:
         next_state = state
 
+    restart_attempts = max(int(next_state.restart_attempts), int(next_state.restart_used))
     if (
         unhealthy
-        and not next_state.restart_used
         and next_state.offline_checks >= offline_threshold
+        and restart_attempts < max(1, int(max_recovery_restarts))
+        and (
+            restart_attempts == 0
+            or now - next_state.restart_requested_at >= recovery_grace_seconds
+        )
     ):
         return (
-            replace(next_state, restart_used=True, restart_requested_at=now),
+            replace(
+                next_state,
+                restart_used=True,
+                restart_attempts=restart_attempts + 1,
+                restart_requested_at=now,
+            ),
             ACTION_RESTART,
         )
     if next_state.alerted:
@@ -138,7 +151,7 @@ def evaluate_state(
     if webui_login_error and not next_state.webui_alerted:
         return replace(next_state, alerted=True, webui_alerted=True), ACTION_NOTIFY
     if (
-        next_state.restart_used
+        restart_attempts >= max(1, int(max_recovery_restarts))
         and now - next_state.restart_requested_at >= recovery_grace_seconds
     ):
         return replace(next_state, alerted=True), ACTION_NOTIFY
@@ -148,9 +161,12 @@ def evaluate_state(
 def load_state(path: Path) -> WatchdogState:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        restart_used = bool(payload.get("restart_used", False))
+        restart_attempts = int(payload.get("restart_attempts", 1 if restart_used else 0))
         return WatchdogState(
             offline_checks=int(payload.get("offline_checks", 0)),
-            restart_used=bool(payload.get("restart_used", False)),
+            restart_used=restart_used or restart_attempts > 0,
+            restart_attempts=max(0, restart_attempts),
             restart_requested_at=float(payload.get("restart_requested_at", 0.0)),
             alerted=bool(payload.get("alerted", False)),
             webui_alerted=bool(payload.get("webui_alerted", False)),
@@ -220,7 +236,12 @@ async def probe_onebot(ws_url: str) -> tuple[bool | None, bool | None, str]:
             if group_list.get("status") != "ok":
                 return online, False, "get_group_list_not_ok"
             return online, True, "get_group_list"
-    except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as exc:
+    except (
+        ConnectionRefusedError,
+        OSError,
+        asyncio.TimeoutError,
+        websockets.WebSocketException,
+    ) as exc:
         # A transport that cannot be reached is a real service outage.  Count
         # it toward the debounced restart threshold instead of treating it as
         # an unknowable probe result forever.
@@ -410,6 +431,7 @@ async def run_check(
         active_session_ok=evaluated_active_session,
         webui_login_error=webui_login_error,
         now=time.time(),
+        max_recovery_restarts=(LLBOT_MAX_RECOVERY_RESTARTS if platform == "llbot" else 1),
     )
     next_state = replace(
         next_state,

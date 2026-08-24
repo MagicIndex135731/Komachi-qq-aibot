@@ -136,19 +136,24 @@ def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
     assert migrated["webui"]["enable"] is True
 
 
-def test_open_llbot_webui_shortcut_checks_local_webui_without_starting_stack() -> None:
+def test_open_llbot_webui_shortcut_uses_the_current_wsl_address_without_starting_stack() -> None:
     shortcut = (REPO_ROOT / "open-llbot-webui.bat").read_text(encoding="utf-8")
     launcher = read_script("open_llbot_webui.ps1")
 
     assert shortcut.isascii()
     assert "curl.exe" in shortcut
-    assert "http://127.0.0.1:3080/" in shortcut
+    assert "http://127.0.0.1:%WEBUI_PORT%/" in shortcut
+    assert "hostname -I" in shortcut
+    assert "WSL_WEBUI_IP" in shortcut
+    assert "WEBUI_URL" in shortcut
     assert "open_llbot_webui.ps1" in shortcut
     assert "start-xiaomachi-wsl.bat" in shortcut
     assert "pause" in shortcut
-    assert "wsl.exe" not in shortcut.lower()
+    assert "wsl.exe" in shortcut.lower()
     assert "docker" not in shortcut.lower()
     assert '"http://127.0.0.1:3080/"' in launcher
+    assert "WebUiUrl" in launcher
+    assert "Invalid LLBot WebUI URL" in launcher
     assert "webui_token.txt" in launcher
     assert "Could not copy the LLBot WebUI password" in launcher
     assert "Start-Process" in launcher

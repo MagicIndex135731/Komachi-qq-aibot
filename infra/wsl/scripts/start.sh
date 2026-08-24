@@ -59,6 +59,7 @@ if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' .
 fi
 
 startup_complete=false
+startup_waiting_for_qq=false
 
 cleanup_failed_start() {
   local status=$?
@@ -129,6 +130,20 @@ fi
 docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
 docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
-bash "${SCRIPT_DIR}/status.sh"
-echo "Xiaomachi startup complete: bot is up and accepting messages."
+if bash "${SCRIPT_DIR}/status.sh"; then
+  :
+else
+  status_exit=$?
+  if [[ "${platform}" == "llbot" && "${status_exit}" == 75 ]]; then
+    echo "LLBot is waiting for QQ network recovery; the stack remains running and the watchdog will retry."
+    startup_waiting_for_qq=true
+  else
+    exit "${status_exit}"
+  fi
+fi
+if [[ "${startup_waiting_for_qq}" == true ]]; then
+  echo "Xiaomachi startup is pending QQ recovery; it is not accepting messages yet."
+else
+  echo "Xiaomachi startup complete: bot is up and accepting messages."
+fi
 startup_complete=true

@@ -58,6 +58,34 @@ def test_offline_after_restart_grace_notifies_once_without_restart_loop() -> Non
     assert state.restart_used is True
 
 
+def test_llbot_gets_one_bounded_additional_restart_before_notification() -> None:
+    watchdog = load_watchdog()
+    state = watchdog.WatchdogState(
+        offline_checks=3,
+        restart_used=True,
+        restart_attempts=1,
+        restart_requested_at=30.0,
+    )
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=150.0,
+        max_recovery_restarts=watchdog.LLBOT_MAX_RECOVERY_RESTARTS,
+    )
+    assert action == watchdog.ACTION_RESTART
+    assert state.restart_attempts == 2
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=270.0,
+        max_recovery_restarts=watchdog.LLBOT_MAX_RECOVERY_RESTARTS,
+    )
+    assert action == watchdog.ACTION_NOTIFY
+    assert state.alerted is True
+
+
 def test_online_probe_resets_incident_state() -> None:
     watchdog = load_watchdog()
     incident = watchdog.WatchdogState(
@@ -172,6 +200,22 @@ def test_connection_refused_counts_as_transport_outage(monkeypatch: pytest.Monke
 
     assert (online, active_session_ok) == (False, False)
     assert detail == "ConnectionRefusedError"
+
+
+def test_invalid_websocket_response_counts_as_transport_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+
+    def invalid(*args: object, **kwargs: object) -> object:
+        raise watchdog.websockets.WebSocketException("local fake invalid response")
+
+    monkeypatch.setattr(watchdog.websockets, "connect", invalid)
+
+    online, active_session_ok, detail = asyncio.run(watchdog.probe_onebot("ws://fake"))
+
+    assert (online, active_session_ok) == (False, False)
+    assert detail == "WebSocketException"
 
 
 def test_explicit_webui_login_error_notifies_once_without_sensitive_state() -> None:

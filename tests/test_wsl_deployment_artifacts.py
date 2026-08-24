@@ -447,6 +447,21 @@ def test_status_script_uses_on_demand_probes_before_logs() -> None:
     assert "LLBot WebUI probe:" in script
     assert "curl -fsS --max-time 8 http://127.0.0.1:3080/ >/dev/null" in script
     assert "waiting for LLBot WebUI" in script
+
+
+def test_llbot_offline_status_keeps_recovery_owned_by_the_watchdog() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
+    start_bat = (REPO_ROOT / "start-xiaomachi-wsl.bat").read_text(encoding="utf-8")
+
+    assert '[[ "${platform}" == "llbot" ]]' in script
+    assert "leaving the stack running so the watchdog can recover" in script
+    assert "exit 75" in script
+    assert '"${platform}" == "llbot" && "${status_exit}" == 75' in start_script
+    assert "watchdog will retry" in start_script
+    assert "not accepting messages yet" in start_script
+    assert 'if "%STATUS_EXIT_CODE%"=="75" goto :recovering' in start_bat
+    assert "stack and watchdog are still running" in start_bat
     assert "OneBot probe (${platform})" in script
     assert "Waiting for xiaomachi bot heartbeat..." in script
     assert "group.heartbeat.json" in script

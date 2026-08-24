@@ -1,13 +1,19 @@
 param(
-    [switch]$OnlyWhenLoginRequired
+    [switch]$OnlyWhenLoginRequired,
+    [string]$WebUiUrl = "http://127.0.0.1:3080/"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $tokenPath = Join-Path $repoRoot "infra\wsl\runtime\llbot\data\webui_token.txt"
-$url = "http://127.0.0.1:3080/"
+$url = ""
 
 try {
+    $uri = [Uri]$WebUiUrl
+    if ($uri.Scheme -ne "http" -or $uri.Port -ne 3080 -or [string]::IsNullOrWhiteSpace($uri.Host)) {
+        throw "Invalid LLBot WebUI URL."
+    }
+    $url = $uri.AbsoluteUri
     Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 3 | Out-Null
 } catch {
     exit 1

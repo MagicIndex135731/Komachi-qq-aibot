@@ -214,6 +214,12 @@ for attempt in $(seq 1 12); do
 done
 if [[ "${probe_ok}" != true ]]; then
   sed -n '1,40p' "${probe_output}"
+  if [[ "${platform}" == "llbot" ]] \
+      && ! docker logs --tail 200 "${container_name}" 2>&1 \
+        | grep -Fq -e "replay protection unavailable" -e "sign 未初始化"; then
+    echo "LLBot QQ is offline; leaving the stack running so the watchdog can recover after the network returns."
+    exit 75
+  fi
   echo "OneBot did not become ready. Check the ${service_name} logs and WebUI."
   exit 1
 fi

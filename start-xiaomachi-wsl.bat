@@ -17,9 +17,17 @@ if errorlevel 1 goto :failed
 echo Xiaomachi started successfully.
 echo Verifying Xiaomachi readiness...
 wsl.exe --user root --exec "%ENTRY%" status
-if errorlevel 1 goto :failed
+set "STATUS_EXIT_CODE=%ERRORLEVEL%"
+if "%STATUS_EXIT_CODE%"=="75" goto :recovering
+if not "%STATUS_EXIT_CODE%"=="0" goto :failed
 timeout /t 2 /nobreak >nul
 exit /b 0
+
+:recovering
+echo LLBot QQ is temporarily offline. The stack and watchdog are still running.
+echo After the network returns, LLBot will retry recovery automatically. Run status-xiaomachi-wsl.bat later to confirm it is online.
+pause
+exit /b 75
 
 :failed
 echo Xiaomachi failed to start. Review the output above.
