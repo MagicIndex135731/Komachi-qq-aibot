@@ -5038,6 +5038,7 @@ class _ToolAwareLlm:
     def __init__(self) -> None:
         self.plain_calls = 0
         self.tool_calls: list[tuple[int, int]] = []
+        self.last_prompt: list[str] = []
         self.supports_selective_web_search = True
         self.supports_forced_web_search = True
 
@@ -5057,6 +5058,7 @@ class _ToolAwareLlm:
         **kwargs,
     ) -> str:
         del conversation_key
+        self.last_prompt = list(prompt_lines)
         self.tool_calls.append((max_tool_rounds, len(tools), kwargs))
         return tool_executor("memory_search", {"query": "x"})
 
@@ -5209,6 +5211,7 @@ def test_generate_group_reply_text_uses_envelope_and_returns_answer(
         use_memory_tools=True,
         memory_tool_executor=executor,
         memory_source_ids=("m1",),
+        memory_has_evidence=True,
     )
     text = router._generate_group_reply_text(
         event=SimpleNamespace(group_id=10001),
@@ -5378,6 +5381,35 @@ def test_generate_group_reply_text_reconsiders_abstention_with_packet_evidence(
     assert text == "他有一个有效事实。"
     assert llm.calls == 2
     assert "Reconsider once" in "\n".join(llm.last_prompt)
+
+
+def test_generate_group_reply_text_skips_envelope_without_memory_evidence(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    llm = _ToolAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "普通回复")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 今天天气怎么样"],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        memory_source_ids=("recent-1",),
+        memory_has_evidence=False,
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "普通回复"
+    assert "Allowed citation IDs JSON list" not in "\n".join(llm.last_prompt)
+    assert "decision_envelope" not in "\n".join(llm.last_prompt)
 
 
 def test_query_mentions_member_detects_nickname_card_and_id() -> None:

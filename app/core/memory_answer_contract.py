@@ -153,6 +153,8 @@ def extract_answer_envelope(
 def validate_envelope_references(
     envelope: DecisionEnvelope,
     allowed_source_ids: Iterable[str],
+    *,
+    require_claims: bool = True,
 ) -> tuple[bool, list[str]]:
     """Mechanical check: claims reference only ids from the accessible packet."""
 
@@ -162,7 +164,7 @@ def validate_envelope_references(
         if envelope.claims:
             failures.append("abstain envelope must have no claims")
         return not failures, failures
-    if not envelope.claims:
+    if not envelope.claims and require_claims:
         failures.append("non-abstain envelope must declare at least one claim")
         return False, failures
     for index, claim in enumerate(envelope.claims):
@@ -183,25 +185,46 @@ def append_envelope_contract(
     allowed_source_ids: Iterable[str],
     *,
     previous_failure: str | None = None,
+    production: bool = False,
 ) -> list[str]:
     """Append the envelope output contract to a base prompt."""
 
     allowed = sorted({str(value) for value in allowed_source_ids if str(value).strip()})
-    schema = (
-        "Return exactly one JSON object with fields answer, cited_source_message_ids, "
-        "abstained, decision_envelope. answer must be the concise reply you would send. "
-        "cited_source_message_ids may only copy ids exactly from the allowed list below. "
-        "abstained must be true only when the retrieved evidence cannot support an answer; "
-        "when abstaining, answer must state that memory evidence is insufficient and "
-        "cited_source_message_ids must be []. decision_envelope must be one JSON object "
-        "with fields decision (one of answer|abstain|clarify|expand), claims (a list of "
-        "objects each with text, evidence_ids, source_ids), answer (your final reply text), "
-        "and expansion_request (an object with facets and layers lists, or null). Every "
-        "substantive factual clause in answer must be represented by one claim whose "
-        "evidence_ids/source_ids come from the allowed list; leaving a clause unclaimed or "
-        "referencing an id outside the allowed list is a failure. Only request expansion "
-        "when the allowed packet is missing a needed attribute, time range, or evidence layer."
-    )
+    if production:
+        schema = (
+            "Return exactly one JSON object with fields answer, cited_source_message_ids, "
+            "abstained, decision_envelope. answer must be your normal concise reply for this "
+            "conversation, whether it is ordinary chat, help, general knowledge, or a memory "
+            "question; never add phrases like 'memory evidence is insufficient' to non-memory "
+            "questions. cited_source_message_ids may only copy ids exactly from the allowed "
+            "list below; use [] when the reply is not based on retrieved memory. abstained is "
+            "a memory-specific flag: true only when the question asks about remembered facts "
+            "and the retrieved evidence cannot support an answer; for ordinary conversation "
+            "always use false. decision_envelope must be one JSON object with fields decision "
+            "(one of answer|abstain|clarify|expand), claims (a list of objects each with text, "
+            "evidence_ids, source_ids), answer (your final reply text), and expansion_request "
+            "(an object with facets and layers lists, or null). For memory-based assertions, "
+            "every clause must be represented by one claim whose evidence_ids/source_ids come "
+            "from the allowed list; a non-memory reply may use an empty claims list. Only "
+            "request expansion when the packet is missing a needed attribute, time range, or "
+            "evidence layer."
+        )
+    else:
+        schema = (
+            "Return exactly one JSON object with fields answer, cited_source_message_ids, "
+            "abstained, decision_envelope. answer must be the concise reply you would send. "
+            "cited_source_message_ids may only copy ids exactly from the allowed list below. "
+            "abstained must be true only when the retrieved evidence cannot support an answer; "
+            "when abstaining, answer must state that memory evidence is insufficient and "
+            "cited_source_message_ids must be []. decision_envelope must be one JSON object "
+            "with fields decision (one of answer|abstain|clarify|expand), claims (a list of "
+            "objects each with text, evidence_ids, source_ids), answer (your final reply text), "
+            "and expansion_request (an object with facets and layers lists, or null). Every "
+            "substantive factual clause in answer must be represented by one claim whose "
+            "evidence_ids/source_ids come from the allowed list; leaving a clause unclaimed or "
+            "referencing an id outside the allowed list is a failure. Only request expansion "
+            "when the allowed packet is missing a needed attribute, time range, or evidence layer."
+        )
     prompt = [*prompt_lines, schema, f"Allowed citation IDs JSON list: {json.dumps(allowed, ensure_ascii=False)}"]
     if previous_failure:
         prompt.append(

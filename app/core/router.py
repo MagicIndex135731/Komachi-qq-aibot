@@ -2524,7 +2524,7 @@ class InboundRouter:
                 "memory_decision_envelope_enabled",
                 False,
             )
-        ) and bool(prepared_reply.memory_source_ids) and not prepared_reply.target_images
+        ) and bool(prepared_reply.memory_has_evidence) and not prepared_reply.target_images
         force_web_search = (
             prepared_reply.force_web_search
             and bool(getattr(self.llm_client, "supports_forced_web_search", False))
@@ -2543,6 +2543,7 @@ class InboundRouter:
                 append_envelope_contract(
                     prepared_reply.prompt_lines,
                     prepared_reply.memory_source_ids,
+                    production=True,
                 )
                 if envelope_enabled
                 else prepared_reply.prompt_lines
@@ -2612,7 +2613,11 @@ class InboundRouter:
         if envelope is None:
             failure = error or "envelope_missing"
         else:
-            ok, failures = validate_envelope_references(envelope, allowed_ids)
+            ok, failures = validate_envelope_references(
+                envelope,
+                allowed_ids,
+                require_claims=False,
+            )
             if ok and envelope.decision == "abstain" and has_evidence:
                 # The packet is not empty: give the model one chance to
                 # reconsider an over-conservative abstention. The final
@@ -2655,7 +2660,11 @@ class InboundRouter:
             reanswer = clean or raw_reply
         _, reenvelope, _ = extract_answer_envelope(reanswer)
         if reenvelope is not None:
-            ok, _failures = validate_envelope_references(reenvelope, allowed_ids)
+            ok, _failures = validate_envelope_references(
+                reenvelope,
+                allowed_ids,
+                require_claims=False,
+            )
             if ok:
                 return reenvelope.answer
         for candidate in (reanswer, raw_reply):
