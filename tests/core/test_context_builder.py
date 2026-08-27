@@ -90,6 +90,64 @@ def test_render_persona_includes_mesugaki_speech_habits() -> None:
     assert "Mild flirting and playful innuendo" in text
 
 
+def test_render_persona_includes_relationships_and_address_rules() -> None:
+    persona = {
+        "name": "测试君",
+        "identity": "AI assistant",
+        "core_traits": ["calm"],
+        "speaking_style": {"tone": "natural"},
+        "address_rules": ["叫熟人外号", "绝不叫主人"],
+        "relationships": [
+            {
+                "member": "路人甲",
+                "relation": "同事",
+                "address_terms": ["老哥"],
+                "how_azha_talks": "直接，不客气",
+            }
+        ],
+    }
+
+    text = render_persona(persona)
+
+    assert "Addressing rules" in text
+    assert "绝不叫主人" in text
+    assert "With 路人甲" in text
+    assert "addresses=老哥" in text
+
+
+def test_render_persona_includes_background_and_example_lines() -> None:
+    persona = {
+        "name": "测试君",
+        "identity": "AI assistant",
+        "core_traits": ["calm"],
+        "speaking_style": {"tone": "natural"},
+        "background": "在快手实习，关心秋招",
+        "example_lines": ["我玩", "真尿了", "在吗？"],
+    }
+
+    text = render_persona(persona)
+
+    assert "Background: 在快手实习，关心秋招" in text
+    assert "「我玩」" in text
+    assert "「真尿了」" in text
+
+
+def test_render_persona_caps_example_lines() -> None:
+    persona = {
+        "name": "测试君",
+        "identity": "AI assistant",
+        "core_traits": [],
+        "speaking_style": {"tone": "natural"},
+        "example_lines": [f"第{i}条" for i in range(30)],
+    }
+
+    text = render_persona(persona)
+
+    assert "「第0条」" in text
+    assert "「第15条」" in text
+    assert "「第29条」" not in text
+
+
 def test_render_persona_keeps_a_required_default_style_contract() -> None:
     persona = {
         "name": "Mira",

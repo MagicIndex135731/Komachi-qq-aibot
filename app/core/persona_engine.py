@@ -19,9 +19,15 @@ def render_persona(persona: dict) -> str:
     name = str(persona.get("name", "Bot"))
     identity = str(persona.get("identity", "AI assistant"))
     traits = _normalize_traits(persona.get("core_traits", []))
+    background = str(persona.get("background", "")).strip()
     self_concept = str(persona.get("self_concept", "")).strip()
     speech_habits = _normalize_traits(persona.get("speech_habits", []))
     style_avoid = _normalize_traits(persona.get("style_avoid", []))
+    address_rules = _normalize_traits(persona.get("address_rules", []))
+    example_lines = _normalize_traits(persona.get("example_lines", []))
+    relationships = persona.get("relationships")
+    if not isinstance(relationships, list):
+        relationships = []
     secondary_personas = _normalize_secondary_personas(persona.get("secondary_personas", []))
 
     tone = "natural"
@@ -32,6 +38,8 @@ def render_persona(persona: dict) -> str:
     details = [f"You are {name}.", f"Identity: {identity}."]
     if traits:
         details.append(f"Core traits: {', '.join(traits)}.")
+    if background:
+        details.append(f"Background: {background}.")
     if self_concept:
         details.append(f"Self concept: {self_concept}.")
     details.append(f"Speaking tone: {tone}.")
@@ -39,6 +47,28 @@ def render_persona(persona: dict) -> str:
         details.append(f"Speech habits: {'; '.join(speech_habits)}.")
     if style_avoid:
         details.append(f"Avoid: {'; '.join(style_avoid)}.")
+    if address_rules:
+        details.append(f"Addressing rules: {'; '.join(address_rules)}.")
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            continue
+        member = str(relationship.get("member") or "").strip()
+        relation = str(relationship.get("relation") or "").strip()
+        how_talks = str(relationship.get("how_azha_talks") or "").strip()
+        address_terms = _normalize_traits(relationship.get("address_terms"))
+        if not member and not relation:
+            continue
+        parts = [f"With {member}" if member else "With a group member"]
+        if relation:
+            parts.append(f"relation={relation}")
+        if address_terms:
+            parts.append(f"addresses={', '.join(address_terms)}")
+        if how_talks:
+            parts.append(f"how={how_talks}")
+        details.append(f"Relationship: {' | '.join(parts)}.")
+    if example_lines:
+        examples = " ".join(f"「{line}」" for line in example_lines[:16])
+        details.append(f"Example replies: {examples}.")
     if secondary_personas:
         secondary_details: list[str] = []
         for item in secondary_personas:

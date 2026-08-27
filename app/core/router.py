@@ -81,6 +81,7 @@ from app.core.memory_query_resolver import (
 )
 from app.core.persona_engine import render_persona, render_safety_lines
 from app.core.persona_switch import (
+    DEFAULT_PERSONA_KEY,
     PersonaManager,
     PersonaSwitchService,
     parse_switch_command,
@@ -757,6 +758,28 @@ class InboundRouter:
         if self.persona_manager is None:
             return self.runtime.persona
         return self.persona_manager.active_persona(group_id)
+
+    def _impersonating(self, group_id: int) -> bool:
+        return (
+            self.persona_manager is not None
+            and self.persona_manager.active_key(group_id) != DEFAULT_PERSONA_KEY
+        )
+
+    def _persona_text_for(self, active_persona: dict, group_id: int) -> str:
+        text = render_persona(active_persona)
+        if not self._impersonating(group_id):
+            return text
+        name = str(active_persona.get("name") or "").strip()
+        text += (
+            f"\n你正在完整扮演群成员 {name}：你就是 TA 本人，不是 AI，也不是小町。"
+            "不要沿用任何属于小町/机器人的身份记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
+            "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
+        )
+        return text
+
+    @staticmethod
+    def _filter_bot_identity_memory_lines(lines: list[str]) -> list[str]:
+        return [line for line in lines if "主人" not in line]
 
     def _normalize_lookup_text(self, value: str) -> str:
         return LOOKUP_NORMALIZER.sub("", value).lower()
@@ -1538,6 +1561,7 @@ class InboundRouter:
             lowered_message = event.plain_text.lower()
             active_persona = self._active_persona(event.group_id)
             persona_name = str(active_persona.get("name", "")).strip()
+            persona_text = self._persona_text_for(active_persona, event.group_id)
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -1881,9 +1905,12 @@ class InboundRouter:
             full_history_preamble = memory_context.full_history_preamble
             full_history_enabled = memory_context.full_history_enabled
             member_focus_lines = memory_context.member_focus_lines
-            relevant_summaries = memory_context.summaries
             relevant_history_lines = memory_context.relevant_history_messages
             relevant_memories = memory_context.memories
+            relevant_summaries = memory_context.summaries
+            if self._impersonating(event.group_id):
+                relevant_memories = self._filter_bot_identity_memory_lines(relevant_memories)
+                relevant_summaries = self._filter_bot_identity_memory_lines(relevant_summaries)
             history_detail = memory_context.history_detail
             if is_bot_self_identity_query(event.plain_text, bot_names=bot_names):
                 group_policy_lines = [
@@ -2120,7 +2147,7 @@ class InboundRouter:
                 if pronoun_referent_note is not None:
                     prompt_target_text = f"{prompt_target_text}\n{pronoun_referent_note}"
             prompt_lines = self.context_builder.build(
-                persona_text=render_persona(active_persona),
+                persona_text=persona_text,
                 safety_rules=render_safety_lines(self.runtime.safety),
                 group_policy_lines=group_policy_lines,
                 reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
@@ -2184,7 +2211,7 @@ class InboundRouter:
                         max_input_tokens,
                     )
                     prompt_lines = self.context_builder.build(
-                        persona_text=render_persona(active_persona),
+                        persona_text=persona_text,
                         safety_rules=render_safety_lines(self.runtime.safety),
                         group_policy_lines=group_policy_lines,
                         reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
@@ -2216,7 +2243,7 @@ class InboundRouter:
                             max_input_tokens,
                         )
                         prompt_lines = self.context_builder.build(
-                            persona_text=render_persona(active_persona),
+                            persona_text=persona_text,
                             safety_rules=render_safety_lines(self.runtime.safety),
                             group_policy_lines=group_policy_lines,
                             reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
