@@ -46,6 +46,10 @@ release/
 # 生产群配置覆盖（含真实群号，不提交 Git）
 configs/groups.local.yaml
 
+# 蒸馏生成的本地人格与样本（源自私聊历史，仅本地使用，不提交 Git）
+configs/personas/
+data/personas/
+
 # WSL/Docker deployment runtime state
 infra/wsl/.env
 infra/wsl/runtime/
