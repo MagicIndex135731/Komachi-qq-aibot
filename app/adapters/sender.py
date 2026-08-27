@@ -108,6 +108,9 @@ class Sender:
             {
                 "group_id": int(group_id),
                 "user_id": int(user_id),
+                # LLBot caches member cards by default; a cached card would
+                # poison the pre-switch snapshot used for restoration.
+                "no_cache": True,
             },
         )
 

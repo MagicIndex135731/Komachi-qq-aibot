@@ -69,7 +69,7 @@ def test_sender_profile_actions_use_onebot_extensions() -> None:
         ("get_qq_avatar", {"user_id": 123456789}),
         ("set_qq_avatar", {"file": "avatar://1"}),
         ("set_group_card", {"group_id": 10001, "user_id": 987654321, "card": "新名片"}),
-        ("get_group_member_info", {"group_id": 10001, "user_id": 987654321}),
+        ("get_group_member_info", {"group_id": 10001, "user_id": 987654321, "no_cache": True}),
     ]
 
 
