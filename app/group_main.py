@@ -17,6 +17,7 @@ from app.config import AppSettings, load_runtime_config
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
 from app.core.group_history_backfill import backfill_recent_group_history
+from app.core.persona_switch import PersonaManager, PersonaSwitchService
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.main import (
@@ -359,6 +360,17 @@ async def run() -> None:
             await group_image_service.start()
         if memory_compaction_service is not None:
             await memory_compaction_service.start()
+        persona_manager = PersonaManager(
+            engine=engine,
+            personas=getattr(runtime, "personas", {}) or {},
+            default_persona=runtime.persona,
+        )
+        await asyncio.to_thread(persona_manager.load_state)
+        persona_switch_service = PersonaSwitchService(
+            manager=persona_manager,
+            sender=sender,
+            bot_qq=settings.bot_qq,
+        )
         router = InboundRouter(
             engine=engine,
             runtime=runtime,
@@ -373,6 +385,8 @@ async def run() -> None:
             group_image_service=group_image_service,
             memory_compaction_service=memory_compaction_service,
             memory_orchestrator=memory_runtime.memory_orchestrator,
+            persona_manager=persona_manager,
+            persona_switch_service=persona_switch_service,
         )
 
         async def handle_payload(payload: dict) -> None:

@@ -116,6 +116,12 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
         ),
     )
     monkeypatch.setattr(group_main, "InboundRouter", lambda **kwargs: captured.update(kwargs) or object())
+    monkeypatch.setattr(
+        group_main,
+        "PersonaManager",
+        lambda **kwargs: SimpleNamespace(load_state=lambda: None),
+    )
+    monkeypatch.setattr(group_main, "PersonaSwitchService", lambda **kwargs: object())
     monkeypatch.setattr(group_main, "_max_message_id", lambda _engine: 0)
 
     async def _noop_replay(**kwargs) -> None:

@@ -362,6 +362,12 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(app_main, "InboundRouter", FakeRouter)
+    monkeypatch.setattr(
+        app_main,
+        "PersonaManager",
+        lambda **kwargs: SimpleNamespace(load_state=lambda: None),
+    )
+    monkeypatch.setattr(app_main, "PersonaSwitchService", lambda **kwargs: object())
 
     await app_main.run()
 

@@ -7,6 +7,8 @@ from app.adapters.sender import (
     OutboundPrivateMessage,
     QQMessageDeliveryUncertainError,
     Sender,
+    _extract_avatar_file,
+    extract_group_card,
 )
 
 
@@ -17,6 +19,16 @@ class FakeGateway:
     async def call_api(self, action: str, params: dict) -> dict:
         self.calls.append((action, params))
         return {"status": "ok"}
+
+
+class ProfileGateway:
+    def __init__(self, responses: dict[str, dict]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_api(self, action: str, params: dict) -> dict:
+        self.calls.append((action, params))
+        return self.responses[action]
 
 
 def test_sender_uses_send_group_msg() -> None:
@@ -33,6 +45,52 @@ def test_sender_uses_send_private_msg() -> None:
     asyncio.run(sender.send_private_text(OutboundPrivateMessage(user_id=10001, text="ok")))
 
     assert gateway.calls == [("send_private_msg", {"user_id": 10001, "message": "ok"})]
+
+
+def test_sender_profile_actions_use_onebot_extensions() -> None:
+    gateway = ProfileGateway(
+        {
+            "get_qq_avatar": {"status": "ok", "retcode": 0, "data": {"url": "avatar://1"}},
+            "set_qq_avatar": {"status": "ok", "retcode": 0},
+            "set_group_card": {"status": "ok", "retcode": 0},
+            "get_group_member_info": {"status": "ok", "retcode": 0, "data": {"card": "原名"}},
+        }
+    )
+    sender = Sender(gateway)
+
+    avatar = asyncio.run(sender.get_qq_avatar(user_id=123456789))
+    asyncio.run(sender.set_qq_avatar(file=avatar))
+    asyncio.run(sender.set_group_card(group_id=10001, user_id=987654321, card="新名片"))
+    member_info = asyncio.run(sender.get_group_member_info(group_id=10001, user_id=987654321))
+
+    assert avatar == "avatar://1"
+    assert extract_group_card(member_info) == "原名"
+    assert gateway.calls == [
+        ("get_qq_avatar", {"user_id": 123456789}),
+        ("set_qq_avatar", {"file": "avatar://1"}),
+        ("set_group_card", {"group_id": 10001, "user_id": 987654321, "card": "新名片"}),
+        ("get_group_member_info", {"group_id": 10001, "user_id": 987654321}),
+    ]
+
+
+def test_sender_profile_failure_raises_runtime_error() -> None:
+    gateway = ProfileGateway(
+        {"set_group_card": {"status": "failed", "retcode": 100, "message": "boom"}}
+    )
+    sender = Sender(gateway)
+
+    with pytest.raises(RuntimeError, match="set_group_card failed"):
+        asyncio.run(
+            sender.set_group_card(group_id=10001, user_id=987654321, card="新名片")
+        )
+
+
+def test_extract_avatar_file_accepts_common_shapes() -> None:
+    assert _extract_avatar_file({"data": {"url": "https://a/1.png"}}) == "https://a/1.png"
+    assert _extract_avatar_file({"data": {"file": "/tmp/1.png"}}) == "/tmp/1.png"
+    assert _extract_avatar_file({"data": "iVBORw0KGgo"}) == "iVBORw0KGgo"
+    with pytest.raises(RuntimeError):
+        _extract_avatar_file({"data": {}})
 
 
 def test_sender_uses_send_group_msg_for_image_segment() -> None:

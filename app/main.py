@@ -61,6 +61,7 @@ from app.core.memory_v2_context import MemoryV2ContextProvider
 from app.core.time_utils import stored_as_utc
 from app.core.group_history_backfill import backfill_recent_group_history
 from app.core.message_archive import sync_group_message_archives_from_db
+from app.core.persona_switch import PersonaManager, PersonaSwitchService
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.dev_control.service import DevControlService
@@ -1493,6 +1494,17 @@ async def run() -> None:
             safety=runtime.safety,
         )
         await dev_control_service.start()
+        persona_manager = PersonaManager(
+            engine=engine,
+            personas=getattr(runtime, "personas", {}) or {},
+            default_persona=runtime.persona,
+        )
+        await asyncio.to_thread(persona_manager.load_state)
+        persona_switch_service = PersonaSwitchService(
+            manager=persona_manager,
+            sender=sender,
+            bot_qq=settings.bot_qq,
+        )
         router = InboundRouter(
             engine=engine,
             runtime=runtime,
@@ -1507,6 +1519,8 @@ async def run() -> None:
             group_image_service=group_image_service,
             memory_compaction_service=memory_compaction_service,
             memory_orchestrator=memory_runtime.memory_orchestrator,
+            persona_manager=persona_manager,
+            persona_switch_service=persona_switch_service,
         )
 
         async def handle_payload(payload: dict) -> None:

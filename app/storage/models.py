@@ -42,6 +42,23 @@ class Group(Base):
     persona_variant: Mapped[str] = mapped_column(String(64), default="default")
 
 
+class GroupPersonaState(Base):
+    """Per-group active persona plus one account-scoped row for profile snapshots.
+
+    ``group_id=0`` is reserved for account-level state (the original QQ
+    avatar). Regular rows store a group's active persona key and the original
+    group card captured before the first persona switch.
+    """
+
+    __tablename__ = "group_persona_states"
+
+    group_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    persona_key: Mapped[str] = mapped_column(String(64), default="default")
+    card_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    avatar_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (

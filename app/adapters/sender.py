@@ -79,6 +79,46 @@ class Sender:
             },
         )
 
+    async def get_qq_avatar(self, *, user_id: int) -> str:
+        response = await self._call_profile_action(
+            "get_qq_avatar",
+            {"user_id": int(user_id)},
+        )
+        return _extract_avatar_file(response)
+
+    async def set_qq_avatar(self, *, file: str) -> None:
+        await self._call_profile_action(
+            "set_qq_avatar",
+            {"file": str(file)},
+        )
+
+    async def set_group_card(self, *, group_id: int, user_id: int, card: str) -> None:
+        await self._call_profile_action(
+            "set_group_card",
+            {
+                "group_id": int(group_id),
+                "user_id": int(user_id),
+                "card": str(card),
+            },
+        )
+
+    async def get_group_member_info(self, *, group_id: int, user_id: int) -> dict:
+        return await self._call_profile_action(
+            "get_group_member_info",
+            {
+                "group_id": int(group_id),
+                "user_id": int(user_id),
+            },
+        )
+
+    async def _call_profile_action(self, action: str, params: dict) -> dict:
+        try:
+            response = await self.gateway.call_api(action, params)
+        except Exception as exc:
+            raise RuntimeError(f"{action} failed: {type(exc).__name__}") from exc
+        self._require_ok(response, action=action)
+        return response or {}
+
     async def _send_once(self, *, action: str, params: dict) -> None:
         try:
             response = await self.gateway.call_api(action, params)
@@ -152,3 +192,41 @@ class Sender:
         if current:
             chunks.append(current)
         return chunks or [normalized]
+
+
+def _extract_avatar_file(payload: dict | None) -> str:
+    """Extract a usable avatar source from a OneBot response payload.
+
+    LLBot/NapCat implementations disagree on the response shape (``data.url``,
+    ``data.file``, a plain base64 string, ...). Accept every documented shape
+    and keep the extracted value verbatim so it can be passed back to
+    ``set_qq_avatar`` without re-encoding.
+    """
+
+    payload = payload or {}
+    data = payload.get("data", payload)
+    if isinstance(data, str):
+        value = data.strip()
+        if value:
+            return value
+        raise RuntimeError("get_qq_avatar returned empty avatar data")
+    if not isinstance(data, dict):
+        raise RuntimeError("get_qq_avatar returned no usable avatar data")
+    for key in ("url", "file", "path", "base64"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    inner = data.get("data")
+    if isinstance(inner, str) and inner.strip():
+        return inner.strip()
+    raise RuntimeError("get_qq_avatar returned no usable avatar data")
+
+
+def extract_group_card(payload: dict | None) -> str:
+    payload = payload or {}
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        card = data.get("card")
+        if isinstance(card, str):
+            return card
+    return ""

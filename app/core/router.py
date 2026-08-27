@@ -80,6 +80,11 @@ from app.core.memory_query_resolver import (
     is_requester_identity_query,
 )
 from app.core.persona_engine import render_persona, render_safety_lines
+from app.core.persona_switch import (
+    PersonaManager,
+    PersonaSwitchService,
+    parse_switch_command,
+)
 from app.core.proactive_judge import (
     build_proactive_judge_prompt,
     judge_proactive_interjection,
@@ -304,12 +309,27 @@ class InboundRouter:
     group_image_service: object | None = None
     memory_compaction_service: object | None = None
     memory_orchestrator: MemoryOrchestrator | None = None
+    persona_manager: PersonaManager | None = None
+    persona_switch_service: PersonaSwitchService | None = None
     pending_group_image_turns: dict[tuple[int, int], tuple[datetime, list[ImageAttachment]]] = field(default_factory=dict)
     _last_proactive_at: dict[int, datetime] = field(default_factory=dict)
     _proactive_inflight: dict[int, datetime] = field(default_factory=dict)
     _proactive_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
+        if self.persona_manager is None:
+            self.persona_manager = PersonaManager(
+                engine=self.engine,
+                personas=getattr(self.runtime, "personas", {}) or {},
+                default_persona=self.runtime.persona,
+            )
+            self.persona_manager.load_state()
+        if self.persona_switch_service is None:
+            self.persona_switch_service = PersonaSwitchService(
+                manager=self.persona_manager,
+                sender=self.sender,
+                bot_qq=self.runtime.settings.bot_qq,
+            )
         if self.memory_orchestrator is not None:
             return
         legacy_context = LegacyMemoryContext(
@@ -733,6 +753,11 @@ class InboundRouter:
             names.add(condensed[-2:])
         return {name for name in names if name}
 
+    def _active_persona(self, group_id: int) -> dict:
+        if self.persona_manager is None:
+            return self.runtime.persona
+        return self.persona_manager.active_persona(group_id)
+
     def _normalize_lookup_text(self, value: str) -> str:
         return LOOKUP_NORMALIZER.sub("", value).lower()
 
@@ -749,8 +774,16 @@ class InboundRouter:
             fallback=fallback,
         )
 
-    def _member_label_for_user(self, *, user_id: int, users_by_id: dict[int, object]) -> str:
+    def _member_label_for_user(
+        self,
+        *,
+        user_id: int,
+        users_by_id: dict[int, object],
+        group_id: int | None = None,
+    ) -> str:
         if user_id == self.runtime.settings.bot_qq:
+            if group_id is not None and self.persona_manager is not None:
+                return self.persona_manager.bot_transcript_label(group_id)
             persona_name = str(self.runtime.persona.get("name", "Bot")).strip()
             return persona_name or "Bot"
         user = users_by_id.get(user_id)
@@ -762,8 +795,18 @@ class InboundRouter:
             fallback=str(user_id),
         )
 
-    def _format_message_line(self, *, user_id: int, plain_text: str, users_by_id: dict[int, object]) -> str:
-        return f"{self._member_label_for_user(user_id=user_id, users_by_id=users_by_id)}: {plain_text}"
+    def _format_message_line(
+        self,
+        *,
+        user_id: int,
+        plain_text: str,
+        users_by_id: dict[int, object],
+        group_id: int | None = None,
+    ) -> str:
+        return (
+            f"{self._member_label_for_user(user_id=user_id, users_by_id=users_by_id, group_id=group_id)}: "
+            f"{plain_text}"
+        )
 
     def _flatten_raw_message_text(self, raw_payload: dict | None) -> str:
         if not isinstance(raw_payload, dict):
@@ -1155,6 +1198,7 @@ class InboundRouter:
                         user_id=event.user_id,
                         plain_text=event.plain_text,
                         users_by_id=current_users_by_id,
+                        group_id=event.group_id,
                     )
                 ]
             )
@@ -1303,6 +1347,7 @@ class InboundRouter:
                             user_id=item.user_id,
                             plain_text=item.plain_text,
                             users_by_id=window_users_by_id,
+                            group_id=event.group_id,
                         )
                         for item in window_messages
                     ]
@@ -1471,6 +1516,7 @@ class InboundRouter:
                     user_id=message.user_id,
                     plain_text=message.plain_text,
                     users_by_id=users_by_id,
+                    group_id=event.group_id,
                 )
                 for message in recent_messages
             ]
@@ -1490,7 +1536,8 @@ class InboundRouter:
                 message.user_id == self.runtime.settings.bot_qq for message in recent_messages[-10:]
             )
             lowered_message = event.plain_text.lower()
-            persona_name = str(self.runtime.persona.get("name", "")).strip()
+            active_persona = self._active_persona(event.group_id)
+            persona_name = str(active_persona.get("name", "")).strip()
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -1701,6 +1748,7 @@ class InboundRouter:
                     speaker=self._member_label_for_user(
                         user_id=message.user_id,
                         users_by_id=users_by_id,
+                        group_id=event.group_id,
                     ),
                     content=message.plain_text,
                     sent_at=self._normalize_timestamp(message.timestamp),
@@ -1722,6 +1770,7 @@ class InboundRouter:
                         speaker=self._member_label_for_user(
                             user_id=quoted_message.user_id,
                             users_by_id=quoted_users,
+                            group_id=event.group_id,
                         ),
                         content=quoted_message.plain_text,
                         sent_at=self._normalize_timestamp(quoted_message.timestamp),
@@ -2071,7 +2120,7 @@ class InboundRouter:
                 if pronoun_referent_note is not None:
                     prompt_target_text = f"{prompt_target_text}\n{pronoun_referent_note}"
             prompt_lines = self.context_builder.build(
-                persona_text=render_persona(self.runtime.persona),
+                persona_text=render_persona(active_persona),
                 safety_rules=render_safety_lines(self.runtime.safety),
                 group_policy_lines=group_policy_lines,
                 reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
@@ -2135,7 +2184,7 @@ class InboundRouter:
                         max_input_tokens,
                     )
                     prompt_lines = self.context_builder.build(
-                        persona_text=render_persona(self.runtime.persona),
+                        persona_text=render_persona(active_persona),
                         safety_rules=render_safety_lines(self.runtime.safety),
                         group_policy_lines=group_policy_lines,
                         reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
@@ -2167,7 +2216,7 @@ class InboundRouter:
                             max_input_tokens,
                         )
                         prompt_lines = self.context_builder.build(
-                            persona_text=render_persona(self.runtime.persona),
+                            persona_text=render_persona(active_persona),
                             safety_rules=render_safety_lines(self.runtime.safety),
                             group_policy_lines=group_policy_lines,
                             reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
@@ -2686,6 +2735,35 @@ class InboundRouter:
             return
         await self._handle_persisted_group_message(event)
 
+    async def _try_handle_persona_switch(self, event) -> bool:
+        """Handle an owner persona-switch command; returns True when consumed."""
+
+        manager = self.persona_manager
+        switch_service = self.persona_switch_service
+        if manager is None or switch_service is None:
+            return False
+        if event.user_id != self.runtime.settings.owner_qq or not event.mentioned_bot:
+            return False
+        target_key = parse_switch_command(event.plain_text, manager.personas)
+        if target_key is None:
+            return False
+        try:
+            confirmation = await switch_service.switch(
+                group_id=event.group_id,
+                target_key=target_key,
+            )
+        except Exception:
+            logger.exception(
+                "persona_switch_failed group_id=%s msg_id=%s target_key=%s",
+                event.group_id,
+                event.platform_msg_id,
+                target_key,
+            )
+            await self._send_prebuilt_reply(event, "人格切换失败，请稍后再试。")
+            return True
+        await self._send_prebuilt_reply(event, confirmation)
+        return True
+
     async def _handle_persisted_group_message(self, event) -> None:
         """Reply pipeline for a message that is already persisted in the ledger.
 
@@ -2710,6 +2788,8 @@ class InboundRouter:
                 rewritten_command = self._resolve_bbot_cached_command(event=event, command_text=bbot_match.command_text)
                 await self._send_prebuilt_reply(event, build_bbot_outbound_message(rewritten_command))
                 return
+        if await self._try_handle_persona_switch(event):
+            return
         quoted_raw_payload = await self._fetch_quoted_message_payload(reply_to_msg_id=event.reply_to_msg_id)
         prepared_reply = await asyncio.to_thread(
             self._prepare_group_reply,

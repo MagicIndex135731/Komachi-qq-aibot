@@ -20,6 +20,7 @@ from app.storage.models import (
     DevTaskArtifact,
     EpisodeMessage,
     Group,
+    GroupPersonaState,
     Job,
     MemoryBackfillRun,
     MemoryItem,
@@ -391,6 +392,41 @@ class GroupRepository:
 
     def get_group(self, group_id: int) -> Group | None:
         return self.session.get(Group, group_id)
+
+
+class GroupPersonaStateRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def load_all(self) -> dict[int, GroupPersonaState]:
+        return {
+            int(state.group_id): state
+            for state in self.session.scalars(select(GroupPersonaState))
+        }
+
+    def get(self, group_id: int) -> GroupPersonaState | None:
+        return self.session.get(GroupPersonaState, int(group_id))
+
+    def set_persona_key(self, group_id: int, persona_key: str) -> GroupPersonaState:
+        state = self.get(group_id) or GroupPersonaState(group_id=int(group_id))
+        state.persona_key = persona_key
+        state.updated_at = shanghai_now_naive()
+        self.session.add(state)
+        return state
+
+    def set_card_snapshot(self, group_id: int, card: str | None) -> GroupPersonaState:
+        state = self.get(group_id) or GroupPersonaState(group_id=int(group_id))
+        state.card_snapshot = card
+        state.updated_at = shanghai_now_naive()
+        self.session.add(state)
+        return state
+
+    def set_avatar_snapshot(self, group_id: int, avatar: str | None) -> GroupPersonaState:
+        state = self.get(group_id) or GroupPersonaState(group_id=int(group_id))
+        state.avatar_snapshot = avatar
+        state.updated_at = shanghai_now_naive()
+        self.session.add(state)
+        return state
 
 
 class UserRepository:

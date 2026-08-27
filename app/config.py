@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -405,6 +405,7 @@ class RuntimeConfig:
     persona: dict[str, Any]
     group_policy: dict[str, Any]
     safety: dict[str, Any]
+    personas: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -419,6 +420,15 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     persona = _read_yaml(settings.config_dir / "persona.yaml")
+    personas: dict[str, dict[str, Any]] = {"default": dict(persona)}
+    personas_dir = settings.config_dir / "personas"
+    if personas_dir.is_dir():
+        for persona_path in sorted(personas_dir.glob("*.yaml")):
+            try:
+                persona_profile = _read_yaml(persona_path)
+            except ValueError as exc:
+                raise ValueError(f"invalid persona profile {persona_path.name}: {exc}") from exc
+            personas[persona_path.stem] = persona_profile
     group_policy = _read_yaml(settings.config_dir / "groups.yaml")
     local_groups_path = settings.config_dir / "groups.local.yaml"
     if local_groups_path.exists():
@@ -426,7 +436,13 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
         if isinstance(local_policy, dict):
             group_policy = _deep_merge_mapping(group_policy, local_policy)
     safety = _read_yaml(settings.config_dir / "safety.yaml")
-    return RuntimeConfig(settings=settings, persona=persona, group_policy=group_policy, safety=safety)
+    return RuntimeConfig(
+        settings=settings,
+        persona=persona,
+        group_policy=group_policy,
+        safety=safety,
+        personas=personas,
+    )
 
 
 def _deep_merge_mapping(base: dict, overlay: dict) -> dict:
