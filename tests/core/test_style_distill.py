@@ -3,6 +3,8 @@ from __future__ import annotations
 from app.core.style_distill import (
     assemble_persona,
     build_style_samples,
+    compute_relationship_map,
+    compute_style_stats,
     parse_persona_yaml,
     speaker_label,
 )
@@ -67,6 +69,11 @@ def test_parse_persona_yaml_extracts_fenced_block() -> None:
     assert profile == {"name": "测试君", "core_traits": ["casual"]}
 
 
+def test_parse_persona_yaml_tolerates_unclosed_fence() -> None:
+    profile = parse_persona_yaml("```yaml\nname: 测试君\ncore_traits:\n  - casual")
+    assert profile == {"name": "测试君", "core_traits": ["casual"]}
+
+
 def test_assemble_persona_normalizes_runtime_fields() -> None:
     persona = assemble_persona(
         {
@@ -87,3 +94,72 @@ def test_assemble_persona_normalizes_runtime_fields() -> None:
     assert persona["source_user_id"] == 222
     assert persona["group_card"] == "测试君"
     assert persona["aliases"] == ["测试君"]
+
+
+def test_assemble_persona_preserves_relationships_and_address_rules() -> None:
+    persona = assemble_persona(
+        {
+            "name": "测试君",
+            "relationships": [
+                {"member": "路人甲", "relation": "同事", "address_terms": ["老哥"]}
+            ],
+            "address_rules": ["叫熟人外号", "绝不叫主人"],
+        },
+        target_name="测试君",
+        group_card="测试君",
+        source_user_id=222,
+    )
+    assert persona["relationships"][0]["member"] == "路人甲"
+    assert persona["address_rules"] == ["叫熟人外号", "绝不叫主人"]
+
+
+def test_compute_style_stats_counts_corpus_shape() -> None:
+    stats = compute_style_stats(
+        [
+            {"text": "我玩"},
+            {"text": "哈哈"},
+            {"text": "真尿了"},
+            {"text": "在吗？"},
+            {"text": ""},
+        ]
+    )
+    assert stats["count"] == 4
+    assert stats["avg_len"] == 2.5
+    assert stats["most_repeated_exact"][0][0] in {"我玩", "哈哈", "真尿了", "在吗？"}
+
+
+def test_compute_relationship_map_tracks_replies_and_mentions() -> None:
+    stream = [
+        {"platform_msg_id": "1", "user_id": 111, "speaker": "路人甲", "text": "在吗"},
+        {
+            "platform_msg_id": "2",
+            "user_id": 222,
+            "speaker": "测试君",
+            "text": "老哥我在",
+            "reply_to_msg_id": "1",
+        },
+        {
+            "platform_msg_id": "3",
+            "user_id": 111,
+            "speaker": "路人甲",
+            "text": "好",
+            "reply_to_msg_id": "2",
+        },
+        {
+            "platform_msg_id": "4",
+            "user_id": 999,
+            "speaker": "机器人",
+            "text": "无关",
+        },
+    ]
+    relationships = compute_relationship_map(
+        stream,
+        user_id=222,
+        exclude_user_ids={999},
+    )
+    assert len(relationships) == 1
+    member = relationships[0]
+    assert member["member"] == "路人甲"
+    assert member["azha_replied_to"] == 1
+    assert member["replies_to_azha"] == 1
+    assert member["mention_examples"] == ["老哥我在"]
