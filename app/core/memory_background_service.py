@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import re
-from typing import Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from sqlalchemy.exc import IntegrityError
 
@@ -27,8 +27,11 @@ from app.core.time_utils import ASIA_SHANGHAI, shanghai_naive
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
+    derive_explicit_memory_invalidations,
     is_addressing_rule,
+    is_single_value_profile_attribute,
     parse_memory_compaction_response,
+    single_value_profile_attribute_predicates,
 )
 from app.core.summarizer import summarize_window
 from app.storage.db import (
@@ -166,11 +169,20 @@ class DerivedEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class DerivedInvalidation:
+    target_canonical_key: str
+    source_msg_ids: tuple[str, ...]
+    reason: str = "explicit_denial"
+    valid_until: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EpisodeDerivation:
     summary: str
     facts: tuple[DerivedFact, ...]
     events: tuple[DerivedEvent, ...]
     windows: tuple[RetrievalWindow, ...]
+    invalidations: tuple[DerivedInvalidation, ...] = ()
 
 
 class EpisodeDeriver(Protocol):
@@ -195,9 +207,13 @@ class CompactionEpisodeDeriver:
         *,
         llm_client: TextGenerationClient,
         max_facts: int = 24,
+        correction_target_loader: Callable[
+            [int, tuple[str, ...]], Sequence[Mapping[str, str]]
+        ] | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.max_facts = max(1, int(max_facts))
+        self.correction_target_loader = correction_target_loader
 
     def derive(
         self,
@@ -206,7 +222,14 @@ class CompactionEpisodeDeriver:
         messages: tuple[BackgroundMessage, ...],
         windows: tuple[RetrievalWindow, ...],
     ) -> EpisodeDerivation:
-        del episode
+        subject_ids = tuple(
+            dict.fromkeys(str(message.user_id) for message in messages)
+        )
+        correction_targets = tuple(
+            self.correction_target_loader(episode.group_id, subject_ids)
+            if self.correction_target_loader is not None
+            else ()
+        )
         prompt_messages = [
             {
                 "source_msg_id": message.platform_msg_id,
@@ -229,6 +252,7 @@ class CompactionEpisodeDeriver:
             messages=prompt_messages,
             previous_digest="",
             language="zh",
+            active_correction_targets=correction_targets,
         )
         raw = self.llm_client.generate_text([prompt])
         compaction = parse_memory_compaction_response(
@@ -243,6 +267,14 @@ class CompactionEpisodeDeriver:
             source_subject_ids={
                 message.platform_msg_id: str(message.user_id)
                 for message in messages
+            },
+            source_contents={
+                message.platform_msg_id: str(message.plain_text or "").strip()
+                for message in messages
+            },
+            allowed_invalidation_targets={
+                str(target["target_canonical_key"]): target
+                for target in correction_targets
             },
             fallback_text=summarize_window(source_lines),
             strict=True,
@@ -269,11 +301,49 @@ class CompactionEpisodeDeriver:
             for fact in compaction.facts[: self.max_facts]
             if fact.kind == "event"
         )
+        invalidations = tuple(
+            DerivedInvalidation(
+                target_canonical_key=item.target_canonical_key,
+                source_msg_ids=item.source_msg_ids,
+                reason=item.reason,
+                valid_until=item.valid_until,
+            )
+            for item in compaction.invalidations
+        )
+        deterministic_invalidations = derive_explicit_memory_invalidations(
+            messages=tuple(
+                {
+                    "source_msg_id": message.platform_msg_id,
+                    "user_id": str(message.user_id),
+                    "plain_text": str(message.plain_text or "").strip(),
+                }
+                for message in messages
+            ),
+            active_correction_targets=correction_targets,
+        )
+        invalidations_by_target = {
+            item.target_canonical_key: item for item in invalidations
+        }
+        for item in deterministic_invalidations:
+            previous = invalidations_by_target.get(item.target_canonical_key)
+            invalidations_by_target[item.target_canonical_key] = DerivedInvalidation(
+                target_canonical_key=item.target_canonical_key,
+                source_msg_ids=tuple(
+                    sorted(
+                        set(item.source_msg_ids).union(
+                            previous.source_msg_ids if previous is not None else ()
+                        )
+                    )
+                ),
+                reason="explicit_denial",
+                valid_until=(previous.valid_until if previous is not None else None),
+            )
         return EpisodeDerivation(
             summary=compaction.summary,
             facts=facts,
             events=events,
             windows=windows,
+            invalidations=tuple(invalidations_by_target.values()),
         )
 
 
@@ -1338,6 +1408,16 @@ class SqlAlchemyMemoryBackgroundStore:
                     )
 
                 memories = MemoryRepository(session)
+                for invalidation in derivation.invalidations:
+                    memories.invalidate_canonical_memory(
+                        scope_id=str(episode.group_id),
+                        target_canonical_key=invalidation.target_canonical_key,
+                        source_msg_ids=list(invalidation.source_msg_ids),
+                        valid_until=(
+                            _parse_timestamp(invalidation.valid_until) or now
+                        ),
+                        reason=invalidation.reason,
+                    )
                 for fact in derivation.facts:
                     source_ids = list(dict.fromkeys(fact.source_msg_ids))
                     source_message_ids = [
@@ -1377,12 +1457,23 @@ class SqlAlchemyMemoryBackgroundStore:
                         valid_from=episode.ended_at or now,
                         valid_until=_parse_timestamp(fact.valid_until),
                         replace_previous=(
-                            fact.kind == "preference"
-                            and is_addressing_rule(
-                                fact.predicate,
-                                fact.object_text,
-                                fact.content,
+                            (
+                                fact.kind == "preference"
+                                and is_addressing_rule(
+                                    fact.predicate,
+                                    fact.object_text,
+                                    fact.content,
+                                )
                             )
+                            or (
+                                fact.kind == "profile"
+                                and is_single_value_profile_attribute(fact.predicate)
+                            )
+                        ),
+                        replacement_predicates=(
+                            single_value_profile_attribute_predicates(fact.predicate)
+                            if fact.kind == "profile"
+                            else ()
                         ),
                     )
                     session.flush()
@@ -1702,6 +1793,7 @@ class MemoryBackgroundService:
             facts=facts,
             events=derivation.events,
             windows=derivation.windows,
+            invalidations=derivation.invalidations,
         )
 
     def _expire_stale_current_memories(self, now: datetime) -> int:
@@ -2399,11 +2491,17 @@ class MemoryBackgroundService:
             for derivation in derivations
             for window in derivation.windows
         )
+        invalidations = tuple(
+            item
+            for derivation in derivations
+            for item in derivation.invalidations
+        )
         return EpisodeDerivation(
             summary="\n\n".join(summaries),
             facts=facts,
             events=events,
             windows=windows,
+            invalidations=invalidations,
         )
 
     def _build_windows(
@@ -2622,4 +2720,12 @@ def _filter_bot_subject_facts(
         facts=facts,
         events=derivation.events,
         windows=derivation.windows,
+        invalidations=tuple(
+            item
+            for item in derivation.invalidations
+            if not (
+                item.target_canonical_key.startswith(f"profile|{bot}|")
+                or item.target_canonical_key.startswith(f"preference|{bot}|")
+            )
+        ),
     )

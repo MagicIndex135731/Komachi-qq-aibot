@@ -33,7 +33,7 @@ def _image_payload(*, message_id: str, timestamp: datetime) -> dict:
     }
 
 
-def _text_event(*, timestamp: datetime) -> object:
+def _text_event(*, timestamp: datetime, text: str = "这张图怎么样") -> object:
     payload = {
         "post_type": "message",
         "message_type": "group",
@@ -43,7 +43,7 @@ def _text_event(*, timestamp: datetime) -> object:
         "sender": {"user_id": USER_ID, "nickname": "Maple", "card": ""},
         "message": [
             {"type": "at", "data": {"qq": str(BOT_QQ)}},
-            {"type": "text", "data": {"text": " 看看奶子"}},
+            {"type": "text", "data": {"text": f" {text}"}},
         ],
         "time": int(timestamp.astimezone(UTC).timestamp()),
     }
@@ -84,7 +84,6 @@ def test_old_image_outside_three_minute_window_is_not_attached(tmp_path) -> None
             addressed_turn=True,
             bot_names={"小町"},
             messages=MessageRepository(session),
-            allow_recent_image_without_intent=True,
         )
 
     assert result is None
@@ -104,7 +103,6 @@ def test_fresh_image_within_window_is_attached(tmp_path) -> None:
             addressed_turn=True,
             bot_names={"小町"},
             messages=MessageRepository(session),
-            allow_recent_image_without_intent=True,
         )
 
     assert result is not None

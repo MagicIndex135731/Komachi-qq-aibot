@@ -278,6 +278,10 @@ class AppSettings(BaseSettings):
         le=5,
         alias="MEMORY_MEMORY_TOOL_MAX_ROUNDS",
     )
+    memory_decision_envelope_enabled: bool = Field(
+        default=True,
+        alias="MEMORY_DECISION_ENVELOPE_ENABLED",
+    )
     memory_memory_tool_max_results: int = Field(
         default=5,
         ge=1,

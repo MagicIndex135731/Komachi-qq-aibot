@@ -1272,6 +1272,7 @@ class MemoryRepository:
         valid_from: datetime | None = None,
         valid_until: datetime | None = None,
         replace_previous: bool = False,
+        replacement_predicates: Sequence[str] = (),
     ) -> MemoryItem:
         """Merge repeated evidence into one compact fact and keep its provenance."""
         normalized_sources = list(dict.fromkeys(str(item).strip() for item in source_msg_ids if str(item).strip()))
@@ -1376,13 +1377,22 @@ class MemoryRepository:
                 )
 
         if replace_previous and predicate.strip():
+            equivalent_predicates = tuple(
+                dict.fromkeys(
+                    str(value).strip().casefold()
+                    for value in (*replacement_predicates, predicate)
+                    if str(value).strip()
+                )
+            )
             previous = list(
                 self.session.scalars(
                     select(MemoryItem).where(
                         MemoryItem.scope_type == scope_type,
                         MemoryItem.scope_id == scope_id,
+                        MemoryItem.subject_type == subject_type,
                         MemoryItem.subject_id == subject_id,
-                        MemoryItem.predicate == predicate,
+                        MemoryItem.memory_kind == memory_kind,
+                        func.lower(MemoryItem.predicate).in_(equivalent_predicates),
                         MemoryItem.status == "active",
                         MemoryItem.id != memory.id,
                     )
@@ -1418,6 +1428,115 @@ class MemoryRepository:
             memory_id=memory.id,
         )
         return memory
+
+    def invalidate_canonical_memory(
+        self,
+        *,
+        scope_id: str,
+        target_canonical_key: str,
+        source_msg_ids: list[str],
+        valid_until: datetime,
+        reason: str = "explicit_denial",
+        expected_target_sha256: str | None = None,
+    ) -> MemoryItem | None:
+        """Retire one exact active fact and persist a non-retrievable receipt."""
+
+        if reason not in {"explicit_denial", "manual_review_rejected"}:
+            return None
+        target_key = str(target_canonical_key or "").strip()
+        sources = list(
+            dict.fromkeys(
+                str(item).strip() for item in source_msg_ids if str(item).strip()
+            )
+        )
+        if not target_key or not sources:
+            return None
+        receipt_key = "invalidation|" + hashlib.sha256(
+            (target_key + "\n" + "\n".join(sorted(sources))).encode("utf-8")
+        ).hexdigest()
+        existing_receipt = self.session.scalars(
+            select(MemoryItem).where(
+                MemoryItem.scope_type == "group",
+                MemoryItem.scope_id == scope_id,
+                MemoryItem.canonical_key == receipt_key,
+                MemoryItem.memory_kind == "expired",
+            )
+        ).first()
+        if existing_receipt is not None:
+            return existing_receipt
+
+        targets = list(
+            self.session.scalars(
+                select(MemoryItem).where(
+                    MemoryItem.scope_type == "group",
+                    MemoryItem.scope_id == scope_id,
+                    MemoryItem.canonical_key == target_key,
+                    MemoryItem.memory_kind.in_(("profile", "preference")),
+                    MemoryItem.status == "active",
+                )
+            )
+        )
+        if len(targets) != 1:
+            return None
+        target = targets[0]
+        if reason == "manual_review_rejected" and (
+            not expected_target_sha256
+            or hashlib.sha256(target_key.encode("utf-8")).hexdigest()
+            != str(expected_target_sha256).strip().casefold()
+        ):
+            return None
+        try:
+            group_id = int(scope_id)
+        except (TypeError, ValueError):
+            return None
+        source_rows = list(
+            self.session.scalars(
+                select(Message).where(
+                    Message.group_id == group_id,
+                    Message.platform_msg_id.in_(sources),
+                )
+            )
+        )
+        if len(source_rows) != len(sources):
+            return None
+        if reason == "explicit_denial" and any(
+            str(row.user_id) != str(target.subject_id) for row in source_rows
+        ):
+            return None
+
+        receipt = MemoryItem(
+            scope_type="group",
+            scope_id=scope_id,
+            subject_type=target.subject_type,
+            subject_id=target.subject_id,
+            memory_kind="expired",
+            canonical_key=receipt_key,
+            predicate=reason,
+            object_text=target_key,
+            content=(
+                "An explicit denial invalidated a prior memory fact."
+                if reason == "explicit_denial"
+                else "A manual evidence review rejected a prior memory fact."
+            ),
+            importance=1,
+            confidence=1.0,
+            source_msg_id=sources[0],
+            source_msg_ids=sources,
+            mention_count=len(sources),
+            valid_from=valid_until,
+            valid_until=valid_until,
+            expires_at=valid_until,
+            status="superseded",
+            supersedes_id=target.id,
+        )
+        self.session.add(receipt)
+        self.session.flush()
+        self.mark_superseded(
+            memory_id=target.id,
+            superseded_by_id=receipt.id,
+            valid_until=valid_until,
+        )
+        return receipt
 
     def find_unique_correction_candidate(
         self,

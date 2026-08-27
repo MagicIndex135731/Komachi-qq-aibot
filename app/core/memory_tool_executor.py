@@ -8,7 +8,13 @@ import logging
 import re
 from typing import Any, Mapping, Sequence
 
-from app.core.memory_compaction import canonical_key, is_addressing_rule
+from app.core.memory_compaction import (
+    canonical_key,
+    is_addressing_rule,
+    is_single_value_profile_attribute,
+    profile_sources_directly_support,
+    single_value_profile_attribute_predicates,
+)
 from app.core.memory_fact_ranking import select_diverse_portrait_facts
 from app.core.memory_tools import (
     MEMORY_TOOL_KINDS,
@@ -275,10 +281,23 @@ class MemoryToolExecutor:
 
         with session_scope(self._engine) as session:
             messages = MessageRepository(session)
+            source_rows = []
             for source_id in source_ids:
                 row = messages.get_by_platform_msg_id(source_id)
                 if row is None or int(row.group_id or 0) != self._group_id:
                     return '{"error":"source_not_in_group"}'
+                source_rows.append(row)
+            if subject != "group" and any(
+                str(row.user_id) != subject for row in source_rows
+            ):
+                return '{"error":"source_author_mismatch"}'
+            if kind == "profile" and not profile_sources_directly_support(
+                predicate=predicate,
+                object_text=object_text,
+                content=content,
+                source_texts=tuple(str(row.plain_text or "") for row in source_rows),
+            ):
+                return '{"error":"profile_source_not_direct"}'
             memory = MemoryRepository(session).upsert_canonical_memory(
                 scope_type="group",
                 scope_id=str(self._group_id),
@@ -300,8 +319,19 @@ class MemoryToolExecutor:
                 valid_from=self._now,
                 valid_until=None,
                 replace_previous=(
-                    kind == "preference"
-                    and is_addressing_rule(predicate, object_text, content)
+                    (
+                        kind == "preference"
+                        and is_addressing_rule(predicate, object_text, content)
+                    )
+                    or (
+                        kind == "profile"
+                        and is_single_value_profile_attribute(predicate)
+                    )
+                ),
+                replacement_predicates=(
+                    single_value_profile_attribute_predicates(predicate)
+                    if kind == "profile"
+                    else ()
                 ),
             )
             memory_id = int(memory.id)

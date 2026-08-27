@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import hashlib
 
 from sqlalchemy import text
 
@@ -406,6 +407,146 @@ def test_canonical_memory_merges_sources_and_removes_superseded_search_entries(s
     assert vector_found == []
 
 
+def test_exact_invalidation_is_auditable_idempotent_and_removes_active_search(
+    sqlite_engine,
+) -> None:
+    observed_at = datetime(2026, 8, 24, 12, 39, 19, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="test",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=42,
+            nickname="Alice",
+            group_card="",
+        )
+        MessageRepository(session).add_group_message(
+            platform_msg_id="deny-age",
+            group_id=10001,
+            user_id=42,
+            timestamp=observed_at,
+            plain_text="我不是40岁",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=True,
+        )
+        memories = MemoryRepository(session)
+        target = memories.upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="profile",
+            canonical_key="profile|42|age|40岁",
+            predicate="age",
+            object_text="40岁",
+            content="Alice is 40 years old.",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=["old-age"],
+        )
+        receipt = memories.invalidate_canonical_memory(
+            scope_id="10001",
+            target_canonical_key="profile|42|age|40岁",
+            source_msg_ids=["deny-age"],
+            valid_until=observed_at,
+        )
+        repeated = memories.invalidate_canonical_memory(
+            scope_id="10001",
+            target_canonical_key="profile|42|age|40岁",
+            source_msg_ids=["deny-age"],
+            valid_until=observed_at,
+        )
+        found = memories.search_group_memories_fts(
+            scope_id="10001",
+            query="40 years old",
+            limit=5,
+            subject_ids=("42",),
+        )
+
+    assert receipt is not None
+    assert repeated is not None
+    assert repeated.id == receipt.id
+    assert receipt.status == "superseded"
+    assert receipt.memory_kind == "expired"
+    assert receipt.source_msg_ids == ["deny-age"]
+    assert target.status == "superseded"
+    assert target.superseded_by_id == receipt.id
+    assert found == []
+
+
+def test_cross_subject_source_requires_explicit_manual_review_reason(sqlite_engine) -> None:
+    observed_at = datetime(2026, 8, 24, 12, 39, 19, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="test",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(user_id=42, nickname="Alice", group_card="")
+        UserRepository(session).upsert_user(user_id=43, nickname="Reviewer", group_card="")
+        MessageRepository(session).add_group_message(
+            platform_msg_id="review-source",
+            group_id=10001,
+            user_id=43,
+            timestamp=observed_at,
+            plain_text="这条旧画像不对。",
+            raw_json={},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=True,
+        )
+        memories = MemoryRepository(session)
+        target = memories.upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="profile",
+            canonical_key="profile|42|nationality|wrong",
+            predicate="nationality",
+            object_text="wrong",
+            content="Wrong legacy profile.",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=["old-source"],
+        )
+        rejected = memories.invalidate_canonical_memory(
+            scope_id="10001",
+            target_canonical_key=target.canonical_key,
+            source_msg_ids=["review-source"],
+            valid_until=observed_at,
+        )
+        missing_hash = memories.invalidate_canonical_memory(
+            scope_id="10001",
+            target_canonical_key=target.canonical_key,
+            source_msg_ids=["review-source"],
+            valid_until=observed_at,
+            reason="manual_review_rejected",
+        )
+        receipt = memories.invalidate_canonical_memory(
+            scope_id="10001",
+            target_canonical_key=target.canonical_key,
+            source_msg_ids=["review-source"],
+            valid_until=observed_at,
+            reason="manual_review_rejected",
+            expected_target_sha256=hashlib.sha256(
+                target.canonical_key.encode("utf-8")
+            ).hexdigest(),
+        )
+
+    assert rejected is None
+    assert missing_hash is None
+    assert receipt is not None
+    assert receipt.predicate == "manual_review_rejected"
+    assert target.status == "superseded"
+
+
 def test_canonical_upsert_upgrades_same_source_legacy_memory(sqlite_engine) -> None:
     with session_scope(sqlite_engine) as session:
         memories = MemoryRepository(session)
@@ -468,6 +609,79 @@ def test_canonical_upsert_upgrades_same_source_legacy_memory(sqlite_engine) -> N
     assert duplicate.status == "superseded"
     assert old_batch_duplicate.status == "superseded"
     assert later_legacy.status == "superseded"
+
+
+def test_replace_previous_never_supersedes_a_different_memory_kind(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        old_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|age|20", predicate="age",
+            object_text="20", content="Alice is 20.", importance=4, confidence=0.9,
+            source_msg_ids=["profile-old"],
+        )
+        unrelated_preference = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="preference", canonical_key="preference|42|age|retro", predicate="age",
+            object_text="retro", content="Alice prefers retro ages in games.", importance=3,
+            confidence=0.8, source_msg_ids=["preference-source"],
+        )
+        new_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|age|21", predicate="age",
+            object_text="21", content="Alice is 21.", importance=4, confidence=0.9,
+            source_msg_ids=["profile-new"], replace_previous=True,
+        )
+
+    assert old_profile.status == "superseded"
+    assert old_profile.superseded_by_id == new_profile.id
+    assert unrelated_preference.status == "active"
+
+
+def test_replace_previous_supersedes_equivalent_profile_predicate_alias(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        old_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|居住地|上海", predicate="居住地",
+            object_text="上海", content="用户居住在上海。", importance=4, confidence=0.9,
+            source_msg_ids=["profile-old"],
+        )
+        new_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|location|深圳", predicate="location",
+            object_text="深圳", content="用户现在居住在深圳。", importance=4, confidence=0.9,
+            source_msg_ids=["profile-new"], replace_previous=True,
+            replacement_predicates=("location", "residence", "所在地", "居住地", "常住地"),
+        )
+
+    assert old_profile.status == "superseded"
+    assert old_profile.superseded_by_id == new_profile.id
+
+
+def test_replace_previous_matches_profile_predicate_case_insensitively(
+    sqlite_engine,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        old_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|Location|上海", predicate="Location",
+            object_text="上海", content="Alice lives in Shanghai.", importance=4, confidence=0.9,
+            source_msg_ids=["profile-old"],
+        )
+        new_profile = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user", subject_id="42",
+            memory_kind="profile", canonical_key="profile|42|location|深圳", predicate="location",
+            object_text="深圳", content="Alice lives in Shenzhen.", importance=4, confidence=0.9,
+            source_msg_ids=["profile-new"], replace_previous=True,
+            replacement_predicates=("location", "residence", "所在地", "居住地", "常住地"),
+        )
+
+    assert old_profile.status == "superseded"
+    assert old_profile.superseded_by_id == new_profile.id
 
 
 def test_supersession_requires_matching_object_and_specific_content(sqlite_engine) -> None:

@@ -172,9 +172,55 @@ _FIRST_PERSON_OWNERSHIP_PATTERN = re.compile(
 )
 _SELF_RELATIONSHIP_QUERY_PATTERN = re.compile(
     r"^\s*(?:我(?:是|算)?(?:你(?:的)?)?(?:谁|什么人)|"
-    r"你(?:觉得|认为)?我(?:是|算)?你(?:的)?(?:谁|什么人)|"
+    r"你(?:觉得|认为)?我(?:是|算)?(?:你(?:的)?)?(?:谁|什么人)|"
     r"(?:你|您).{0,16}?(?:该|应该)?(?:怎么)?(?:称呼|叫).{0,8}?(?:我|本人))\s*[？?]?\s*$"
 )
+_BOT_SELF_IDENTITY_QUERY_PATTERN = re.compile(
+    r"^\s*(?:请问|想问(?:一下)?|我想问(?:一下)?)?\s*"
+    r"(?:你|您)(?:到底|究竟)?(?:是)?"
+    r"(?:谁|叫什么(?:名字|名)?|叫啥(?:名字|名)?|是什么(?:人|身份)?|"
+    r"是干嘛的|是做什么的)\s*[？?]?\s*$"
+)
+_BOT_SELF_IDENTITY_CORRECTION_PATTERN = re.compile(
+    r"(?:我)?(?:问|说)的?是\s*(?:你|您)(?:到底|究竟)?(?:是)?谁"
+    r".{0,16}?(?:不是|而不是)\s*我(?:是)?谁"
+)
+
+
+def is_bot_self_identity_query(
+    query: str,
+    *,
+    bot_names: Sequence[str] = (),
+) -> bool:
+    """Whether the user asks for the bot's own identity, not a member's."""
+
+    text = str(query or "").strip()
+    # OneBot mention rendering normally leaves a separating space.  Strip only
+    # such leading display mentions so an arbitrary compact token is not lost.
+    text = re.sub(r"^(?:@[^\s，,:：]+[\s，,:：]+)+", "", text).strip()
+    for name in sorted(
+        {str(value).strip() for value in bot_names if str(value).strip()},
+        key=len,
+        reverse=True,
+    ):
+        text = re.sub(
+            rf"^(?:@?{re.escape(name)}[\s，,:：]*)+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+    return bool(
+        _BOT_SELF_IDENTITY_QUERY_PATTERN.fullmatch(text)
+        or _BOT_SELF_IDENTITY_CORRECTION_PATTERN.search(text)
+    )
+
+
+def is_requester_identity_query(query: str) -> bool:
+    """Whether the user asks for their own remembered identity or portrait."""
+
+    return _SELF_RELATIONSHIP_QUERY_PATTERN.fullmatch(str(query or "").strip()) is not None
+
+
 _ASSESSMENT_PATTERN = re.compile(
     r"评价|点评|印象|怎么看|性格|分析(?:一下)?(?:我|[\u4e00-\u9fffA-Za-z0-9_-]+)"
     r"|(?:觉得|感觉|认为|以为|看来|听起来|看起来|咋看|啥看法)"
@@ -464,6 +510,26 @@ class MemoryQueryResolver:
             or _HISTORY_PATTERN.search(original)
             or answer_mode in {"mention", "summary", "assessment"}
         )
+
+        if is_bot_self_identity_query(original):
+            # Second-person bot identity is persona knowledge, not member
+            # memory.  Keep the query unbound so a trailing correction such as
+            # "不是我是谁" cannot accidentally load the requester's profile.
+            return ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query=original,
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=False,
+                needs_detail=needs_detail,
+                group_id=normalized_group_id,
+                requester_id=normalized_requester_id,
+                subject_binding="unbound",
+                answer_mode="general_history",
+                coverage_mode="relevance",
+                subject_role="bot",
+                semantic_general=True,
+            )
 
         if (
             normalized_requester_id is not None
@@ -1364,9 +1430,6 @@ class MemoryQueryResolver:
         return has_weak_alias and has_strong_alias
 
     @staticmethod
-    @staticmethod
-    @staticmethod
-    @staticmethod
     def _has_unknown_joined_member(
         query: str,
         group_members: Sequence[GroupMemberIdentity],
@@ -1500,8 +1563,19 @@ class MemoryQueryResolver:
             )
             if speech is not None:
                 target = speech.group("target")
+                normalized_target = normalize_member_alias(target)
+                target_is_known_alias = any(
+                    normalized_target == alias for alias in all_aliases
+                )
+                # A single known alias after “说/提到” can itself be the
+                # question's subject (for example “为什么说 Maple 是…”). It is
+                # not evidence of a second person. Two distinct known aliases
+                # are handled by the span check below.
+                if target_is_known_alias:
+                    target = ""
                 if (
-                    not looks_like_placeholder(target)
+                    target
+                    and not looks_like_placeholder(target)
                     and not any(
                         normalize_member_alias(target) == alias
                         and normalize_member_alias(alias) in common_aliases

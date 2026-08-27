@@ -705,6 +705,38 @@ def test_citation_repair_exhaustion_keeps_original_answer_fail_closed() -> None:
     assert outcome.protocol_failure_codes == ("citation_repair_invalid",)
 
 
+def test_citation_repair_allows_only_canonical_abstention_for_empty_allowlist() -> None:
+    original = GeneratedAnswer("recent-only claim", ("recent-1",), False)
+    fixed = json.dumps(
+        {
+            "answer": FIXED_ABSTENTION_ANSWER,
+            "cited_source_message_ids": [],
+            "abstained": True,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    transport = _SequenceGenerationTransport(
+        [
+            '{"answer":"changed","cited_source_message_ids":[],"abstained":true}',
+            fixed,
+        ]
+    )
+
+    outcome = _generate_citation_repair_with_retry(
+        transport,
+        ["repair"],
+        model="generator",
+        attempts=2,
+        original_answer=original,
+        allowed_citation_ids=(),
+    )
+
+    assert transport.call_count == 2
+    assert outcome.answer == GeneratedAnswer(FIXED_ABSTENTION_ANSWER, (), True)
+    assert outcome.protocol_failure_codes == ()
+
+
 def test_fail_closed_judgment_does_not_upgrade_unsupported_answers() -> None:
     raw = JudgeDecision(True, True, False, "supported")
     answer = GeneratedAnswer("ok", ("m1",), False)

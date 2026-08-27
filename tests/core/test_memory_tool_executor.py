@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.memory_tool_executor import MemoryToolExecutor, _relative_day_range
 from app.storage.db import session_scope
+from app.storage.models import MemoryItem
 from app.storage.repositories import (
     GroupRepository,
     MemoryRepository,
@@ -250,6 +251,65 @@ def test_memory_write_persists_source_backed_fact(sqlite_engine) -> None:
     assert any("提问者喜欢喝冰美式" in row.content for row in rows)
 
 
+def test_memory_write_replaces_equivalent_single_value_profile_predicate(
+    sqlite_engine,
+) -> None:
+    _seed(sqlite_engine)
+    with session_scope(sqlite_engine) as session:
+        source = MessageRepository(session).add_group_message(
+            platform_msg_id="profile-location-source",
+            group_id=100,
+            user_id=99,
+            timestamp=datetime(2026, 7, 23, 12, 2, tzinfo=UTC),
+            plain_text="我现在居住在深圳",
+            raw_json={"sender": {"card": "提问者"}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        old = MemoryRepository(session).upsert_canonical_memory(
+            scope_type="group",
+            scope_id="100",
+            subject_type="user",
+            subject_id="99",
+            memory_kind="profile",
+            canonical_key="profile|99|居住地|上海",
+            predicate="居住地",
+            object_text="上海",
+            content="提问者居住在上海",
+            importance=1,
+            confidence=0.6,
+            source_msg_ids=["old-location-source"],
+        )
+        old_id = int(old.id)
+        session.flush()
+        assert source.id is not None
+
+    output = _executor(
+        sqlite_engine,
+        recent_source_ids=("profile-location-source",),
+    ).execute(
+        "memory_write",
+        {
+            "kind": "profile",
+            "subject": "99",
+            "predicate": "location",
+            "object_text": "深圳",
+            "content": "我现在居住在深圳",
+            "source_msg_ids": ["profile-location-source"],
+        },
+    )
+
+    assert output.startswith('{"memory_id":')
+    with session_scope(sqlite_engine) as session:
+        old = session.get(MemoryItem, old_id)
+        active = MemoryRepository(session).list_group_memories_for_subject(
+            scope_id="100", subject_id="99", limit=10
+        )
+    assert old is not None and old.status == "superseded"
+    assert any(row.predicate == "location" and row.status == "active" for row in active)
+
+
 def test_memory_write_accepts_source_backed_self_relationship(sqlite_engine) -> None:
     _seed(sqlite_engine)
     output = _executor(sqlite_engine).execute(
@@ -278,7 +338,7 @@ def test_memory_write_rejects_scope_and_source_violations(sqlite_engine) -> None
     _seed(sqlite_engine)
     executor = _executor(
         sqlite_engine,
-        recent_source_ids=("tool-query", "tool-cross-200"),
+        recent_source_ids=("tool-query", "tool-cross-200", "tool-source"),
     )
     base = {
         "kind": "preference",
@@ -299,10 +359,60 @@ def test_memory_write_rejects_scope_and_source_violations(sqlite_engine) -> None
         "memory_write",
         {**base, "source_msg_ids": ["tool-cross-200"]},
     ) == '{"error":"source_not_in_group"}'
+    assert executor.execute(
+        "memory_write",
+        {**base, "source_msg_ids": ["tool-source"]},
+    ) == '{"error":"source_author_mismatch"}'
     assert executor.execute("memory_write", {**base, "kind": "expired"}) == (
         '{"error":"kind is not in the allowed set"}'
     )
     assert executor.execute("unknown_tool", {}) == '{"error":"unknown_tool"}'
+
+
+def test_memory_write_profile_requires_direct_self_authored_source(sqlite_engine) -> None:
+    _seed(sqlite_engine)
+    with session_scope(sqlite_engine) as session:
+        messages = MessageRepository(session)
+        for source_id, text in (
+            ("profile-direct", "我今年四十岁"),
+            ("profile-future", "等我四十岁再看全金属狂潮"),
+        ):
+            messages.add_group_message(
+                platform_msg_id=source_id,
+                group_id=100,
+                user_id=99,
+                timestamp=datetime(2026, 7, 23, 12, 2, tzinfo=UTC),
+                plain_text=text,
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=True,
+            )
+    base = {
+        "kind": "profile",
+        "subject": "99",
+        "predicate": "年龄",
+        "object_text": "四十岁",
+        "content": "提问者今年四十岁",
+    }
+    executor = _executor(
+        sqlite_engine,
+        recent_source_ids=("profile-direct", "profile-future", "tool-source"),
+    )
+
+    accepted = executor.execute(
+        "memory_write", {**base, "source_msg_ids": ["profile-direct"]}
+    )
+    future = executor.execute(
+        "memory_write", {**base, "source_msg_ids": ["profile-future"]}
+    )
+    other_author = executor.execute(
+        "memory_write", {**base, "source_msg_ids": ["tool-source"]}
+    )
+
+    assert accepted.startswith('{"memory_id":')
+    assert future == '{"error":"profile_source_not_direct"}'
+    assert other_author == '{"error":"source_author_mismatch"}'
 
 
 def test_relative_day_range_resolves_shanghai_days() -> None:

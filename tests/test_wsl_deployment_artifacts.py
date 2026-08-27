@@ -266,7 +266,7 @@ def test_wsl_env_example_has_no_real_secrets() -> None:
     assert "GROUP_STREAM_WATCH_GROUP_ID=" in env_example
 
 
-def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> None:
+def test_memory_orchestration_env_and_wsl_runbook_define_a_safe_bot_only_rollout() -> None:
     env_example = (REPO_ROOT / "infra/wsl/.env.example").read_text(encoding="utf-8")
     root_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     wsl_readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
@@ -312,7 +312,7 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
     for setting in required_settings:
         assert setting in env_example
 
-    for documentation in (root_readme, wsl_readme):
+    for documentation in (wsl_readme,):
         assert "MEMORY_ORCHESTRATION_V2_ENABLED=true" in documentation
         assert "MEMORY_EMBEDDING_PROVIDER=disabled" in documentation
         assert "MEMORY_EMBEDDING_DEVICE=auto" in documentation
@@ -323,7 +323,8 @@ def test_memory_orchestration_env_and_docs_define_a_safe_bot_only_rollout() -> N
         assert "xiaomachi-llbot" in documentation
     assert "/workspace/data/models" in wsl_readme
     assert "must not restart xiaomachi-llbot" in wsl_readme
-    assert "MEMORY_ORCHESTRATION_V2_ENABLED" in root_readme
+    assert "[WSL/Docker 部署与运维](infra/wsl/README.md)" in root_readme
+    assert "MEMORY_ORCHESTRATION_V2_ENABLED" not in root_readme
 
 
 def test_gitignore_excludes_wsl_runtime_state() -> None:

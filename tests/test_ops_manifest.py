@@ -28,7 +28,7 @@ def test_supported_wsl_operations_files_exist() -> None:
     assert not missing, f"missing WSL operations files: {missing}"
 
 
-def test_readme_documents_only_supported_wsl_launchers() -> None:
+def test_root_readme_routes_wsl_operations_to_authoritative_docs() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     for launcher in (
@@ -36,34 +36,31 @@ def test_readme_documents_only_supported_wsl_launchers() -> None:
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
         "open-napcat-webui.bat",
+        "open-llbot-webui.bat",
     ):
         assert launcher in readme
-    assert "infra/wsl/.env" in readme
-    assert "SEARCH_API_KEY" in readme
-    assert "CONTEXT_RECENT_LIMIT" in readme
+    assert "[WSL/Docker 部署与运维](infra/wsl/README.md)" in readme
+    assert "[工程架构与运行原理](docs/ARCHITECTURE.md)" in readme
+    assert "[`infra/wsl/.env.example`](infra/wsl/.env.example)" in readme
     assert "start_xiaomachi.ps1" not in readme
     assert "NAPCAT_SHELL_DIR" not in readme
     assert "QQ_EXE_PATH" not in readme
 
 
-def test_readme_describes_the_current_v10_memory_and_release_baseline() -> None:
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    normalized_readme = " ".join(readme.split())
+def test_wsl_documents_own_exact_runtime_configuration_contracts() -> None:
+    root_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    wsl_readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
+    env_example = (REPO_ROOT / "infra/wsl/.env.example").read_text(encoding="utf-8")
 
-    required = [
-        "当前生产基线（v10）",
-        "300/300",
-        "275/300（91.67%）",
-        "MEMORY_QUERY_REWRITE_ENABLED=false",
-        "configs/groups.local.yaml",
-        "共享运行配置",
-        "评测链路",
-        "不会加入 QQ 正常回复链路",
-    ]
-    for item in required:
-        assert item in normalized_readme
-
-    assert "分层/记忆工具/语义排序/改写均开启" not in normalized_readme
+    # The concise root README points operators to the authoritative documents;
+    # exact settings and release procedures belong to the WSL runbook/template.
+    assert "SEARCH_API_KEY" not in root_readme
+    assert "MEMORY_QUERY_REWRITE_ENABLED=false" not in root_readme
+    assert "SEARCH_API_KEY=" in env_example
+    assert "CONTEXT_RECENT_LIMIT=60" in env_example
+    assert "MEMORY_QUERY_REWRITE_ENABLED=false" in env_example
+    assert "MEMORY_ORCHESTRATION_V2_ENABLED=true" in wsl_readme
+    assert "Memory V3 发布与回滚" in wsl_readme
 
 
 def test_groups_manifest_enables_target_group() -> None:

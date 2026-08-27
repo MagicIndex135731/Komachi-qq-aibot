@@ -57,6 +57,7 @@ _ADDRESSING_TARGET_QQ_PATTERN = re.compile(r"(?:对用户|对|针对)\s*[“\"']
 _MAX_SUMMARY_CHARS = 2_000
 _MAX_FIELD_CHARS = 600
 _MAX_FACTS = 64
+_MAX_INVALIDATIONS = 32
 _ROLLING_PREFIX = re.compile(
     r"^\s*(?:(?:rolling group memory|structured memory(?: digest)?|memory digest|summary)\s*:\s*|(?:滚动群记忆|结构化记忆|记忆摘要|摘要)\s*[：:]\s*)",
     re.IGNORECASE,
@@ -67,6 +68,38 @@ _DIGEST_SUMMARY = re.compile(
 )
 _WHITESPACE = re.compile(r"\s+")
 _COLLECTIVE_PATTERN = re.compile(r"(?:大家|我们|群里|群内|全员|\bwe\b|\bour\b|\bgroup\b|\beveryone\b)", re.IGNORECASE)
+_SINGLE_VALUE_PROFILE_ATTRIBUTE_ALIASES = {
+    "age": frozenset({"age", "年龄", "岁数"}),
+    "nationality": frozenset({"nationality", "国籍"}),
+    "origin": frozenset({"hometown", "origin", "籍贯", "家乡", "老家", "出生地"}),
+    "location": frozenset({"residence", "location", "所在地", "居住地", "常住地"}),
+}
+_AGE_VALUE_PATTERN = re.compile(r"(?P<age>\d{1,3})\s*岁")
+_FUTURE_AGE_PATTERN = re.compile(
+    r"(?:等到?|到了?|到|等)\s*(?:\d{1,3}|[零〇一二两三四五六七八九十]{1,3})\s*岁|"
+    r"(?:\d{1,3}|[零〇一二两三四五六七八九十]{1,3})\s*岁.{0,8}?(?:再|以后|之后|的时候)"
+)
+_EXPLICIT_DENIAL_PATTERN = re.compile(
+    r"不是|并非|才不是|没有|没看过|没读过|不看|不喜欢|说错|错误|不对|假的|作废|别再说|别乱说|哪有|什么时候.{0,12}(?:岁|\d)"
+)
+_CJK_TERM_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
+_CHINESE_AGE_PATTERN = re.compile(
+    r"(?P<age>[零〇一二两三四五六七八九十]{1,3})\s*岁"
+)
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +118,24 @@ class MemoryFact:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryInvalidation:
+    """A source-backed request to retire one exact active canonical fact."""
+
+    target_canonical_key: str
+    source_msg_ids: tuple[str, ...]
+    reason: str = "explicit_denial"
+    valid_until: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryCompaction:
     """Validated model result. Facts are source-backed and de-duplicated."""
 
     summary: str
     facts: tuple[MemoryFact, ...] = ()
+    invalidations: tuple[MemoryInvalidation, ...] = ()
     rejected_fact_count: int = 0
+    rejected_invalidation_count: int = 0
 
 
 def is_addressing_rule(*values: object) -> bool:
@@ -101,9 +146,184 @@ def is_addressing_rule(*values: object) -> bool:
     ) is not None
 
 
+def is_single_value_profile_attribute(predicate: object) -> bool:
+    """Whether a newer profile value should replace the older same attribute."""
+
+    return bool(single_value_profile_attribute_predicates(predicate))
+
+
+def single_value_profile_attribute_predicates(predicate: object) -> tuple[str, ...]:
+    """Return all exact predicate spellings that share one profile slot."""
+
+    normalized = str(predicate or "").strip().casefold()
+    for aliases in _SINGLE_VALUE_PROFILE_ATTRIBUTE_ALIASES.values():
+        if normalized in {value.casefold() for value in aliases}:
+            return tuple(sorted(aliases))
+    return ()
+
+
+def _canonical_profile_predicate(predicate: object) -> str:
+    normalized = str(predicate or "").strip().casefold()
+    for slot, aliases in _SINGLE_VALUE_PROFILE_ATTRIBUTE_ALIASES.items():
+        if normalized in {value.casefold() for value in aliases}:
+            return slot
+    return str(predicate or "")
+
+
+def derive_explicit_memory_invalidations(
+    *,
+    messages: Sequence[Mapping[str, Any]],
+    active_correction_targets: Sequence[Mapping[str, Any]],
+) -> tuple[MemoryInvalidation, ...]:
+    """Derive only direct, same-subject denials of an exact catalog object."""
+
+    sources_by_target: dict[str, set[str]] = {}
+    for message in messages:
+        source_id = _clean_text(
+            message.get("source_msg_id") or message.get("platform_msg_id"),
+            limit=128,
+        )
+        subject_id = _clean_text(message.get("user_id"), limit=128)
+        text = _clean_text(
+            message.get("plain_text") or message.get("text") or message.get("content"),
+            limit=_MAX_SUMMARY_CHARS,
+        )
+        if not source_id or not subject_id or not _EXPLICIT_DENIAL_PATTERN.search(text):
+            continue
+        for target in active_correction_targets:
+            if str(target.get("subject_id") or "") != subject_id:
+                continue
+            if str(target.get("memory_kind") or "") not in {"profile", "preference"}:
+                continue
+            key = _clean_text(target.get("target_canonical_key"), limit=255)
+            object_text = _clean_text(target.get("object_text"), limit=_MAX_FIELD_CHARS)
+            if not key or not object_text:
+                continue
+            if _message_explicitly_denies_target(text=text, target=target):
+                sources_by_target.setdefault(key, set()).add(source_id)
+    return tuple(
+        MemoryInvalidation(
+            target_canonical_key=key,
+            source_msg_ids=tuple(sorted(source_ids)),
+        )
+        for key, source_ids in sorted(sources_by_target.items())
+    )
+
+
+def _message_explicitly_denies_target(
+    *, text: str, target: Mapping[str, Any]
+) -> bool:
+    """Match a denial locally to its target; fail closed on negated negations."""
+
+    object_text = _clean_text(target.get("object_text"), limit=_MAX_FIELD_CHARS)
+    predicate = _clean_text(target.get("predicate"), limit=_MAX_FIELD_CHARS)
+    memory_kind = str(target.get("memory_kind") or "")
+    if not object_text or memory_kind not in {"profile", "preference"}:
+        return False
+    if re.search(
+        r"(?:没有|没|不是)\s*(?:说过?|表示|承认)?\s*(?:不喜欢|不看|不读|不是)|"
+        r"(?:其实|仍然|还是|就是|确实)\s*(?:喜欢|在看|是)",
+        text,
+    ):
+        return False
+
+    age_values = _extract_age_values(object_text)
+    if age_values and (
+        memory_kind == "profile"
+        or re.search(r"age|年龄|岁数|年龄阶段", predicate, re.IGNORECASE)
+    ):
+        return any(_directly_denies_age(text, age) for age in age_values)
+
+    terms = _target_lexical_terms(object_text)
+    if not terms:
+        return False
+    for term in terms:
+        escaped = re.escape(term)
+        if re.search(
+            rf"(?:我|本人)?\s*(?:不是|并非|才不是|没看过|没读过|不看|不读|不喜欢|不爱)"
+            rf".{{0,10}}{escaped}|{escaped}.{{0,10}}(?:不是真的|是假的|不对|错误|说错|作废)",
+            text,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
+def _directly_denies_age(text: str, age: int) -> bool:
+    aliases = {str(age), _format_chinese_number(age)}
+    alias_pattern = "(?:" + "|".join(re.escape(value) for value in aliases) + ")"
+    if re.search(
+        rf"(?:我|本人)\s*(?:今年)?\s*(?:就是|确实是|是)\s*{alias_pattern}\s*岁",
+        text,
+    ):
+        return False
+    return re.search(
+        rf"(?:我|本人)?\s*(?:不是|并非|才不是|没到|不到|不满)\s*{alias_pattern}\s*岁|"
+        rf"(?:我|本人).{{0,6}}(?:哪有|什么时候).{{0,6}}{alias_pattern}(?:\s*岁|了|啊|呀|呢|[？?！!]|$)|"
+        rf"{alias_pattern}\s*岁.{{0,6}}(?:不对|错误|假的|说错)|"
+        rf"(?:不对|错误|说错).{{0,8}}(?:年近|接近)?\s*{alias_pattern}\s*(?:岁)?\s*(?:哪来的|从哪来)",
+        text,
+    ) is not None
+
+
+def _target_lexical_terms(object_text: str) -> tuple[str, ...]:
+    normalized = _canonical_part(object_text)
+    terms: set[str] = {normalized} if len(normalized) >= 2 else set()
+    for raw_term in _CJK_TERM_PATTERN.findall(object_text):
+        term = raw_term.casefold()
+        if len(term) >= 2:
+            terms.add(term)
+        if len(term) >= 4:
+            terms.update(term[index : index + 4] for index in range(len(term) - 3))
+    return tuple(sorted(terms, key=lambda value: (-len(value), value)))
+
+
+def _format_chinese_number(value: int) -> str:
+    digits = "零一二三四五六七八九"
+    if value < 10:
+        return digits[value]
+    if value < 20:
+        return "十" + (digits[value % 10] if value % 10 else "")
+    if value < 100:
+        return digits[value // 10] + "十" + (digits[value % 10] if value % 10 else "")
+    return str(value)
+
+
+def _extract_age_values(text: object) -> set[int]:
+    """Extract comparable Arabic/Chinese ages without broad semantic guessing."""
+
+    value = str(text or "")
+    ages = {
+        int(match)
+        for match in re.findall(r"(?<!\d)(\d{1,3})(?!\d)", value)
+        if 0 < int(match) < 130
+    }
+    for match in _CHINESE_AGE_PATTERN.finditer(value):
+        parsed = _parse_chinese_number(match.group("age"))
+        if parsed is not None and 0 < parsed < 130:
+            ages.add(parsed)
+    return ages
+
+
+def _parse_chinese_number(value: str) -> int | None:
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = _CHINESE_DIGITS.get(left, 1) if left else 1
+        units = _CHINESE_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + units
+    digits = [_CHINESE_DIGITS.get(char) for char in value]
+    if not digits or any(digit is None for digit in digits):
+        return None
+    return int("".join(str(digit) for digit in digits))
+
+
 def canonical_key(kind: str, subject_id: str, predicate: str, object_text: str) -> str:
     """Return a stable fact identity insensitive to case, spacing and Unicode form."""
 
+    if str(kind or "").strip().casefold() == "profile":
+        predicate = _canonical_profile_predicate(predicate)
     return "|".join(_canonical_part(part) for part in (kind, subject_id, predicate, object_text))
 
 
@@ -113,6 +333,8 @@ def parse_memory_compaction_response(
     allowed_source_msg_ids: Iterable[str] | None = None,
     allowed_subject_ids: Iterable[str] | None = None,
     source_subject_ids: Mapping[str, str] | None = None,
+    source_contents: Mapping[str, str] | None = None,
+    allowed_invalidation_targets: Mapping[str, Mapping[str, str]] | None = None,
     fallback_text: str = "",
     strict: bool = False,
 ) -> MemoryCompaction:
@@ -153,16 +375,40 @@ def parse_memory_compaction_response(
                 allowed_sources=allowed_sources,
                 allowed_subjects=allowed_subjects,
                 source_subject_ids=source_subject_ids,
+                source_contents=source_contents,
             )
             if fact is None:
                 rejected_fact_count += 1
                 continue
             parsed.append(fact)
 
+    invalidations: list[MemoryInvalidation] = []
+    rejected_invalidation_count = 0
+    candidate_invalidations = payload.get("invalidations", [])
+    if isinstance(candidate_invalidations, list):
+        for candidate in candidate_invalidations[:_MAX_INVALIDATIONS]:
+            invalidation = _parse_invalidation(
+                candidate,
+                allowed_sources=allowed_sources,
+                source_subject_ids=source_subject_ids,
+                allowed_targets=allowed_invalidation_targets,
+            )
+            if invalidation is None:
+                rejected_invalidation_count += 1
+                continue
+            invalidations.append(invalidation)
+    elif candidate_invalidations is not None:
+        rejected_invalidation_count = 1
+
+    deduped_invalidations = {
+        item.target_canonical_key: item for item in invalidations
+    }
     return MemoryCompaction(
         summary=summary,
         facts=_dedupe_facts(parsed),
+        invalidations=tuple(deduped_invalidations.values()),
         rejected_fact_count=rejected_fact_count,
+        rejected_invalidation_count=rejected_invalidation_count,
     )
 
 
@@ -199,6 +445,7 @@ def build_memory_compaction_prompt(
     messages: Sequence[Mapping[str, Any]],
     previous_digest: str = "",
     language: str = "zh",
+    active_correction_targets: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """Build a bounded, bilingual-capable prompt for one compact JSON result."""
 
@@ -212,13 +459,16 @@ def build_memory_compaction_prompt(
         instructions = (
             "Compact the chat into auditable structured memory and write summary and fact content in Chinese. "
             "Output exactly one compact JSON object with no Markdown or explanation.\n"
-            "The object must contain summary (a non-empty string) and facts (an array). Each fact may contain only kind, "
+            "The object must contain summary (a non-empty string), facts (an array), and invalidations (an array). Each fact may contain only kind, "
             "subject_id, predicate, object_text, content, importance, confidence, source_msg_ids, valid_until.\n"
             "For a user fact, subject_id must be the numeric user_id of the author and every cited source must be written by that user. "
             "Use subject_id=group only for explicitly collective facts; cite at least two authors unless the source explicitly says everyone, the group, or we.\n"
             "Use only fact, preference, taboo, plan, decision, profile, relationship, event, running_joke, current, or expired as kind. "
             "Every fact needs at least one exact source_msg_id from the messages below. Never invent a source. "
             "If any field is uncertain, omit that fact instead of guessing. Return facts=[] when there is no durable fact.\n"
+            "For profile facts, require a direct declarative self-statement by that user. Never infer age from a future or hypothetical phrase such as '40岁再看', and never turn a question, joke, quotation, bot reply, another member's claim, or a denied claim into an active profile fact.\n"
+            "When the user explicitly denies or retracts an older fact repeated in this window, emit kind=expired with the same subject_id, predicate, and object_text as the rejected fact and cite the user's denial message. If the rejected target is not unique, omit the expiration. When the user also supplies a corrected stable value, emit a new profile fact for that value as well.\n"
+            "Prefer invalidations over kind=expired when the exact target is listed in Active correction targets below. Each invalidation may contain only target_canonical_key, source_msg_ids, reason, valid_until; copy target_canonical_key exactly, use reason=explicit_denial, and cite only the target user's direct denial. Never invent or approximately match a target key.\n"
             "importance must be an integer from 1 to 5, confidence a number from 0 to 1, and valid_until an ISO date/time or null. "
             "The previous digest is context only and is never evidence."
         )
@@ -226,6 +476,12 @@ def build_memory_compaction_prompt(
         lines.append(KIND_SEMANTIC_GUIDANCE_ZH)
         if previous:
             lines.extend(("Previous digest (context only, not evidence):", previous))
+        if active_correction_targets:
+            lines.append("Active correction targets (catalog only, not evidence):")
+            lines.extend(
+                json.dumps(dict(target), ensure_ascii=False, sort_keys=True)
+                for target in active_correction_targets
+            )
         lines.append("Citable messages:")
         lines.extend(message_lines or ["(none)"])
         return "\n".join(lines)
@@ -319,6 +575,7 @@ def _parse_fact(
     allowed_sources: set[str] | None,
     allowed_subjects: set[str] | None,
     source_subject_ids: Mapping[str, str] | None,
+    source_contents: Mapping[str, str] | None,
 ) -> MemoryFact | None:
     if not isinstance(candidate, Mapping):
         return None
@@ -382,6 +639,18 @@ def _parse_fact(
         source_authors = {str(source_subject_ids.get(source, "")) for source in source_ids}
         if len(source_authors) < 2 and not _COLLECTIVE_PATTERN.search(f"{content} {object_text}"):
             return None
+    if kind == "profile" and source_contents is not None:
+        source_texts = tuple(
+            str(source_contents.get(source, "") or "").strip()
+            for source in source_ids
+        )
+        if not profile_sources_directly_support(
+            predicate=predicate,
+            object_text=object_text,
+            content=content,
+            source_texts=source_texts,
+        ):
+            return None
     if candidate.get("valid_until") is not None and valid_until is None:
         return None
     return MemoryFact(
@@ -394,6 +663,160 @@ def _parse_fact(
         confidence=float(confidence),
         source_msg_ids=source_ids,
         valid_until=valid_until,
+    )
+
+
+def _parse_invalidation(
+    candidate: Any,
+    *,
+    allowed_sources: set[str] | None,
+    source_subject_ids: Mapping[str, str] | None,
+    allowed_targets: Mapping[str, Mapping[str, str]] | None,
+) -> MemoryInvalidation | None:
+    if not isinstance(candidate, Mapping) or allowed_targets is None:
+        return None
+    target_key = _clean_text(candidate.get("target_canonical_key"), limit=255)
+    reason = _clean_text(candidate.get("reason"), limit=32)
+    sources_raw = candidate.get("source_msg_ids")
+    valid_until = _parse_valid_until(candidate.get("valid_until"))
+    target = allowed_targets.get(target_key)
+    if (
+        not target_key
+        or target is None
+        or str(target.get("memory_kind") or "") not in {"profile", "preference"}
+        or reason != "explicit_denial"
+        or not isinstance(sources_raw, list)
+    ):
+        return None
+    source_ids = tuple(
+        sorted(
+            {
+                cleaned
+                for source in sources_raw
+                if (cleaned := _clean_text(source, limit=128))
+            }
+        )
+    )
+    if (
+        not source_ids
+        or len(source_ids) != len(sources_raw)
+        or (allowed_sources is not None and any(source not in allowed_sources for source in source_ids))
+    ):
+        return None
+    subject_id = str(target.get("subject_id") or "")
+    if not subject_id or source_subject_ids is None or any(
+        str(source_subject_ids.get(source, "")) != subject_id
+        for source in source_ids
+    ):
+        return None
+    if candidate.get("valid_until") is not None and valid_until is None:
+        return None
+    return MemoryInvalidation(
+        target_canonical_key=target_key,
+        source_msg_ids=source_ids,
+        reason=reason,
+        valid_until=valid_until,
+    )
+
+
+def profile_sources_directly_support(
+    *,
+    predicate: str,
+    object_text: str,
+    content: str,
+    source_texts: Sequence[str],
+) -> bool:
+    """Fail closed for high-risk profile inferences from self-authored chatter."""
+
+    texts = tuple(text for text in source_texts if text)
+    if not texts:
+        return False
+    combined = "\n".join(texts)
+    if any(_profile_source_is_non_declarative(text) for text in texts):
+        return False
+    if _FUTURE_AGE_PATTERN.search(combined):
+        return False
+    if not _profile_content_matches_object(content=content, object_text=object_text):
+        return False
+    escaped_object = re.escape(str(object_text or "").strip())
+    if escaped_object and re.search(
+        rf"(?:不是|并非|才不是|没有|没说过|别再说).{{0,12}}{escaped_object}|"
+        rf"{escaped_object}.{{0,12}}(?:不是真的|是假的|不对|作废)",
+        combined,
+        re.IGNORECASE,
+    ):
+        return False
+    age_values = _extract_age_values(object_text)
+    if age_values and re.search(
+        r"age|年龄|岁数|年龄阶段|岁", f"{predicate} {object_text}", re.IGNORECASE
+    ):
+        for age in age_values:
+            aliases = {str(age), _format_chinese_number(age)}
+            alias_pattern = "(?:" + "|".join(
+                re.escape(value) for value in aliases
+            ) + ")"
+            if any(
+                _FUTURE_AGE_PATTERN.search(text) is None
+                and re.search(
+                    rf"(?:我|本人).{{0,8}}(?:今年|已经|都|才|刚满|就是|是)?\s*"
+                    rf"{alias_pattern}\s*岁",
+                    text,
+                )
+                is not None
+                for text in texts
+            ):
+                return True
+        return False
+    if re.search(r"nationality|国籍", predicate, re.IGNORECASE):
+        return any(
+            re.search(
+                rf"(?:我|本人)\s*(?:是|来自)\s*.{{0,8}}{escaped_object}",
+                text,
+                re.IGNORECASE,
+            )
+            is not None
+            for text in texts
+        )
+    terms = _target_lexical_terms(object_text)
+    for text in texts:
+        if re.search(r"[？?]|(?:如果|假如|等到?|以后).{0,12}(?:我|本人)", text):
+            continue
+        for term in terms:
+            escaped_term = re.escape(term)
+            if re.search(
+                rf"(?:我|本人)(?:的)?[^。！？\n]{{0,24}}(?:是|叫|在|住在|来自|出生于|属于|有|为)"
+                rf"[^。！？\n]{{0,24}}{escaped_term}",
+                text,
+                re.IGNORECASE,
+            ):
+                return True
+    return False
+
+
+def _profile_source_is_non_declarative(text: str) -> bool:
+    """Reject questions and attributed claims before profile-specific parsing."""
+
+    return re.search(
+        r"[？?]|"
+        r"(?:谁|哪有|怎么|为何|为什么|是不是|难道|凭什么).{0,18}(?:我|本人)|"
+        r"(?:你|他|她|它|别人|人家|大家|他们|她们|群里).{0,12}"
+        r"(?:说|讲|觉得|认为|猜|听说|传|称).{0,18}(?:我|本人)|"
+        r"(?:我|本人).{0,18}(?:听说|被说成|被称为)",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _profile_content_matches_object(*, content: str, object_text: str) -> bool:
+    """Ensure the persisted prose cannot silently contradict its structured value."""
+
+    object_ages = _extract_age_values(object_text)
+    if object_ages:
+        return bool(object_ages.intersection(_extract_age_values(content)))
+    normalized_content = _canonical_part(content)
+    return any(
+        _canonical_part(term) in normalized_content
+        for term in _target_lexical_terms(object_text)
     )
 
 

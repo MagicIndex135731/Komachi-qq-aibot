@@ -38,8 +38,9 @@ from scripts import memory_test_fullchain as fullchain
 from scripts.memory_test_metrics import (
     category_counts,
     classification_metrics,
-    diff_metrics,
+    fullchain_baseline_diff,
     fullchain_metrics,
+    offline_baseline_diff,
 )
 
 
@@ -47,7 +48,7 @@ DEFAULT_WORKDIR = Path("data/test-platform")
 
 
 def _engine(database: Path):
-    return _build_engine(database)
+    return _build_engine(database, read_only=True)
 
 
 def _iter_rows(engine, statement: str, parameters: dict[str, Any] | None = None):
@@ -128,6 +129,8 @@ def stage_dataset(
     count: int,
     seed: int,
     group_ids: Sequence[int],
+    identity_audit_start: str | None = None,
+    identity_audit_end: str | None = None,
 ) -> dict[str, Any]:
     engine = _engine(database)
     cases = dataset_builder.build_cases(
@@ -135,6 +138,8 @@ def stage_dataset(
         count=count,
         seed=seed,
         group_ids=group_ids or None,
+        identity_audit_start=identity_audit_start,
+        identity_audit_end=identity_audit_end,
     )
     output = workdir / "cases.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -206,6 +211,94 @@ def stage_offline(
     }
 
 
+def _latest_jsonl_rows_by_case_id(path: Path) -> dict[str, dict[str, Any]]:
+    """Return the latest valid JSON object for each append-only case result."""
+
+    latest: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return latest
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("case_id"):
+            latest[str(value["case_id"])] = value
+    return latest
+
+
+def _selected_case_id(case: Mapping[str, Any]) -> str:
+    return str(case.get("case_id") or fullchain._sha256(case["query"])[:16])
+
+
+def _materialize_fullchain_rows(
+    selected_cases: Sequence[Mapping[str, Any]],
+    *,
+    fresh_rows: Sequence[Mapping[str, Any]],
+    detail_path: Path,
+    progress_path: Path,
+    resume: bool,
+) -> list[dict[str, Any]]:
+    """Rebuild one signed result set without retaining stale workdir rows.
+
+    ``run_cases`` owns signature validation before it skips a completed case.
+    The suite then recovers only the detail row that matches that latest signed
+    progress record.  Newly executed rows always win, including a current
+    protocol failure that must remain visible to reporting.
+    """
+
+    selected_ids = [_selected_case_id(case) for case in selected_cases]
+    selected_id_set = set(selected_ids)
+    fresh_by_case_id = {
+        str(row["case_id"]): dict(row)
+        for row in fresh_rows
+        if row.get("case_id") and str(row["case_id"]) in selected_id_set
+    }
+    latest_detail = _latest_jsonl_rows_by_case_id(detail_path)
+    latest_progress = _latest_jsonl_rows_by_case_id(progress_path)
+    materialized: list[dict[str, Any]] = []
+    missing_signed_detail: list[str] = []
+
+    for case_id in selected_ids:
+        fresh = fresh_by_case_id.get(case_id)
+        if fresh is not None:
+            materialized.append(fresh)
+            continue
+        if not resume:
+            continue
+        progress = latest_progress.get(case_id)
+        detail = latest_detail.get(case_id)
+        progress_signature = str((progress or {}).get("case_input_signature") or "")
+        if (
+            progress is not None
+            and progress.get("ok") is True
+            and progress_signature
+            and detail is not None
+            and str(detail.get("case_input_signature") or "") == progress_signature
+            and str(detail.get("resume_base_signature") or "")
+            and not detail.get("protocol_failure_codes")
+        ):
+            materialized.append(detail)
+        elif progress is not None and progress.get("ok") is True:
+            missing_signed_detail.append(case_id)
+
+    if missing_signed_detail:
+        raise RuntimeError(
+            "resume progress has no matching signed fullchain detail row"
+        )
+    base_signatures = {
+        str(row.get("resume_base_signature"))
+        for row in materialized
+        if row.get("resume_base_signature")
+    }
+    if len(base_signatures) > 1:
+        raise RuntimeError("fullchain result materialization mixed base signatures")
+    return materialized
+
+
 def _offline_case(
     *, engine, runtime, case: Mapping[str, Any], settings: AppSettings
 ) -> dict[str, Any]:
@@ -245,6 +338,9 @@ def _offline_case(
         str(value) for value in (case.get("expected_evidence_message_ids") or ())
     )
     packed_ids = tuple(str(value) for value in (packed.source_msg_ids or ()))
+    allowed_citation_ids = tuple(
+        str(value) for value in fullchain.allowed_citation_ids_from_packed_context(packed)
+    )
     expected_layer = str(case.get("expected_layer") or "raw")
     tags = " ".join(str(value) for value in (case.get("tags") or ()))
     expected_subject = (
@@ -283,9 +379,11 @@ def _offline_case(
         "case_id": str(case.get("case_id") or ""),
         "category": str(case.get("category") or "unknown"),
         "kind": str(case.get("kind") or ""),
+        "answer_expectation": str(case.get("answer_expectation") or ""),
         "expected_layer": expected_layer,
         "expected_evidence_message_ids": expected,
         "packed_source_ids": packed_ids,
+        "allowed_citation_ids": allowed_citation_ids,
         "subject_expected": expected_subject,
         "subject_actual": actual_subject_tuple,
         "subject_match": actual_subject_tuple == expected_subject,
@@ -334,27 +432,14 @@ def stage_fullchain(
     answer_effort: str,
     aux_model: str,
     aux_effort: str,
+    judge_packet_mode: str = fullchain.DEFAULT_JUDGE_PACKET_MODE,
 ) -> dict[str, Any]:
     cases = fullchain._load_cases(workdir / "cases.jsonl")
+    selected_cases = fullchain._stratify(cases, limit=limit, seed=seed)
     engine = _engine(database)
     output = workdir / "fullchain-results.jsonl"
     detail_path = workdir / "fullchain-results.detail.jsonl"
-    # Recover rows from an interrupted run before resuming so checkpointed
-    # rows are never lost when --resume skips already-completed cases.
-    if detail_path.exists():
-        recovered: list[dict[str, Any]] = []
-        for line in detail_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and value.get("case_id"):
-                recovered.append(value)
-        if recovered:
-            fullchain._merge_results(output, recovered)
+    progress_path = workdir / "progress-fullchain.jsonl"
     rows, summary = fullchain.run_cases(
         engine,
         cases,
@@ -375,13 +460,25 @@ def stage_fullchain(
         answer_effort=answer_effort,
         aux_model=aux_model,
         aux_effort=aux_effort,
-        progress_path=workdir / "progress-fullchain.jsonl",
+        progress_path=progress_path,
         detail_path=detail_path,
         prewarm_embedding=not dry_run,
+        judge_packet_mode=judge_packet_mode,
     )
-    if rows:
-        fullchain._merge_results(output, rows)
-    metrics = fullchain_metrics(rows) if rows else {}
+    if dry_run:
+        return {"summary": summary, "metrics": {}, "output": str(output)}
+    materialized_rows = _materialize_fullchain_rows(
+        selected_cases,
+        fresh_rows=rows,
+        detail_path=detail_path,
+        progress_path=progress_path,
+        resume=resume,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as handle:
+        for row in materialized_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    metrics = fullchain_metrics(materialized_rows)
     return {"summary": summary, "metrics": metrics, "output": str(output)}
 
 
@@ -461,10 +558,10 @@ def stage_report(
             baseline = json.loads(baseline_report_path.read_text(encoding="utf-8"))
             report["baseline"] = {
                 "path": str(baseline_report_path),
-                "offline_diff": diff_metrics(
+                "offline_diff": offline_baseline_diff(
                     baseline.get("offline") or {}, offline_metrics
                 ),
-                "fullchain_diff": diff_metrics(
+                "fullchain_diff": fullchain_baseline_diff(
                     baseline.get("fullchain") or {}, fc_metrics
                 ),
             }
@@ -542,7 +639,12 @@ def _render_report_markdown(report: Mapping[str, Any]) -> str:
         lines.append("## Offline retrieval")
         lines.append(f"- cases: {offline.get('cases')}")
         lines.append(
-            f"- kind recall: {json.dumps(offline.get('kind_recall'), ensure_ascii=False)}"
+            "- current kind recall (allowed-citation): "
+            + json.dumps(offline.get("kind_recall"), ensure_ascii=False)
+        )
+        lines.append(
+            "- legacy kind recall (packed-ID): "
+            + json.dumps(offline.get("legacy_kind_recall"), ensure_ascii=False)
         )
         lines.append(
             f"- layer hit rate: {json.dumps(offline.get('layer_hit_rate'), ensure_ascii=False)}"
@@ -561,7 +663,54 @@ def _render_report_markdown(report: Mapping[str, Any]) -> str:
     if fullchain_metrics_value:
         lines.append("## Full-chain (real model)")
         for key, value in fullchain_metrics_value.items():
-            lines.append(f"- {key}: {value}")
+            if key.startswith("legacy_abstention_"):
+                label = f"legacy (empty-gold) {key}"
+            elif key.startswith("abstention_"):
+                label = f"current (expectation-aware) {key}"
+            else:
+                label = key
+            lines.append(f"- {label}: {value}")
+        lines.append("")
+    baseline = report.get("baseline") or {}
+    if baseline:
+        lines.append("## Baseline comparison (same-definition metrics only)")
+        lines.append(f"- baseline report: {baseline.get('path')}")
+        offline_diff = baseline.get("offline_diff") or {}
+        lines.append(
+            "- offline current (allowed-citation) recall: "
+            + json.dumps(
+                (offline_diff.get("current") or {}).get(
+                    "allowed_citation_kind_recall"
+                ),
+                ensure_ascii=False,
+            )
+        )
+        lines.append(
+            "- offline legacy (packed-ID) recall: "
+            + json.dumps(
+                (offline_diff.get("legacy") or {}).get("packed_ids_kind_recall"),
+                ensure_ascii=False,
+            )
+        )
+        fullchain_diff = baseline.get("fullchain_diff") or {}
+        lines.append(
+            "- fullchain current (expectation-aware) abstention: "
+            + json.dumps(
+                (fullchain_diff.get("current") or {}).get(
+                    "expectation_aware_abstention"
+                ),
+                ensure_ascii=False,
+            )
+        )
+        lines.append(
+            "- fullchain legacy (empty-gold) abstention: "
+            + json.dumps(
+                (fullchain_diff.get("legacy") or {}).get(
+                    "empty_gold_abstention"
+                ),
+                ensure_ascii=False,
+            )
+        )
         lines.append("")
     gate = report.get("gate") or {}
     if gate:
@@ -592,6 +741,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--group-ids", type=str, default="")
+    parser.add_argument("--identity-audit-start", default="")
+    parser.add_argument("--identity-audit-end", default="")
     parser.add_argument("--fullchain-limit", type=int, default=300)
     parser.add_argument("--offline-limit", type=int, default=300)
     parser.add_argument("--model", default="")
@@ -626,6 +777,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--answer-effort", default=fullchain.DEFAULT_ANSWER_EFFORT)
     parser.add_argument("--aux-model", default=fullchain.DEFAULT_AUX_MODEL)
     parser.add_argument("--aux-effort", default=fullchain.DEFAULT_AUX_EFFORT)
+    parser.add_argument(
+        "--judge-packet-mode",
+        choices=fullchain.JUDGE_PACKET_MODES,
+        default=fullchain.DEFAULT_JUDGE_PACKET_MODE,
+    )
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--stress-groups", type=str, default="")
     parser.add_argument("--stress-limit", type=int, default=300)
@@ -667,6 +823,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 count=args.count,
                 seed=args.seed,
                 group_ids=group_ids,
+                identity_audit_start=args.identity_audit_start or None,
+                identity_audit_end=args.identity_audit_end or None,
             )
         elif stage == "offline":
             result["offline"] = stage_offline(
@@ -697,6 +855,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 answer_effort=args.answer_effort,
                 aux_model=args.aux_model,
                 aux_effort=args.aux_effort,
+                judge_packet_mode=args.judge_packet_mode,
             )
         elif stage == "stress":
             if not args.stress_groups:

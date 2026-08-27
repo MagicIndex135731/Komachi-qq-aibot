@@ -28,6 +28,7 @@ from scripts.memory_test_fullchain import (
     _cache_save,
     _generate_with_retries,
     _parse_answer_loose,
+    _sanitize_citation_ids,
     _sha256,
 )
 from scripts.run_memory_v3_quality_replay import (
@@ -39,7 +40,11 @@ from scripts.run_memory_v3_quality_replay import (
 )
 
 
-CONTRACT_VERSION = "memory-test-confidence-v1"
+CONTRACT_VERSION = "memory-test-confidence-v7"
+SCHEMA_VERSION = 5
+LEGACY_JUDGE_PACKET_MODE = "legacy-stored"
+RESAMPLE_JUDGE_PACKET_MODE = "full"
+UNSAMPLED_JUDGE_PACKET_MODE = "not-sampled"
 _ANSWER_MARKER = "Generated answer:\n"
 _CITATION_MARKER = "\nGenerated citation IDs:\n"
 _ABSTAINED_MARKER = "\nGenerated abstained flag:\n"
@@ -132,6 +137,61 @@ def _extract_judge_answer(
             raise ValueError("judge prompt generated-answer fields are invalid")
         return answer, tuple(citations), abstained
     raise ValueError("judge prompt does not contain generated-answer fields")
+
+
+def _string_sequence_field(
+    row: Mapping[str, Any], field: str, *, allow_empty: bool
+) -> tuple[str, ...]:
+    """Read a private string-array field without accepting scalar coercion."""
+
+    value = row.get(field)
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) for item in value
+    ):
+        raise ValueError(f"confidence replay requires private {field}")
+    resolved = tuple(value)
+    if not allow_empty and not resolved:
+        raise ValueError(f"confidence replay requires private {field}")
+    return resolved
+
+
+def _validate_confidence_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    requires_full_judge_packet: bool,
+    requires_answer_allowlist: bool,
+) -> None:
+    """Validate every private input before checkpoint mutation or transport.
+
+    A confidence checkpoint is a valid completed-case prefix only after the
+    complete input batch has passed its private-data contract.  In particular,
+    do not let a malformed later row leave an apparently resumable prefix.
+    """
+
+    base_signatures = {str(row.get("resume_base_signature") or "") for row in rows}
+    if rows and (
+        len(base_signatures) != 1
+        or not _valid_signature(next(iter(base_signatures), ""))
+    ):
+        raise ValueError("confidence input rows must share one signed fullchain base")
+    if any(not _valid_signature(row.get("case_input_signature")) for row in rows):
+        raise ValueError("confidence input requires signed fullchain rows")
+    if any(row.get("protocol_failure_codes") for row in rows):
+        raise ValueError("confidence input contains protocol failures")
+
+    for row in rows:
+        _string_sequence_field(row, "answer_prompt", allow_empty=False)
+        judge_prompt = _string_sequence_field(row, "judge_prompt", allow_empty=False)
+        # Both fields are retained in the private checkpoint.  Parsing them here
+        # also proves they can be safely frozen/replaced before any judge call.
+        _extract_judge_answer(judge_prompt)
+        if requires_full_judge_packet:
+            full_prompt = _string_sequence_field(
+                row, "judge_prompt_full", allow_empty=False
+            )
+            _extract_judge_answer(full_prompt)
+        if requires_answer_allowlist:
+            _string_sequence_field(row, "allowed_citation_ids", allow_empty=True)
 
 
 def _observation_payload(observation: Any) -> dict[str, Any]:
@@ -301,6 +361,21 @@ def _repair_answer(
     allowed = tuple(str(value) for value in allowed_ids)
     if parsed.abstained or (cited and set(cited) <= set(allowed)):
         return parsed, None
+    sanitized, citation_sanitized = _sanitize_citation_ids(cited, allowed)
+    if citation_sanitized:
+        return (
+            GeneratedAnswer(
+                answer=parsed.answer,
+                cited_source_message_ids=sanitized,
+                abstained=parsed.abstained,
+            ),
+            {
+                "protocol_failure_codes": [],
+                "observations": [],
+                "citation_sanitized": True,
+                "method": "deterministic_allowlist_filter",
+            },
+        )
     original = GeneratedAnswer(
         answer=parsed.answer,
         cited_source_message_ids=cited,
@@ -364,32 +439,43 @@ def run_confidence_replay(
     provider_attempts: int = PROVIDER_ATTEMPTS,
     provider_backoff: float = PROVIDER_BACKOFF_SECONDS,
     checkpoint_path: Path | None = None,
+    compare_full_judge_packet: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if answer_repeats < 1 or answer_repeats % 2 == 0:
         raise ValueError("answer_repeats must be a positive odd integer")
     if judge_repeats < 1 or judge_repeats % 2 == 0:
         raise ValueError("judge_repeats must be a positive odd integer")
-    base_signatures = {str(row.get("resume_base_signature") or "") for row in rows}
-    if rows and (
-        len(base_signatures) != 1
-        or not _valid_signature(next(iter(base_signatures), ""))
-    ):
-        raise ValueError("confidence input rows must share one signed fullchain base")
+    requires_full_judge_packet = answer_repeats > 1 or compare_full_judge_packet
+    _validate_confidence_rows(
+        rows,
+        requires_full_judge_packet=requires_full_judge_packet,
+        requires_answer_allowlist=answer_repeats > 1,
+    )
     private_rows: list[dict[str, Any]] = []
     if checkpoint_path is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_path.write_text("", encoding="utf-8")
     for row_index, row in enumerate(rows, start=1):
-        if not _valid_signature(
-            row.get("case_input_signature")
-        ) or not _valid_signature(row.get("resume_base_signature")):
-            raise ValueError("confidence input requires signed fullchain rows")
-        answer_prompt = tuple(str(value) for value in row.get("answer_prompt") or ())
-        judge_prompt = tuple(str(value) for value in row.get("judge_prompt") or ())
-        if not answer_prompt or not judge_prompt:
-            raise ValueError(
-                "confidence input requires private answer_prompt and judge_prompt"
-            )
+        answer_prompt = _string_sequence_field(row, "answer_prompt", allow_empty=False)
+        judge_prompt = _string_sequence_field(row, "judge_prompt", allow_empty=False)
+        baseline_judge_packet_mode = str(
+            row.get("judge_packet_mode") or LEGACY_JUDGE_PACKET_MODE
+        )
+        resample_judge_packet_mode = (
+            RESAMPLE_JUDGE_PACKET_MODE
+            if requires_full_judge_packet
+            else UNSAMPLED_JUDGE_PACKET_MODE
+        )
+        full_judge_prompt = (
+            _string_sequence_field(row, "judge_prompt_full", allow_empty=False)
+            if requires_full_judge_packet
+            else ()
+        )
+        repair_allowed_ids = (
+            _string_sequence_field(row, "allowed_citation_ids", allow_empty=True)
+            if answer_repeats > 1
+            else tuple(str(value) for value in row.get("packed_source_ids") or ())
+        )
         _, _, frozen_generated_abstained = _extract_judge_answer(judge_prompt)
         generated_abstained = bool(
             row.get("generated_abstained", frozen_generated_abstained)
@@ -418,15 +504,60 @@ def run_confidence_replay(
         answer_samples: list[dict[str, Any]] = []
         baseline_answer = {
             "sample_index": 0,
+            "sample_role": "baseline",
             "answer": str(row.get("answer") or ""),
             "cited_source_message_ids": list(row.get("cited_source_message_ids") or ()),
             "abstained": generated_abstained,
+            "decision_envelope": row.get("decision_envelope_shadow"),
+            "decision_envelope_validation": row.get("decision_envelope_validation"),
+            "decision_envelope_reanswered": bool(row.get("decision_envelope_reanswered")),
+            "decision_envelope_expanded": bool(row.get("decision_envelope_expanded")),
+            "judge_packet_mode": baseline_judge_packet_mode,
             "judge_samples": baseline_judges,
             "judge_majority": _majority_decision(baseline_judges),
         }
         answer_samples.append(baseline_answer)
+        if (
+            requires_full_judge_packet
+            and baseline_judge_packet_mode != RESAMPLE_JUDGE_PACKET_MODE
+        ):
+            frozen_full_prompt = _replace_judge_answer(
+                full_judge_prompt,
+                answer=str(row.get("answer") or ""),
+                cited_ids=tuple(row.get("cited_source_message_ids") or ()),
+                abstained=generated_abstained,
+            )
+            frozen_full_judges = _judge_samples(
+                prompt=frozen_full_prompt,
+                baseline_decision=None,
+                repeats=judge_repeats,
+                axis="baseline-full-judge|" + str(row["case_id"]),
+                transport=judge_transport,
+                model=judge_model,
+                effort=judge_effort,
+                cache_dir=cache_dir,
+                provider_attempts=provider_attempts,
+                provider_backoff=provider_backoff,
+            )
+            answer_samples.append(
+                {
+                    "sample_index": 0,
+                    "sample_role": "baseline-full-rejudge",
+                    "answer": str(row.get("answer") or ""),
+                    "cited_source_message_ids": list(
+                        row.get("cited_source_message_ids") or ()
+                    ),
+                    "abstained": generated_abstained,
+                    "judge_packet_mode": RESAMPLE_JUDGE_PACKET_MODE,
+                    "judge_samples": frozen_full_judges,
+                    "judge_majority": _majority_decision(frozen_full_judges),
+                }
+            )
         for sample_index in range(1, answer_repeats):
-            sample: dict[str, Any] = {"sample_index": sample_index}
+            sample: dict[str, Any] = {
+                "sample_index": sample_index,
+                "sample_role": "resample",
+            }
             try:
                 observation, cached = _generate_cached(
                     transport=answer_transport,
@@ -445,7 +576,7 @@ def run_confidence_replay(
                 parsed, repair = _repair_answer(
                     answer_prompt=answer_prompt,
                     parsed=parsed,
-                    allowed_ids=tuple(row.get("packed_source_ids") or ()),
+                    allowed_ids=repair_allowed_ids,
                     transport=judge_transport,
                     judge_model=judge_model,
                     judge_effort=judge_effort,
@@ -455,31 +586,49 @@ def run_confidence_replay(
                     provider_backoff=provider_backoff,
                 )
                 sample["repair"] = repair
+                sample["citation_sanitized"] = bool(
+                    repair and repair.get("citation_sanitized")
+                )
+                repair_protocol_failure_codes = tuple(
+                    str(value)
+                    for value in (
+                        repair.get("protocol_failure_codes")
+                        if isinstance(repair, Mapping)
+                        else ()
+                    )
+                    or ()
+                )
                 sample["answer"] = parsed.answer
                 sample["cited_source_message_ids"] = list(
                     parsed.cited_source_message_ids
                 )
                 sample["abstained"] = bool(parsed.abstained)
                 sample_prompt = _replace_judge_answer(
-                    canonical_judge_prompt,
+                    full_judge_prompt,
                     answer=parsed.answer,
                     cited_ids=parsed.cited_source_message_ids,
                     abstained=parsed.abstained,
                 )
-                judges = _judge_samples(
-                    prompt=sample_prompt,
-                    baseline_decision=None,
-                    repeats=judge_repeats,
-                    axis=f"answer-{sample_index}-judge|{row['case_id']}",
-                    transport=judge_transport,
-                    model=judge_model,
-                    effort=judge_effort,
-                    cache_dir=cache_dir,
-                    provider_attempts=provider_attempts,
-                    provider_backoff=provider_backoff,
-                )
-                sample["judge_samples"] = judges
-                sample["judge_majority"] = _majority_decision(judges)
+                sample["judge_packet_mode"] = RESAMPLE_JUDGE_PACKET_MODE
+                if repair_protocol_failure_codes:
+                    sample["repair_protocol_failure_codes"] = list(
+                        repair_protocol_failure_codes
+                    )
+                else:
+                    judges = _judge_samples(
+                        prompt=sample_prompt,
+                        baseline_decision=None,
+                        repeats=judge_repeats,
+                        axis=f"answer-{sample_index}-judge|{row['case_id']}",
+                        transport=judge_transport,
+                        model=judge_model,
+                        effort=judge_effort,
+                        cache_dir=cache_dir,
+                        provider_attempts=provider_attempts,
+                        provider_backoff=provider_backoff,
+                    )
+                    sample["judge_samples"] = judges
+                    sample["judge_majority"] = _majority_decision(judges)
             except QualityReplayError as exc:
                 sample["provider_error"] = str(exc)
                 sample["provider_failure_kind"] = str(
@@ -498,6 +647,10 @@ def run_confidence_replay(
             ),
             "answer_prompt": list(answer_prompt),
             "judge_prompt": list(canonical_judge_prompt),
+            "judge_prompt_full": list(full_judge_prompt),
+            "baseline_judge_packet_mode": baseline_judge_packet_mode,
+            "resample_judge_packet_mode": resample_judge_packet_mode,
+            "compare_full_judge_packet": bool(compare_full_judge_packet),
             "answer_samples": answer_samples,
         }
         private_rows.append(private_row)
@@ -538,12 +691,37 @@ def build_public_summary(private_rows: Sequence[Mapping[str, Any]]) -> dict[str,
         judge_flips = 0
         answer_flips = 0
         answer_sampled = 0
+        cross_mode_disagreements = 0
+        cross_mode_sampled = 0
+        full_packet_comparison_requested = 0
+        full_packet_comparison_performed = 0
         majority_gc = 0
         baseline_gc = 0
         provider_failures = 0
         protocol_failures = 0
+        baseline_packet_modes: set[str] = set()
+        resample_packet_modes: set[str] = set()
         for row in rows:
+            full_packet_comparison_requested += int(
+                bool(row.get("compare_full_judge_packet"))
+            )
+            baseline_packet_modes.add(
+                str(
+                    row.get("baseline_judge_packet_mode")
+                    or LEGACY_JUDGE_PACKET_MODE
+                )
+            )
             answers = list(row.get("answer_samples") or ())
+            resample_packet_modes.add(
+                str(
+                    row.get("resample_judge_packet_mode")
+                    or (
+                        LEGACY_JUDGE_PACKET_MODE
+                        if len(answers) > 1
+                        else UNSAMPLED_JUDGE_PACKET_MODE
+                    )
+                )
+            )
             if not answers:
                 protocol_failures += 1
                 continue
@@ -570,18 +748,85 @@ def build_public_summary(private_rows: Sequence[Mapping[str, Any]]) -> dict[str,
                 )
             )
             majority_gc += int(bool(baseline_majority.get("grounded_correct")))
-            valid_outcomes = [
-                bool((answer.get("judge_majority") or {}).get("grounded_correct"))
-                for answer in answers
-                if int((answer.get("judge_majority") or {}).get("valid_samples") or 0)
-                > 0
+            outcomes_by_packet_mode: dict[str, list[bool]] = defaultdict(list)
+            frozen_baseline_by_role: dict[
+                str, tuple[str, bool, tuple[str, tuple[str, ...], bool]]
+            ] = {}
+            for answer_index, answer in enumerate(answers):
+                repair = answer.get("repair")
+                if isinstance(repair, Mapping) and repair.get(
+                    "protocol_failure_codes"
+                ):
+                    continue
+                majority = answer.get("judge_majority") or {}
+                if int(majority.get("valid_samples") or 0) <= 0:
+                    continue
+                packet_mode = str(
+                    answer.get("judge_packet_mode")
+                    or (
+                        row.get("baseline_judge_packet_mode")
+                        if answer_index == 0
+                        else row.get("resample_judge_packet_mode")
+                    )
+                    or LEGACY_JUDGE_PACKET_MODE
+                )
+                outcomes_by_packet_mode[packet_mode].append(
+                    bool(majority.get("grounded_correct"))
+                )
+                sample_role = str(answer.get("sample_role") or "")
+                if answer_index == 0 and not sample_role:
+                    sample_role = "baseline"
+                if sample_role in {"baseline", "baseline-full-rejudge"}:
+                    frozen_baseline_by_role[sample_role] = (
+                        packet_mode,
+                        bool(majority.get("grounded_correct")),
+                        (
+                            str(answer.get("answer") or ""),
+                            tuple(
+                                str(value)
+                                for value in answer.get(
+                                    "cited_source_message_ids"
+                                )
+                                or ()
+                            ),
+                            bool(answer.get("abstained")),
+                        ),
+                    )
+            comparable_outcomes = [
+                outcomes
+                for outcomes in outcomes_by_packet_mode.values()
+                if len(outcomes) > 1
             ]
-            if len(answers) > 1:
+            if comparable_outcomes:
                 answer_sampled += 1
-                answer_flips += int(len(set(valid_outcomes)) > 1)
+                answer_flips += int(
+                    any(len(set(outcomes)) > 1 for outcomes in comparable_outcomes)
+                )
+            frozen_baseline = frozen_baseline_by_role.get("baseline")
+            frozen_full_rejudge = frozen_baseline_by_role.get(
+                "baseline-full-rejudge"
+            )
+            if (
+                frozen_baseline is not None
+                and frozen_full_rejudge is not None
+                and frozen_baseline[0] != frozen_full_rejudge[0]
+                and frozen_baseline[2] == frozen_full_rejudge[2]
+            ):
+                cross_mode_sampled += 1
+                full_packet_comparison_performed += int(
+                    bool(row.get("compare_full_judge_packet"))
+                )
+                cross_mode_disagreements += int(
+                    frozen_baseline[1] != frozen_full_rejudge[1]
+                )
             for answer in answers:
                 provider_failures += int(bool(answer.get("provider_error")))
                 protocol_failures += int(bool(answer.get("protocol_error")))
+                repair = answer.get("repair")
+                protocol_failures += int(
+                    isinstance(repair, Mapping)
+                    and bool(repair.get("protocol_failure_codes"))
+                )
                 for sample in answer.get("judge_samples") or ():
                     provider_failures += int(bool(sample.get("provider_error")))
                     protocol_failures += int(bool(sample.get("protocol_error")))
@@ -599,12 +844,27 @@ def build_public_summary(private_rows: Sequence[Mapping[str, Any]]) -> dict[str,
             "answer_outcome_flip_rate": (
                 round(answer_flips / answer_sampled, 6) if answer_sampled else 0.0
             ),
+            "cross_mode_sampled_cases": cross_mode_sampled,
+            "cross_mode_outcome_disagreement_cases": cross_mode_disagreements,
+            "cross_mode_outcome_disagreement_rate": (
+                round(cross_mode_disagreements / cross_mode_sampled, 6)
+                if cross_mode_sampled
+                else 0.0
+            ),
+            "full_judge_packet_comparison_requested_cases": (
+                full_packet_comparison_requested
+            ),
+            "full_judge_packet_comparison_performed_cases": (
+                full_packet_comparison_performed
+            ),
             "provider_failures": provider_failures,
             "protocol_failures": protocol_failures,
+            "baseline_judge_packet_modes": sorted(baseline_packet_modes),
+            "resample_judge_packet_modes": sorted(resample_packet_modes),
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "contract_version": CONTRACT_VERSION,
         "overall": aggregate(private_rows),
         "by_category": {
@@ -646,6 +906,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--answer-repeats", type=int, default=1)
     parser.add_argument("--judge-repeats", type=int, default=3)
+    parser.add_argument(
+        "--compare-full-judge-packet",
+        action="store_true",
+        help=(
+            "Rejudge the frozen baseline answer against judge_prompt_full; "
+            "does not generate another answer."
+        ),
+    )
     parser.add_argument("--answer-model", default=DEFAULT_ANSWER_MODEL)
     parser.add_argument("--answer-effort", default=DEFAULT_ANSWER_EFFORT)
     parser.add_argument("--judge-model", default=DEFAULT_AUX_MODEL)
@@ -696,6 +964,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         provider_attempts=args.provider_attempts,
         provider_backoff=args.provider_backoff,
         checkpoint_path=args.output_private,
+        compare_full_judge_packet=args.compare_full_judge_packet,
     )
     _write_jsonl(args.output_private, private_rows)
     args.output_public.parent.mkdir(parents=True, exist_ok=True)

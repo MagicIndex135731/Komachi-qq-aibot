@@ -13,6 +13,7 @@ from app.core.memory_background_service import (
     BackgroundJob,
     BackgroundMessage,
     DerivedFact,
+    DerivedInvalidation,
     EpisodeDerivation,
     LateArrivalPlan,
     MemoryBackgroundService,
@@ -28,11 +29,12 @@ from app.storage.db import (
     session_scope,
     write_retrieval_vector_embeddings,
 )
-from app.storage.models import Job, Message, RetrievalDocument
+from app.storage.models import Job, MemoryItem, Message, RetrievalDocument
 from app.storage.repositories import (
     EpisodeRepository,
     GroupRepository,
     JobRepository,
+    MemoryRepository,
     MessageRepository,
     RetrievalDocumentRepository,
     UserRepository,
@@ -827,6 +829,16 @@ class BotFactDeriver(FakeDeriver):
             ),
             events=(),
             windows=windows,
+            invalidations=(
+                DerivedInvalidation(
+                    target_canonical_key="profile|999|自称|小町",
+                    source_msg_ids=("m-2",),
+                ),
+                DerivedInvalidation(
+                    target_canonical_key="profile|10001|age|40岁",
+                    source_msg_ids=("m-1",),
+                ),
+            ),
         )
 
 
@@ -874,6 +886,9 @@ def test_bot_subject_facts_are_filtered_before_persist() -> None:
     assert store.compactions
     persisted = store.compactions[-1][1]
     assert [fact.content for fact in persisted.facts] == ["user plan"]
+    assert [item.target_canonical_key for item in persisted.invalidations] == [
+        "profile|10001|age|40岁"
+    ]
 
 
 def test_current_facts_get_default_expiry() -> None:
@@ -1992,6 +2007,75 @@ def test_sqlalchemy_store_end_to_end_allocate_close_derive_complete(
         )
         assert documents
         assert all(document.group_id == 10001 for document in documents)
+
+
+def test_background_write_replaces_equivalent_single_value_profile_predicate(
+    sqlite_engine,
+) -> None:
+    class LocationDeriver(FakeDeriver):
+        def derive(self, *, episode, messages, windows) -> EpisodeDerivation:
+            return EpisodeDerivation(
+                summary="location update",
+                facts=(
+                    DerivedFact(
+                        content="我现在居住在深圳",
+                        source_msg_ids=("m-1",),
+                        kind="profile",
+                        subject_id="42",
+                        predicate="location",
+                        object_text="深圳",
+                        importance=4,
+                        confidence=0.9,
+                    ),
+                ),
+                events=(),
+                windows=windows,
+            )
+
+    message_ids = _seed_sqlite_messages(
+        sqlite_engine,
+        [
+            _message(1, minute=0, text="我现在居住在深圳"),
+            _message(2, minute=40, text="下一段聊天"),
+        ],
+    )
+    with session_scope(sqlite_engine) as session:
+        old = MemoryRepository(session).upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="42",
+            memory_kind="profile",
+            canonical_key="profile|42|居住地|上海",
+            predicate="居住地",
+            object_text="上海",
+            content="用户居住在上海",
+            importance=4,
+            confidence=0.9,
+            source_msg_ids=["old-location-source"],
+        )
+        old_id = int(old.id)
+
+    store = SqlAlchemyMemoryBackgroundStore(sqlite_engine)
+    service = _service(store, deriver=LocationDeriver())
+    service.enqueue_message(
+        group_id=10001,
+        message_id=message_ids[-1],
+        now=NOW,
+    )
+
+    assert service.run_once(now=NOW)
+    assert service.run_once(now=NOW)
+
+    with session_scope(sqlite_engine) as session:
+        old = session.get(MemoryItem, old_id)
+        active = MemoryRepository(session).list_group_memories_for_subject(
+            scope_id="10001",
+            subject_id="42",
+            limit=10,
+        )
+    assert old is not None and old.status == "superseded"
+    assert any(row.predicate == "location" and row.status == "active" for row in active)
 
 
 def test_sqlalchemy_worker_does_not_claim_another_generation(

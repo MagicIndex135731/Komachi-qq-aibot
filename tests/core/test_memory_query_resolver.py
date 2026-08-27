@@ -7,7 +7,13 @@ import time
 
 import pytest
 
-from app.core.memory_query_resolver import MemoryQueryResolver, ResolvedMemoryQuery, TimeRange
+from app.core.memory_query_resolver import (
+    MemoryQueryResolver,
+    ResolvedMemoryQuery,
+    TimeRange,
+    is_bot_self_identity_query,
+    is_requester_identity_query,
+)
 from app.core.member_identity import GroupMemberIdentity
 
 
@@ -26,6 +32,16 @@ class Recent:
 NOW = datetime(2026, 7, 23, 0, 10)
 
 
+@pytest.mark.parametrize("query", ("我是谁", "我是你的谁", "你觉得我是谁"))
+def test_requester_identity_query_recognizes_first_person_portrait(query: str) -> None:
+    assert is_requester_identity_query(query) is True
+
+
+@pytest.mark.parametrize("query", ("你是谁", "我问的是你是谁，不是我是谁", "Maple是谁"))
+def test_requester_identity_query_rejects_bot_or_third_person_identity(query: str) -> None:
+    assert is_requester_identity_query(query) is False
+
+
 @pytest.mark.parametrize("query", ("我是你的谁", "我是谁", "你应该怎么称呼我"))
 def test_self_relationship_queries_bind_requester_and_load_history(query: str) -> None:
     result = MemoryQueryResolver().resolve(
@@ -41,6 +57,38 @@ def test_self_relationship_queries_bind_requester_and_load_history(query: str) -
     assert result.answer_mode == "current_fact"
     assert result.needs_history is True
     assert result.retrieval_query == "称呼 身份 关系"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "你是谁",
+        "你叫什么名字？",
+        "@Mira 你是做什么的",
+        "我问的是你是谁，不是我是谁",
+    ),
+)
+def test_bot_self_identity_queries_do_not_bind_or_load_requester_memory(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.subject_ids is None
+    assert result.speaker_ids == ()
+    assert result.requester_id == "10001"
+    assert result.subject_binding == "unbound"
+    assert result.subject_role == "bot"
+    assert result.needs_history is False
+    assert result.semantic_general is True
+    assert result.rewrite_used is False
+
+
+@pytest.mark.parametrize("query", ("我是谁", "我是你的谁", "你觉得我是谁"))
+def test_requester_identity_queries_are_not_bot_self_identity(query: str) -> None:
+    assert is_bot_self_identity_query(query, bot_names=("Mira",)) is False
 
 
 def test_deterministic_follow_up_uses_quoted_message_without_rewrite() -> None:
@@ -2002,7 +2050,28 @@ def test_requester_mention_query_without_requester_fails_closed() -> None:
 
     assert result.answer_mode == "mention"
     assert result.subject_ids == ()
-    assert result.needs_history is True
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "为什么说maple是日本人",
+        "为什么说Maple是日本人",
+        "为什么说 Maple 是日本人？",
+        "之前为什么提到 Maple 是日本人？",
+    ),
+)
+def test_single_speech_target_alias_remains_the_profile_subject(query: str) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(GroupMemberIdentity(user_id=819212124, nickname="Maple"),),
+    )
+
+    assert result.subject_ids == ("819212124",)
+    assert result.speaker_ids == ("819212124",)
+    assert result.needs_history is query.startswith("之前")
 
 
 def test_generic_mention_query_keeps_author_subject_empty_and_binds_target() -> None:
@@ -2016,6 +2085,7 @@ def test_generic_mention_query_keeps_author_subject_empty_and_binds_target() -> 
 
     assert result.answer_mode == "mention"
     assert result.subject_ids == ()
+    assert result.needs_history is True
     assert result.mentioned_user_ids == ("90001",)
     assert result.subject_binding == "unbound"
 

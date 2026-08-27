@@ -61,9 +61,25 @@ def validate_retrieval_vector_table_name(
     return str(physical_table)
 
 
-def build_engine(sqlite_path: Path) -> Engine:
+def build_engine(sqlite_path: Path, *, read_only: bool = False) -> Engine:
+    """Build a SQLAlchemy engine for the SQLite database.
+
+    ``read_only=True`` opens the file with SQLite URI ``mode=ro&immutable=1``
+    and skips the ``journal_mode=WAL`` pragma. ``immutable=1`` tells SQLite the
+    file cannot change, so it does not create ``-wal``/``-shm`` files even for
+    a WAL-mode snapshot. Evaluation harnesses use this so a frozen fact
+    snapshot is never mutated by opening it, keeping resume fingerprints
+    stable.
+    """
+
+    if read_only:
+        url = (
+            f"sqlite:///file:{sqlite_path.as_posix()}?mode=ro&immutable=1&uri=true"
+        )
+    else:
+        url = f"sqlite:///{sqlite_path}"
     engine = create_engine(
-        f"sqlite:///{sqlite_path}",
+        url,
         future=True,
         connect_args={"timeout": 30},
     )
@@ -86,8 +102,9 @@ def build_engine(sqlite_path: Path) -> Engine:
             except AttributeError:
                 pass
 
-    with engine.begin() as connection:
-        connection.execute(text("PRAGMA journal_mode=WAL;"))
+    if not read_only:
+        with engine.begin() as connection:
+            connection.execute(text("PRAGMA journal_mode=WAL;"))
     return engine
 
 

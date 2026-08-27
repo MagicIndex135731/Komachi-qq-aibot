@@ -49,6 +49,9 @@ PRIVATE_IMAGE_FOLLOWUP_HINTS = (
     "名字",
 )
 NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?，。！？：；、“”‘’（）《》【】]+")
+_DEICTIC_IMAGE_FOLLOWUP_PATTERN = re.compile(
+    r"^(?:(?:这|那)(?:个|张)?(?:人|东西|角色)?|他|她|它)(?:是|叫)?(?:谁|什么|哪位|哪个)(?:啊|呀)?$"
+)
 
 
 @dataclass(slots=True)
@@ -95,6 +98,15 @@ def _has_image_intent_keywords(text: str) -> bool:
     return any(keyword in normalized_text for keyword in IMAGE_INTENT_KEYWORDS)
 
 
+def is_image_reference_followup(text: str, *, bot_names: set[str]) -> bool:
+    """Whether a short addressed follow-up clearly refers to a prior image."""
+
+    stripped_text = _strip_bot_names(text, bot_names)
+    return _has_image_intent_keywords(stripped_text) or bool(
+        _DEICTIC_IMAGE_FOLLOWUP_PATTERN.fullmatch(stripped_text)
+    )
+
+
 def _looks_like_contextual_private_image_followup(text: str) -> bool:
     normalized_text = _normalize_text(text)
     if not normalized_text or len(normalized_text) > 32:
@@ -118,10 +130,9 @@ def _message_opens_image_session(
         return False
     if has_images or reply_to_msg_id is not None:
         return True
-    remaining_text = _strip_bot_names(plain_text, bot_names)
-    if not remaining_text:
+    if not _strip_bot_names(plain_text, bot_names):
         return True
-    return _has_image_intent_keywords(remaining_text)
+    return is_image_reference_followup(plain_text, bot_names=bot_names)
 
 
 def _extract_message_images(message) -> list[ImageAttachment]:
@@ -257,7 +268,11 @@ def resolve_images_for_turn(
         reply_to_msg_id=event.reply_to_msg_id,
         has_images=False,
     )
-    if not opens_image_session and not (allow_recent_image_without_intent and addressed_turn and event.reply_to_msg_id is None):
+    if not opens_image_session and not (
+        allow_recent_image_without_intent
+        and addressed_turn
+        and event.reply_to_msg_id is None
+    ):
         return None
 
     if event.reply_to_msg_id is not None:

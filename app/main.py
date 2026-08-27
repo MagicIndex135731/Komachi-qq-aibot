@@ -1238,6 +1238,34 @@ def build_memory_runtime(
     )
     background_service = None
     if settings.memory_orchestration_v2_enabled:
+        def load_active_correction_targets(
+            group_id: int,
+            subject_ids: tuple[str, ...],
+        ) -> tuple[dict[str, str], ...]:
+            with session_scope(engine) as session:
+                repository = MemoryRepository(session)
+                rows = tuple(
+                    row
+                    for subject_id in dict.fromkeys(subject_ids)
+                    for row in repository.list_current_group_memories(
+                        scope_id=str(group_id),
+                        subject_id=subject_id,
+                        limit=500,
+                    )
+                )
+                return tuple(
+                    {
+                        "target_canonical_key": str(row.canonical_key),
+                        "memory_kind": str(row.memory_kind),
+                        "subject_id": str(row.subject_id),
+                        "predicate": str(row.predicate or ""),
+                        "object_text": str(row.object_text or ""),
+                    }
+                    for row in rows
+                    if str(row.memory_kind) in {"profile", "preference"}
+                    and bool(str(row.canonical_key or "").strip())
+                )
+
         identity = embedding_provider.identity
         background_service = MemoryBackgroundService(
             store=SqlAlchemyMemoryBackgroundStore(
@@ -1259,6 +1287,7 @@ def build_memory_runtime(
                     engine=engine,
                 ),
                 max_facts=settings.memory_compaction_max_facts,
+                correction_target_loader=load_active_correction_targets,
             ),
             worker_id="group-memory-v2",
             segmentation_generation=MEMORY_SEGMENTATION_GENERATION,

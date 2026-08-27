@@ -15,7 +15,11 @@ from app.core.message_content import ImageAttachment
 from app.core.memory_context_packer import PackedMemoryContext
 from app.core.memory_orchestrator import MemoryContextResult, MemoryOrchestrator
 import app.core.router as router_module
-from app.core.router import InboundRouter, PreparedGroupReply
+from app.core.router import (
+    MEMORY_ATTRIBUTE_MATCHING_INSTRUCTION,
+    InboundRouter,
+    PreparedGroupReply,
+)
 from app.core.reply_policy import ReplyDecision
 from app.core.search_policy import AddressDecision
 from app.storage.db import session_scope
@@ -687,6 +691,74 @@ async def test_router_replies_to_direct_mention_in_allowlisted_group(sqlite_engi
     assert [outbound.text for outbound in sender.sent] == ["I am here."]
     assert len(llm.calls) == 1
     assert llm.conversation_keys == ["group:10001"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    ("@Mira 你是谁", "@Mira 我问的是你是谁，不是我是谁"),
+)
+async def test_router_pins_second_person_identity_to_bot_persona(
+    sqlite_engine,
+    query: str,
+) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id=f"bot-self-{len(query)}",
+            plain_text=query,
+        )
+    )
+
+    prompt_text = "\n".join(llm.calls[-1])
+    assert "'you' means the assistant described by System persona" in prompt_text
+    assert "Do not describe, profile, name, or identify the requester" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_router_treats_who_am_i_as_partial_requester_portrait(
+    sqlite_engine,
+) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="requester-identity",
+            plain_text="我是谁",
+        )
+    )
+
+    prompt_text = "\n".join(llm.calls[-1])
+    assert "request for a remembered portrait" in prompt_text
+    assert "Target message sender label is direct identity evidence" in prompt_text
+    assert "you must answer concisely" in prompt_text
+    assert "do not abstain merely because the portrait is incomplete" in prompt_text
+    assert "Never copy a nearby assistant reply about another member" in prompt_text
+
+
+def test_router_memory_policy_requires_exact_attribute_matching() -> None:
+    assert "Match the memory question's requested subject, attribute" in (
+        MEMORY_ATTRIBUTE_MATCHING_INSTRUCTION
+    )
+    assert "Use plan evidence for plans" in MEMORY_ATTRIBUTE_MATCHING_INSTRUCTION
+    assert "exact historical phrase" in MEMORY_ATTRIBUTE_MATCHING_INSTRUCTION
 
 
 @pytest.mark.asyncio
@@ -1682,7 +1754,7 @@ async def test_router_passes_images_for_addressed_turn_without_putting_them_in_r
 
 
 @pytest.mark.asyncio
-async def test_router_addressed_turn_without_explicit_image_uses_latest_two_recent_images(
+async def test_router_addressed_image_reference_uses_only_requester_prior_image(
     sqlite_engine,
     monkeypatch,
 ) -> None:
@@ -1738,18 +1810,16 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
             group_id=10001,
             mentioned_bot=False,
             message_id="addressed-recent-target",
-            plain_text="@Mira 这两张图怎么样",
+            plain_text="@Mira 这张图怎么样",
         )
     )
 
     assert [image.url for image in llm.calls[-1]["images"]] == [
-        "https://img.example.test/addressed-recent-2.png",
-        "https://img.example.test/addressed-recent-1.png",
+        "https://img.example.test/addressed-recent-0.png",
     ]
     prompt_text = "\n".join(llm.calls[-1]["prompt_lines"])
-    assert router_module.AMBIENT_IMAGE_GROUNDING_INSTRUCTION in prompt_text
-    assert "Attached image 1 was sent by Carol." in prompt_text
-    assert "Attached image 2 was sent by Bob." in prompt_text
+    assert "Attached image 1 was sent by Alice." in prompt_text
+    assert "Attached image 2" not in prompt_text
 
 
 @pytest.mark.asyncio
@@ -1757,7 +1827,6 @@ async def test_router_addressed_turn_without_explicit_image_uses_latest_two_rece
 async def test_router_subject_bound_memory_query_excludes_ambient_recent_images(
     sqlite_engine,
     monkeypatch,
-    caplog,
     ambient_user_id,
 ) -> None:
     class SubjectBoundMemoryOrchestrator:
@@ -1820,7 +1889,6 @@ async def test_router_subject_bound_memory_query_excludes_ambient_recent_images(
         "detect_address_intent",
         lambda **kwargs: AddressDecision(True, "named_bot", 10),
     )
-    caplog.set_level(logging.INFO)
     await router.handle_group_message(
         make_event(
             group_id=10001,
@@ -1832,7 +1900,6 @@ async def test_router_subject_bound_memory_query_excludes_ambient_recent_images(
 
     assert llm.calls[-1]["images"] is None
     assert "unrelated-title.png" not in "\n".join(llm.calls[-1]["prompt_lines"])
-    assert "reason=personal_fact_grounding" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2299,7 +2366,7 @@ async def test_router_uses_gateway_resolved_quoted_image_when_local_quote_id_is_
 
 
 @pytest.mark.asyncio
-async def test_router_uses_recent_image_when_quoted_remote_message_has_no_image(sqlite_engine) -> None:
+async def test_router_does_not_fallback_to_recent_image_when_quoted_remote_message_has_no_image(sqlite_engine) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     sender.gateway = FakeGateway(
@@ -2364,9 +2431,7 @@ async def test_router_uses_recent_image_when_quoted_remote_message_has_no_image(
     )
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
-    assert [image.url for image in llm.calls[0]["images"]] == [
-        "https://img.example.test/other-user.png"
-    ]
+    assert llm.calls[0]["images"] is None
 
 
 @pytest.mark.asyncio
@@ -2533,7 +2598,7 @@ async def test_router_does_not_bind_stale_image_for_non_image_addressed_text(sql
     )
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it."]
-    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/stale.png"]
+    assert llm.calls[-1]["images"] is None
 
 
 @pytest.mark.asyncio
@@ -2584,7 +2649,7 @@ async def test_router_uses_latest_recent_image_after_intervening_user_text(sqlit
 
     assert [outbound.text for outbound in sender.sent] == ["I can see it.", "I can see it."]
     assert [image.url for image in llm.calls[0]["images"]] == ["https://img.example.test/consumed.png"]
-    assert [image.url for image in llm.calls[-1]["images"]] == ["https://img.example.test/consumed.png"]
+    assert llm.calls[-1]["images"] is None
 
 
 @pytest.mark.asyncio
@@ -5078,6 +5143,243 @@ def test_generate_group_reply_text_uses_plain_path_without_executor(
     assert llm.plain_calls == 1
 
 
+class _EnvelopeAwareLlm:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+        self.last_prompt: list[str] = []
+        self.supports_selective_web_search = True
+        self.supports_forced_web_search = True
+
+    def generate_text(self, prompt_lines, *, conversation_key=None, **kwargs) -> str:
+        del prompt_lines, conversation_key, kwargs
+        raise AssertionError("envelope path must use tools")
+
+    def generate_text_with_tools(
+        self,
+        prompt_lines,
+        *,
+        tools,
+        tool_executor,
+        conversation_key=None,
+        max_tool_rounds=2,
+        **kwargs,
+    ) -> str:
+        del tools, tool_executor, conversation_key, max_tool_rounds, kwargs
+        self.calls += 1
+        self.last_prompt = list(prompt_lines)
+        return self.responses[min(self.calls - 1, len(self.responses) - 1)]
+
+
+def test_generate_group_reply_text_uses_envelope_and_returns_answer(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    valid = json.dumps(
+        {
+            "answer": "记忆里的回答",
+            "cited_source_message_ids": ["m1"],
+            "abstained": False,
+            "decision_envelope": {
+                "decision": "answer",
+                "claims": [
+                    {
+                        "text": "记忆里的回答",
+                        "evidence_ids": ["m1"],
+                        "source_ids": ["m1"],
+                    }
+                ],
+                "answer": "记忆里的回答",
+                "expansion_request": None,
+            },
+        },
+        ensure_ascii=False,
+    )
+    llm = _EnvelopeAwareLlm([valid])
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 阿渣喜欢什么"],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        memory_source_ids=("m1",),
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "记忆里的回答"
+    assert llm.calls == 1
+    assert "Allowed citation IDs JSON list" in "\n".join(llm.last_prompt)
+    assert "m1" in "\n".join(llm.last_prompt)
+
+
+def test_generate_group_reply_text_reanswers_once_when_envelope_invalid(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    invalid = json.dumps(
+        {
+            "answer": "坏引用",
+            "cited_source_message_ids": ["bad"],
+            "abstained": False,
+            "decision_envelope": {
+                "decision": "answer",
+                "claims": [
+                    {
+                        "text": "坏引用",
+                        "evidence_ids": ["bad"],
+                        "source_ids": ["bad"],
+                    }
+                ],
+                "answer": "坏引用",
+                "expansion_request": None,
+            },
+        },
+        ensure_ascii=False,
+    )
+    valid = json.dumps(
+        {
+            "answer": "修正后的回答",
+            "cited_source_message_ids": ["m1"],
+            "abstained": False,
+            "decision_envelope": {
+                "decision": "answer",
+                "claims": [
+                    {
+                        "text": "修正后的回答",
+                        "evidence_ids": ["m1"],
+                        "source_ids": ["m1"],
+                    }
+                ],
+                "answer": "修正后的回答",
+                "expansion_request": None,
+            },
+        },
+        ensure_ascii=False,
+    )
+    llm = _EnvelopeAwareLlm([invalid, valid])
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe."],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        memory_source_ids=("m1",),
+        memory_has_evidence=True,
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "修正后的回答"
+    assert llm.calls == 2
+    assert "failed structural validation" in "\n".join(llm.last_prompt)
+
+
+def test_generate_group_reply_text_disabled_envelope_keeps_plain_tools(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    llm = _ToolAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    router.runtime.settings.memory_decision_envelope_enabled = False
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe."],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        memory_source_ids=("m1",),
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "tooled reply"
+    assert llm.tool_calls == [(2, 3, {"allow_web_search": False})]
+
+
+def test_generate_group_reply_text_reconsiders_abstention_with_packet_evidence(
+    sqlite_engine,
+) -> None:
+    from types import SimpleNamespace
+
+    abstain = json.dumps(
+        {
+            "answer": "没有足够的记忆素材回答这个问题。",
+            "cited_source_message_ids": [],
+            "abstained": True,
+            "decision_envelope": {
+                "decision": "abstain",
+                "claims": [],
+                "answer": "没有足够的记忆素材回答这个问题。",
+                "expansion_request": None,
+            },
+        },
+        ensure_ascii=False,
+    )
+    answer = json.dumps(
+        {
+            "answer": "他有一个有效事实。",
+            "cited_source_message_ids": ["m1"],
+            "abstained": False,
+            "decision_envelope": {
+                "decision": "answer",
+                "claims": [
+                    {
+                        "text": "他有一个有效事实。",
+                        "evidence_ids": ["m1"],
+                        "source_ids": ["m1"],
+                    }
+                ],
+                "answer": "他有一个有效事实。",
+                "expansion_request": None,
+            },
+        },
+        ensure_ascii=False,
+    )
+    llm = _EnvelopeAwareLlm([abstain, answer])
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=llm,
+    )
+    executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
+    reply = PreparedGroupReply(
+        should_reply=True,
+        prompt_lines=["Group policy: keep safe."],
+        use_memory_tools=True,
+        memory_tool_executor=executor,
+        memory_source_ids=("m1",),
+        memory_has_evidence=True,
+    )
+    text = router._generate_group_reply_text(
+        event=SimpleNamespace(group_id=10001),
+        prepared_reply=reply,
+    )
+    assert text == "他有一个有效事实。"
+    assert llm.calls == 2
+    assert "Reconsider once" in "\n".join(llm.last_prompt)
+
+
 def test_query_mentions_member_detects_nickname_card_and_id() -> None:
     from types import SimpleNamespace
 
@@ -5291,20 +5593,18 @@ async def test_router_local_proactive_candidate_skips_judge_and_replies(sqlite_e
     assert len(sender.sent) == 1
     assert len(llm.calls) == 1
     assert judge.calls == []
-    assert [image.url for image in llm.calls[0]["images"]] == [
-        "https://img.example.test/local-proactive-image-2.png",
-        "https://img.example.test/local-proactive-image-1.png",
-    ]
+    assert llm.calls[0]["images"] is None
 
 
 @pytest.mark.asyncio
-async def test_router_proactive_judge_and_generation_include_recent_images(sqlite_engine, monkeypatch) -> None:
+async def test_router_proactive_judge_and_generation_include_explicitly_quoted_image(sqlite_engine, monkeypatch) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()
     judge = FakeProactiveJudgeLlm(decision=True)
     router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
     router.reply_policy = AlwaysCandidateReplyPolicy()
     router.proactive_judge_client = judge
+    router.runtime.settings.proactive_image_max_count = 1
 
     with session_scope(sqlite_engine) as session:
         groups = GroupRepository(session)
@@ -5319,7 +5619,21 @@ async def test_router_proactive_judge_and_generation_include_recent_images(sqlit
                         "file": "recent.png",
                         "url": "http://example/recent.png",
                     },
-                }
+                },
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "second.png",
+                        "url": "http://example/second.png",
+                    },
+                },
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "third.png",
+                        "url": "http://example/third.png",
+                    },
+                },
             ],
             "message_id": "img-recent-1",
         }
@@ -5352,11 +5666,89 @@ async def test_router_proactive_judge_and_generation_include_recent_images(sqlit
     )
 
     assert len(judge.calls) == 1
-    assert judge.seen_images[0], "judge should receive images from the recent window"
-    assert any(image.url == "http://example/recent.png" for image in judge.seen_images[0])
+    assert judge.seen_images[0], "judge should receive the explicitly quoted image"
+    assert [image.url for image in judge.seen_images[0]] == ["http://example/recent.png"]
     assert len(sender.sent) == 1
-    assert llm.calls[-1]["images"], "generation should receive the image pool too"
+    assert llm.calls[-1]["images"], "generation should receive the quoted image too"
     assert any(image.url == "http://example/recent.png" for image in llm.calls[-1]["images"])
+
+
+@pytest.mark.asyncio
+async def test_router_proactive_judge_limits_current_multiple_images(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    sender = FakeSender()
+    llm = ImageCapturingLlm()
+    judge = FakeProactiveJudgeLlm(decision=True)
+    router = InboundRouter.build_for_test(sqlite_engine=sqlite_engine, sender=sender, llm_client=llm)
+    router.reply_policy = AlwaysCandidateReplyPolicy()
+    router.proactive_judge_client = judge
+    router.runtime.settings.proactive_image_max_count = 1
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(False, "none", 0),
+    )
+    monkeypatch.setattr(
+        router_module,
+        "cache_images_in_raw_payload",
+        lambda raw_payload, *, cache_dir: None,
+    )
+
+    with session_scope(sqlite_engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        groups.upsert_group(
+            group_id=10001,
+            group_name="10001",
+            enabled=True,
+            speak_enabled=True,
+        )
+        users.upsert_user(user_id=20001, nickname="Alice", group_card="")
+        MessageRepository(session).add_group_message(
+            platform_msg_id="open-prompt-1",
+            group_id=10001,
+            user_id=20001,
+            timestamp=datetime(2026, 5, 9, 11, 59, 50, tzinfo=UTC),
+            plain_text="@Mira 帮我看看",
+            raw_json={
+                "message": [{"type": "text", "data": {"text": "@Mira 帮我看看"}}],
+                "message_id": "open-prompt-1",
+            },
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=True,
+        )
+
+    images = [
+        ImageAttachment(
+            url=f"http://example/current-{index}.png",
+            file_id=f"current-{index}.png",
+            source_message_id="current-img-1",
+            source_user_id=20001,
+            source_nickname="Alice",
+        )
+        for index in range(3)
+    ]
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="current-img-1",
+            plain_text="这张图好怪",
+            images=images,
+        )
+    )
+
+    assert len(judge.calls) == 1
+    assert judge.seen_images[0], "judge should receive current images"
+    assert [image.url for image in judge.seen_images[0]] == [
+        "http://example/current-0.png"
+    ]
+    assert llm.calls[-1]["images"]
+    assert len(llm.calls[-1]["images"]) == 3
 
 
 @pytest.mark.asyncio

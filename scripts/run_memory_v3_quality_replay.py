@@ -804,7 +804,9 @@ def build_answer_repair_prompt(
         "Evaluation contract repair: the previous draft violated only the listed output/evidence "
         f"contracts {failures}. Previous draft: {prior}. Re-read the same packet and return a replacement "
         "JSON object whose answer text and abstained value are byte-for-byte identical to the previous "
-        "draft; only cited_source_message_ids may change. Do not preserve a citation merely because it appeared before. For "
+        "draft; only cited_source_message_ids may change. The sole exception is an empty Allowed citation "
+        f"IDs list: then return exactly {json.dumps(FIXED_ABSTENTION_ANSWER, ensure_ascii=False)} with "
+        "cited_source_message_ids=[] and abstained=true. Do not preserve a citation merely because it appeared before. For "
         "citation_not_minimal, keep exactly the source line whose own text states each factual clause; "
         "remove adjacent reactions, replies, corroboration, and context. For citation_missing, cite a "
         "direct source or use the fixed abstention contract. For citation_outside_allowlist, copy only an "
@@ -848,7 +850,7 @@ def _generate_citation_repair_with_retry(
     original_answer: GeneratedAnswer,
     allowed_citation_ids: Sequence[str],
 ) -> AnswerGenerationOutcome:
-    """Accept a repair only when it changes citations and nothing substantive."""
+    """Accept citation-only repair, or canonical abstention with no citable evidence."""
 
     allowed = set(allowed_citation_ids)
     last_observed: ObservedGeneration | None = None
@@ -863,10 +865,19 @@ def _generate_citation_repair_with_retry(
             repaired = parse_generated_answer(observed.text)
         except (ValueError, json.JSONDecodeError):
             continue
+        canonical_empty_abstention = bool(
+            not allowed
+            and repaired.answer == FIXED_ABSTENTION_ANSWER
+            and repaired.abstained
+            and not repaired.cited_source_message_ids
+        )
         if (
-            repaired.answer != original_answer.answer
-            or repaired.abstained != original_answer.abstained
-            or not set(repaired.cited_source_message_ids) <= allowed
+            not canonical_empty_abstention
+            and (
+                repaired.answer != original_answer.answer
+                or repaired.abstained != original_answer.abstained
+                or not set(repaired.cited_source_message_ids) <= allowed
+            )
         ):
             continue
         return AnswerGenerationOutcome(observation=observed, answer=repaired)

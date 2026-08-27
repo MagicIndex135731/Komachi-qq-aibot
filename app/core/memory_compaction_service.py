@@ -12,8 +12,11 @@ from zoneinfo import ZoneInfo
 from app.core.memory_compaction import (
     build_memory_compaction_prompt,
     canonical_key,
+    derive_explicit_memory_invalidations,
     is_addressing_rule,
+    is_single_value_profile_attribute,
     parse_memory_compaction_response,
+    single_value_profile_attribute_predicates,
     structured_digest,
 )
 from app.core.summarizer import summarize_window
@@ -388,12 +391,32 @@ class MemoryCompactionService:
                 summary_key=day_key,
             )
             previous_digest = existing_daily[-1].content if existing_daily else ""
+            allowed_subjects = tuple(dict.fromkeys(str(row.user_id) for row in rows))
+            memory_repository = MemoryRepository(session)
+            correction_targets = tuple(
+                {
+                    "target_canonical_key": str(memory.canonical_key),
+                    "memory_kind": str(memory.memory_kind),
+                    "subject_id": str(memory.subject_id),
+                    "predicate": str(memory.predicate or ""),
+                    "object_text": str(memory.object_text or ""),
+                }
+                for subject_id in allowed_subjects
+                for memory in memory_repository.list_current_group_memories(
+                    scope_id=str(group_id),
+                    subject_id=subject_id,
+                    limit=500,
+                )
+                if str(memory.memory_kind) in {"profile", "preference"}
+                and bool(str(memory.canonical_key or "").strip())
+            )
 
         fallback = summarize_window(source_lines)
         prompt = build_memory_compaction_prompt(
             messages=prompt_messages,
             previous_digest=previous_digest,
             language="zh",
+            active_correction_targets=correction_targets,
         )
         raw = self.llm_client.generate_text([prompt])
         compaction = parse_memory_compaction_response(
@@ -401,8 +424,27 @@ class MemoryCompactionService:
             allowed_source_msg_ids={item["source_msg_id"] for item in prompt_messages},
             allowed_subject_ids={"group", *(str(row.user_id) for row in rows)},
             source_subject_ids={row.platform_msg_id: str(row.user_id) for row in rows},
+            source_contents={
+                row.platform_msg_id: str(row.plain_text or "").strip()
+                for row in rows
+            },
+            allowed_invalidation_targets={
+                str(target["target_canonical_key"]): target
+                for target in correction_targets
+            },
             fallback_text=fallback,
             strict=True,
+        )
+        deterministic_invalidations = derive_explicit_memory_invalidations(
+            messages=tuple(
+                {
+                    "source_msg_id": row.platform_msg_id,
+                    "user_id": str(row.user_id),
+                    "plain_text": str(row.plain_text or "").strip(),
+                }
+                for row in rows
+            ),
+            active_correction_targets=correction_targets,
         )
         digest = structured_digest(compaction.summary, compaction.facts[: self.max_facts])
 
@@ -433,6 +475,33 @@ class MemoryCompactionService:
                 source_start_msg_id=rows[0].platform_msg_id,
                 source_end_msg_id=rows[-1].platform_msg_id,
             )
+            invalidations_by_target = {
+                item.target_canonical_key: item for item in compaction.invalidations
+            }
+            for item in deterministic_invalidations:
+                previous = invalidations_by_target.get(item.target_canonical_key)
+                invalidations_by_target[item.target_canonical_key] = type(item)(
+                    target_canonical_key=item.target_canonical_key,
+                    source_msg_ids=tuple(
+                        sorted(
+                            set(item.source_msg_ids).union(
+                                previous.source_msg_ids if previous is not None else ()
+                            )
+                        )
+                    ),
+                    reason="explicit_denial",
+                    valid_until=(previous.valid_until if previous is not None else None),
+                )
+            for invalidation in invalidations_by_target.values():
+                memories.invalidate_canonical_memory(
+                    scope_id=str(group_id),
+                    target_canonical_key=invalidation.target_canonical_key,
+                    source_msg_ids=list(invalidation.source_msg_ids),
+                    valid_until=(
+                        _parse_timestamp(invalidation.valid_until) or end_at
+                    ),
+                    reason=invalidation.reason,
+                )
             for fact in compaction.facts[: self.max_facts]:
                 valid_until = _parse_timestamp(fact.valid_until)
                 if fact.kind == "expired":
@@ -460,12 +529,23 @@ class MemoryCompactionService:
                     valid_from=end_at,
                     valid_until=valid_until,
                     replace_previous=(
-                        fact.kind == "preference"
-                        and is_addressing_rule(
-                            fact.predicate,
-                            fact.object_text,
-                            fact.content,
+                        (
+                            fact.kind == "preference"
+                            and is_addressing_rule(
+                                fact.predicate,
+                                fact.object_text,
+                                fact.content,
+                            )
                         )
+                        or (
+                            fact.kind == "profile"
+                            and is_single_value_profile_attribute(fact.predicate)
+                        )
+                    ),
+                    replacement_predicates=(
+                        single_value_profile_attribute_predicates(fact.predicate)
+                        if fact.kind == "profile"
+                        else ()
                     ),
                 )
             existing_daily = summaries.list_group_summaries(

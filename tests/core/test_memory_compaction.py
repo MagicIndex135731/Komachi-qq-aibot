@@ -6,6 +6,8 @@ from app.core.memory_compaction import (
     MemoryFact,
     build_memory_compaction_prompt,
     canonical_key,
+    derive_explicit_memory_invalidations,
+    is_single_value_profile_attribute,
     parse_memory_compaction_response,
     structured_digest,
 )
@@ -295,6 +297,442 @@ def test_prompt_builder_includes_kind_semantic_guidance() -> None:
     assert "explicitly says they are currently watching" in english
     assert "Merely discussing a plot, character, or season" in english
     assert "profile is not a fallback category" in english
+    assert "40岁再看" in chinese
+    assert "emit kind=expired" in chinese
+
+
+def test_profile_parser_rejects_hypothetical_future_age_inference() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户讨论以后重看作品。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate="age",
+                    object_text="40岁",
+                    content="42 目前 40 岁。",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": "等我40岁再看这部作品"},
+    )
+
+    assert result.facts == ()
+    assert result.rejected_fact_count == 1
+
+
+def test_profile_parser_rejects_chinese_hypothetical_future_age_inference() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户讨论以后重看作品。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate="年龄阶段",
+                    object_text="接近四十岁",
+                    content="42 接近四十岁。",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": "等我四十岁再看全金属狂潮"},
+    )
+
+    assert result.facts == ()
+    assert result.rejected_fact_count == 1
+
+
+def test_profile_parser_accepts_direct_self_reported_age() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户直接说明年龄。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate="age",
+                    object_text="28岁",
+                    content="42 今年 28 岁。",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": "我今年28岁"},
+    )
+
+    assert len(result.facts) == 1
+
+
+def test_profile_parser_rejects_active_value_from_explicit_denial() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户否认旧国籍标签。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate="nationality",
+                    object_text="日本人",
+                    content="42 是日本人。",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": "我不是日本人，那个说法不对"},
+    )
+
+    assert result.facts == ()
+
+
+@pytest.mark.parametrize(
+    ("predicate", "object_text", "content", "source_text"),
+    (
+        ("nationality", "日本人", "42 是日本人。", "你怎么知道我是日本人？"),
+        ("nationality", "日本人", "42 是日本人。", "别人说我是日本人"),
+        ("age", "40岁", "42 今年 40 岁。", "谁说我今年40岁？"),
+    ),
+)
+def test_profile_parser_rejects_questions_and_attributed_claims(
+    predicate: str,
+    object_text: str,
+    content: str,
+    source_text: str,
+) -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户讨论一项画像说法。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate=predicate,
+                    object_text=object_text,
+                    content=content,
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": source_text},
+    )
+
+    assert result.facts == ()
+
+
+def test_profile_parser_rejects_content_that_disagrees_with_object() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户直接说明国籍。",
+            "facts": [
+                _fact(
+                    kind="profile",
+                    subject_id="42",
+                    predicate="nationality",
+                    object_text="日本人",
+                    content="42 是中国人。",
+                    source_ids=["m-1"],
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        source_contents={"m-1": "我是日本人"},
+    )
+
+    assert result.facts == ()
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    ("age", "nationality", "hometown", "年龄", "国籍", "常住地"),
+)
+def test_single_value_profile_attribute_recognizes_replacement_predicates(
+    predicate: str,
+) -> None:
+    assert is_single_value_profile_attribute(predicate) is True
+
+
+def test_single_value_profile_attribute_does_not_replace_multi_value_traits() -> None:
+    assert is_single_value_profile_attribute("personality_trait") is False
+
+
+def test_profile_canonical_key_normalizes_single_value_predicate_aliases() -> None:
+    assert canonical_key("profile", "42", "居住地", "深圳") == canonical_key(
+        "profile", "42", "location", "深圳"
+    )
+    assert canonical_key("profile", "42", "岁数", "40") == canonical_key(
+        "profile", "42", "age", "40"
+    )
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    (
+        "年龄阶段",
+        "所在地天气感受",
+        "hometown_reference",
+        "国籍与常住地",
+        "籍贯或地域认同",
+        "来自",
+    ),
+)
+def test_single_value_profile_attribute_rejects_composite_or_derived_predicates(
+    predicate: str,
+) -> None:
+    assert is_single_value_profile_attribute(predicate) is False
+
+
+def test_parser_accepts_exact_source_backed_profile_invalidation() -> None:
+    target_key = "profile|42|age|40岁"
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户否认旧年龄。",
+            "facts": [],
+            "invalidations": [
+                {
+                    "target_canonical_key": target_key,
+                    "source_msg_ids": ["deny-1"],
+                    "reason": "explicit_denial",
+                    "valid_until": "2026-08-24T20:39:19+08:00",
+                }
+            ],
+        },
+        allowed_source_msg_ids={"deny-1"},
+        source_subject_ids={"deny-1": "42"},
+        allowed_invalidation_targets={
+            target_key: {
+                "subject_id": "42",
+                "memory_kind": "profile",
+            }
+        },
+    )
+
+    assert len(result.invalidations) == 1
+    assert result.invalidations[0].target_canonical_key == target_key
+    assert result.invalidations[0].source_msg_ids == ("deny-1",)
+
+
+@pytest.mark.parametrize(
+    ("target_key", "source_subject"),
+    (("profile|42|age|unknown", "42"), ("profile|42|age|40岁", "43")),
+)
+def test_parser_rejects_unknown_or_cross_subject_invalidation(
+    target_key: str,
+    source_subject: str,
+) -> None:
+    allowed_key = "profile|42|age|40岁"
+    result = parse_memory_compaction_response(
+        {
+            "summary": "否认。",
+            "facts": [],
+            "invalidations": [
+                {
+                    "target_canonical_key": target_key,
+                    "source_msg_ids": ["deny-1"],
+                    "reason": "explicit_denial",
+                    "valid_until": None,
+                }
+            ],
+        },
+        allowed_source_msg_ids={"deny-1"},
+        source_subject_ids={"deny-1": source_subject},
+        allowed_invalidation_targets={
+            allowed_key: {
+                "subject_id": "42",
+                "memory_kind": "profile",
+            }
+        },
+    )
+
+    assert result.invalidations == ()
+    assert result.rejected_invalidation_count == 1
+
+
+def test_prompt_lists_exact_active_correction_catalog() -> None:
+    prompt = build_memory_compaction_prompt(
+        language="zh",
+        messages=[{"source_msg_id": "deny-1", "content": "我不是40岁"}],
+        active_correction_targets=[
+            {
+                "target_canonical_key": "profile|42|age|40岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "predicate": "age",
+                "object_text": "40岁",
+            }
+        ],
+    )
+
+    assert "Active correction targets (catalog only, not evidence)" in prompt
+    assert '"target_canonical_key": "profile|42|age|40岁"' in prompt
+
+
+def test_direct_same_subject_denials_derive_exact_catalog_invalidations() -> None:
+    invalidations = derive_explicit_memory_invalidations(
+        messages=(
+            {
+                "source_msg_id": "deny-age",
+                "user_id": "42",
+                "plain_text": "我不是40岁",
+            },
+            {
+                "source_msg_id": "deny-work",
+                "user_id": "42",
+                "plain_text": "我没看过全金属狂潮，也不看小说",
+            },
+        ),
+        active_correction_targets=(
+            {
+                "target_canonical_key": "profile|42|age|40岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "object_text": "40岁",
+            },
+            {
+                "target_canonical_key": "preference|42|likes|全金属狂潮小说",
+                "memory_kind": "preference",
+                "subject_id": "42",
+                "object_text": "全金属狂潮小说",
+            },
+        ),
+    )
+
+    assert {item.target_canonical_key for item in invalidations} == {
+        "profile|42|age|40岁",
+        "preference|42|likes|全金属狂潮小说",
+    }
+
+
+def test_direct_age_denial_matches_chinese_age_object_to_arabic_source() -> None:
+    invalidations = derive_explicit_memory_invalidations(
+        messages=(
+            {
+                "source_msg_id": "deny-age",
+                "user_id": "42",
+                "plain_text": "我什么时候40了，别乱说",
+            },
+        ),
+        active_correction_targets=(
+            {
+                "target_canonical_key": "profile|42|年龄阶段|四十岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "object_text": "四十岁",
+            },
+        ),
+    )
+
+    assert [item.target_canonical_key for item in invalidations] == [
+        "profile|42|年龄阶段|四十岁"
+    ]
+
+
+def test_direct_age_denial_matches_real_near_age_correction_wording() -> None:
+    invalidations = derive_explicit_memory_invalidations(
+        messages=(
+            {
+                "source_msg_id": "deny-age",
+                "user_id": "42",
+                "plain_text": "不对啊年近40哪来的",
+            },
+        ),
+        active_correction_targets=(
+            {
+                "target_canonical_key": "profile|42|年龄阶段|接近四十岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "predicate": "年龄阶段",
+                "object_text": "接近四十岁",
+            },
+        ),
+    )
+
+    assert [item.target_canonical_key for item in invalidations] == [
+        "profile|42|年龄阶段|接近四十岁"
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "我没有40块钱",
+        "没有，我今年就是40岁",
+        "我没有说不喜欢全金属狂潮",
+        "全金属狂潮没有库存，但我还是喜欢",
+    ),
+)
+def test_deterministic_invalidation_rejects_unrelated_or_negated_denials(
+    message: str,
+) -> None:
+    invalidations = derive_explicit_memory_invalidations(
+        messages=(
+            {"source_msg_id": "m-1", "user_id": "42", "plain_text": message},
+        ),
+        active_correction_targets=(
+            {
+                "target_canonical_key": "profile|42|age|40岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "predicate": "age",
+                "object_text": "40岁",
+            },
+            {
+                "target_canonical_key": "preference|42|likes|全金属狂潮",
+                "memory_kind": "preference",
+                "subject_id": "42",
+                "predicate": "likes",
+                "object_text": "全金属狂潮",
+            },
+        ),
+    )
+
+    assert invalidations == ()
+
+
+def test_direct_denial_does_not_cross_subject_or_fuzzy_match_unrelated_fact() -> None:
+    invalidations = derive_explicit_memory_invalidations(
+        messages=(
+            {
+                "source_msg_id": "deny-age",
+                "user_id": "43",
+                "plain_text": "我不是40岁",
+            },
+        ),
+        active_correction_targets=(
+            {
+                "target_canonical_key": "profile|42|age|40岁",
+                "memory_kind": "profile",
+                "subject_id": "42",
+                "object_text": "40岁",
+            },
+            {
+                "target_canonical_key": "preference|43|likes|科幻小说",
+                "memory_kind": "preference",
+                "subject_id": "43",
+                "object_text": "科幻小说",
+            },
+        ),
+    )
+
+    assert invalidations == ()
 
 
 def test_addressing_rule_decision_is_remapped_to_preference() -> None:
