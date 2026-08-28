@@ -167,10 +167,6 @@ def test_router_impersonation_guardrail_and_memory_filter(sqlite_engine) -> None
         sender=object(),
         llm_client=object(),
     )
-    assert InboundRouter._filter_bot_identity_memory_lines(
-        ["主人今天心情不错", "晚上吃什么"]
-    ) == ["晚上吃什么"]
-
     router.persona_manager.personas["test_self"] = {
         "name": "测试君",
         "identity": "group member",
@@ -178,10 +174,10 @@ def test_router_impersonation_guardrail_and_memory_filter(sqlite_engine) -> None
     router.persona_manager.set_persona_key(10001, "test_self")
     text = router._persona_text_for(router._active_persona(10001), 10001)
     assert "完整扮演群成员 测试君" in text
-    assert "不是小町" in text
+    assert "不是任何其他身份" in text
 
 
-def test_router_scrubs_bot_voice_in_context_lines(sqlite_engine) -> None:
+def test_router_sanitizes_impersonation_context_lines(sqlite_engine) -> None:
     from app.core.router import InboundRouter
 
     router = InboundRouter.build_for_test(
@@ -191,16 +187,47 @@ def test_router_scrubs_bot_voice_in_context_lines(sqlite_engine) -> None:
     )
     router.runtime.persona["name"] = "测试小町"
 
-    scrubbed = router._scrub_bot_voice_lines(
+    router.persona_manager.personas["test_self"] = {
+        "name": "测试君",
+        "identity": "group member",
+    }
+    router.persona_manager.set_persona_key(10001, "test_self")
+
+    scrubbed = router._sanitize_impersonation_lines(
         [
             "阿渣（小町扮演）: 主人，来了",
             "测试小町: 大人您稍等",
             "路人: 谁是你的主人",
-        ]
+            "测试君: 大人您稍等",
+            "小町今天毒舌了一整天",
+        ],
+        group_id=10001,
     )
 
     assert scrubbed == [
-        "阿渣（小町扮演）: 你，来了",
-        "测试小町: 你稍等",
-        "路人: 谁是你的主人",
+        "测试君: 你稍等",
     ]
+
+
+def test_router_formats_clean_bot_label_for_prompt_lines(sqlite_engine) -> None:
+    from app.core.router import InboundRouter
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=object(),
+    )
+    router.persona_manager.personas["test_self"] = {
+        "name": "测试君",
+        "identity": "group member",
+    }
+    router.persona_manager.set_persona_key(10001, "test_self")
+
+    line = router._format_message_line(
+        user_id=router.runtime.settings.bot_qq,
+        plain_text="来了",
+        users_by_id={},
+        group_id=10001,
+    )
+
+    assert line == "测试君: 来了"

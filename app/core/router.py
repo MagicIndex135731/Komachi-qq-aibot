@@ -168,6 +168,18 @@ BOT_SELF_IDENTITY_INSTRUCTION = (
     "identify the requester, even if recent or historical context discusses them."
 )
 
+IMPERSONATION_CONTAMINANT_MARKERS = (
+    "主人",
+    "小町",
+    "比企谷",
+    "机器人",
+    "AI助手",
+    "AI群友",
+    "mesugaki",
+    "笨蛋",
+    "毒舌",
+)
+
 REQUESTER_IDENTITY_INSTRUCTION = (
     "For this requester identity question, 'I/me' means the current human requester. "
     "Treat the literal question 'who am I' as a request for a remembered portrait, not "
@@ -827,8 +839,8 @@ class InboundRouter:
             return text
         name = str(active_persona.get("name") or "").strip()
         text += (
-            f"\n你正在完整扮演群成员 {name}：你就是 TA 本人，不是 AI，也不是小町。"
-            "不要沿用任何属于小町/机器人的身份记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
+            f"\n你正在完整扮演群成员 {name}：你就是 TA 本人，不是 AI，也不是任何其他身份。"
+            "不要沿用任何属于 AI 或其他身份的设定与记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
             "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
         )
         return text
@@ -844,50 +856,51 @@ class InboundRouter:
             ]
         return lines
 
-    def _scrub_bot_voice_lines(self, lines: list[str]) -> list[str]:
-        """Remove honorifics from the bot's own historical lines in context.
+    def _impersonation_bot_labels(self, group_id: int) -> set[str]:
+        labels = {str(self.runtime.persona.get("name", "") or "").strip()}
+        if self.persona_manager is not None:
+            labels.add(self.persona_manager.active_name(group_id))
+        return {label for label in labels if label}
 
-        Old outbound messages (from previous personas) are the primary
-        self-imitation source for stray address terms; scrubbing them prevents
-        the model from copying its own history.
+    def _sanitize_impersonation_lines(
+        self, lines: list[str], *, group_id: int
+    ) -> list[str]:
+        """Strip every factor that could pull the model out of character.
+
+        In impersonation mode the injected context must not teach the model
+        any previous bot persona: drop lines mentioning 小町/AI/主人 markers,
+        and scrub honorifics from the bot's own historical lines.
         """
 
-        marker = "（小町扮演）"
-        default_label = str(self.runtime.persona.get("name", "") or "").strip()
-        scrubbed: list[str] = []
+        bot_labels = self._impersonation_bot_labels(group_id)
+        sanitized: list[str] = []
         for line in lines:
             text = str(line)
-            is_bot_line = marker in text or (
-                bool(default_label) and text.startswith(f"{default_label}:")
-            )
-            if not is_bot_line:
-                scrubbed.append(text)
+            if any(marker in text for marker in IMPERSONATION_CONTAMINANT_MARKERS):
                 continue
             head, separator, tail = text.partition(":")
-            if separator:
+            is_bot_line = separator and (
+                head.strip() in bot_labels or "（小町扮演）" in head
+            )
+            if is_bot_line:
                 text = (
                     f"{head}:"
                     f"{scrub_banned_address_terms(tail, BANNED_ADDRESS_TERMS)}"
                 )
-            else:
-                text = scrub_banned_address_terms(text, BANNED_ADDRESS_TERMS)
-            scrubbed.append(text)
-        return scrubbed
+            sanitized.append(text)
+        return sanitized
 
-    def _scrub_packed_bot_voice(self, packed):
+    def _sanitize_packed_context(self, packed, *, group_id: int):
         if packed is not None and isinstance(getattr(packed, "text", None), str):
-            lines = [
-                line for line in packed.text.splitlines() if "主人" not in line
-            ]
             packed = replace(
                 packed,
-                text="\n".join(self._scrub_bot_voice_lines(lines)),
+                text="\n".join(
+                    self._sanitize_impersonation_lines(
+                        packed.text.splitlines(), group_id=group_id
+                    )
+                ),
             )
         return packed
-
-    @staticmethod
-    def _filter_bot_identity_memory_lines(lines: list[str]) -> list[str]:
-        return [line for line in lines if "主人" not in line]
 
     def _normalize_lookup_text(self, value: str) -> str:
         return LOOKUP_NORMALIZER.sub("", value).lower()
@@ -933,10 +946,21 @@ class InboundRouter:
         plain_text: str,
         users_by_id: dict[int, object],
         group_id: int | None = None,
+        bot_marker: bool = False,
     ) -> str:
+        if (
+            not bot_marker
+            and user_id == self.runtime.settings.bot_qq
+            and group_id is not None
+            and self.persona_manager is not None
+        ):
+            label = self.persona_manager.active_name(group_id)
+        else:
+            label = self._member_label_for_user(
+                user_id=user_id, users_by_id=users_by_id, group_id=group_id
+            )
         return (
-            f"{self._member_label_for_user(user_id=user_id, users_by_id=users_by_id, group_id=group_id)}: "
-            f"{plain_text}"
+            f"{label}: {plain_text}"
         )
 
     def _flatten_raw_message_text(self, raw_payload: dict | None) -> str:
@@ -1330,6 +1354,7 @@ class InboundRouter:
                         plain_text=event.plain_text,
                         users_by_id=current_users_by_id,
                         group_id=event.group_id,
+                        bot_marker=True,
                     )
                 ]
             )
@@ -1479,6 +1504,7 @@ class InboundRouter:
                             plain_text=item.plain_text,
                             users_by_id=window_users_by_id,
                             group_id=event.group_id,
+                            bot_marker=True,
                         )
                         for item in window_messages
                     ]
@@ -1672,7 +1698,9 @@ class InboundRouter:
             persona_text = self._persona_text_for(active_persona, event.group_id)
             impersonating = self._impersonating(event.group_id)
             if impersonating:
-                recent_lines = self._scrub_bot_voice_lines(recent_lines)
+                recent_lines = self._sanitize_impersonation_lines(
+                    recent_lines, group_id=event.group_id
+                )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -2007,7 +2035,9 @@ class InboundRouter:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
             if self._impersonating(event.group_id):
-                packed_memory_context = self._scrub_packed_bot_voice(packed_memory_context)
+                packed_memory_context = self._sanitize_packed_context(
+                    packed_memory_context, group_id=event.group_id
+                )
             memory_answer_anchor = (
                 build_memory_answer_anchor(event.plain_text, packed_memory_context)
                 if packed_memory_context is not None
@@ -2022,12 +2052,24 @@ class InboundRouter:
             relevant_memories = memory_context.memories
             relevant_summaries = memory_context.summaries
             if self._impersonating(event.group_id):
-                relevant_memories = self._filter_bot_identity_memory_lines(relevant_memories)
-                relevant_summaries = self._filter_bot_identity_memory_lines(relevant_summaries)
-                prompt_recent_lines = self._scrub_bot_voice_lines(prompt_recent_lines)
-                full_history_lines = self._scrub_bot_voice_lines(full_history_lines)
-                relevant_history_lines = self._scrub_bot_voice_lines(relevant_history_lines)
-                member_focus_lines = self._scrub_bot_voice_lines(member_focus_lines)
+                relevant_memories = self._sanitize_impersonation_lines(
+                    relevant_memories, group_id=event.group_id
+                )
+                relevant_summaries = self._sanitize_impersonation_lines(
+                    relevant_summaries, group_id=event.group_id
+                )
+                prompt_recent_lines = self._sanitize_impersonation_lines(
+                    prompt_recent_lines, group_id=event.group_id
+                )
+                full_history_lines = self._sanitize_impersonation_lines(
+                    full_history_lines, group_id=event.group_id
+                )
+                relevant_history_lines = self._sanitize_impersonation_lines(
+                    relevant_history_lines, group_id=event.group_id
+                )
+                member_focus_lines = self._sanitize_impersonation_lines(
+                    member_focus_lines, group_id=event.group_id
+                )
             history_detail = memory_context.history_detail
             if is_bot_self_identity_query(event.plain_text, bot_names=bot_names):
                 if impersonating:
