@@ -28,6 +28,7 @@ BANNED_ADDRESS_TERMS = (
     "小姐",
     "夫君",
     "娘子",
+    "您",
 )
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, time, timedelta
 import json
 import logging
@@ -844,6 +844,44 @@ class InboundRouter:
             ]
         return lines
 
+    def _scrub_bot_voice_lines(self, lines: list[str]) -> list[str]:
+        """Remove honorifics from the bot's own historical lines in context.
+
+        Old outbound messages (from previous personas) are the primary
+        self-imitation source for stray address terms; scrubbing them prevents
+        the model from copying its own history.
+        """
+
+        marker = "（小町扮演）"
+        default_label = str(self.runtime.persona.get("name", "") or "").strip()
+        scrubbed: list[str] = []
+        for line in lines:
+            text = str(line)
+            is_bot_line = marker in text or (
+                bool(default_label) and text.startswith(f"{default_label}:")
+            )
+            if not is_bot_line:
+                scrubbed.append(text)
+                continue
+            head, separator, tail = text.partition(":")
+            if separator:
+                text = (
+                    f"{head}:"
+                    f"{scrub_banned_address_terms(tail, BANNED_ADDRESS_TERMS)}"
+                )
+            else:
+                text = scrub_banned_address_terms(text, BANNED_ADDRESS_TERMS)
+            scrubbed.append(text)
+        return scrubbed
+
+    def _scrub_packed_bot_voice(self, packed):
+        if packed is not None and isinstance(getattr(packed, "text", None), str):
+            packed = replace(
+                packed,
+                text=self._scrub_bot_voice_lines([packed.text])[0],
+            )
+        return packed
+
     @staticmethod
     def _filter_bot_identity_memory_lines(lines: list[str]) -> list[str]:
         return [line for line in lines if "主人" not in line]
@@ -1630,6 +1668,8 @@ class InboundRouter:
             persona_name = str(active_persona.get("name", "")).strip()
             persona_text = self._persona_text_for(active_persona, event.group_id)
             impersonating = self._impersonating(event.group_id)
+            if impersonating:
+                recent_lines = self._scrub_bot_voice_lines(recent_lines)
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -1963,6 +2003,8 @@ class InboundRouter:
             else:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
+            if self._impersonating(event.group_id):
+                packed_memory_context = self._scrub_packed_bot_voice(packed_memory_context)
             memory_answer_anchor = (
                 build_memory_answer_anchor(event.plain_text, packed_memory_context)
                 if packed_memory_context is not None
@@ -1979,6 +2021,10 @@ class InboundRouter:
             if self._impersonating(event.group_id):
                 relevant_memories = self._filter_bot_identity_memory_lines(relevant_memories)
                 relevant_summaries = self._filter_bot_identity_memory_lines(relevant_summaries)
+                prompt_recent_lines = self._scrub_bot_voice_lines(prompt_recent_lines)
+                full_history_lines = self._scrub_bot_voice_lines(full_history_lines)
+                relevant_history_lines = self._scrub_bot_voice_lines(relevant_history_lines)
+                member_focus_lines = self._scrub_bot_voice_lines(member_focus_lines)
             history_detail = memory_context.history_detail
             if is_bot_self_identity_query(event.plain_text, bot_names=bot_names):
                 if impersonating:

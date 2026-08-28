@@ -179,3 +179,28 @@ def test_router_impersonation_guardrail_and_memory_filter(sqlite_engine) -> None
     text = router._persona_text_for(router._active_persona(10001), 10001)
     assert "完整扮演群成员 测试君" in text
     assert "不是小町" in text
+
+
+def test_router_scrubs_bot_voice_in_context_lines(sqlite_engine) -> None:
+    from app.core.router import InboundRouter
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=object(),
+    )
+    router.runtime.persona["name"] = "测试小町"
+
+    scrubbed = router._scrub_bot_voice_lines(
+        [
+            "阿渣（小町扮演）: 主人，来了",
+            "测试小町: 大人您稍等",
+            "路人: 谁是你的主人",
+        ]
+    )
+
+    assert scrubbed == [
+        "阿渣（小町扮演）: 你，来了",
+        "测试小町: 你稍等",
+        "路人: 谁是你的主人",
+    ]

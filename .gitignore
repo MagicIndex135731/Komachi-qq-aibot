@@ -58,6 +58,7 @@ infra/wsl/mihomo/
 
 # 一次性调试探针脚本（含本地真实群号/QQ，仅本地使用，不提交）
 scripts/probe_*.py
+scripts/repair_zhuren_memory.py
 scripts/verify_rewrite_skip.py
 
 # Trellis 仅本地维护，永不推送到 GitHub（含历史 journal、任务、spec）
