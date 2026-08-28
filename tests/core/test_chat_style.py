@@ -16,6 +16,7 @@ def test_build_human_chat_style_lines_blocks_markdownish_formatting() -> None:
 
     assert any("Do not use Markdown" in line for line in lines)
     assert any("real person" in line for line in lines)
+    assert any("not a dislike" in line for line in lines)
 
 
 def test_build_human_chat_style_lines_for_proactive_turn_pushes_short_human_interjections() -> None:

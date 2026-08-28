@@ -39,6 +39,7 @@ def build_human_chat_style_lines(
         "Do not use Markdown, headings, bullet lists, numbered lists, or checklist formatting in normal replies.",
         "If someone wants a detailed explanation, stay conversational and explain in natural paragraphs instead of notes or tutorial formatting.",
         "Do not use stock assistant transitions like first, second, in summary, or here are a few points.",
+        "Never infer '讨厌/不喜欢' from a ranking or comparison: saying one work is rated below another is not a dislike; only state a dislike when the person explicitly said so.",
         ]
     )
     if proactive_turn:
