@@ -26,6 +26,8 @@ from app.storage.models import (
     MemoryItem,
     MemoryItemSemanticVector,
     Message,
+    PersonaStyleExample,
+    PersonaStyleSyncState,
     RetrievalDocument,
     RetrievalDocumentMessage,
     RetrievalIndexState,
@@ -424,6 +426,77 @@ class GroupPersonaStateRepository:
     def set_avatar_snapshot(self, group_id: int, avatar: str | None) -> GroupPersonaState:
         state = self.get(group_id) or GroupPersonaState(group_id=int(group_id))
         state.avatar_snapshot = avatar
+        state.updated_at = shanghai_now_naive()
+        self.session.add(state)
+        return state
+
+
+class PersonaStyleExampleRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def load_active(self, *, user_id: int, limit: int = 600) -> list[PersonaStyleExample]:
+        return list(
+            self.session.scalars(
+                select(PersonaStyleExample)
+                .where(PersonaStyleExample.user_id == int(user_id))
+                .order_by(PersonaStyleExample.timestamp.desc())
+                .limit(limit)
+            )
+        )
+
+    def insert_many(self, rows: list[dict]) -> int:
+        inserted = 0
+        for row in rows:
+            if self.session.get(PersonaStyleExample, row["msg_id"]) is not None:
+                continue
+            self.session.add(PersonaStyleExample(**row))
+            inserted += 1
+        return inserted
+
+    def trim_to(self, *, user_id: int, keep: int) -> int:
+        ids = [
+            example.msg_id
+            for example in self.session.scalars(
+                select(PersonaStyleExample)
+                .where(PersonaStyleExample.user_id == int(user_id))
+                .order_by(PersonaStyleExample.timestamp.desc())
+                .offset(keep)
+            )
+        ]
+        for msg_id in ids:
+            self.session.delete(self.session.get(PersonaStyleExample, msg_id))
+        return len(ids)
+
+
+class PersonaStyleSyncStateRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, *, group_id: int, user_id: int) -> PersonaStyleSyncState | None:
+        return self.session.get(
+            PersonaStyleSyncState,
+            (int(group_id), int(user_id)),
+        )
+
+    def set_watermark(self, *, group_id: int, user_id: int, last_msg_id: str, new_count: int) -> PersonaStyleSyncState:
+        state = self.get(group_id=group_id, user_id=user_id) or PersonaStyleSyncState(
+            group_id=int(group_id), user_id=int(user_id)
+        )
+        state.last_msg_id = last_msg_id
+        state.new_since_refresh = int(state.new_since_refresh or 0) + max(
+            0, int(new_count)
+        )
+        state.updated_at = shanghai_now_naive()
+        self.session.add(state)
+        return state
+
+    def mark_refreshed(self, *, group_id: int, user_id: int, when: datetime) -> PersonaStyleSyncState:
+        state = self.get(group_id=group_id, user_id=user_id) or PersonaStyleSyncState(
+            group_id=int(group_id), user_id=int(user_id)
+        )
+        state.last_refresh_at = when
+        state.new_since_refresh = 0
         state.updated_at = shanghai_now_naive()
         self.session.add(state)
         return state

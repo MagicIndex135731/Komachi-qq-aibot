@@ -17,6 +17,7 @@ from app.config import AppSettings, load_runtime_config
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
 from app.core.group_history_backfill import backfill_recent_group_history
+from app.core.persona_live_sync import PersonaLiveSyncService
 from app.core.persona_switch import PersonaManager, PersonaSwitchService
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
@@ -307,6 +308,7 @@ async def run() -> None:
     engine = None
     group_image_service = None
     memory_compaction_service = None
+    persona_sync_task = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
         await asyncio.to_thread(create_all, engine)
@@ -371,6 +373,13 @@ async def run() -> None:
             sender=sender,
             bot_qq=settings.bot_qq,
         )
+        persona_sync_service = PersonaLiveSyncService(
+            engine=engine,
+            settings=settings,
+            personas=getattr(runtime, "personas", {}) or {},
+            manager=persona_manager,
+        )
+        persona_sync_task = asyncio.create_task(persona_sync_service.run())
         router = InboundRouter(
             engine=engine,
             runtime=runtime,
@@ -440,6 +449,8 @@ async def run() -> None:
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
+        if persona_sync_task is not None:
+            persona_sync_task.cancel()
         if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
         if memory_compaction_service is not None:

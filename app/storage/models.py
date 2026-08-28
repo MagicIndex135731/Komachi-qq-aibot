@@ -59,6 +59,38 @@ class GroupPersonaState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
 
+class PersonaStyleExample(Base):
+    """A verbatim member message plus its conversation context."""
+
+    __tablename__ = "persona_style_examples"
+    __table_args__ = (
+        Index("ix_persona_style_examples_user_time", "user_id", "timestamp"),
+    )
+
+    group_id: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[int] = mapped_column(Integer)
+    msg_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    context_before: Mapped[list] = mapped_column(JSON, default=list)
+    reply_target: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+
+class PersonaStyleSyncState(Base):
+    """Watermark and refresh bookkeeping for one member's live style sync."""
+
+    __tablename__ = "persona_style_sync_state"
+
+    group_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_msg_id: Mapped[str] = mapped_column(String(128), default="")
+    last_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    new_since_refresh: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (

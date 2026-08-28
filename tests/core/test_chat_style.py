@@ -130,6 +130,7 @@ def test_retrieve_relevant_examples_ranks_by_topic_overlap() -> None:
 
     picked = retrieve_relevant_examples(bank, context, limit=2)
 
-    assert "明天看球吗" in picked
-    assert "写日报好烦" not in picked
-    assert "吃啥" not in picked
+    texts = [entry["text"] for entry in picked]
+    assert "明天看球吗" in texts
+    assert "写日报好烦" not in texts
+    assert "吃啥" not in texts

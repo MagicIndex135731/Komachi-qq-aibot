@@ -251,6 +251,7 @@ def test_router_appends_relevant_examples_while_impersonating(sqlite_engine) -> 
         "persona-text",
         persona,
         ["甲: 明天看球吗"],
+        10001,
     )
 
     assert "明天看球" in text

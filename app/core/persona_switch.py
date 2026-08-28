@@ -11,7 +11,10 @@ import logging
 import re
 
 from app.storage.db import session_scope
-from app.storage.repositories import GroupPersonaStateRepository
+from app.storage.repositories import (
+    GroupPersonaStateRepository,
+    PersonaStyleExampleRepository,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,7 @@ class PersonaManager:
         self._group_keys: dict[int, str] = {}
         self._card_snapshots: dict[int, str] = {}
         self._account_avatar_snapshot: str | None = None
+        self._style_banks: dict[int, list[dict]] = {}
 
     def load_state(self) -> None:
         with session_scope(self.engine) as session:
@@ -89,6 +93,65 @@ class PersonaManager:
                 self._group_keys[group_id] = state.persona_key or DEFAULT_PERSONA_KEY
                 if state.card_snapshot is not None:
                     self._card_snapshots[group_id] = state.card_snapshot
+        self.load_style_banks()
+
+    def load_style_banks(self) -> None:
+        """Load live style examples per member, seeding from baked banks."""
+
+        for persona_key, persona in self.personas.items():
+            if persona_key == DEFAULT_PERSONA_KEY:
+                continue
+            user_id = _as_positive_int(persona.get("source_user_id"))
+            group_id = _as_positive_int(persona.get("source_group_id"))
+            if user_id is None or group_id is None:
+                continue
+            with session_scope(self.engine) as session:
+                repo = PersonaStyleExampleRepository(session)
+                rows = repo.load_active(user_id=user_id, limit=600)
+                if not rows:
+                    baked = [
+                        str(value).strip()
+                        for value in (persona.get("example_bank") or [])
+                        if str(value).strip()
+                    ]
+                    if baked:
+                        repo.insert_many(
+                            [
+                                {
+                                    "group_id": group_id,
+                                    "user_id": user_id,
+                                    "msg_id": f"baked-{index}",
+                                    "text": text,
+                                    "context_before": [],
+                                    "reply_target": None,
+                                }
+                                for index, text in enumerate(baked)
+                            ]
+                        )
+                        rows = repo.load_active(user_id=user_id, limit=600)
+                self._style_banks[user_id] = [
+                    {
+                        "text": row.text,
+                        "context_before": row.context_before or [],
+                        "reply_target": row.reply_target,
+                    }
+                    for row in rows
+                ]
+
+    def style_bank(self, group_id: int) -> list[dict]:
+        persona = self.active_persona(group_id)
+        user_id = _as_positive_int(persona.get("source_user_id"))
+        if user_id is not None and self._style_banks.get(user_id):
+            return list(self._style_banks[user_id])
+        return [
+            {
+                "text": str(value).strip(),
+                "context_before": [],
+                "reply_target": None,
+            }
+            for value in (persona.get("example_bank") or [])
+            if str(value).strip()
+        ]
 
     def active_key(self, group_id: int) -> str:
         return self._group_keys.get(int(group_id), DEFAULT_PERSONA_KEY)

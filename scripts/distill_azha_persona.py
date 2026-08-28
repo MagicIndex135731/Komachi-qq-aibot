@@ -124,6 +124,7 @@ def main() -> int:
     parser.add_argument("--user-id", required=True, type=int)
     parser.add_argument("--target-name", default="")
     parser.add_argument("--group-card", default="")
+    parser.add_argument("--source-group-id", type=int, default=0)
     parser.add_argument("--exclude-user-ids", default="")
     parser.add_argument("--output", default="configs/personas/azha.yaml")
     parser.add_argument("--samples", default="data/personas/azha/samples.jsonl")
@@ -173,7 +174,13 @@ def main() -> int:
     settings = AppSettings()
     stage1_path = Path(args.stage1_draft)
     if args.reuse_stage1 and stage1_path.exists():
-        draft = parse_persona_yaml(stage1_path.read_text(encoding="utf-8"))
+        draft = assemble_persona(
+            parse_persona_yaml(stage1_path.read_text(encoding="utf-8")),
+            target_name=args.target_name,
+            group_card=args.group_card,
+            source_user_id=args.user_id,
+            aliases=[args.target_name],
+        )
         print("stage1_profile_reused")
     else:
         stage_one_text = _complete_responses_nonstream(
@@ -232,6 +239,8 @@ def main() -> int:
                     final = draft
     final["example_lines"] = deterministic_examples
     final["example_bank"] = example_bank
+    if args.source_group_id > 0:
+        final["source_group_id"] = args.source_group_id
     output_path = Path(args.output)
     _write_yaml(output_path, final)
     print(f"persona_written path={output_path}")

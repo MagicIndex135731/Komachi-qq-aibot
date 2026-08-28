@@ -429,6 +429,16 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid persona profile {persona_path.name}: {exc}") from exc
             personas[persona_path.stem] = persona_profile
+    live_personas_dir = settings.data_dir / "personas"
+    if live_personas_dir.is_dir():
+        for live_path in sorted(live_personas_dir.glob("*.live.yaml")):
+            persona_key = live_path.name.removesuffix(".live.yaml")
+            if persona_key not in personas:
+                continue
+            live_profile = _read_yaml(live_path)
+            personas[persona_key] = _deep_merge_mapping(
+                personas[persona_key], live_profile
+            )
     group_policy = _read_yaml(settings.config_dir / "groups.yaml")
     local_groups_path = settings.config_dir / "groups.local.yaml"
     if local_groups_path.exists():

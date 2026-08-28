@@ -33,6 +33,7 @@ from app.core.bbot_listener_cache import (
 )
 from app.core.chat_style import (
     build_human_chat_style_lines,
+    format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
@@ -863,16 +864,22 @@ class InboundRouter:
         persona_text: str,
         active_persona: dict,
         context_lines: list[str],
+        group_id: int,
     ) -> str:
-        bank = (
-            active_persona.get("example_bank")
-            or active_persona.get("example_lines")
-            or []
-        )
+        if self.persona_manager is not None:
+            bank = self.persona_manager.style_bank(group_id)
+        else:
+            bank = []
+        if not bank:
+            bank = (
+                active_persona.get("example_bank")
+                or active_persona.get("example_lines")
+                or []
+            )
         picked = retrieve_relevant_examples(bank, context_lines, limit=6)
         if not picked:
             return persona_text
-        examples = " ".join(f"「{line}」" for line in picked)
+        examples = format_example_pairs(picked, max_pairs=4)
         return f"{persona_text}\n相关话题下他的原话示例：{examples}"
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:
@@ -1721,7 +1728,7 @@ class InboundRouter:
                     recent_lines, group_id=event.group_id
                 )
                 persona_text = self._with_relevant_examples(
-                    persona_text, active_persona, recent_lines
+                    persona_text, active_persona, recent_lines, event.group_id
                 )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(

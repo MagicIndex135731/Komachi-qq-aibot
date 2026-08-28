@@ -315,25 +315,68 @@ def _topic_units(text: str) -> set[str]:
 
 
 def retrieve_relevant_examples(
-    bank: list[str] | tuple[str, ...],
+    bank: list[str] | tuple[str, ...] | list[dict],
     context_lines: list[str],
     *,
     limit: int = 6,
-) -> list[str]:
-    """Pick persona examples by topic overlap with the current conversation."""
+) -> list[dict]:
+    """Pick persona examples by topic overlap with the current conversation.
+
+    Each returned entry carries its conversation context so the caller can
+    show "上文「…」→ 他回「…」" pairs instead of a bare quote. Context text
+    participates in matching, so an example ranks high only when its
+    *situation* resembles the current chat.
+    """
 
     context_units = _topic_units(
         "\n".join(str(line).split(":", 1)[-1] for line in context_lines)
     )
-    scored: list[tuple[int, int, str]] = []
+    scored: list[tuple[int, int, dict]] = []
     seen: set[str] = set()
     for example in bank or []:
-        text = str(example).strip()
+        if isinstance(example, dict):
+            text = str(example.get("text") or "").strip()
+            context_before = [
+                str(item.get("text") or "").strip()
+                for item in (example.get("context_before") or [])
+                if isinstance(item, dict)
+            ]
+            reply_target = str(example.get("reply_target") or "").strip()
+        else:
+            text = str(example).strip()
+            context_before = []
+            reply_target = ""
         if not text or text in seen:
             continue
         seen.add(text)
-        overlap = len(context_units & _topic_units(text))
+        matchable = " ".join([*context_before, reply_target, text])
+        overlap = len(context_units & _topic_units(matchable))
         if overlap:
-            scored.append((overlap, len(text), text))
+            scored.append(
+                (
+                    overlap,
+                    len(text),
+                    {
+                        "text": text,
+                        "context_before": context_before,
+                        "reply_target": reply_target,
+                    },
+                )
+            )
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return [text for _, _, text in scored[: max(0, limit)]]
+    return [entry for _, _, entry in scored[: max(0, limit)]]
+
+
+def format_example_pairs(entries: list[dict], *, max_pairs: int = 4) -> str:
+    """Render retrieved examples as context→reply pairs."""
+
+    pairs: list[str] = []
+    for entry in entries[: max(0, max_pairs)]:
+        lead = entry.get("reply_target") or (
+            (entry.get("context_before") or [""])[-1]
+        )
+        if lead:
+            pairs.append(f"上文「{lead}」→ 他回「{entry.get('text')}」")
+        else:
+            pairs.append(f"他回「{entry.get('text')}」")
+    return "；".join(pairs)
