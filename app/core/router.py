@@ -929,7 +929,9 @@ class InboundRouter:
             return persona_text
         return (
             f"{persona_text}\n关于他的已知事实（只使用这些与他相符的事实，"
-            "没有的事实不要编，用他的语气带过）：\n" + "\n".join(lines)
+            "没有的事实不要编，用他的语气带过；"
+            "特别注意：'评价/排行低于某作品'不等于'讨厌'，讨厌类结论必须有明确的讨厌/不喜欢依据）：\n"
+            + "\n".join(lines)
         )
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:

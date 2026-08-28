@@ -298,6 +298,7 @@ def test_router_appends_relevant_facts_from_shared_memory(sqlite_engine) -> None
         10001,
     )
     assert "主玩英雄联盟手游" in text
+    assert "不等于'讨厌'" in text
 
 
 def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
