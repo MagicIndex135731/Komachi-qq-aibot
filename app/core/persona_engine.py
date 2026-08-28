@@ -25,6 +25,7 @@ def render_persona(persona: dict) -> str:
     style_avoid = _normalize_traits(persona.get("style_avoid", []))
     address_rules = _normalize_traits(persona.get("address_rules", []))
     example_lines = _normalize_traits(persona.get("example_lines", []))
+    burst = persona.get("burst")
     relationships = persona.get("relationships")
     if not isinstance(relationships, list):
         relationships = []
@@ -69,6 +70,16 @@ def render_persona(persona: dict) -> str:
     if example_lines:
         examples = " ".join(f"「{line}」" for line in example_lines[:16])
         details.append(f"Example replies: {examples}.")
+    if isinstance(burst, dict) and burst.get("enabled"):
+        separator = str(burst.get("separator") or "|")
+        max_messages = max(1, min(6, int(burst.get("max_messages") or 3)))
+        details.append(
+            f"Reply burst: when a short single message is not enough, split your "
+            f"reply into up to {max_messages} short messages joined by "
+            f"'{separator}' (each part its own complete short message, keep the "
+            f"parts as short as the person would type them); otherwise reply "
+            f"with one message."
+        )
     if secondary_personas:
         secondary_details: list[str] = []
         for item in secondary_personas:

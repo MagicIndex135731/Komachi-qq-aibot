@@ -7,6 +7,7 @@ from datetime import UTC, datetime, time, timedelta
 import json
 import logging
 from pathlib import Path
+import random
 import re
 import threading
 import zlib
@@ -35,6 +36,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    split_burst_reply,
 )
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
@@ -689,12 +691,21 @@ class InboundRouter:
         self._ingest_bbot_listener_cache(event)
         return True
 
-    async def _send_prebuilt_reply(self, event, reply_text: str, *, allow_chunking: bool = False) -> None:
+    async def _send_prebuilt_reply(
+        self,
+        event,
+        reply_text: str,
+        *,
+        allow_chunking: bool = False,
+        platform_msg_id: str | None = None,
+    ) -> None:
         reply_text = filter_reply_urls(
             reply_text,
             allow_urls=explicitly_requests_urls(event.plain_text),
         )
-        reserved = self._reserve_outbound_reply(event, reply_text)
+        reserved = self._reserve_outbound_reply(
+            event, reply_text, platform_msg_id=platform_msg_id
+        )
         if not reserved:
             return
 
@@ -709,8 +720,12 @@ class InboundRouter:
                 event.platform_msg_id,
                 type(exc).__name__,
             )
-            uncertain_reply_text = self._mark_outbound_reply_uncertain(event, reply_text)
-            self._archive_outbound_reply(event, uncertain_reply_text)
+            uncertain_reply_text = self._mark_outbound_reply_uncertain(
+                event, reply_text, platform_msg_id=platform_msg_id
+            )
+            self._archive_outbound_reply(
+                event, uncertain_reply_text, platform_msg_id=platform_msg_id
+            )
             return
         except QQMessageBlockedError as exc:
             logger.warning(
@@ -719,8 +734,12 @@ class InboundRouter:
                 event.platform_msg_id,
                 str(exc),
             )
-            blocked_reply_text = self._mark_outbound_reply_blocked(event, reply_text)
-            self._archive_outbound_reply(event, blocked_reply_text)
+            blocked_reply_text = self._mark_outbound_reply_blocked(
+                event, reply_text, platform_msg_id=platform_msg_id
+            )
+            self._archive_outbound_reply(
+                event, blocked_reply_text, platform_msg_id=platform_msg_id
+            )
             await self._send_qq_block_notice(event)
             return
         except Exception:
@@ -729,7 +748,7 @@ class InboundRouter:
                 event.group_id,
                 event.platform_msg_id,
             )
-            self._clear_outbound_reply_reservation(event)
+            self._clear_outbound_reply_reservation(event, platform_msg_id=platform_msg_id)
             raise
         logger.info(
             "reply_send_success group_id=%s msg_id=%s",
@@ -738,10 +757,40 @@ class InboundRouter:
         )
 
         try:
-            self._mark_outbound_reply_sent(event, reply_text)
+            self._mark_outbound_reply_sent(event, reply_text, platform_msg_id=platform_msg_id)
         except Exception:
-            self._fallback_mark_outbound_reply_sent(event, reply_text)
-        self._archive_outbound_reply(event, reply_text)
+            self._fallback_mark_outbound_reply_sent(
+                event, reply_text, platform_msg_id=platform_msg_id
+            )
+        self._archive_outbound_reply(
+            event, reply_text, platform_msg_id=platform_msg_id
+        )
+
+    async def _send_chat_reply(self, event, reply_text: str) -> None:
+        """Send an LLM chat reply, optionally as a short multi-message burst."""
+
+        active_persona = self._active_persona(event.group_id)
+        burst = (
+            active_persona.get("burst")
+            if isinstance(active_persona, dict)
+            else None
+        )
+        segments = split_burst_reply(reply_text, burst)
+        base_id = self._outbound_platform_msg_id(event.platform_msg_id)
+        delay_min = 0.0
+        delay_max = 0.0
+        if isinstance(burst, dict) and len(segments) > 1:
+            delay_min = max(0.0, float(burst.get("min_delay_seconds") or 0.8))
+            delay_max = max(delay_min, float(burst.get("max_delay_seconds") or 2.5))
+        for index, segment in enumerate(segments):
+            platform_msg_id = base_id if index == 0 else f"{base_id}-b{index}"
+            await self._send_prebuilt_reply(
+                event,
+                segment,
+                platform_msg_id=platform_msg_id,
+            )
+            if index < len(segments) - 1 and delay_max > 0:
+                await asyncio.sleep(random.uniform(delay_min, delay_max))
 
     def _build_bot_names(self, persona_name: str) -> set[str]:
         normalized = persona_name.strip().lower()
@@ -2345,12 +2394,21 @@ class InboundRouter:
         }
         return any(label and label in query for label in member_labels)
 
-    def _reserve_outbound_reply(self, event, reply_text: str) -> bool:
+    def _reserve_outbound_reply(
+        self,
+        event,
+        reply_text: str,
+        *,
+        platform_msg_id: str | None = None,
+    ) -> bool:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         with session_scope(self.engine) as session:
             users = UserRepository(session)
             messages = MessageRepository(session)
 
-            if messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id)) is not None:
+            if messages.get_by_platform_msg_id(resolved_id) is not None:
                 return False
 
             users.upsert_user(
@@ -2359,7 +2417,7 @@ class InboundRouter:
                 group_card="",
             )
             messages.add_group_message(
-                platform_msg_id=self._outbound_platform_msg_id(event.platform_msg_id),
+                platform_msg_id=resolved_id,
                 group_id=event.group_id,
                 user_id=self.runtime.settings.bot_qq,
                 timestamp=event.timestamp,
@@ -2375,19 +2433,29 @@ class InboundRouter:
             )
             return True
 
-    def _clear_outbound_reply_reservation(self, event) -> None:
+    def _clear_outbound_reply_reservation(
+        self, event, *, platform_msg_id: str | None = None
+    ) -> None:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         with session_scope(self.engine) as session:
             messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            outbound_message = messages.get_by_platform_msg_id(resolved_id)
             if outbound_message is None:
                 return
             session.delete(outbound_message)
 
-    def _mark_outbound_reply_blocked(self, event, reply_text: str) -> str:
+    def _mark_outbound_reply_blocked(
+        self, event, reply_text: str, *, platform_msg_id: str | None = None
+    ) -> str:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         blocked_reply_text = f"{str(reply_text).strip()}\n\n{QQ_BLOCKED_CONTEXT_NOTE}"
         with session_scope(self.engine) as session:
             messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            outbound_message = messages.get_by_platform_msg_id(resolved_id)
             if outbound_message is None:
                 raise RuntimeError("blocked outbound reply reservation is missing")
             outbound_message.plain_text = blocked_reply_text
@@ -2402,11 +2470,16 @@ class InboundRouter:
             session.add(outbound_message)
         return blocked_reply_text
 
-    def _mark_outbound_reply_uncertain(self, event, reply_text: str) -> str:
+    def _mark_outbound_reply_uncertain(
+        self, event, reply_text: str, *, platform_msg_id: str | None = None
+    ) -> str:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         uncertain_reply_text = f"{str(reply_text).strip()}\n\n{DELIVERY_UNCERTAIN_CONTEXT_NOTE}"
         with session_scope(self.engine) as session:
             messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            outbound_message = messages.get_by_platform_msg_id(resolved_id)
             if outbound_message is None:
                 raise RuntimeError("uncertain outbound reply reservation is missing")
             outbound_message.plain_text = uncertain_reply_text
@@ -2499,10 +2572,15 @@ class InboundRouter:
             event.platform_msg_id,
         )
 
-    def _mark_outbound_reply_sent(self, event, reply_text: str) -> None:
+    def _mark_outbound_reply_sent(
+        self, event, reply_text: str, *, platform_msg_id: str | None = None
+    ) -> None:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         with session_scope(self.engine) as session:
             messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            outbound_message = messages.get_by_platform_msg_id(resolved_id)
             if outbound_message is None:
                 return
             outbound_message.plain_text = reply_text
@@ -2514,14 +2592,19 @@ class InboundRouter:
             session.add(outbound_message)
         self._enqueue_episode_message(
             group_id=event.group_id,
-            platform_msg_id=self._outbound_platform_msg_id(event.platform_msg_id),
+            platform_msg_id=resolved_id,
             timestamp=event.timestamp,
         )
 
-    def _fallback_mark_outbound_reply_sent(self, event, reply_text: str) -> None:
+    def _fallback_mark_outbound_reply_sent(
+        self, event, reply_text: str, *, platform_msg_id: str | None = None
+    ) -> None:
+        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
+            event.platform_msg_id
+        )
         with session_scope(self.engine) as session:
             messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(self._outbound_platform_msg_id(event.platform_msg_id))
+            outbound_message = messages.get_by_platform_msg_id(resolved_id)
             if outbound_message is None:
                 return
             outbound_message.plain_text = reply_text
@@ -2533,7 +2616,7 @@ class InboundRouter:
             session.add(outbound_message)
         self._enqueue_episode_message(
             group_id=event.group_id,
-            platform_msg_id=self._outbound_platform_msg_id(event.platform_msg_id),
+            platform_msg_id=resolved_id,
             timestamp=event.timestamp,
         )
 
@@ -2892,7 +2975,7 @@ class InboundRouter:
                         )
                 return
 
-            await self._send_prebuilt_reply(event, reply_text)
+            await self._send_chat_reply(event, reply_text)
         finally:
             if proactive_cleanup_group is not None:
                 self._last_proactive_at[proactive_cleanup_group] = datetime.now(UTC)

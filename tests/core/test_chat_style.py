@@ -3,6 +3,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    split_burst_reply,
 )
 
 
@@ -85,3 +86,15 @@ def test_normalize_chat_reply_strips_model_think_blocks() -> None:
     )
 
     assert normalize_chat_reply(raw) == "当然开车去啊，不然你走过去是让老板洗你吗。"
+
+
+def test_split_burst_reply_disabled_without_burst_config() -> None:
+    assert split_burst_reply("来了|人呢", None) == ["来了|人呢"]
+    assert split_burst_reply("来了|人呢", {"enabled": False}) == ["来了|人呢"]
+
+
+def test_split_burst_reply_splits_and_caps_segments() -> None:
+    burst = {"enabled": True, "separator": "|", "max_messages": 3}
+    assert split_burst_reply("来了|人呢", burst) == ["来了", "人呢"]
+    assert split_burst_reply("一|二|三|四", burst) == ["一", "二", "三|四"]
+    assert split_burst_reply("一条消息", burst) == ["一条消息"]

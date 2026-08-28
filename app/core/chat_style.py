@@ -248,3 +248,27 @@ def normalize_brief_group_interjection_reply(text: str) -> str:
     if sentence_match:
         return sentence_match.group(1).strip()
     return normalized
+
+
+def split_burst_reply(text: str, burst: dict | None) -> list[str]:
+    """Split one reply into a short message burst when the persona allows it.
+
+    A burst is enabled by a persona-level ``burst`` mapping with ``enabled:
+    true``. The model joins burst messages with the configured separator; this
+    function splits them back into individual QQ messages. Personas without
+    burst configuration always reply with a single message.
+    """
+
+    normalized = str(text or "").strip()
+    if not normalized or not isinstance(burst, dict) or not burst.get("enabled"):
+        return [normalized] if normalized else []
+    separator = str(burst.get("separator") or "|")
+    max_messages = max(1, min(6, int(burst.get("max_messages") or 3)))
+    parts = [part.strip() for part in normalized.split(separator)]
+    parts = [part for part in parts if part]
+    if len(parts) < 2:
+        return [normalized]
+    if len(parts) > max_messages:
+        overflow = parts[max_messages - 1 :]
+        parts = parts[: max_messages - 1] + [separator.join(overflow)]
+    return [part for part in parts if part]

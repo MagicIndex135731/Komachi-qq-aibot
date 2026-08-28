@@ -694,6 +694,30 @@ async def test_router_replies_to_direct_mention_in_allowlisted_group(sqlite_engi
 
 
 @pytest.mark.asyncio
+async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("来了|人呢|上号")
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    router.runtime.persona["burst"] = {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "min_delay_seconds": 0,
+        "max_delay_seconds": 0,
+    }
+
+    await router.handle_group_message(
+        make_event(group_id=10001, mentioned_bot=True)
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["来了", "人呢", "上号"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "query",
     ("@Mira 你是谁", "@Mira 我问的是你是谁，不是我是谁"),
@@ -3273,11 +3297,13 @@ async def test_router_fallback_marks_delivered_reply_visible_for_cooldown(sqlite
     original_mark = InboundRouter._mark_outbound_reply_sent
     state = {"calls": 0}
 
-    def fail_once(self, event, reply_text: str) -> None:
+    def fail_once(
+        self, event, reply_text: str, *, platform_msg_id: str | None = None
+    ) -> None:
         state["calls"] += 1
         if state["calls"] == 1:
             raise RuntimeError("mark failed once")
-        original_mark(self, event, reply_text)
+        original_mark(self, event, reply_text, platform_msg_id=platform_msg_id)
 
     monkeypatch.setattr(InboundRouter, "_mark_outbound_reply_sent", fail_once)
 
