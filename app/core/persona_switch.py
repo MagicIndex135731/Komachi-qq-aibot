@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 
-from app.core.chat_style import retrieve_relevant_facts
+from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
 from app.storage.models import MemoryItem
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -75,6 +75,7 @@ class PersonaManager:
         engine,
         personas: dict[str, dict],
         default_persona: dict,
+        embedding_provider=None,
     ) -> None:
         self.engine = engine
         self.personas = {str(key): value for key, value in (personas or {}).items()}
@@ -84,6 +85,10 @@ class PersonaManager:
         self._card_snapshots: dict[int, str] = {}
         self._account_avatar_snapshot: str | None = None
         self._style_banks: dict[int, list[dict]] = {}
+        self.embedding_provider = embedding_provider
+        self._example_vectors: dict[
+            int, tuple[str, list[list[float]] | None, list[dict]]
+        ] = {}
 
     def load_state(self) -> None:
         with session_scope(self.engine) as session:
@@ -154,6 +159,70 @@ class PersonaManager:
             for value in (persona.get("example_bank") or [])
             if str(value).strip()
         ]
+
+    def retrieve_examples(
+        self,
+        group_id: int,
+        context_lines: list[str],
+        *,
+        limit: int = 6,
+    ) -> list[dict]:
+        """Retrieve examples by embedding similarity when available."""
+
+        bank = self.style_bank(group_id)
+        if not bank or self.embedding_provider is None:
+            return retrieve_relevant_examples(bank, context_lines, limit=limit)
+        persona = self.active_persona(group_id)
+        user_id = _as_positive_int(persona.get("source_user_id"))
+        cache_key = int(user_id) if user_id is not None else hash(repr(persona.get("name")))
+        signature = "|".join(
+            f"{entry.get('text')}\u241f{entry.get('reply_target') or ''}"
+            for entry in bank[:80]
+        )
+        cached = self._example_vectors.get(cache_key)
+        if cached is None or cached[0] != signature:
+            texts = [
+                " ".join(
+                    [
+                        entry.get("reply_target") or "",
+                        entry.get("text") or "",
+                        *[
+                            str(item.get("text") or "")
+                            for item in (entry.get("context_before") or [])[-2:]
+                            if isinstance(item, dict)
+                        ],
+                    ]
+                )
+                for entry in bank
+            ]
+            vectors = self.embedding_provider.embed_documents(texts)
+            cached = (signature, vectors, bank)
+            self._example_vectors[cache_key] = cached
+        _, vectors, entries = cached
+        query_text = " ".join(
+            str(line).split(":", 1)[-1] for line in context_lines
+        )
+        query_vector = self.embedding_provider.embed_query(query_text)
+        if not vectors or query_vector is None:
+            return retrieve_relevant_examples(bank, context_lines, limit=limit)
+        scored = [
+            (self._cosine(query_vector, vector), entry)
+            for vector, entry in zip(vectors, entries)
+            if vector
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _, entry in scored[: max(0, limit)]]
+
+    @staticmethod
+    def _cosine(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        norm_left = sum(a * a for a in left) ** 0.5
+        norm_right = sum(b * b for b in right) ** 0.5
+        if not norm_left or not norm_right:
+            return 0.0
+        return dot / (norm_left * norm_right)
 
     def retrieve_facts(
         self,
@@ -251,7 +320,11 @@ class PersonaManager:
 
 
 class PersonaSwitchService:
-    """Orchestrates avatar/group-card changes around a persona key switch."""
+    """Orchestrates group-card changes around a persona key switch.
+
+    The QQ avatar is intentionally never touched: every persona keeps the
+    bot's original avatar.
+    """
 
     def __init__(self, *, manager: PersonaManager, sender, bot_qq: int) -> None:
         self.manager = manager
@@ -288,29 +361,7 @@ class PersonaSwitchService:
                         target_key,
                     )
                     failures.append("群名片切换失败")
-            source_user_id = _as_positive_int(target_persona.get("source_user_id"))
-            if source_user_id is not None:
-                try:
-                    avatar = await self.sender.get_qq_avatar(user_id=source_user_id)
-                    await self.sender.set_qq_avatar(file=avatar)
-                except Exception:
-                    logger.exception(
-                        "persona_avatar_apply_failed group_id=%s persona_key=%s",
-                        group_id,
-                        target_key,
-                    )
-                    failures.append("头像切换失败")
         else:
-            avatar_snapshot = self.manager.account_avatar_snapshot()
-            if avatar_snapshot is not None:
-                try:
-                    await self.sender.set_qq_avatar(file=avatar_snapshot)
-                except Exception:
-                    logger.exception(
-                        "persona_avatar_restore_failed group_id=%s",
-                        group_id,
-                    )
-                    failures.append("头像恢复失败")
             card_snapshot = self.manager.card_snapshot(group_id)
             try:
                 await self.sender.set_group_card(
@@ -353,13 +404,6 @@ class PersonaSwitchService:
             except Exception:
                 logger.exception("persona_card_snapshot_failed group_id=%s", group_id)
                 failures.append("群名片快照失败")
-        if self.manager.account_avatar_snapshot() is None:
-            try:
-                avatar = await self.sender.get_qq_avatar(user_id=self.bot_qq)
-                self.manager.set_account_avatar_snapshot(avatar)
-            except Exception:
-                logger.exception("persona_avatar_snapshot_failed group_id=%s", group_id)
-                failures.append("头像快照失败")
 
 
 def _as_positive_int(value: object) -> int | None:

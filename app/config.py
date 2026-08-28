@@ -433,6 +433,12 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
             personas[persona_path.stem] = persona_profile
     live_personas_dir = settings.data_dir / "personas"
     if live_personas_dir.is_dir():
+        for persona_path in sorted(live_personas_dir.glob("*.yaml")):
+            if persona_path.name.endswith(".live.yaml"):
+                continue
+            persona_key = persona_path.stem
+            persona_profile = _read_yaml(persona_path)
+            personas[persona_key] = persona_profile
         for live_path in sorted(live_personas_dir.glob("*.live.yaml")):
             persona_key = live_path.name.removesuffix(".live.yaml")
             if persona_key not in personas:

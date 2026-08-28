@@ -870,6 +870,14 @@ class InboundRouter:
         group_id: int,
     ) -> str:
         if self.persona_manager is not None:
+            picked = self.persona_manager.retrieve_examples(
+                group_id, context_lines, limit=6
+            )
+            if picked:
+                return (
+                    f"{persona_text}\n相关话题下他的原话示例："
+                    f"{format_example_pairs(picked, max_pairs=4)}"
+                )
             bank = self.persona_manager.style_bank(group_id)
         else:
             bank = []

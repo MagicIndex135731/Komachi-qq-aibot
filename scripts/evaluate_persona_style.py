@@ -70,6 +70,8 @@ def build_holdout(
     for index, row in enumerate(non_empty):
         if int(row.get("user_id") or 0) != target:
             continue
+        if len(str(row.get("text") or "").strip()) < 6:
+            continue
         ts = _parse_timestamp(row.get("timestamp"))
         if ts is None or ts < cutoff:
             continue

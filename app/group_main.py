@@ -368,6 +368,7 @@ async def run() -> None:
             engine=engine,
             personas=getattr(runtime, "personas", {}) or {},
             default_persona=runtime.persona,
+            embedding_provider=memory_runtime.embedding_provider,
         )
         await asyncio.to_thread(persona_manager.load_state)
         persona_switch_service = PersonaSwitchService(

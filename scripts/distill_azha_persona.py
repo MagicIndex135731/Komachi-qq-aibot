@@ -250,6 +250,12 @@ def main() -> int:
             "max_delay_seconds": 2.5,
         },
     )
+    existing_path = Path(args.output)
+    if existing_path.exists():
+        existing = yaml.safe_load(existing_path.read_text(encoding="utf-8")) or {}
+        for preserved_key in ("facts", "external_relations"):
+            if existing.get(preserved_key):
+                final[preserved_key] = existing[preserved_key]
     if args.source_group_id > 0:
         final["source_group_id"] = args.source_group_id
     output_path = Path(args.output)
