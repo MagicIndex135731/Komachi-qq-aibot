@@ -184,6 +184,16 @@ IMPERSONATION_CONTAMINANT_MARKERS = (
     "毒舌",
 )
 
+
+def _should_bind_impersonated_self(text: str) -> bool:
+    """True when the query addresses the bot as 'you' and is not first-person
+    about the requester (whose '我' must stay bound to the requester)."""
+
+    normalized = str(text or "")
+    if "你" not in normalized:
+        return False
+    return not any(token in normalized for token in ("我", "咱"))
+
 REQUESTER_IDENTITY_INSTRUCTION = (
     "For this requester identity question, 'I/me' means the current human requester. "
     "Treat the literal question 'who am I' as a request for a remembered portrait, not "
@@ -2094,10 +2104,10 @@ class InboundRouter:
                 and self._query_mentions_member(event.plain_text, users_by_id)
             )
             memory_query = event.plain_text
-            if impersonating:
+            if impersonating and _should_bind_impersonated_self(event.plain_text):
                 # Bind self-referential pronouns to the impersonated member so
                 # the semantic retrieval loads their profile facts.
-                memory_query = f"{memory_query}（'你/我'指{persona_name}本人）"
+                memory_query = f"{memory_query}（'你'指{persona_name}本人）"
             memory_request = GroupMemoryContextRequest(
                 group_id=event.group_id,
                 query=memory_query,

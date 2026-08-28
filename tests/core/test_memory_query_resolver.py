@@ -41,7 +41,7 @@ def test_impersonation_hint_binds_subject_to_member() -> None:
         )
     ]
     result = MemoryQueryResolver().resolve(
-        "你最近面了哪些企业（'你/我'指阿渣本人）",
+        "你最近面了哪些企业（'你'指阿渣本人）",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -49,6 +49,23 @@ def test_impersonation_hint_binds_subject_to_member() -> None:
 
     assert result.subject_ids is not None
     assert "222" in result.subject_ids
+
+
+def test_third_person_query_binds_the_named_member_not_impersonated_one() -> None:
+    from app.core.member_identity import GroupMemberIdentity
+
+    members = [
+        GroupMemberIdentity(user_id=222, nickname="阿渣", group_card="足泽满灰交", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", group_card="逆蝶蝶", in_scope=True),
+    ]
+    result = MemoryQueryResolver().resolve(
+        "逆蝶蝶喜欢什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids == ("333",)
 
 
 NOW = datetime(2026, 7, 23, 0, 10)

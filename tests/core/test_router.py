@@ -45,6 +45,15 @@ class FakeSender:
         self.private_sent.append(outbound)
 
 
+def test_should_bind_impersonated_self() -> None:
+    from app.core.router import _should_bind_impersonated_self
+
+    assert _should_bind_impersonated_self("你最近面了哪些企业") is True
+    assert _should_bind_impersonated_self("逆蝶蝶喜欢什么") is False
+    assert _should_bind_impersonated_self("如何评价我") is False
+    assert _should_bind_impersonated_self("你如何评价我") is False
+
+
 class FailingSenderOnce:
     def __init__(self) -> None:
         self.attempts = 0
