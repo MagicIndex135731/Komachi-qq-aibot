@@ -876,9 +876,12 @@ class InboundRouter:
 
     def _scrub_packed_bot_voice(self, packed):
         if packed is not None and isinstance(getattr(packed, "text", None), str):
+            lines = [
+                line for line in packed.text.splitlines() if "主人" not in line
+            ]
             packed = replace(
                 packed,
-                text=self._scrub_bot_voice_lines([packed.text])[0],
+                text="\n".join(self._scrub_bot_voice_lines(lines)),
             )
         return packed
 
