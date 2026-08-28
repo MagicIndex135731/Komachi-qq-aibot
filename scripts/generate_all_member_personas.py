@@ -41,12 +41,14 @@ def main() -> int:
     parser.add_argument("--min-messages", type=int, default=100)
     parser.add_argument("--out-dir", default="/workspace/data/personas")
     parser.add_argument("--skip-user-ids", default="")
+    parser.add_argument("--only-user-ids", default="")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     con = sqlite3.connect(f"file:{args.db}", uri=True, timeout=30)
     con.row_factory = sqlite3.Row
     skip = {int(value.strip()) for value in args.skip_user_ids.split(",") if value.strip()}
+    only = {int(value.strip()) for value in args.only_user_ids.split(",") if value.strip()}
     members = con.execute(
         "SELECT user_id FROM messages WHERE group_id=? AND user_id<>? AND plain_text<>'' "
         "GROUP BY user_id HAVING COUNT(*)>=?",
@@ -56,6 +58,8 @@ def main() -> int:
     for (user_id,) in members:
         user_id = int(user_id)
         if user_id in skip:
+            continue
+        if only and user_id not in only:
             continue
         label_row = con.execute(
             "SELECT raw_json FROM messages WHERE group_id=? AND user_id=? "
