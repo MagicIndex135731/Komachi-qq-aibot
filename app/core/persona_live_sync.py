@@ -211,6 +211,10 @@ class PersonaLiveSyncService:
             yaml.safe_dump(profile, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
+        merged = _merge_profile(current_profile, profile)
+        self.personas[persona_key] = merged
+        if hasattr(self.manager, "personas"):
+            self.manager.personas[persona_key] = merged
         return live_path
 
 
@@ -260,3 +264,13 @@ def _format_example_line(example) -> str:
     if lead:
         return f"上文「{lead}」→ 他回「{text}」"
     return f"他回「{text}」"
+
+
+def _merge_profile(base: dict, overlay: dict) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_profile(merged[key], value)
+        else:
+            merged[key] = value
+    return merged

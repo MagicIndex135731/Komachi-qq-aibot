@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.core.persona_live_sync import PersonaLiveSyncService, _build_examples
+from app.core.persona_live_sync import (
+    PersonaLiveSyncService,
+    _build_examples,
+    _merge_profile,
+)
 from app.core.persona_switch import PersonaManager
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -196,6 +200,23 @@ def test_load_runtime_config_merges_live_persona(tmp_path) -> None:
 
     assert runtime.personas["azha"]["core_traits"] == ["A", "B"]
     assert runtime.personas["azha"]["speech_habits"] == ["短句"]
+
+
+def test_merge_profile_replaces_lists_and_merges_mappings() -> None:
+    merged = _merge_profile(
+        {
+            "name": "阿渣",
+            "core_traits": ["A"],
+            "speaking_style": {"tone": "casual", "sentence_length": "short"},
+        },
+        {
+            "core_traits": ["A", "B"],
+            "speaking_style": {"tone": "blunt"},
+        },
+    )
+
+    assert merged["core_traits"] == ["A", "B"]
+    assert merged["speaking_style"] == {"tone": "blunt", "sentence_length": "short"}
 
 
 class _fake_settings:
