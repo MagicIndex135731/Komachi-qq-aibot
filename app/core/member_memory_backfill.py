@@ -33,12 +33,12 @@ _FACT_PROMPT = (
 )
 
 
-def extract_facts_from_lines(
-    settings,
+def build_slices(
     lines: list[str],
     *,
     slice_chars: int = 16000,
-) -> list[dict]:
+    overlap_lines: int = 2,
+) -> list[list[str]]:
     slices: list[list[str]] = [[]]
     used = 0
     for text in lines:
@@ -46,11 +46,32 @@ def extract_facts_from_lines(
         if not text:
             continue
         if used + len(text) > slice_chars and slices[-1]:
+            tail = list(slices[-1][-max(0, overlap_lines) :])
             slices.append([])
             used = 0
+            if tail:
+                slices[-1].extend(tail)
+                used = sum(len(item) for item in tail)
         slices[-1].append(text)
         used += len(text)
     if not slices[0]:
+        return []
+    return slices
+
+
+def extract_facts_from_lines(
+    settings,
+    lines: list[str],
+    *,
+    slice_chars: int = 16000,
+    overlap_lines: int = 2,
+) -> list[dict]:
+    slices = build_slices(
+        lines,
+        slice_chars=slice_chars,
+        overlap_lines=overlap_lines,
+    )
+    if not slices:
         return []
 
     client = LlmClient(
