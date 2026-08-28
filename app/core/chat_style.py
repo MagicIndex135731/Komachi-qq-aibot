@@ -340,6 +340,14 @@ def scrub_banned_address_terms(
 def _topic_units(text: str) -> set[str]:
     compact = re.sub(r"[\s\u3000]+", "", str(text or "").lower())
     units = {compact[index : index + 2] for index in range(len(compact) - 1)}
+    stop_chars = set(
+        "的了是我你他她它吗呢啊吧呀在就都很不这那什么怎么哪个有和与跟给对向把被让说做要想能会可以没别去来看回上下中前后里外天点个些再还也才只"
+    )
+    units.update(
+        char
+        for char in compact
+        if "\u4e00" <= char <= "\u9fff" and char not in stop_chars
+    )
     units.update(token for token in re.findall(r"[a-z0-9]+", compact))
     units.discard("")
     return units
