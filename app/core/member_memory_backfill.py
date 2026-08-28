@@ -9,6 +9,7 @@ import re
 from datetime import UTC, datetime
 
 import yaml
+from zoneinfo import ZoneInfo
 
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
@@ -138,6 +139,50 @@ def upsert_member_facts(
     return imported
 
 
+def review_facts(settings, facts: list[dict]) -> list[dict]:
+    """Second-pass semantic review; drop joke/irony/misread facts."""
+
+    if not facts:
+        return []
+    block = "\n".join(
+        f"- fact: {fact.get('fact')}\n  evidence: {fact.get('evidence')}"
+        for fact in facts
+    )
+    prompt = (
+        "你是记忆事实审核员。下面是从群成员聊天记录里抽取的候选事实，每条附逐字证据。"
+        "判断每条是真实的持久事实，还是从玩笑、反讽、虚构故事、断章取义里反推出的错误事实。"
+        "只输出一个 ```json 代码块："
+        '{"drop": ["要丢弃的事实原文"], "reasons": {"事实原文": "一句话理由"}}。'
+        "只把有明确依据判定为玩笑/反讽/错误的放 drop；证据不足或不确定的一律保留。\n候选：\n"
+        + block
+    )
+    client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        fallback_model=settings.llm_fallback_model,
+        responses_only=True,
+        responses_model=settings.llm_model,
+        max_output_tokens=4000,
+        timeout_seconds=300.0,
+        reasoning_effort="low",
+    )
+    generated = client.generate_text([prompt])
+    drop_set = parse_review_output(generated)
+    return [fact for fact in facts if str(fact.get("fact") or "") not in drop_set]
+
+
+def parse_review_output(text: str) -> set[str]:
+    match = re.search(r"```(?:json|yaml|yml)?\s*(.*?)```", str(text or ""), re.DOTALL)
+    raw = match.group(1) if match else text
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = yaml.safe_load(raw) or {}
+    drop = data.get("drop") if isinstance(data, dict) else []
+    return {str(item).strip() for item in (drop or []) if str(item).strip()}
+
+
 def _find_source_id(session, *, group_id: int, user_id: int, evidence: str) -> str | None:
     from sqlalchemy import select
 
@@ -166,7 +211,7 @@ def _find_source_id(session, *, group_id: int, user_id: int, evidence: str) -> s
 
 
 class MemberFactRefreshService:
-    """Scheduled incremental fact refresh for all active members, with a quota."""
+    """Daily fact refresh for every active member, with semantic review."""
 
     def __init__(
         self,
@@ -176,7 +221,6 @@ class MemberFactRefreshService:
         group_ids: set[int],
         bot_qq: int,
         interval_seconds: float = 21600.0,
-        daily_quota: int = 2,
         threshold: int = 50,
         cooldown_seconds: float = 86400.0,
         min_member_messages: int = 300,
@@ -186,7 +230,6 @@ class MemberFactRefreshService:
         self.group_ids = set(int(value) for value in group_ids)
         self.bot_qq = int(bot_qq)
         self.interval_seconds = max(1800.0, float(interval_seconds))
-        self.daily_quota = max(1, int(daily_quota))
         self.threshold = max(10, int(threshold))
         self.cooldown_seconds = max(3600.0, float(cooldown_seconds))
         self.min_member_messages = max(50, int(min_member_messages))
@@ -218,16 +261,21 @@ class MemberFactRefreshService:
                     new_count = int(state.new_since_refresh or 0) if state else 0
                     last_refresh = state.last_refresh_at if state else None
                     overdue = False
+                    due_today = True
                     if last_refresh is not None:
                         if last_refresh.tzinfo is None:
                             last_refresh = last_refresh.replace(tzinfo=UTC)
                         overdue = (
                             now - last_refresh
                         ).total_seconds() >= self.cooldown_seconds
-                    if new_count >= self.threshold or overdue:
+                        last_local = last_refresh.astimezone(ZoneInfo("Asia/Shanghai"))
+                        due_today = last_local.date() < now.astimezone(
+                            ZoneInfo("Asia/Shanghai")
+                        ).date()
+                    if new_count >= self.threshold or overdue or due_today:
                         due.append((new_count, user_id))
             due.sort(reverse=True)
-            for _, user_id in due[: self.daily_quota]:
+            for _, user_id in due:
                 self._refresh_member(group_id, user_id)
 
     def _refresh_member(self, group_id: int, user_id: int) -> None:
@@ -256,6 +304,7 @@ class MemberFactRefreshService:
             self.settings,
             [str(row.plain_text) for row in new_lines],
         )
+        facts = review_facts(self.settings, facts)
         imported = upsert_member_facts(
             self.engine,
             group_id=group_id,
