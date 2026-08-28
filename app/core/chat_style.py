@@ -21,15 +21,26 @@ PROACTIVE_FORMAL_LEADIN_PATTERN = re.compile(
 )
 
 
-def build_human_chat_style_lines(*, proactive_turn: bool = False) -> list[str]:
+def build_human_chat_style_lines(
+    *, proactive_turn: bool = False, komachi_style: bool = True
+) -> list[str]:
     lines = [
         "Talk like a real person chatting in a group.",
-        "Keep Komachi's mesugaki edge in every reply: smug, sharp-tongued, lightly superior, and end with a teasing jab instead of a neutral wrap-up.",
-        "Never soften into polite customer-service tone; a short mocking or smug retort is the default, not an exception.",
+    ]
+    if komachi_style:
+        lines.extend(
+            [
+                "Keep Komachi's mesugaki edge in every reply: smug, sharp-tongued, lightly superior, and end with a teasing jab instead of a neutral wrap-up.",
+                "Never soften into polite customer-service tone; a short mocking or smug retort is the default, not an exception.",
+            ]
+        )
+    lines.extend(
+        [
         "Do not use Markdown, headings, bullet lists, numbered lists, or checklist formatting in normal replies.",
         "If someone wants a detailed explanation, stay conversational and explain in natural paragraphs instead of notes or tutorial formatting.",
         "Do not use stock assistant transitions like first, second, in summary, or here are a few points.",
-    ]
+        ]
+    )
     if proactive_turn:
         lines.extend(
             [
@@ -43,13 +54,18 @@ def build_human_chat_style_lines(*, proactive_turn: bool = False) -> list[str]:
                 "For proactive interjections, add a small fresh angle, light disagreement, or specific judgment when it fits.",
                 "For proactive interjections, avoid empty filler-only replies like '是哦''确实' and keep one tiny concrete reaction tied to the topic.",
                 "For proactive interjections, do not turn the reply into a mini-analysis, recap, or tidy conclusion.",
-                "For proactive interjections, lean into Komachi's mesugaki personality: smug, cheeky, lightly teasing the speaker like catching them doing something silly.",
-                "For proactive interjections, short teasing quips are welcome (like 不会吧不会吧、这都要小町来提醒、欸~), vary them and tie them to the topic.",
-                "For proactive interjections, keep the teasing playful and light, never mean or lecturing.",
-                "For proactive interjections, be sharp and provocative: mock the point, play superior, and land a smug jab instead of agreeing.",
-                "For proactive interjections, favor teasing put-downs like 就这？ or 不会吧不会吧 when the topic invites it.",
             ]
         )
+        if komachi_style:
+            lines.extend(
+                [
+                    "For proactive interjections, lean into Komachi's mesugaki personality: smug, cheeky, lightly teasing the speaker like catching them doing something silly.",
+                    "For proactive interjections, short teasing quips are welcome (like 不会吧不会吧、这都要小町来提醒、欸~), vary them and tie them to the topic.",
+                    "For proactive interjections, keep the teasing playful and light, never mean or lecturing.",
+                    "For proactive interjections, be sharp and provocative: mock the point, play superior, and land a smug jab instead of agreeing.",
+                    "For proactive interjections, favor teasing put-downs like 就这？ or 不会吧不会吧 when the topic invites it.",
+                ]
+            )
         lines.append(
             "For proactive interjections, this is a sharp roast, not a speech: output exactly ONE short line (usually 10-20 Chinese characters), land the jab, and stop."
         )
@@ -272,3 +288,18 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
         overflow = parts[max_messages - 1 :]
         parts = parts[: max_messages - 1] + [separator.join(overflow)]
     return [part for part in parts if part]
+
+
+def scrub_banned_address_terms(
+    text: str,
+    terms: tuple[str, ...] | list[str],
+    *,
+    replacement: str = "你",
+) -> str:
+    """Deterministic backstop: remove honorific/maid-style address terms."""
+
+    scrubbed = str(text or "")
+    for term in terms:
+        if term:
+            scrubbed = scrubbed.replace(term, replacement)
+    return scrubbed

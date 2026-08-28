@@ -36,6 +36,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    scrub_banned_address_terms,
     split_burst_reply,
 )
 from app.core.context_builder import ContextBuilder
@@ -111,6 +112,7 @@ from app.core.search_policy import (
     parse_search_decision,
     SearchDecision,
 )
+from app.core.style_distill import BANNED_ADDRESS_TERMS
 from app.core.summarizer import summarize_recursive, summarize_window
 from app.core.url_policy import explicitly_requests_urls, filter_reply_urls, url_reply_policy_instruction
 from app.core.web_grounding import build_grounding_notes
@@ -776,6 +778,7 @@ class InboundRouter:
             else None
         )
         segments = split_burst_reply(reply_text, burst)
+        impersonating = self._impersonating(event.group_id)
         base_id = self._outbound_platform_msg_id(event.platform_msg_id)
         delay_min = 0.0
         delay_max = 0.0
@@ -783,6 +786,10 @@ class InboundRouter:
             delay_min = max(0.0, float(burst.get("min_delay_seconds") or 0.8))
             delay_max = max(delay_min, float(burst.get("max_delay_seconds") or 2.5))
         for index, segment in enumerate(segments):
+            if impersonating:
+                segment = scrub_banned_address_terms(
+                    segment, BANNED_ADDRESS_TERMS
+                )
             platform_msg_id = base_id if index == 0 else f"{base_id}-b{index}"
             await self._send_prebuilt_reply(
                 event,
@@ -825,6 +832,17 @@ class InboundRouter:
             "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
         )
         return text
+
+    def _safety_lines_for(self, *, impersonating: bool) -> list[str]:
+        lines = render_safety_lines(self.runtime.safety)
+        if impersonating:
+            # Full impersonation is incompatible with the AI-disclosure line:
+            # it flips the model back into assistant voice and encourages
+            # maid-style address terms.
+            lines = [
+                line for line in lines if "Disclose that you are an AI" not in line
+            ]
+        return lines
 
     @staticmethod
     def _filter_bot_identity_memory_lines(lines: list[str]) -> list[str]:
@@ -1611,6 +1629,7 @@ class InboundRouter:
             active_persona = self._active_persona(event.group_id)
             persona_name = str(active_persona.get("name", "")).strip()
             persona_text = self._persona_text_for(active_persona, event.group_id)
+            impersonating = self._impersonating(event.group_id)
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -1962,10 +1981,21 @@ class InboundRouter:
                 relevant_summaries = self._filter_bot_identity_memory_lines(relevant_summaries)
             history_detail = memory_context.history_detail
             if is_bot_self_identity_query(event.plain_text, bot_names=bot_names):
-                group_policy_lines = [
-                    *group_policy_lines,
-                    BOT_SELF_IDENTITY_INSTRUCTION,
-                ]
+                if impersonating:
+                    group_policy_lines = [
+                        *group_policy_lines,
+                        (
+                            "Identity question: answer as the group member you are "
+                            "playing, in one short natural line, never mention AI, "
+                            "robot, assistant, or any previous persona, and never "
+                            "call anyone 主人 or use honorifics."
+                        ),
+                    ]
+                else:
+                    group_policy_lines = [
+                        *group_policy_lines,
+                        BOT_SELF_IDENTITY_INSTRUCTION,
+                    ]
             elif is_requester_identity_query(event.plain_text):
                 group_policy_lines = [
                     *group_policy_lines,
@@ -2173,6 +2203,11 @@ class InboundRouter:
                     )
 
             proactive_turn = not addressed_turn
+            safety_rules = self._safety_lines_for(impersonating=impersonating)
+            reply_style_lines = build_human_chat_style_lines(
+                proactive_turn=proactive_turn,
+                komachi_style=not impersonating,
+            )
             if search_priority_turn:
                 group_policy_lines = [
                     *group_policy_lines,
@@ -2197,9 +2232,9 @@ class InboundRouter:
                     prompt_target_text = f"{prompt_target_text}\n{pronoun_referent_note}"
             prompt_lines = self.context_builder.build(
                 persona_text=persona_text,
-                safety_rules=render_safety_lines(self.runtime.safety),
+                safety_rules=safety_rules,
                 group_policy_lines=group_policy_lines,
-                reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
+                reply_style_lines=reply_style_lines,
                 recent_messages=prompt_recent_lines,
                 full_history_messages=full_history_lines,
                 full_history_preamble=full_history_preamble,
@@ -2261,9 +2296,9 @@ class InboundRouter:
                     )
                     prompt_lines = self.context_builder.build(
                         persona_text=persona_text,
-                        safety_rules=render_safety_lines(self.runtime.safety),
+                        safety_rules=safety_rules,
                         group_policy_lines=group_policy_lines,
-                        reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
+                        reply_style_lines=reply_style_lines,
                         recent_messages=prompt_recent_lines,
                         full_history_messages=retained_history_lines,
                         full_history_preamble=full_history_preamble,
@@ -2293,9 +2328,9 @@ class InboundRouter:
                         )
                         prompt_lines = self.context_builder.build(
                             persona_text=persona_text,
-                            safety_rules=render_safety_lines(self.runtime.safety),
+                            safety_rules=safety_rules,
                             group_policy_lines=group_policy_lines,
-                            reply_style_lines=build_human_chat_style_lines(proactive_turn=proactive_turn),
+                            reply_style_lines=reply_style_lines,
                             recent_messages=prompt_recent_lines,
                             full_history_messages=[],
                             full_history_preamble=[],

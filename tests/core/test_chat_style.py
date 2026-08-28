@@ -3,6 +3,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    scrub_banned_address_terms,
     split_burst_reply,
 )
 
@@ -79,6 +80,22 @@ def test_normalize_brief_group_interjection_keeps_first_complete_sentence_only()
     raw = "First jab. Second unnecessary sentence."
     assert normalize_brief_group_interjection_reply(raw) == "First jab."
 
+
+def test_build_human_chat_style_lines_can_drop_komachi_voice() -> None:
+    lines = build_human_chat_style_lines(komachi_style=False)
+    joined = "\n".join(lines)
+
+    assert "mesugaki" not in joined
+    assert "Komachi" not in joined
+    assert any("real person" in line for line in lines)
+
+    proactive = build_human_chat_style_lines(
+        proactive_turn=True, komachi_style=False
+    )
+    proactive_joined = "\n".join(proactive)
+    assert "mesugaki" not in proactive_joined
+    assert "就这？" not in proactive_joined
+
 def test_normalize_chat_reply_strips_model_think_blocks() -> None:
     raw = (
         "<think>Considering concise responses I should keep this short.</think> "
@@ -98,3 +115,9 @@ def test_split_burst_reply_splits_and_caps_segments() -> None:
     assert split_burst_reply("来了|人呢", burst) == ["来了", "人呢"]
     assert split_burst_reply("一|二|三|四", burst) == ["一", "二", "三|四"]
     assert split_burst_reply("一条消息", burst) == ["一条消息"]
+
+
+def test_scrub_banned_address_terms_replaces_honorifics() -> None:
+    assert scrub_banned_address_terms(
+        "主人，阿渣啊。大人您稍等", ("主人", "大人", "您")
+    ) == "你，阿渣啊。你你稍等"

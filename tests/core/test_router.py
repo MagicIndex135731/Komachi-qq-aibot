@@ -718,6 +718,32 @@ async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> N
 
 
 @pytest.mark.asyncio
+async def test_router_scrubs_honorifics_while_impersonating(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("主人，阿渣啊，打游戏看球写日报的那个")
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    router.persona_manager.personas["test_self"] = {
+        "name": "测试君",
+        "identity": "group member",
+        "core_traits": ["casual"],
+        "speaking_style": {"tone": "natural"},
+    }
+    router.persona_manager.set_persona_key(10001, "test_self")
+
+    await router.handle_group_message(
+        make_event(group_id=10001, mentioned_bot=True)
+    )
+
+    assert [outbound.text for outbound in sender.sent] == [
+        "你，阿渣啊，打游戏看球写日报的那个"
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "query",
     ("@Mira 你是谁", "@Mira 我问的是你是谁，不是我是谁"),
