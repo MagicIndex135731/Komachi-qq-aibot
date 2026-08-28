@@ -39,6 +39,7 @@ from app.core.chat_style import (
     normalize_chat_reply_burst_aware,
     normalize_proactive_chat_reply,
     retrieve_relevant_examples,
+    retrieve_relevant_facts,
     scrub_banned_address_terms,
     split_burst_reply,
 )
@@ -883,6 +884,28 @@ class InboundRouter:
             return persona_text
         examples = format_example_pairs(picked, max_pairs=4)
         return f"{persona_text}\n相关话题下他的原话示例：{examples}"
+
+    def _with_relevant_facts(
+        self,
+        persona_text: str,
+        active_persona: dict,
+        context_lines: list[str],
+    ) -> str:
+        facts = active_persona.get("facts") or []
+        picked = retrieve_relevant_facts(facts, context_lines, limit=5)
+        if not picked:
+            return persona_text
+        lines = [
+            f"- [{fact.get('category') or '事实'}] {fact.get('fact')}"
+            for fact in picked
+            if isinstance(fact, dict)
+        ]
+        if not lines:
+            return persona_text
+        return (
+            f"{persona_text}\n关于他的已知事实（只使用这些与他相符的事实，"
+            "没有的事实不要编，用他的语气带过）：\n" + "\n".join(lines)
+        )
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:
         labels = {str(self.runtime.persona.get("name", "") or "").strip()}
@@ -1731,6 +1754,13 @@ class InboundRouter:
                 )
                 persona_text = self._with_relevant_examples(
                     persona_text, active_persona, recent_lines, event.group_id
+                )
+                query_lines = [
+                    f"{self._member_label_for_user(user_id=event.user_id, users_by_id=users_by_id, group_id=event.group_id)}: {event.plain_text}",
+                    *recent_lines,
+                ]
+                persona_text = self._with_relevant_facts(
+                    persona_text, active_persona, query_lines
                 )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(

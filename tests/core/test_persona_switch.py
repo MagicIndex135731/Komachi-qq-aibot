@@ -256,3 +256,30 @@ def test_router_appends_relevant_examples_while_impersonating(sqlite_engine) -> 
 
     assert "明天看球" in text
     assert "上号" not in text
+
+
+def test_router_appends_relevant_facts_while_impersonating(sqlite_engine) -> None:
+    from app.core.router import InboundRouter
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=object(),
+    )
+
+    persona = {
+        "name": "测试君",
+        "identity": "group member",
+        "facts": [
+            {"category": "游戏", "fact": "主玩英雄联盟手游"},
+            {"category": "工作", "fact": "在快手实习"},
+        ],
+    }
+    text = router._with_relevant_facts(
+        "persona-text",
+        persona,
+        ["你最擅长什么lol英雄"],
+    )
+
+    assert "主玩英雄联盟手游" in text
+    assert "在快手实习" not in text

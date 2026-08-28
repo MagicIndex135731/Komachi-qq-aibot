@@ -411,3 +411,32 @@ def format_example_pairs(entries: list[dict], *, max_pairs: int = 4) -> str:
         else:
             pairs.append(f"他回「{entry.get('text')}」")
     return "；".join(pairs)
+
+
+def retrieve_relevant_facts(
+    facts: list[dict] | tuple[dict, ...],
+    context_lines: list[str],
+    *,
+    limit: int = 5,
+) -> list[dict]:
+    """Pick member facts by topic overlap with the current conversation."""
+
+    context_units = _topic_units(
+        "\n".join(str(line).split(":", 1)[-1] for line in context_lines)
+    )
+    scored: list[tuple[int, int, dict]] = []
+    seen: set[str] = set()
+    for fact in facts or []:
+        if isinstance(fact, dict):
+            text = f"{fact.get('category') or ''} {fact.get('fact') or ''}"
+        else:
+            text = str(fact)
+        key = str(fact.get("fact") if isinstance(fact, dict) else fact).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        overlap = len(context_units & _topic_units(text))
+        if overlap:
+            scored.append((overlap, len(text), fact if isinstance(fact, dict) else {"fact": text}))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [fact for _, _, fact in scored[: max(0, limit)]]

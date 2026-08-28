@@ -304,6 +304,7 @@ def build_profile_prompt(
         "- speech_habits: 15-30 条，每条都指向真人可验证的口头禅、断句、接话方式、情绪表达、抬杠/自嘲/附和风格；能写具体词就写具体词\n"
         "- style_avoid: 8-15 条禁区，尤其覆盖：客服腔、解释腔、AI 腔、正式书面语、长篇大论、客套\n"
         "- relationships: 按互动数据逐人列出他对每个群友的关系，每项含 member/relation/how_azha_talks/address_terms/notes；有语料依据才写，没依据的不写\n"
+        "- external_relations: 他反复提及/关注/评价的**群外人物**（虚拟主播、球星、up主、角色等），每项含 name（名字）/who（这个人的身份）/relation（他与这个人的关系，如铁粉/黑粉/路人）/attitude（他的真实态度，用他的原话风格概括）/evidence（1-2 条他本人的原句）；他高频转发、玩梗、维护的对象要写全\n"
         "- address_rules: 3-8 条他的称呼习惯（他怎么叫别人），并明确列出他绝不会用的称呼（如'主人''亲'这类与他不符的称呼）\n"
         "示例原句由程序确定性选取，你不需要输出 example_lines。\n"
         "关键要求：要把'像真人'的细节写满，包括他怎么起句、怎么收尾、什么时候发一个字的消息、怎么用语气词和表情；"
@@ -423,6 +424,11 @@ def assemble_persona(
     if isinstance(relationships, list):
         persona["relationships"] = [
             item for item in relationships if isinstance(item, dict)
+        ]
+    external_relations = profile.get("external_relations")
+    if isinstance(external_relations, list):
+        persona["external_relations"] = [
+            item for item in external_relations if isinstance(item, dict)
         ]
     address_rules = _as_string_list(profile.get("address_rules"))
     if address_rules:

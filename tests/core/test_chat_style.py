@@ -5,6 +5,7 @@ from app.core.chat_style import (
     normalize_chat_reply_burst_aware,
     normalize_proactive_chat_reply,
     retrieve_relevant_examples,
+    retrieve_relevant_facts,
     scrub_banned_address_terms,
     split_burst_reply,
 )
@@ -143,6 +144,19 @@ def test_burst_aware_normalize_keeps_newlines_as_separators() -> None:
     normalized = normalize_chat_reply_burst_aware("季挺nb\n前半像日常番", burst)
 
     assert normalized == "季挺nb|前半像日常番"
+
+
+def test_retrieve_relevant_facts_ranks_by_topic_overlap() -> None:
+    facts = [
+        {"category": "游戏", "fact": "主玩英雄联盟手游"},
+        {"category": "工作", "fact": "在快手实习"},
+    ]
+
+    picked = retrieve_relevant_facts(
+        facts, ["你最擅长什么lol英雄"], limit=1
+    )
+
+    assert picked == [{"category": "游戏", "fact": "主玩英雄联盟手游"}]
 
 
 def test_split_burst_reply_auto_splits_long_sentences() -> None:

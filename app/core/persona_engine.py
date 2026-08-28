@@ -26,6 +26,7 @@ def render_persona(persona: dict) -> str:
     address_rules = _normalize_traits(persona.get("address_rules", []))
     example_lines = _normalize_traits(persona.get("example_lines", []))
     burst = persona.get("burst")
+    external_relations = persona.get("external_relations")
     relationships = persona.get("relationships")
     if not isinstance(relationships, list):
         relationships = []
@@ -80,6 +81,24 @@ def render_persona(persona: dict) -> str:
             f"parts as short as the person would type them); otherwise reply "
             f"with one message."
         )
+    if isinstance(external_relations, list):
+        for item in external_relations:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            who = str(item.get("who") or "").strip()
+            relation = str(item.get("relation") or "").strip()
+            attitude = str(item.get("attitude") or "").strip()
+            if not name:
+                continue
+            parts = [f"{name}"]
+            if who:
+                parts.append(f"身份={who}")
+            if relation:
+                parts.append(f"关系={relation}")
+            if attitude:
+                parts.append(f"他的态度={attitude}")
+            details.append(f"External relation: {' | '.join(parts)}.")
     if secondary_personas:
         secondary_details: list[str] = []
         for item in secondary_personas:
