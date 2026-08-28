@@ -848,6 +848,11 @@ class InboundRouter:
         )
 
     def _persona_text_for(self, active_persona: dict, group_id: int) -> str:
+        if (
+            self._impersonating(group_id)
+            and self.persona_manager is not None
+        ):
+            active_persona = self.persona_manager.live_persona(group_id)
         text = render_persona(active_persona)
         if not self._impersonating(group_id):
             return text

@@ -33,6 +33,29 @@ def _speaker_label(raw_json: str | None, user_id: int) -> str:
     return card or nickname or str(user_id)
 
 
+def _flatten_db_row(row) -> dict:
+    raw = row["raw_json"]
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {}
+    sender = payload.get("sender") if isinstance(payload, dict) else {}
+    sender = sender if isinstance(sender, dict) else {}
+    card = str(sender.get("card") or "").strip()
+    nickname = str(sender.get("nickname") or "").strip()
+    return {
+        "platform_msg_id": row["platform_msg_id"],
+        "timestamp": row["timestamp"],
+        "user_id": int(row["user_id"]),
+        "text": row["plain_text"],
+        "reply_to_msg_id": row["reply_to_msg_id"],
+        "speaker": card or nickname or str(row["user_id"]),
+        "group_card": card,
+        "nickname": nickname,
+        "raw_json": raw,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="/workspace/data/bot.db")
@@ -70,7 +93,7 @@ def main() -> int:
         if not display_name:
             display_name = f"成员{user_id}"
         stream = [
-            dict(row)
+            _flatten_db_row(row)
             for row in con.execute(
                 "SELECT platform_msg_id, timestamp, user_id, plain_text, msg_type, "
                 "reply_to_msg_id, raw_json FROM messages WHERE group_id=? ORDER BY timestamp, id",
@@ -80,6 +103,7 @@ def main() -> int:
         corpus = [
             {
                 "text": row["plain_text"],
+                "speaker": row["speaker"],
                 "platform_msg_id": row["platform_msg_id"],
                 "timestamp": row["timestamp"],
             }
@@ -132,6 +156,17 @@ def main() -> int:
             aliases=[display_name],
         )
         persona["source_group_id"] = args.group_id
+        name_to_user_id = {
+            str(rel.get("member")): int(rel.get("user_id"))
+            for rel in relationships
+            if rel.get("member") and rel.get("user_id")
+        }
+        for rel in persona.get("relationships") or []:
+            if not isinstance(rel, dict) or rel.get("member_user_id"):
+                continue
+            matched = name_to_user_id.get(str(rel.get("member") or ""))
+            if matched:
+                rel["member_user_id"] = matched
         persona["example_lines"] = select_examples(corpus, count=36)
         persona["example_bank"] = select_examples(corpus, count=120)
         persona.setdefault(

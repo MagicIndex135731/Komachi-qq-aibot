@@ -7,11 +7,13 @@ or the safety layer.
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
+import time
 
 from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
-from app.storage.models import MemoryItem
+from app.storage.models import MemoryItem, User
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupPersonaStateRepository,
@@ -85,6 +87,8 @@ class PersonaManager:
         self._card_snapshots: dict[int, str] = {}
         self._account_avatar_snapshot: str | None = None
         self._style_banks: dict[int, list[dict]] = {}
+        self._member_aliases: dict[int, str] = {}
+        self._member_aliases_loaded_at: float = 0.0
         self.embedding_provider = embedding_provider
         self._example_vectors: dict[
             int, tuple[str, list[list[float]] | None, list[dict]]
@@ -262,6 +266,44 @@ class PersonaManager:
     def active_persona(self, group_id: int) -> dict:
         key = self.active_key(group_id)
         return self.personas.get(key) or self.default_persona
+
+    def _member_alias_map(self, *, max_age_seconds: float = 300.0) -> dict[int, str]:
+        now = time.monotonic()
+        if now - self._member_aliases_loaded_at > max_age_seconds:
+            aliases: dict[int, str] = {}
+            with session_scope(self.engine) as session:
+                for user in session.query(User).all():
+                    label = str(user.group_card or "").strip() or str(
+                        user.nickname or ""
+                    ).strip()
+                    if label:
+                        aliases[int(user.user_id)] = label
+            self._member_aliases = aliases
+            self._member_aliases_loaded_at = now
+        return self._member_aliases
+
+    def live_persona(self, group_id: int) -> dict:
+        """Return the active persona with relationship labels pointing at the
+        members' CURRENT group names (nicknames change; QQ ids stay stable)."""
+
+        persona = self.active_persona(group_id)
+        live = copy.deepcopy(persona)
+        aliases = self._member_alias_map()
+        relationships = live.get("relationships")
+        if not isinstance(relationships, list):
+            return live
+        for rel in relationships:
+            if not isinstance(rel, dict):
+                continue
+            user_id = rel.get("member_user_id")
+            if user_id is None and str(rel.get("member") or "").isdigit():
+                user_id = int(rel["member"])
+            if user_id is None:
+                continue
+            label = aliases.get(int(user_id))
+            if label:
+                rel["member"] = label
+        return live
 
     def active_name(self, group_id: int) -> str:
         name = str(self.active_persona(group_id).get("name", "") or "").strip()

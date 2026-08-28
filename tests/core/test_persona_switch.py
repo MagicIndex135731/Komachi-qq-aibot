@@ -340,3 +340,40 @@ def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
     picked = manager.retrieve_facts(10001, ["你最擅长什么英雄"], limit=2)
 
     assert any(item["fact"] == "主玩英雄联盟手游" for item in picked)
+
+
+def test_live_persona_refreshes_relationship_labels(sqlite_engine) -> None:
+    from app.storage.db import session_scope
+    from app.storage.repositories import UserRepository
+
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "relationships": [
+                {"member": "999", "member_user_id": 999, "relation": "朋友"},
+                {"member": "888", "relation": "球友"},
+            ],
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    with session_scope(sqlite_engine) as session:
+        UserRepository(session).upsert_user(
+            user_id=999, nickname="旧昵称", group_card="路人卡"
+        )
+        UserRepository(session).upsert_user(
+            user_id=888, nickname="球友甲", group_card=""
+        )
+    manager.set_persona_key(10001, "test_self")
+
+    live = manager.live_persona(10001)
+
+    assert live["relationships"][0]["member"] == "路人卡"
+    assert live["relationships"][1]["member"] == "球友甲"
