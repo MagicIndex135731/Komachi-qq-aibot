@@ -17,6 +17,7 @@ from app.config import AppSettings, load_runtime_config
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
 from app.core.group_history_backfill import backfill_recent_group_history
+from app.core.member_memory_backfill import MemberFactRefreshService
 from app.core.persona_live_sync import PersonaLiveSyncService
 from app.core.persona_switch import PersonaManager, PersonaSwitchService
 from app.core.reply_policy import ReplyPolicy
@@ -309,6 +310,7 @@ async def run() -> None:
     group_image_service = None
     memory_compaction_service = None
     persona_sync_task = None
+    member_fact_refresh_task = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
         await asyncio.to_thread(create_all, engine)
@@ -380,6 +382,23 @@ async def run() -> None:
             manager=persona_manager,
         )
         persona_sync_task = asyncio.create_task(persona_sync_service.run())
+        memory_group_ids = {
+            int(group_id)
+            for group_id in runtime.group_policy.get("groups", {})
+            if should_enable_memory_in_group(
+                group_id=int(group_id),
+                group_policy=runtime.group_policy,
+            )
+        }
+        member_fact_refresh_service = MemberFactRefreshService(
+            engine=engine,
+            settings=settings,
+            group_ids=memory_group_ids,
+            bot_qq=settings.bot_qq,
+        )
+        member_fact_refresh_task = asyncio.create_task(
+            member_fact_refresh_service.run()
+        )
         router = InboundRouter(
             engine=engine,
             runtime=runtime,
@@ -449,6 +468,8 @@ async def run() -> None:
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
+        if member_fact_refresh_task is not None:
+            member_fact_refresh_task.cancel()
         if persona_sync_task is not None:
             persona_sync_task.cancel()
         if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:

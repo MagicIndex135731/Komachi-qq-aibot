@@ -890,9 +890,16 @@ class InboundRouter:
         persona_text: str,
         active_persona: dict,
         context_lines: list[str],
+        group_id: int,
     ) -> str:
-        facts = active_persona.get("facts") or []
-        picked = retrieve_relevant_facts(facts, context_lines, limit=5)
+        if self.persona_manager is not None:
+            picked = self.persona_manager.retrieve_facts(
+                group_id, context_lines, limit=5
+            )
+        else:
+            picked = retrieve_relevant_facts(
+                active_persona.get("facts") or [], context_lines, limit=5
+            )
         if not picked:
             return persona_text
         lines = [
@@ -1760,7 +1767,7 @@ class InboundRouter:
                     *recent_lines,
                 ]
                 persona_text = self._with_relevant_facts(
-                    persona_text, active_persona, query_lines
+                    persona_text, active_persona, query_lines, event.group_id
                 )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(

@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import re
 
+from app.core.chat_style import retrieve_relevant_facts
+from app.storage.models import MemoryItem
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupPersonaStateRepository,
@@ -152,6 +154,38 @@ class PersonaManager:
             for value in (persona.get("example_bank") or [])
             if str(value).strip()
         ]
+
+    def retrieve_facts(
+        self,
+        group_id: int,
+        context_lines: list[str],
+        *,
+        limit: int = 5,
+    ) -> list[dict]:
+        """Pull topic-relevant facts about the active member from shared memory."""
+
+        persona = self.active_persona(group_id)
+        user_id = _as_positive_int(persona.get("source_user_id"))
+        if user_id is None:
+            return []
+        with session_scope(self.engine) as session:
+            rows = list(
+                session.query(MemoryItem)
+                .filter(
+                    MemoryItem.scope_type == "group",
+                    MemoryItem.scope_id == str(int(group_id)),
+                    MemoryItem.subject_id == str(user_id),
+                    MemoryItem.memory_kind.in_(("fact", "relationship")),
+                    MemoryItem.status == "active",
+                )
+                .all()
+            )
+        bank = [
+            {"category": str(row.predicate or "fact"), "fact": str(row.content or "")}
+            for row in rows
+            if str(row.content or "").strip()
+        ]
+        return retrieve_relevant_facts(bank, context_lines, limit=limit)
 
     def active_key(self, group_id: int) -> str:
         return self._group_keys.get(int(group_id), DEFAULT_PERSONA_KEY)

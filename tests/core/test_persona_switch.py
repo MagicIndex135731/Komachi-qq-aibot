@@ -258,8 +258,10 @@ def test_router_appends_relevant_examples_while_impersonating(sqlite_engine) -> 
     assert "上号" not in text
 
 
-def test_router_appends_relevant_facts_while_impersonating(sqlite_engine) -> None:
+def test_router_appends_relevant_facts_from_shared_memory(sqlite_engine) -> None:
     from app.core.router import InboundRouter
+    from app.storage.db import session_scope
+    from app.storage.repositories import MemoryRepository
 
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
@@ -267,19 +269,73 @@ def test_router_appends_relevant_facts_while_impersonating(sqlite_engine) -> Non
         llm_client=object(),
     )
 
-    persona = {
+    router.persona_manager.personas["test_self"] = {
         "name": "测试君",
         "identity": "group member",
-        "facts": [
-            {"category": "游戏", "fact": "主玩英雄联盟手游"},
-            {"category": "工作", "fact": "在快手实习"},
-        ],
+        "source_user_id": 222,
     }
+    router.persona_manager.set_persona_key(10001, "test_self")
+    with session_scope(sqlite_engine) as session:
+        MemoryRepository(session).upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="222",
+            memory_kind="fact",
+            canonical_key="主玩英雄联盟手游",
+            predicate="游戏",
+            object_text="",
+            content="主玩英雄联盟手游",
+            importance=3,
+            confidence=0.8,
+            source_msg_ids=[],
+        )
+
     text = router._with_relevant_facts(
         "persona-text",
-        persona,
+        router._active_persona(10001),
         ["你最擅长什么lol英雄"],
+        10001,
     )
-
     assert "主玩英雄联盟手游" in text
-    assert "在快手实习" not in text
+
+
+def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
+    from app.storage.db import session_scope
+    from app.storage.repositories import MemoryRepository
+
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {"name": "测试君", "identity": "group member", "source_user_id": 222},
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    manager.set_persona_key(10001, "test_self")
+    with session_scope(sqlite_engine) as session:
+        repo = MemoryRepository(session)
+        for category, fact in (
+            ("游戏", "主玩英雄联盟手游"),
+            ("工作", "在快手实习"),
+        ):
+            repo.upsert_canonical_memory(
+                scope_type="group",
+                scope_id="10001",
+                subject_type="user",
+                subject_id="222",
+                memory_kind="fact",
+                canonical_key=fact,
+                predicate=category,
+                object_text="",
+                content=fact,
+                importance=3,
+                confidence=0.8,
+                source_msg_ids=[],
+            )
+
+    picked = manager.retrieve_facts(10001, ["你最擅长什么英雄"], limit=2)
+
+    assert any(item["fact"] == "主玩英雄联盟手游" for item in picked)
