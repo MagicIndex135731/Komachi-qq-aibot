@@ -427,6 +427,8 @@ def assemble_persona(
     address_rules = _as_string_list(profile.get("address_rules"))
     if address_rules:
         persona["address_rules"] = address_rules
+    if isinstance(profile.get("burst"), dict):
+        persona["burst"] = dict(profile["burst"])
     if source_user_id is not None and int(source_user_id) > 0:
         persona["source_user_id"] = int(source_user_id)
     resolved_aliases = [str(alias).strip() for alias in (aliases or []) if str(alias).strip()]

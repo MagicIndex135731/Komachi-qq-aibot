@@ -36,6 +36,7 @@ from app.core.chat_style import (
     format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
+    normalize_chat_reply_burst_aware,
     normalize_proactive_chat_reply,
     retrieve_relevant_examples,
     scrub_banned_address_terms,
@@ -845,6 +846,7 @@ class InboundRouter:
             "不要沿用任何属于 AI 或其他身份的设定与记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
             "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
             "你的回复必须极短，通常只有几个字到十几个字，像真人随手打字一样；除非对方明确要求详细解释，否则不要超过一两句。"
+            "需要连续说几句时，用换行把它们拆成多条（每条几个字），或者按系统提示用 | 分隔；绝对不要写成一句长话，也不要复述或总结对方的话。"
         )
         return text
 
@@ -2895,11 +2897,15 @@ class InboundRouter:
                 conversation_key=conversation_key,
                 **generation_kwargs,
             )
-        return (
-            normalize_brief_group_interjection_reply(raw_reply)
-            if prepared_reply.proactive_turn
-            else normalize_chat_reply(raw_reply)
+        if prepared_reply.proactive_turn:
+            return normalize_brief_group_interjection_reply(raw_reply)
+        active_persona = self._active_persona(event.group_id)
+        burst = (
+            active_persona.get("burst")
+            if isinstance(active_persona, dict)
+            else None
         )
+        return normalize_chat_reply_burst_aware(raw_reply, burst)
 
     def _enforce_envelope_reply(
         self,

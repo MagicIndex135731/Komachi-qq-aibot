@@ -239,6 +239,17 @@ def main() -> int:
                     final = draft
     final["example_lines"] = deterministic_examples
     final["example_bank"] = example_bank
+    final.setdefault(
+        "burst",
+        {
+            "enabled": True,
+            "separator": "|",
+            "max_messages": 3,
+            "max_chars": 18,
+            "min_delay_seconds": 0.8,
+            "max_delay_seconds": 2.5,
+        },
+    )
     if args.source_group_id > 0:
         final["source_group_id"] = args.source_group_id
     output_path = Path(args.output)

@@ -2,6 +2,7 @@ from app.core.chat_style import (
     build_human_chat_style_lines,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
+    normalize_chat_reply_burst_aware,
     normalize_proactive_chat_reply,
     retrieve_relevant_examples,
     scrub_banned_address_terms,
@@ -134,3 +135,29 @@ def test_retrieve_relevant_examples_ranks_by_topic_overlap() -> None:
     assert "明天看球吗" in texts
     assert "写日报好烦" not in texts
     assert "吃啥" not in texts
+
+
+def test_burst_aware_normalize_keeps_newlines_as_separators() -> None:
+    burst = {"enabled": True, "separator": "|", "max_messages": 3}
+
+    normalized = normalize_chat_reply_burst_aware("季挺nb\n前半像日常番", burst)
+
+    assert normalized == "季挺nb|前半像日常番"
+
+
+def test_split_burst_reply_auto_splits_long_sentences() -> None:
+    burst = {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "max_chars": 8,
+    }
+    text = "季挺挺nb呀哈。前半像日常番哦。后半直接精神污染了。"
+
+    parts = split_burst_reply(text, burst)
+
+    assert parts == [
+        "季挺挺nb呀哈。",
+        "前半像日常番哦。",
+        "后半直接精神污染了。",
+    ]

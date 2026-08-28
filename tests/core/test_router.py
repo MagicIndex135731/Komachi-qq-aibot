@@ -718,6 +718,31 @@ async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> N
 
 
 @pytest.mark.asyncio
+async def test_router_sends_newline_burst_as_separate_messages(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("来了\n人呢")
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    router.runtime.persona["burst"] = {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "max_chars": 18,
+        "min_delay_seconds": 0,
+        "max_delay_seconds": 0,
+    }
+
+    await router.handle_group_message(
+        make_event(group_id=10001, mentioned_bot=True)
+    )
+
+    assert [outbound.text for outbound in sender.sent] == ["来了", "人呢"]
+
+
+@pytest.mark.asyncio
 async def test_router_scrubs_honorifics_while_impersonating(sqlite_engine) -> None:
     sender = FakeSender()
     llm = LongReplyLlm("主人，阿渣啊，打游戏看球写日报的那个")

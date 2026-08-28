@@ -282,12 +282,43 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
     max_messages = max(1, min(6, int(burst.get("max_messages") or 3)))
     parts = [part.strip() for part in normalized.split(separator)]
     parts = [part for part in parts if part]
+    max_chars = max(8, int(burst.get("max_chars") or 24))
+    if len(parts) == 1 and len(parts[0]) > max_chars:
+        parts = _split_long_segment(parts[0], max_chars)
     if len(parts) < 2:
         return [normalized]
     if len(parts) > max_messages:
         overflow = parts[max_messages - 1 :]
         parts = parts[: max_messages - 1] + [separator.join(overflow)]
     return [part for part in parts if part]
+
+
+def normalize_chat_reply_burst_aware(text: str, burst: dict | None) -> str:
+    """Normalize a reply while preserving burst separators and line breaks."""
+
+    if not isinstance(burst, dict) or not burst.get("enabled"):
+        return normalize_chat_reply(text)
+    separator = str(burst.get("separator") or "|")
+    pieces = re.split(rf"{re.escape(separator)}|\n+", str(text or ""))
+    normalized = [normalize_chat_reply(piece) for piece in pieces]
+    normalized = [piece for piece in normalized if piece]
+    if not normalized:
+        return normalize_chat_reply(text)
+    return separator.join(normalized)
+
+
+def _split_long_segment(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for char in str(text):
+        current += char
+        if len(current) >= limit and char in SENTENCE_ENDINGS:
+            chunks.append(current)
+            current = ""
+    if current.strip():
+        chunks.append(current)
+    cleaned = [chunk.strip() for chunk in chunks if chunk.strip()]
+    return cleaned or [str(text).strip()]
 
 
 def scrub_banned_address_terms(
