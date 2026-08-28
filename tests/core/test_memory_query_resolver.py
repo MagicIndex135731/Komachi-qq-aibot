@@ -29,6 +29,28 @@ class Recent:
     is_bot: bool = False
 
 
+def test_impersonation_hint_binds_subject_to_member() -> None:
+    from app.core.member_identity import GroupMemberIdentity
+
+    members = [
+        GroupMemberIdentity(
+            user_id=222,
+            nickname="阿渣",
+            group_card="足泽满灰交",
+            in_scope=True,
+        )
+    ]
+    result = MemoryQueryResolver().resolve(
+        "你最近面了哪些企业（'你/我'指阿渣本人）",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+    )
+
+    assert result.subject_ids is not None
+    assert "222" in result.subject_ids
+
+
 NOW = datetime(2026, 7, 23, 0, 10)
 
 

@@ -2085,9 +2085,14 @@ class InboundRouter:
                 memory_tool_executor is not None
                 and self._query_mentions_member(event.plain_text, users_by_id)
             )
+            memory_query = event.plain_text
+            if impersonating:
+                # Bind self-referential pronouns to the impersonated member so
+                # the semantic retrieval loads their profile facts.
+                memory_query = f"{memory_query}（'你/我'指{persona_name}本人）"
             memory_request = GroupMemoryContextRequest(
                 group_id=event.group_id,
-                query=event.plain_text,
+                query=memory_query,
                 recent_messages=recent_memory_messages,
                 quoted_message=quoted_memory_message,
                 target_message_id=event.platform_msg_id,
