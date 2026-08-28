@@ -302,4 +302,5 @@ def scrub_banned_address_terms(
     for term in terms:
         if term:
             scrubbed = scrubbed.replace(term, replacement)
+    scrubbed = re.sub(r"你{2,}", "你", scrubbed)
     return scrubbed

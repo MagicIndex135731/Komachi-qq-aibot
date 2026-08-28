@@ -120,4 +120,4 @@ def test_split_burst_reply_splits_and_caps_segments() -> None:
 def test_scrub_banned_address_terms_replaces_honorifics() -> None:
     assert scrub_banned_address_terms(
         "主人，阿渣啊。大人您稍等", ("主人", "大人", "您")
-    ) == "你，阿渣啊。你你稍等"
+    ) == "你，阿渣啊。你稍等"
