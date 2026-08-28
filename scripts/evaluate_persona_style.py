@@ -100,35 +100,34 @@ def _judge_responses(
         "model": model,
         "stream": False,
         "input": prompt,
-        "max_output_tokens": 1200,
+        "max_output_tokens": 8000,
         "reasoning": {"effort": "low"},
     }
-    with httpx.Client(timeout=120) as client:
-        response = client.post(
-            f"{base_url.rstrip('/')}/responses",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
-    parts: list[str] = []
-    for item in body.get("output") or []:
-        if item.get("type") != "message":
-            continue
-        direct_text = item.get("text")
-        if isinstance(direct_text, str) and direct_text:
-            parts.append(direct_text)
-        for content in item.get("content") or []:
-            if content.get("type") in {"output_text", "text"}:
-                text = str(content.get("text") or "")
-                if text:
-                    parts.append(text)
-    if not parts:
-        raise ValueError(
-            "judge response had no text: "
-            + json.dumps(body, ensure_ascii=False)[:400]
-        )
-    return parse_fenced_json("\n".join(parts))
+    with httpx.Client(timeout=180) as client:
+        for attempt in range(1, 3):
+            response = client.post(
+                f"{base_url.rstrip('/')}/responses",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+            parts: list[str] = []
+            for item in body.get("output") or []:
+                if item.get("type") != "message":
+                    continue
+                direct_text = item.get("text")
+                if isinstance(direct_text, str) and direct_text:
+                    parts.append(direct_text)
+                for content in item.get("content") or []:
+                    if content.get("type") in {"output_text", "text"}:
+                        text = str(content.get("text") or "")
+                        if text:
+                            parts.append(text)
+            if parts:
+                return parse_fenced_json("\n".join(parts))
+            print(f"judge_empty_retry attempt={attempt}")
+    raise ValueError("judge response had no text after retries")
 
 
 def main() -> int:
