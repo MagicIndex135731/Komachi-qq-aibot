@@ -168,6 +168,61 @@ def test_refresh_gate_skips_below_threshold(sqlite_engine) -> None:
     assert not (settings.data_dir / "personas" / "test_self.live.yaml").exists()
 
 
+def test_refresh_triggers_on_threshold_and_overdue(
+    sqlite_engine, monkeypatch
+) -> None:
+    from datetime import timedelta
+    from pathlib import Path
+
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    calls = []
+
+    def fake_write(**kwargs):
+        del kwargs
+        calls.append(1)
+        return Path("unused.live.yaml")
+
+    monkeypatch.setattr(service, "_write_refreshed_profile", fake_write)
+
+    with session_scope(sqlite_engine) as session:
+        PersonaStyleSyncStateRepository(session).set_watermark(
+            group_id=10001, user_id=222, last_msg_id="9", new_count=50
+        )
+    service._maybe_refresh_profile("test_self", 222, 10001)
+    assert calls == [1]
+
+    calls.clear()
+    with session_scope(sqlite_engine) as session:
+        state = PersonaStyleSyncStateRepository(session).get(
+            group_id=10001, user_id=222
+        )
+        state.last_refresh_at = datetime.now(UTC) - timedelta(hours=25)
+        session.add(state)
+    service._maybe_refresh_profile("test_self", 222, 10001)
+    assert calls == [1]
+
+
 def test_load_runtime_config_merges_live_persona(tmp_path) -> None:
     from app.config import AppSettings, load_runtime_config
 
@@ -217,6 +272,25 @@ def test_merge_profile_replaces_lists_and_merges_mappings() -> None:
 
     assert merged["core_traits"] == ["A", "B"]
     assert merged["speaking_style"] == {"tone": "blunt", "sentence_length": "short"}
+
+
+def test_merge_profile_unions_facts_and_external_relations() -> None:
+    merged = _merge_profile(
+        {
+            "facts": [{"category": "游戏", "fact": "玩lolm"}],
+            "external_relations": [{"name": "灰泽满", "relation": "铁粉"}],
+        },
+        {
+            "facts": [
+                {"category": "游戏", "fact": "玩lolm"},
+                {"category": "体育", "fact": "看阿森纳"},
+            ],
+            "external_relations": [{"name": "灰泽满", "relation": "铁粉"}],
+        },
+    )
+
+    assert [item.get("fact") for item in merged["facts"]] == ["玩lolm", "看阿森纳"]
+    assert [item.get("name") for item in merged["external_relations"]] == ["灰泽满"]
 
 
 class _fake_settings:

@@ -8,6 +8,8 @@ import yaml
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.style_distill import merge_persona_lists
+
 
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -462,6 +464,8 @@ def _deep_merge_mapping(base: dict, overlay: dict) -> dict:
         if key == "groups" and isinstance(value, dict):
             # 生产覆盖文件提供完整、真实的群表，整体替换占位群表。
             merged[key] = value
+        elif key in {"facts", "external_relations"} and isinstance(value, list):
+            merged[key] = merge_persona_lists(merged.get(key), value)
         elif isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge_mapping(merged[key], value)
         else:

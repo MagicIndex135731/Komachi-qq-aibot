@@ -449,3 +449,22 @@ def _as_string_list(value: object) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def merge_persona_lists(base: object, overlay: object) -> list:
+    """Union persona entry lists (facts / external_relations) by stable key."""
+
+    def entry_key(item: object) -> str:
+        if isinstance(item, dict):
+            return str(item.get("fact") or item.get("name") or "").strip()
+        return str(item).strip()
+
+    result = [item for item in (base or [])]
+    seen = {entry_key(item) for item in result if entry_key(item)}
+    for item in overlay or []:
+        key = entry_key(item)
+        if not key or key in seen:
+            continue
+        result.append(item)
+        seen.add(key)
+    return result

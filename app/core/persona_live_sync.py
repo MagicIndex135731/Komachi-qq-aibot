@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.core.persona_switch import DEFAULT_PERSONA_KEY
 from app.core.style_distill import parse_persona_yaml
+from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
 from app.storage.repositories import (
     PersonaStyleExampleRepository,
@@ -49,7 +50,7 @@ class PersonaLiveSyncService:
         personas: dict[str, dict],
         manager,
         interval_seconds: float = 300.0,
-        refresh_threshold: int = 300,
+        refresh_threshold: int = 50,
         refresh_cooldown_seconds: float = 86400.0,
     ) -> None:
         self.engine = engine
@@ -134,14 +135,17 @@ class PersonaLiveSyncService:
             state = state_repo.get(group_id=group_id, user_id=user_id)
             if state is None:
                 return
-            if state.new_since_refresh < self.refresh_threshold:
-                return
+            new_count = int(state.new_since_refresh or 0)
             last_refresh = state.last_refresh_at
+            overdue = False
             if last_refresh is not None:
                 if last_refresh.tzinfo is None:
                     last_refresh = last_refresh.replace(tzinfo=UTC)
-                if (now - last_refresh).total_seconds() < self.refresh_cooldown_seconds:
-                    return
+                overdue = (
+                    now - last_refresh
+                ).total_seconds() >= self.refresh_cooldown_seconds
+            if new_count < self.refresh_threshold and not overdue:
+                return
             examples = PersonaStyleExampleRepository(session).load_active(
                 user_id=user_id, limit=200
             )
@@ -272,7 +276,9 @@ def _format_example_line(example) -> str:
 def _merge_profile(base: dict, overlay: dict) -> dict:
     merged = dict(base)
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+        if key in {"facts", "external_relations"} and isinstance(value, list):
+            merged[key] = merge_persona_lists(merged.get(key), value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _merge_profile(merged[key], value)
         else:
             merged[key] = value
