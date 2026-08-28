@@ -3,6 +3,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    retrieve_relevant_examples,
     scrub_banned_address_terms,
     split_burst_reply,
 )
@@ -121,3 +122,14 @@ def test_scrub_banned_address_terms_replaces_honorifics() -> None:
     assert scrub_banned_address_terms(
         "主人，阿渣啊。大人您稍等", ("主人", "大人", "您")
     ) == "你，阿渣啊。你稍等"
+
+
+def test_retrieve_relevant_examples_ranks_by_topic_overlap() -> None:
+    bank = ["上号", "明天看球吗", "写日报好烦", "吃啥"]
+    context = ["明天有比赛吗", "看球不"]
+
+    picked = retrieve_relevant_examples(bank, context, limit=2)
+
+    assert "明天看球吗" in picked
+    assert "写日报好烦" not in picked
+    assert "吃啥" not in picked

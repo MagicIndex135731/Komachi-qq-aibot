@@ -17,6 +17,7 @@ import yaml
 
 
 _FENCED_YAML_PATTERN = re.compile(r"```(?:yaml|yml)?\s*(.*?)```", re.DOTALL)
+_FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 BANNED_ADDRESS_TERMS = (
     "主人",
@@ -382,6 +383,15 @@ def parse_persona_yaml(text: str) -> dict:
     data = yaml.safe_load(raw or "")
     if not isinstance(data, dict):
         raise ValueError("model output is not a YAML mapping")
+    return data
+
+
+def parse_fenced_json(text: str) -> Any:
+    match = _FENCED_JSON_PATTERN.search(str(text or ""))
+    raw = match.group(1) if match else text
+    data = json.loads(raw or "")
+    if not isinstance(data, (dict, list)):
+        raise ValueError("model output is not a JSON object or array")
     return data
 
 

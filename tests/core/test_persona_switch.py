@@ -231,3 +231,27 @@ def test_router_formats_clean_bot_label_for_prompt_lines(sqlite_engine) -> None:
     )
 
     assert line == "测试君: 来了"
+
+
+def test_router_appends_relevant_examples_while_impersonating(sqlite_engine) -> None:
+    from app.core.router import InboundRouter
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=object(),
+    )
+
+    persona = {
+        "name": "测试君",
+        "identity": "group member",
+        "example_bank": ["明天看球", "上号"],
+    }
+    text = router._with_relevant_examples(
+        "persona-text",
+        persona,
+        ["甲: 明天看球吗"],
+    )
+
+    assert "明天看球" in text
+    assert "上号" not in text

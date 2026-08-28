@@ -36,6 +36,7 @@ from app.core.chat_style import (
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_proactive_chat_reply,
+    retrieve_relevant_examples,
     scrub_banned_address_terms,
     split_burst_reply,
 )
@@ -855,6 +856,23 @@ class InboundRouter:
                 line for line in lines if "Disclose that you are an AI" not in line
             ]
         return lines
+
+    def _with_relevant_examples(
+        self,
+        persona_text: str,
+        active_persona: dict,
+        context_lines: list[str],
+    ) -> str:
+        bank = (
+            active_persona.get("example_bank")
+            or active_persona.get("example_lines")
+            or []
+        )
+        picked = retrieve_relevant_examples(bank, context_lines, limit=6)
+        if not picked:
+            return persona_text
+        examples = " ".join(f"「{line}」" for line in picked)
+        return f"{persona_text}\n相关话题下他的原话示例：{examples}"
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:
         labels = {str(self.runtime.persona.get("name", "") or "").strip()}
@@ -1700,6 +1718,9 @@ class InboundRouter:
             if impersonating:
                 recent_lines = self._sanitize_impersonation_lines(
                     recent_lines, group_id=event.group_id
+                )
+                persona_text = self._with_relevant_examples(
+                    persona_text, active_persona, recent_lines
                 )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(

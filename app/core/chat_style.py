@@ -304,3 +304,36 @@ def scrub_banned_address_terms(
             scrubbed = scrubbed.replace(term, replacement)
     scrubbed = re.sub(r"你{2,}", "你", scrubbed)
     return scrubbed
+
+
+def _topic_units(text: str) -> set[str]:
+    compact = re.sub(r"[\s\u3000]+", "", str(text or "").lower())
+    units = {compact[index : index + 2] for index in range(len(compact) - 1)}
+    units.update(token for token in re.findall(r"[a-z0-9]+", compact))
+    units.discard("")
+    return units
+
+
+def retrieve_relevant_examples(
+    bank: list[str] | tuple[str, ...],
+    context_lines: list[str],
+    *,
+    limit: int = 6,
+) -> list[str]:
+    """Pick persona examples by topic overlap with the current conversation."""
+
+    context_units = _topic_units(
+        "\n".join(str(line).split(":", 1)[-1] for line in context_lines)
+    )
+    scored: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for example in bank or []:
+        text = str(example).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        overlap = len(context_units & _topic_units(text))
+        if overlap:
+            scored.append((overlap, len(text), text))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [text for _, _, text in scored[: max(0, limit)]]

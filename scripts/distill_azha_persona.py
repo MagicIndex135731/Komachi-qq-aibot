@@ -169,6 +169,7 @@ def main() -> int:
     held_out = samples[-40:]
     stage_one_samples = samples[:-40][:160]
     deterministic_examples = select_examples(corpus, count=36)
+    example_bank = select_examples(corpus, count=240)
     settings = AppSettings()
     stage1_path = Path(args.stage1_draft)
     if args.reuse_stage1 and stage1_path.exists():
@@ -230,6 +231,7 @@ def main() -> int:
                 if attempt == 2:
                     final = draft
     final["example_lines"] = deterministic_examples
+    final["example_bank"] = example_bank
     output_path = Path(args.output)
     _write_yaml(output_path, final)
     print(f"persona_written path={output_path}")
