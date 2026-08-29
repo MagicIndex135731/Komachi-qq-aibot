@@ -201,8 +201,7 @@ class PersonaManager:
         elif user_id is not None:
             vectors_by_id = self._load_persisted_example_vectors(user_id)
         bank_ids = {str(entry.get("msg_id") or "") for entry in bank if entry.get("msg_id")}
-        current_ids = set(entries_by_id)
-        stale_ids = current_ids - bank_ids
+        stale_ids = (set(entries_by_id) | set(vectors_by_id)) - bank_ids
         for stale_id in stale_ids:
             entries_by_id.pop(stale_id, None)
             vectors_by_id.pop(stale_id, None)
