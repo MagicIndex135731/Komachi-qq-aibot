@@ -843,7 +843,12 @@ class InboundRouter:
                 await asyncio.sleep(random.uniform(delay_min, delay_max))
 
     def _build_bot_names(self, persona_name: str) -> set[str]:
-        normalized = persona_name.strip().lower()
+        # Trigger names stay with the bot's default identity (比企谷小町 /
+        # 小町) no matter which persona is being impersonated. The impersonated
+        # member's name is deliberately not a trigger, so @真人同名不会误触.
+        del persona_name
+        default_name = str(self.runtime.persona.get("name", "") or "").strip()
+        normalized = default_name.lower()
         if not normalized:
             return set()
 
@@ -851,6 +856,7 @@ class InboundRouter:
         names = {normalized, condensed}
         if condensed and any("\u4e00" <= char <= "\u9fff" for char in condensed) and len(condensed) >= 2:
             names.add(condensed[-2:])
+        names.add("小町")
         return {name for name in names if name}
 
     def _active_persona(self, group_id: int) -> dict:

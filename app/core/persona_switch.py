@@ -618,10 +618,11 @@ class PersonaManager:
 
 
 class PersonaSwitchService:
-    """Orchestrates group-card changes around a persona key switch.
+    """Orchestrates persona key switches.
 
-    The QQ avatar is intentionally never touched: every persona keeps the
-    bot's original avatar.
+    The QQ avatar and group card are intentionally never touched: the bot
+    always keeps the 比企谷小町 display name, regardless of which persona is
+    impersonated.
     """
 
     def __init__(self, *, manager: PersonaManager, sender, bot_qq: int) -> None:
@@ -639,69 +640,13 @@ class PersonaSwitchService:
         if current_key == target_key:
             return f"当前已经是{target_name}人格，无需切换。"
 
-        failures: list[str] = []
-        if target_key != DEFAULT_PERSONA_KEY:
-            await self._capture_snapshots(group_id=group_id, failures=failures)
-            group_card = str(
-                target_persona.get("group_card") or target_persona.get("name") or ""
-            ).strip()
-            if group_card:
-                try:
-                    await self.sender.set_group_card(
-                        group_id=group_id,
-                        user_id=self.bot_qq,
-                        card=group_card,
-                    )
-                except Exception:
-                    logger.exception(
-                        "persona_group_card_apply_failed group_id=%s persona_key=%s",
-                        group_id,
-                        target_key,
-                    )
-                    failures.append("群名片切换失败")
-        else:
-            card_snapshot = self.manager.card_snapshot(group_id)
-            try:
-                await self.sender.set_group_card(
-                    group_id=group_id,
-                    user_id=self.bot_qq,
-                    card=card_snapshot or "",
-                )
-            except Exception:
-                logger.exception(
-                    "persona_group_card_restore_failed group_id=%s",
-                    group_id,
-                )
-                failures.append("群名片恢复失败")
-
         self.manager.set_persona_key(group_id, target_key)
         logger.info(
-            "persona_switch group_id=%s persona_key=%s profile_failures=%s",
+            "persona_switch group_id=%s persona_key=%s",
             group_id,
             target_key,
-            ";".join(failures),
         )
-        confirmation = f"已切换为{target_name}人格。"
-        if failures:
-            confirmation += f"（{'；'.join(failures)}）"
-        return confirmation
-
-    async def _capture_snapshots(self, *, group_id: int, failures: list[str]) -> None:
-        from app.adapters.sender import extract_group_card
-
-        if self.manager.card_snapshot(group_id) is None:
-            try:
-                member_info = await self.sender.get_group_member_info(
-                    group_id=group_id,
-                    user_id=self.bot_qq,
-                )
-                self.manager.set_card_snapshot(
-                    group_id,
-                    extract_group_card(member_info),
-                )
-            except Exception:
-                logger.exception("persona_card_snapshot_failed group_id=%s", group_id)
-                failures.append("群名片快照失败")
+        return f"已切换为{target_name}人格。"
 
 
 def _as_positive_int(value: object) -> int | None:

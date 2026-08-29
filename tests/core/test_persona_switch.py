@@ -115,7 +115,7 @@ class FakeSender:
         return {"status": "ok", "data": {"card": "原名"}}
 
 
-def test_switch_service_applies_and_restores_profile(sqlite_engine) -> None:
+def test_switch_service_switches_without_touching_display(sqlite_engine) -> None:
     personas = _personas()
     manager = PersonaManager(
         engine=sqlite_engine,
@@ -133,14 +133,12 @@ def test_switch_service_applies_and_restores_profile(sqlite_engine) -> None:
     confirmation = asyncio.run(service.switch(group_id=10001, target_key="test_self"))
     assert manager.active_key(10001) == "test_self"
     assert "已切换为测试君人格" in confirmation
-    assert not any(action == "set_qq_avatar" for action, _ in sender.calls)
-    assert ("set_group_card", {"group_id": 10001, "user_id": 987654321, "card": "测试君"}) in sender.calls
+    assert sender.calls == []
 
     sender.calls.clear()
     confirmation = asyncio.run(service.switch(group_id=10001, target_key="default"))
     assert manager.active_key(10001) == DEFAULT_PERSONA_KEY
-    assert not any(action == "set_qq_avatar" for action, _ in sender.calls)
-    assert ("set_group_card", {"group_id": 10001, "user_id": 987654321, "card": "原名"}) in sender.calls
+    assert sender.calls == []
 
 
 def test_switch_service_confirms_noop_when_already_active(sqlite_engine) -> None:

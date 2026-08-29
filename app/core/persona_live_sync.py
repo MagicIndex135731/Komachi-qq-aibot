@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
 
 import yaml
 from sqlalchemy import text
@@ -18,7 +17,7 @@ from app.core.message_mentions import (
     message_mentions_bot,
 )
 from app.core.time_utils import ASIA_SHANGHAI
-from app.core.style_distill import parse_fenced_json, parse_persona_yaml
+from app.core.style_distill import parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -63,58 +62,6 @@ def _speaker_label(raw_json: object) -> str:
     card = str(sender.get("card") or "").strip()
     nickname = str(sender.get("nickname") or "").strip()
     return card or nickname
-
-
-def _extract_image_urls(raw_json: object) -> list[str]:
-    if isinstance(raw_json, str):
-        try:
-            raw_json = json.loads(raw_json)
-        except (json.JSONDecodeError, TypeError):
-            return []
-    if not isinstance(raw_json, dict):
-        return []
-    message = raw_json.get("message")
-    if not isinstance(message, list):
-        return []
-    urls: list[str] = []
-    for item in message:
-        if not isinstance(item, dict) or item.get("type") != "image":
-            continue
-        data = item.get("data") if isinstance(item.get("data"), dict) else {}
-        url = str(data.get("url") or data.get("file") or "").strip()
-        if url:
-            urls.append(url)
-    return urls
-
-
-def _extract_image_attachments(raw_json: object) -> list[tuple[str, str | None]]:
-    """Extract (url, local_path) pairs for image items.
-
-    ``local_path`` is set when the message handler cached the image locally;
-    refreshing should prefer it because QQ CDN URLs expire quickly.
-    """
-
-    if isinstance(raw_json, str):
-        try:
-            raw_json = json.loads(raw_json)
-        except (json.JSONDecodeError, TypeError):
-            return []
-    if not isinstance(raw_json, dict):
-        return []
-    message = raw_json.get("message")
-    if not isinstance(message, list):
-        return []
-    attachments: list[tuple[str, str | None]] = []
-    for item in message:
-        if not isinstance(item, dict) or item.get("type") != "image":
-            continue
-        data = item.get("data") if isinstance(item.get("data"), dict) else {}
-        url = str(data.get("url") or data.get("file") or "").strip()
-        if not url:
-            continue
-        local_path = str(data.get("local_path") or "").strip() or None
-        attachments.append((url, local_path))
-    return attachments
 
 
 class PersonaLiveSyncService:
@@ -353,15 +300,14 @@ class PersonaLiveSyncService:
     ) -> Path:
         from app.providers.llm_client import LlmClient
 
-        transcript, _, window_image_ids = self._window_transcript_block(
+        transcript = self._window_transcript_block(
             user_id=user_id,
             group_id=group_id,
             examples=examples,
         )
         prompt = (
             "你是人设维护助手。下面是群成员最近一段时间的真实对话记录"
-            "（按时间顺序 + 发言者，[图片] 表示对话中出现的图片，"
-            "本阶段不提供图片视觉内容，只按文本蒸馏）。"
+            "（按时间顺序 + 发言者）。"
             "以及当前的人格画像 YAML。请根据新语料增量更新画像：修正过时特质、补充新出现的口头禅/"
             "话题/关系与称呼习惯，保持 v2 字段结构（name/identity/core_traits/speaking_style/"
             "self_concept/speech_habits/style_avoid/relationships/address_rules），"
@@ -387,33 +333,6 @@ class PersonaLiveSyncService:
         )
         generated = client.generate_text([prompt])
         profile = parse_persona_yaml(generated)
-        supplement = self._distill_image_supplement(
-            user_id=user_id,
-            group_id=group_id,
-            examples=examples,
-            client=client,
-        )
-        if supplement:
-            existing_habits = {
-                str(item).strip()
-                for item in (profile.get("speech_habits") or [])
-                if str(item).strip()
-            }
-            existing_traits = {
-                str(item).strip()
-                for item in (profile.get("core_traits") or [])
-                if str(item).strip()
-            }
-            for habit in supplement.get("habits") or []:
-                cleaned = str(habit).strip()
-                if cleaned and cleaned not in existing_habits:
-                    profile.setdefault("speech_habits", []).append(cleaned)
-                    existing_habits.add(cleaned)
-            for trait in supplement.get("traits") or []:
-                cleaned = str(trait).strip()
-                if cleaned and cleaned not in existing_traits:
-                    profile.setdefault("core_traits", []).append(cleaned)
-                    existing_traits.add(cleaned)
         # Bind relationships by the current profile's member->id map so a
         # model that drops member_user_id cannot silently regress bindings.
         id_by_name: dict[str, int] = {}
@@ -434,202 +353,11 @@ class PersonaLiveSyncService:
             yaml.safe_dump(profile, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
-        self._cleanup_refresh_images(window_image_ids, group_id)
         merged = _merge_profile(current_profile, profile)
         self.personas[persona_key] = merged
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
-
-    def _image_scenes_for_member(
-        self,
-        *,
-        user_id: int,
-        group_id: int,
-        examples: list,
-        limit: int = 10,
-    ) -> list[dict]:
-        """Images directly tied to the member: ones he sent, plus images he
-        commented on (an image with his text within +-2 messages)."""
-
-        from app.core.message_content import ImageAttachment
-
-        stamps = []
-        for example in examples:
-            timestamp = (
-                example.get("timestamp")
-                if isinstance(example, dict)
-                else getattr(example, "timestamp", None)
-            )
-            if timestamp is not None:
-                stamps.append(timestamp)
-        if not stamps:
-            return []
-        start = min(stamps)
-        end = max(stamps)
-        start_str = (
-            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if start.tzinfo is not None
-            else start
-        ).strftime("%Y-%m-%d %H:%M:%S.%f")
-        end_str = (
-            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if end.tzinfo is not None
-            else end
-        ).strftime("%Y-%m-%d %H:%M:%S.%f")
-        with session_scope(self.engine) as session:
-            rows = session.execute(
-                text(
-                    "SELECT id, platform_msg_id, user_id, timestamp, plain_text, "
-                    "msg_type, raw_json FROM messages "
-                    "WHERE group_id = :group_id AND timestamp BETWEEN :start AND :end "
-                    "ORDER BY id"
-                ),
-                {"group_id": int(group_id), "start": start_str, "end": end_str},
-            ).mappings().all()
-        scenes: list[dict] = []
-        seen_urls: set[str] = set()
-        for index, row in enumerate(rows):
-            if str(row.get("msg_type") or "") != "image":
-                continue
-            row_user_id = int(row.get("user_id") or 0)
-            nearby = rows[max(0, index - 2) : index + 3]
-            member_nearby = any(
-                int(item.get("user_id") or 0) == int(user_id)
-                and str(item.get("plain_text") or "").strip()
-                for item in nearby
-            )
-            if row_user_id != int(user_id) and not member_nearby:
-                continue
-            attachments = _extract_image_attachments(row.get("raw_json"))
-            if not attachments:
-                continue
-            url, local_path = attachments[0]
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            reactions = [
-                f"{_speaker_label(item.get('raw_json'))}: "
-                f"{str(item.get('plain_text') or '').strip()}"
-                for item in nearby
-                if str(item.get("plain_text") or "").strip()
-            ]
-            scenes.append(
-                {
-                    "image": ImageAttachment(
-                        url=url,
-                        local_path=local_path,
-                        source_message_id=str(
-                            row.get("platform_msg_id") or ""
-                        )
-                        or None,
-                    ),
-                    "time": str(row.get("timestamp") or "")[:16],
-                    "sent_by_member": row_user_id == int(user_id),
-                    "context": reactions[:5],
-                }
-            )
-            if len(scenes) >= int(limit):
-                break
-        return scenes
-
-    def _distill_image_supplement(
-        self,
-        *,
-        user_id: int,
-        group_id: int,
-        examples: list,
-        client,
-    ) -> dict:
-        """Second round: show a few images tied to the member and fold what he
-        cares about into normal speech habits / core traits (no separate
-        image field, no 'he likes posting images' meta descriptions)."""
-
-        scenes = self._image_scenes_for_member(
-            user_id=user_id,
-            group_id=group_id,
-            examples=examples,
-        )
-        if not scenes:
-            return {}
-        scene_text = "\n\n".join(
-            f"图 {index + 1}（{scene['time']}"
-            f"{'，他发的' if scene['sent_by_member'] else '，他在现场'}）：\n"
-            + "\n".join(f"- {line}" for line in scene["context"])
-            for index, scene in enumerate(scenes)
-        )
-        prompt = (
-            "你是人设蒸馏专家。下面是群成员参与对话时出现的几张图片"
-            "（他发的，或他在场讨论的），以及图片前后的聊天内容。\n"
-            "图片是这段对话的一部分。请只输出：从这些内容里能看出的"
-            "他的说话习惯补充与性格特质补充（他关注什么内容、如何评价这些内容、"
-            "用什么词），并融入普通说话习惯，不要提'发图/分享图片'这个行为。\n"
-            f"场景：\n{scene_text}\n"
-            '只输出一个 ```json 代码块：{"habits": ["3-6条具体习惯，带原话"], '
-            '"traits": ["1-3条内容/性格特质"]}'
-        )
-        try:
-            generated = client.generate_text(
-                [prompt],
-                images=[scene["image"] for scene in scenes],
-            )
-            payload = parse_fenced_json(generated)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "persona_image_supplement_failed user_id=%s group_id=%s",
-                user_id,
-                group_id,
-            )
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {
-            "habits": [
-                str(item).strip()
-                for item in (payload.get("habits") or [])
-                if str(item).strip()
-            ],
-            "traits": [
-                str(item).strip()
-                for item in (payload.get("traits") or [])
-                if str(item).strip()
-            ],
-        }
-
-    def _cleanup_refresh_images(
-        self,
-        window_image_ids: list[str],
-        group_id: int,
-    ) -> int:
-        """Delete local image_cache files for every image in the refresh
-        window, not only the ones selected as visual inputs, so caches do not
-        accumulate across refreshes."""
-
-        cache_dir = (
-            self.settings.data_dir / "image_cache" / str(int(group_id))
-        )
-        if not cache_dir.exists():
-            return 0
-        removed = 0
-        for message_id in window_image_ids:
-            message_id = str(message_id or "").strip()
-            if not message_id:
-                continue
-            for path in cache_dir.glob(f"{message_id}-*"):
-                try:
-                    path.unlink()
-                    removed += 1
-                except OSError:
-                    logger.exception(
-                        "persona_refresh_image_cleanup_failed path=%s",
-                        path,
-                    )
-        if removed:
-            logger.info(
-                "persona_refresh_image_cleanup removed=%s",
-                removed,
-            )
-        return removed
 
     def _window_transcript_block(
         self,
@@ -637,14 +365,11 @@ class PersonaLiveSyncService:
         user_id: int,
         group_id: int,
         examples: list,
-        max_images: int = 30,
         context_radius: int = 3,
         max_lines: int = 2000,
-    ) -> tuple[str, list, list[str]]:
+    ) -> str:
         """Render the refresh window as a chronological transcript with
-        speaker labels; collect images that appear in it as visual inputs."""
-
-        from app.core.message_content import ImageAttachment
+        speaker labels. Image messages appear as a plain [图片] placeholder."""
 
         stamps = []
         for example in examples:
@@ -656,7 +381,7 @@ class PersonaLiveSyncService:
             if timestamp is not None:
                 stamps.append(timestamp)
         if not stamps:
-            return "", [], []
+            return ""
         from datetime import timedelta
 
         start = min(stamps)
@@ -702,44 +427,6 @@ class PersonaLiveSyncService:
                 selected[int(position * step)] for position in range(int(max_lines))
             ]
         lines: list[str] = []
-        candidates: list[tuple[str, str | None, str | None]] = []
-        window_image_ids: list[str] = []
-        for row in selected:
-            if str(row.get("msg_type") or "") != "image":
-                continue
-            message_id = str(row.get("platform_msg_id") or "").strip()
-            if message_id and message_id not in window_image_ids:
-                window_image_ids.append(message_id)
-            for url, local_path in _extract_image_attachments(row.get("raw_json")):
-                if not url:
-                    continue
-                candidates.append(
-                    (
-                        url,
-                        local_path,
-                        str(row.get("platform_msg_id") or "") or None,
-                    )
-                )
-        # Prefer images that are already cached locally (QQ CDN URLs expire);
-        # keep the rest only as URL fallbacks when we have room.
-        candidates.sort(
-            key=lambda item: (
-                0 if item[1] and Path(item[1]).exists() else 1,
-                item[0],
-            )
-        )
-        chosen: list[tuple[str, str | None, str | None]] = candidates[
-            : int(max_images)
-        ]
-        chosen_urls = {item[0] for item in chosen}
-        images = [
-            ImageAttachment(
-                url=url,
-                local_path=local_path,
-                source_message_id=message_id,
-            )
-            for url, local_path, message_id in chosen
-        ]
         for row in selected:
             row_user_id = int(row.get("user_id") or 0)
             if row_user_id in self.bot_qqs:
@@ -748,20 +435,10 @@ class PersonaLiveSyncService:
             timestamp = str(row.get("timestamp") or "")[:16]
             plain = str(row.get("plain_text") or "").strip()
             if str(row.get("msg_type") or "") == "image":
-                urls_in_row = [
-                    url
-                    for url, _ in _extract_image_attachments(row.get("raw_json"))
-                    if url
-                ]
-                if any(url in chosen_urls for url in urls_in_row):
-                    lines.append(f"[{timestamp}] {speaker}: [图片]")
-                elif urls_in_row:
-                    lines.append(f"[{timestamp}] {speaker}: [图片(略)]")
-                else:
-                    lines.append(f"[{timestamp}] {speaker}: [图片(无链接)]")
+                lines.append(f"[{timestamp}] {speaker}: [图片]")
             elif plain:
                 lines.append(f"[{timestamp}] {speaker}: {plain}")
-        return "\n".join(lines), images, window_image_ids
+        return "\n".join(lines)
 
 def _build_examples(
     rows: list,
