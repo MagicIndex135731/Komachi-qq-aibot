@@ -95,7 +95,7 @@ class PersonaLiveSyncService:
         personas: dict[str, dict],
         manager,
         interval_seconds: float = 300.0,
-        refresh_threshold: int = 50,
+        refresh_threshold: int = 100,
         refresh_cooldown_seconds: float = 86400.0,
     ) -> None:
         self.engine = engine
@@ -254,7 +254,6 @@ class PersonaLiveSyncService:
         )
 
     def _maybe_refresh_profile(self, persona_key: str, user_id: int, group_id: int) -> None:
-        now = datetime.now(UTC)
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
@@ -262,18 +261,25 @@ class PersonaLiveSyncService:
                 return
             new_count = int(state.new_since_refresh or 0)
             last_refresh = state.last_refresh_at
-            overdue = False
-            if last_refresh is not None:
-                if last_refresh.tzinfo is None:
-                    last_refresh = last_refresh.replace(tzinfo=UTC)
-                overdue = (
-                    now - last_refresh
-                ).total_seconds() >= self.refresh_cooldown_seconds
-            if new_count < self.refresh_threshold and not overdue:
+            if new_count < self.refresh_threshold:
                 return
-            examples = PersonaStyleExampleRepository(session).load_active(
-                user_id=user_id, limit=200
-            )
+            if last_refresh is not None:
+                if last_refresh.tzinfo is not None:
+                    last_refresh = (
+                        last_refresh.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+                    )
+            repo = PersonaStyleExampleRepository(session)
+            if last_refresh is None:
+                examples = repo.load_active(
+                    user_id=user_id,
+                    limit=int(self.refresh_threshold),
+                )
+            else:
+                examples = repo.load_since(
+                    user_id=user_id,
+                    since=last_refresh,
+                    limit=int(self.refresh_threshold),
+                )
             current_profile = self.personas.get(persona_key) or {}
 
         try:
@@ -293,7 +299,11 @@ class PersonaLiveSyncService:
             return
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
-            state_repo.mark_refreshed(group_id=group_id, user_id=user_id, when=now)
+            state_repo.mark_refreshed(
+                group_id=group_id,
+                user_id=user_id,
+                when=datetime.now(UTC),
+            )
         logger.info(
             "persona_live_refresh persona_key=%s user_id=%s path=%s",
             persona_key,
@@ -370,11 +380,41 @@ class PersonaLiveSyncService:
             yaml.safe_dump(profile, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
+        self._cleanup_refresh_images(images, group_id)
         merged = _merge_profile(current_profile, profile)
         self.personas[persona_key] = merged
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
+
+    def _cleanup_refresh_images(self, images: list, group_id: int) -> int:
+        """Delete local image_cache files that were used by this refresh."""
+
+        cache_dir = (
+            self.settings.data_dir / "image_cache" / str(int(group_id))
+        )
+        if not cache_dir.exists():
+            return 0
+        removed = 0
+        for image in images:
+            message_id = str(getattr(image, "source_message_id", "") or "").strip()
+            if not message_id:
+                continue
+            for path in cache_dir.glob(f"{message_id}-*"):
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    logger.exception(
+                        "persona_refresh_image_cleanup_failed path=%s",
+                        path,
+                    )
+        if removed:
+            logger.info(
+                "persona_refresh_image_cleanup removed=%s",
+                removed,
+            )
+        return removed
 
     def _window_transcript_block(
         self,
@@ -382,7 +422,7 @@ class PersonaLiveSyncService:
         user_id: int,
         group_id: int,
         examples: list,
-        max_images: int = 8,
+        max_images: int = 30,
         context_radius: int = 3,
         max_lines: int = 2000,
     ) -> tuple[str, list]:
@@ -425,7 +465,8 @@ class PersonaLiveSyncService:
         with session_scope(self.engine) as session:
             rows = session.execute(
                 text(
-                    "SELECT id, user_id, timestamp, plain_text, msg_type, raw_json "
+                    "SELECT id, platform_msg_id, user_id, timestamp, plain_text, "
+                    "msg_type, raw_json "
                     "FROM messages WHERE group_id = :group_id "
                     "AND timestamp BETWEEN :start AND :end ORDER BY id"
                 ),
@@ -462,7 +503,15 @@ class PersonaLiveSyncService:
                     for url in urls:
                         if url and url not in seen_urls and len(images) < int(max_images):
                             seen_urls.add(url)
-                            images.append(ImageAttachment(url=url))
+                            images.append(
+                                ImageAttachment(
+                                    url=url,
+                                    source_message_id=str(
+                                        row.get("platform_msg_id") or ""
+                                    )
+                                    or None,
+                                )
+                            )
                 else:
                     lines.append(f"[{timestamp}] {speaker}: [图片(无链接)]")
             elif plain:

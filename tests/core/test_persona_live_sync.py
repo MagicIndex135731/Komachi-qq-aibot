@@ -254,7 +254,7 @@ def test_tick_only_refreshes_personas_with_live_refresh_flag(
     assert synced == ["live_self"]
 
 
-def test_refresh_triggers_on_threshold_and_overdue(
+def test_refresh_triggers_on_threshold_only(
     sqlite_engine, monkeypatch
 ) -> None:
     from datetime import timedelta
@@ -293,18 +293,22 @@ def test_refresh_triggers_on_threshold_and_overdue(
 
     with session_scope(sqlite_engine) as session:
         PersonaStyleSyncStateRepository(session).set_watermark(
-            group_id=10001, user_id=222, last_msg_id="9", new_count=50
+            group_id=10001, user_id=222, last_msg_id="9", new_count=100
+        )
+        state = PersonaStyleSyncStateRepository(session).get(
+            group_id=10001, user_id=222
         )
     service._maybe_refresh_profile("test_self", 222, 10001)
     assert calls == [1]
 
-    calls.clear()
+    # Below threshold: no refresh, even if a day has passed.
     with session_scope(sqlite_engine) as session:
-        state = PersonaStyleSyncStateRepository(session).get(
-            group_id=10001, user_id=222
-        )
-        state.last_refresh_at = datetime.now(UTC) - timedelta(hours=25)
+        repo = PersonaStyleSyncStateRepository(session)
+        state = repo.get(group_id=10001, user_id=222)
+        state.last_refresh_at = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        state.new_since_refresh = 50
         session.add(state)
+        session.commit()
     service._maybe_refresh_profile("test_self", 222, 10001)
     assert calls == [1]
 

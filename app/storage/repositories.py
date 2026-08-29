@@ -445,6 +445,28 @@ class PersonaStyleExampleRepository:
             )
         )
 
+    def load_since(
+        self,
+        *,
+        user_id: int,
+        since,
+        limit: int = 100,
+    ) -> list[PersonaStyleExample]:
+        """Samples strictly newer than ``since`` (no overlap with the
+        previous refresh window)."""
+
+        return list(
+            self.session.scalars(
+                select(PersonaStyleExample)
+                .where(
+                    PersonaStyleExample.user_id == int(user_id),
+                    PersonaStyleExample.timestamp > since,
+                )
+                .order_by(PersonaStyleExample.timestamp.asc())
+                .limit(limit)
+            )
+        )
+
     def insert_many(self, rows: list[dict]) -> int:
         inserted = 0
         for row in rows:
