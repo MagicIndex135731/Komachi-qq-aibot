@@ -425,15 +425,31 @@ def _initialize_optional_memory_fts(engine: Engine) -> bool:
                     ")"
                 )
             )
-            connection.execute(
-                text(
-                    "INSERT INTO memory_items_fts (content, scope_type, scope_id, memory_id) "
-                    "SELECT content, scope_type, scope_id, CAST(id AS TEXT) FROM memory_items "
-                    "WHERE status = 'active' AND NOT EXISTS ("
-                    "SELECT 1 FROM memory_items_fts WHERE memory_id = CAST(memory_items.id AS TEXT)"
-                    ")"
+            existing_fts_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    text("SELECT memory_id FROM memory_items_fts")
+                ).fetchall()
+            }
+            missing_rows = [
+                (content, scope_type, scope_id, str(memory_id))
+                for memory_id, content, scope_type, scope_id in connection.execute(
+                    text(
+                        "SELECT id, content, scope_type, scope_id "
+                        "FROM memory_items WHERE status = 'active'"
+                    )
+                ).fetchall()
+                if str(memory_id) not in existing_fts_ids
+            ]
+            if missing_rows:
+                connection.execute(
+                    text(
+                        "INSERT INTO memory_items_fts "
+                        "(content, scope_type, scope_id, memory_id) "
+                        "VALUES (?, ?, ?, ?)"
+                    ),
+                    missing_rows,
                 )
-            )
         return True
     except SQLAlchemyError:
         return False
@@ -476,19 +492,34 @@ def _initialize_optional_retrieval_fts(engine: Engine) -> bool:
                     ")"
                 )
             )
-            connection.execute(
-                text(
-                    "INSERT INTO retrieval_documents_fts "
-                    "(content, group_id, document_id, content_hash) "
-                    "SELECT content, CAST(group_id AS TEXT), CAST(id AS TEXT), content_hash "
-                    "FROM retrieval_documents "
-                    "WHERE status = 'active' AND NOT EXISTS ("
-                    "SELECT 1 FROM retrieval_documents_fts "
-                    "WHERE document_id = CAST(retrieval_documents.id AS TEXT) "
-                    "AND content_hash = retrieval_documents.content_hash"
-                    ")"
+            existing_fts = {
+                (str(document_id), str(content_hash or ""))
+                for document_id, content_hash in connection.execute(
+                    text(
+                        "SELECT document_id, content_hash "
+                        "FROM retrieval_documents_fts"
+                    )
+                ).fetchall()
+            }
+            missing_rows = [
+                (content, str(group_id or ""), str(document_id), content_hash)
+                for document_id, content, group_id, content_hash in connection.execute(
+                    text(
+                        "SELECT id, content, group_id, content_hash "
+                        "FROM retrieval_documents WHERE status = 'active'"
+                    )
+                ).fetchall()
+                if (str(document_id), str(content_hash or "")) not in existing_fts
+            ]
+            if missing_rows:
+                connection.execute(
+                    text(
+                        "INSERT INTO retrieval_documents_fts "
+                        "(content, group_id, document_id, content_hash) "
+                        "VALUES (?, ?, ?, ?)"
+                    ),
+                    missing_rows,
                 )
-            )
             total_documents = int(
                 connection.execute(
                     text(
