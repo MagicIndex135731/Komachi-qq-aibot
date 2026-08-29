@@ -379,6 +379,104 @@ def test_merge_profile_unions_facts_and_external_relations() -> None:
     assert [item.get("name") for item in merged["external_relations"]] == ["灰泽满"]
 
 
+def test_image_context_block_includes_urls_and_nearby_lines(sqlite_engine) -> None:
+    from datetime import timedelta
+
+    from app.storage.repositories import MessageRepository
+
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    base = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001, group_name="test", enabled=True, speak_enabled=True
+        )
+        UserRepository(session).upsert_user(
+            user_id=111, nickname="路人甲", group_card=""
+        )
+        UserRepository(session).upsert_user(
+            user_id=222, nickname="测试君", group_card=""
+        )
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="ctx-1",
+            group_id=10001,
+            user_id=111,
+            timestamp=base - timedelta(minutes=1),
+            plain_text="发张图看看",
+            raw_json={"sender": {"nickname": "路人甲", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="img-1",
+            group_id=10001,
+            user_id=222,
+            timestamp=base,
+            plain_text="",
+            raw_json={
+                "sender": {"nickname": "测试君", "card": ""},
+                "message": [{"type": "image", "data": {"url": "http://img/x.png"}}],
+            },
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="ctx-2",
+            group_id=10001,
+            user_id=111,
+            timestamp=base + timedelta(minutes=1),
+            plain_text="好看",
+            raw_json={"sender": {"nickname": "路人甲", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.commit()
+    examples = [
+        {
+            "msg_id": "ctx-1",
+            "text": "发张图看看",
+            "timestamp": base - timedelta(minutes=1),
+        },
+        {
+            "msg_id": "ctx-2",
+            "text": "好看",
+            "timestamp": base + timedelta(minutes=1),
+        },
+    ]
+    block = service._image_context_block(
+        user_id=222,
+        group_id=10001,
+        examples=examples,
+    )
+    assert "http://img/x.png" in block
+    assert "前文「路人甲: 发张图看看」" in block
+    assert "后文「路人甲: 好看」" in block
+
+
 class _fake_settings:
     from pathlib import Path
 

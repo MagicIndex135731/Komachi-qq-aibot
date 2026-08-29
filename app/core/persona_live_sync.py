@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -15,6 +16,7 @@ from app.core.message_mentions import (
     collect_bot_display_names,
     message_mentions_bot,
 )
+from app.core.time_utils import ASIA_SHANGHAI
 from app.core.style_distill import parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
@@ -47,6 +49,11 @@ def _positive_int(value: object) -> int | None:
 
 
 def _speaker_label(raw_json: object) -> str:
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            return ""
     if not isinstance(raw_json, dict):
         return ""
     sender = raw_json.get("sender")
@@ -55,6 +62,28 @@ def _speaker_label(raw_json: object) -> str:
     card = str(sender.get("card") or "").strip()
     nickname = str(sender.get("nickname") or "").strip()
     return card or nickname
+
+
+def _extract_image_urls(raw_json: object) -> list[str]:
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if not isinstance(raw_json, dict):
+        return []
+    message = raw_json.get("message")
+    if not isinstance(message, list):
+        return []
+    urls: list[str] = []
+    for item in message:
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        url = str(data.get("url") or data.get("file") or "").strip()
+        if url:
+            urls.append(url)
+    return urls
 
 
 class PersonaLiveSyncService:
@@ -252,6 +281,8 @@ class PersonaLiveSyncService:
                 persona_key=persona_key,
                 current_profile=current_profile,
                 examples=examples,
+                user_id=user_id,
+                group_id=group_id,
             )
         except Exception:
             logger.exception(
@@ -276,11 +307,18 @@ class PersonaLiveSyncService:
         persona_key: str,
         current_profile: dict,
         examples: list,
+        user_id: int,
+        group_id: int,
     ) -> Path:
         from app.providers.llm_client import LlmClient
 
         sample_block = "\n".join(
             _format_example_line(example) for example in examples
+        )
+        image_block = self._image_context_block(
+            user_id=user_id,
+            group_id=group_id,
+            examples=examples,
         )
         prompt = (
             "你是人设维护助手。下面是群成员最新的真实发言（含语境：上文/回复对象 + 他说的原话），"
@@ -295,6 +333,12 @@ class PersonaLiveSyncService:
             f"当前画像：\n{yaml.safe_dump(current_profile, allow_unicode=True, sort_keys=False)}\n"
             f"最新语料：\n{sample_block}"
         )
+        if image_block:
+            prompt += (
+                "\n\n该阶段他发过的图片（含发图前后语境，用于理解他的发图习惯；"
+                "图片视觉内容本身不在上下文中，不要臆测图片内容）：\n"
+                f"{image_block}"
+            )
         client = LlmClient(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -333,6 +377,108 @@ class PersonaLiveSyncService:
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
+
+    def _image_context_block(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        limit: int = 20,
+    ) -> str:
+        """Images the member sent inside the refresh window, with nearby chat
+        lines as context (URLs only; no visual content)."""
+
+        stamps = []
+        for example in examples:
+            timestamp = (
+                example.get("timestamp")
+                if isinstance(example, dict)
+                else getattr(example, "timestamp", None)
+            )
+            if timestamp is not None:
+                stamps.append(timestamp)
+        if not stamps:
+            return ""
+        start = min(stamps)
+        end = max(stamps)
+        start_local = (
+            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if start.tzinfo is not None
+            else start
+        )
+        end_local = (
+            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if end.tzinfo is not None
+            else end
+        )
+        start_str = str(start_local)[:19]
+        end_str = str(end_local)[:19]
+        with session_scope(self.engine) as session:
+            image_rows = session.execute(
+                text(
+                    "SELECT id, timestamp, raw_json FROM messages "
+                    "WHERE group_id = :group_id AND user_id = :user_id "
+                    "AND msg_type = 'image' AND timestamp BETWEEN :start AND :end "
+                    "ORDER BY id DESC LIMIT :limit"
+                ),
+                {
+                    "group_id": int(group_id),
+                    "user_id": int(user_id),
+                    "start": start_str,
+                    "end": end_str,
+                    "limit": int(limit),
+                },
+            ).mappings().all()
+            if not image_rows:
+                return ""
+            context_by_id: dict[int, list] = {}
+            for image_row in image_rows:
+                row_id = int(image_row["id"])
+                window = session.execute(
+                    text(
+                        "SELECT id, user_id, plain_text, raw_json FROM messages "
+                        "WHERE group_id = :group_id AND id BETWEEN :lo AND :hi "
+                        "ORDER BY id"
+                    ),
+                    {"group_id": int(group_id), "lo": row_id - 3, "hi": row_id + 3},
+                ).mappings().all()
+                context_by_id[row_id] = window
+        lines: list[str] = []
+        for image_row in image_rows:
+            row_id = int(image_row["id"])
+            urls = _extract_image_urls(image_row.get("raw_json"))
+            url_text = " | ".join(urls[:3]) if urls else "(无链接)"
+            window = context_by_id.get(row_id, [])
+            before = [
+                item
+                for item in window
+                if int(item["id"]) < row_id
+                and str(item.get("plain_text") or "").strip()
+            ]
+            after = [
+                item
+                for item in window
+                if int(item["id"]) > row_id
+                and str(item.get("plain_text") or "").strip()
+            ]
+
+            def _render(items: list) -> str:
+                return " / ".join(
+                    f"{_speaker_label(item.get('raw_json'))}: "
+                    f"{str(item.get('plain_text') or '').strip()}"
+                    for item in items[-2:]
+                )
+
+            before_text = _render(before)
+            after_text = _render(after)
+            line = f"- [{str(image_row['timestamp'])[:16]}] 发图: {url_text}"
+            if before_text:
+                line += f" ｜ 前文「{before_text}」"
+            if after_text:
+                line += f" ｜ 后文「{after_text}」"
+            lines.append(line)
+        return "\n".join(lines)
 
 
 def _build_examples(
