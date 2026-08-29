@@ -353,7 +353,7 @@ class PersonaLiveSyncService:
     ) -> Path:
         from app.providers.llm_client import LlmClient
 
-        transcript, images = self._window_transcript_block(
+        transcript, images, window_image_ids = self._window_transcript_block(
             user_id=user_id,
             group_id=group_id,
             examples=examples,
@@ -411,15 +411,21 @@ class PersonaLiveSyncService:
             yaml.safe_dump(profile, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
-        self._cleanup_refresh_images(images, group_id)
+        self._cleanup_refresh_images(window_image_ids, group_id)
         merged = _merge_profile(current_profile, profile)
         self.personas[persona_key] = merged
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
 
-    def _cleanup_refresh_images(self, images: list, group_id: int) -> int:
-        """Delete local image_cache files that were used by this refresh."""
+    def _cleanup_refresh_images(
+        self,
+        window_image_ids: list[str],
+        group_id: int,
+    ) -> int:
+        """Delete local image_cache files for every image in the refresh
+        window, not only the ones selected as visual inputs, so caches do not
+        accumulate across refreshes."""
 
         cache_dir = (
             self.settings.data_dir / "image_cache" / str(int(group_id))
@@ -427,8 +433,8 @@ class PersonaLiveSyncService:
         if not cache_dir.exists():
             return 0
         removed = 0
-        for image in images:
-            message_id = str(getattr(image, "source_message_id", "") or "").strip()
+        for message_id in window_image_ids:
+            message_id = str(message_id or "").strip()
             if not message_id:
                 continue
             for path in cache_dir.glob(f"{message_id}-*"):
@@ -456,7 +462,7 @@ class PersonaLiveSyncService:
         max_images: int = 30,
         context_radius: int = 3,
         max_lines: int = 2000,
-    ) -> tuple[str, list]:
+    ) -> tuple[str, list, list[str]]:
         """Render the refresh window as a chronological transcript with
         speaker labels; collect images that appear in it as visual inputs."""
 
@@ -472,7 +478,7 @@ class PersonaLiveSyncService:
             if timestamp is not None:
                 stamps.append(timestamp)
         if not stamps:
-            return "", []
+            return "", [], []
         from datetime import timedelta
 
         start = min(stamps)
@@ -519,9 +525,13 @@ class PersonaLiveSyncService:
             ]
         lines: list[str] = []
         candidates: list[tuple[str, str | None, str | None]] = []
+        window_image_ids: list[str] = []
         for row in selected:
             if str(row.get("msg_type") or "") != "image":
                 continue
+            message_id = str(row.get("platform_msg_id") or "").strip()
+            if message_id and message_id not in window_image_ids:
+                window_image_ids.append(message_id)
             for url, local_path in _extract_image_attachments(row.get("raw_json")):
                 if not url:
                     continue
@@ -573,7 +583,7 @@ class PersonaLiveSyncService:
                     lines.append(f"[{timestamp}] {speaker}: [图片(无链接)]")
             elif plain:
                 lines.append(f"[{timestamp}] {speaker}: {plain}")
-        return "\n".join(lines), images
+        return "\n".join(lines), images, window_image_ids
 
 def _build_examples(
     rows: list,

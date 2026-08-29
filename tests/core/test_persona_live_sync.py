@@ -474,7 +474,7 @@ def test_window_transcript_block_renders_flow_and_collects_images(sqlite_engine)
             "timestamp": base + timedelta(minutes=1),
         },
     ]
-    transcript, images = service._window_transcript_block(
+    transcript, images, window_ids = service._window_transcript_block(
         user_id=222,
         group_id=10001,
         examples=examples,
@@ -484,6 +484,7 @@ def test_window_transcript_block_renders_flow_and_collects_images(sqlite_engine)
     assert "路人甲: 好看" in transcript
     assert len(images) == 1
     assert images[0].url == "http://img/x.png"
+    assert "img-1" in window_ids
 
 
 def test_window_transcript_skips_bot_lines(sqlite_engine) -> None:
@@ -565,7 +566,7 @@ def test_window_transcript_skips_bot_lines(sqlite_engine) -> None:
             mentioned_bot=False,
         )
         session.commit()
-    transcript, _ = service._window_transcript_block(
+    transcript, _, window_ids = service._window_transcript_block(
         user_id=222,
         group_id=10001,
         examples=[
@@ -584,6 +585,7 @@ def test_window_transcript_skips_bot_lines(sqlite_engine) -> None:
     assert "测试君: [图片]" in transcript
     assert "路人甲: 这图真不错" in transcript
     assert "机器人发言不应出现" not in transcript
+    assert "img-2" in window_ids
 
 
 class _fake_settings:
