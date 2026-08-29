@@ -322,6 +322,169 @@ def build_profile_prompt(
     return [instructions]
 
 
+def build_segment_blocks(
+    records: Sequence[dict],
+    *,
+    num_segments: int,
+    target_user_id: int | None = None,
+    target_name: str = "",
+    min_chars: int = 1,
+) -> list[dict]:
+    """Split the full conversation stream into chronological whole-history
+    blocks.
+
+    Every message in a block participates (no sampling): the block keeps the
+    complete ordered transcript so the target member's every utterance is
+    seen with its real surrounding context.
+    """
+
+    num_segments = max(1, int(num_segments))
+    target_user_id = int(target_user_id) if target_user_id is not None else None
+    target_name = str(target_name or "").strip()
+    name_by_uid: dict[int, str] = {}
+    aliases_by_uid: dict[int, set[str]] = {}
+    for item in records:
+        row_user_id = int(item.get("user_id") or 0)
+        label = speaker_label(item)
+        if label:
+            name_by_uid[row_user_id] = label
+            aliases_by_uid.setdefault(row_user_id, set()).add(label)
+    ordered = [
+        dict(item)
+        for item in records
+        if str(item.get("text") or item.get("plain_text") or "").strip()
+        and len(str(item.get("text") or item.get("plain_text") or "").strip()) >= min_chars
+    ]
+    if not ordered:
+        return []
+    alias_map: dict[int, dict] = {}
+    for user_id, aliases in aliases_by_uid.items():
+        if len(aliases) <= 1 or not name_by_uid.get(user_id):
+            continue
+        current = (
+            target_name
+            if target_user_id is not None
+            and user_id == target_user_id
+            and target_name
+            else name_by_uid[user_id]
+        )
+        alias_map[int(user_id)] = {
+            "current": current,
+            "aliases": sorted(aliases - {current}),
+        }
+    block_size = max(1, (len(ordered) + num_segments - 1) // num_segments)
+    blocks: list[dict] = []
+    for index in range(0, len(ordered), block_size):
+        chunk = ordered[index : index + block_size]
+        lines: list[str] = []
+        for item in chunk:
+            text = str(item.get("text") or item.get("plain_text") or "").strip()
+            row_user_id = int(item.get("user_id") or 0)
+            speaker = (
+                target_name
+                if target_user_id is not None
+                and row_user_id == target_user_id
+                and target_name
+                else name_by_uid.get(row_user_id) or speaker_label(item)
+            )
+            timestamp = str(item.get("timestamp") or "")[:19]
+            prefix = f"[{timestamp}] " if timestamp else ""
+            lines.append(f"{prefix}{speaker}: {text}")
+        blocks.append(
+            {
+                "index": len(blocks),
+                "start": str(chunk[0].get("timestamp") or "")[:10],
+                "end": str(chunk[-1].get("timestamp") or "")[:10],
+                "messages": len(chunk),
+                "characters": sum(len(line) for line in lines),
+                "transcript": "\n".join(lines),
+                "alias_map": alias_map,
+            }
+        )
+    return blocks
+
+
+def build_segment_prompt(
+    *,
+    block: dict,
+    target_user_id: int,
+    target_name: str,
+) -> list[str]:
+    """Distill one chronological slice into a compact style summary."""
+
+    alias_lines: list[str] = []
+    alias_map = block.get("alias_map") or {}
+    for user_id, info in sorted(alias_map.items(), key=lambda item: item[1]["current"]):
+        current = info["current"]
+        old = "、".join(info["aliases"])
+        alias_lines.append(f"- {current}（历史名片：{old}）")
+    alias_block = (
+        "\n历史名片对照（同一个人在不同时期改过群名片，流水里已统一为最新名；"
+        "对话内容里出现的旧名字也指同一人）：\n"
+        + "\n".join(alias_lines)
+        if alias_lines
+        else ""
+    )
+    instructions = (
+        f"你是人设蒸馏专家。下面是一个 QQ 群在 {block['start']} 到 {block['end']} 的完整聊天流水，"
+        f"你需要提炼其中群成员（{target_name}，user_id={target_user_id}）在这个阶段的说话风格。\n"
+        f"{alias_block}\n"
+        "要求：只依据流水里该成员真正说过的话，不要脑补。输出一个 ```json 代码块，字段：\n"
+        '{"period": "该阶段时间范围", "member_message_count": 该成员消息数, '
+        '"identity_fragment": "该阶段他是什么样的人、主要在聊什么（2-3句）", '
+        '"speech_habits": ["10-20条该阶段可验证的说话习惯，带具体词句"], '
+        '"vocabulary": ["该阶段高频词/口头禅/网络用语"], '
+        '"tone": "该阶段语气特征（英文或中文）", '
+        '"topics": ["主要话题"], '
+        '"emotion_patterns": "情绪表达方式（怎么震惊、怎么吐槽、怎么认可）", '
+        '"representative_lines": ["8-15条他该阶段的真实原话"]}\n'
+        "注意：speech_habits 和 vocabulary 必须写具体词（如'确实''woc''完蛋了'），不要泛泛而谈。\n\n"
+        f"聊天流水（{block['messages']} 条消息）：\n{block['transcript']}"
+    )
+    return [instructions]
+
+
+def build_merged_profile_prompt(
+    *,
+    segment_summaries: list[dict],
+    stats: dict[str, Any],
+    relationships: list[dict],
+    target_name: str,
+) -> list[str]:
+    """Stage 2: merge per-segment summaries into the final persona profile."""
+
+    summary_block = "\n\n".join(
+        json.dumps(summary, ensure_ascii=False, indent=2)
+        for summary in segment_summaries
+    )
+    stats_block = json.dumps(stats, ensure_ascii=False, indent=2)
+    relationships_block = json.dumps(relationships, ensure_ascii=False, indent=2)
+    instructions = (
+        f"你是人设蒸馏专家。下面是一个 QQ 群成员（{target_name}）的**全历史分阶段风格摘要**"
+        "（每个阶段都是基于该阶段完整聊天流水提炼的，覆盖全部时间），"
+        "以及基于全部发言的机械统计和关系数据。\n"
+        "请把各阶段摘要合并成一份完整、连贯、可驱动 AI 扮演的深度画像。\n"
+        "输出：只输出一个 ```yaml 代码块，字段如下：\n"
+        "- name: 固定为 {target_name}\n"
+        "- identity: 他在群里是什么样的人（含身份、关系、常见话题，2-3 句）\n"
+        "- core_traits: 8-15 个有语料依据的具体特质（覆盖全部阶段，不只最近）\n"
+        "- speaking_style: 字典，包含 tone、sentence_length、emoji_level（none/low/medium/high）、reply_length（短/中/长）、opening_style、closing_style\n"
+        "- self_concept: 400-800 字第一人称自我认知\n"
+        "- speech_habits: 20-35 条，合并各阶段的习惯，每条都指向可验证的口头禅、断句、接话方式、情绪表达、抬杠/自嘲/附和风格；能写具体词就写具体词\n"
+        "- style_avoid: 8-15 条禁区（客服腔、解释腔、AI 腔、正式书面语、长篇大论、客套）\n"
+        "- relationships: 按互动数据逐人列出，每项含 member/relation/how_azha_talks/address_terms/notes\n"
+        "- external_relations: 他反复提及/关注/评价的群外人物（虚拟主播、球星、up主、角色等），含 name/who/relation/attitude/evidence\n"
+        "- address_rules: 3-8 条他的称呼习惯，并明确列出他绝不会用的称呼（如'主人''亲'）\n"
+        "示例原句由程序确定性选取，你不需要输出 example_lines。\n"
+        "关键要求：合并时保留每个阶段独有的细节，不要因为阶段多就把画像写泛；"
+        "要有'像真人'的具体词句，包括怎么起句、怎么收尾、什么时候发一个字的消息、怎么用语气词。\n\n"
+        f"全历史分阶段摘要：\n{summary_block}\n\n"
+        f"机械统计（基于全部 {stats.get('count', 0)} 条发言）：\n{stats_block}\n\n"
+        f"关系证据：\n{relationships_block}"
+    )
+    return [instructions]
+
+
 def build_refine_prompt(
     *,
     draft_yaml: str,
