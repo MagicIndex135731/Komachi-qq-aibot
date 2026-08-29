@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from app.config import AppSettings
+from app.core.message_mentions import message_mentions_bot
 from app.core.style_distill import (
     assemble_persona,
     build_profile_prompt,
@@ -61,6 +62,7 @@ def main() -> int:
     parser.add_argument("--db", default="/workspace/data/bot.db")
     parser.add_argument("--group-id", type=int, required=True)
     parser.add_argument("--bot-qq", type=int, required=True)
+    parser.add_argument("--bot-name", default="")
     parser.add_argument("--min-messages", type=int, default=100)
     parser.add_argument("--out-dir", default="/workspace/data/personas")
     parser.add_argument("--skip-user-ids", default="")
@@ -92,14 +94,23 @@ def main() -> int:
         display_name = _speaker_label(label_row[0] if label_row else None, user_id)
         if not display_name:
             display_name = f"成员{user_id}"
-        stream = [
-            _flatten_db_row(row)
-            for row in con.execute(
-                "SELECT platform_msg_id, timestamp, user_id, plain_text, msg_type, "
-                "reply_to_msg_id, raw_json FROM messages WHERE group_id=? ORDER BY timestamp, id",
-                (args.group_id,),
-            )
-        ]
+        stream = []
+        for row in con.execute(
+            "SELECT platform_msg_id, timestamp, user_id, plain_text, msg_type, "
+            "reply_to_msg_id, raw_json FROM messages WHERE group_id=? ORDER BY timestamp, id",
+            (args.group_id,),
+        ):
+            if (
+                int(row["user_id"]) == user_id
+                and message_mentions_bot(
+                    row["raw_json"],
+                    bot_qq=args.bot_qq,
+                    bot_name=args.bot_name,
+                )
+            ):
+                # Human-to-AI turns must not enter the style corpus.
+                continue
+            stream.append(_flatten_db_row(row))
         corpus = [
             {
                 "text": row["plain_text"],

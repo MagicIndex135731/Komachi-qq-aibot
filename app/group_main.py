@@ -396,6 +396,7 @@ async def run() -> None:
             settings=settings,
             group_ids=memory_group_ids,
             bot_qq=settings.bot_qq,
+            bot_name=str(runtime.persona.get("name", settings.bot_qq)),
             member_allowlist={
                 int(persona["source_user_id"])
                 for persona in getattr(runtime, "personas", {}).values()

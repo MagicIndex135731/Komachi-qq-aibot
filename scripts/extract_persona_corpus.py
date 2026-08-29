@@ -12,6 +12,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from app.core.message_mentions import message_mentions_bot
+
 
 def _speaker_label(raw_json: str | None, user_id: int) -> str:
     raw = raw_json or ""
@@ -31,6 +33,8 @@ def main() -> int:
     parser.add_argument("--db", required=True)
     parser.add_argument("--group-id", type=int, required=True)
     parser.add_argument("--user-id", type=int, required=True)
+    parser.add_argument("--bot-qq", type=int, required=True)
+    parser.add_argument("--bot-name", default="")
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
 
@@ -58,6 +62,16 @@ def main() -> int:
                 continue
             seen_ids.add(platform_msg_id)
             text = str(row["plain_text"] or "").strip()
+            if (
+                int(row["user_id"]) == args.user_id
+                and message_mentions_bot(
+                    row["raw_json"],
+                    bot_qq=args.bot_qq,
+                    bot_name=args.bot_name,
+                )
+            ):
+                # Human-to-AI turns must not enter the style corpus.
+                continue
             record = {
                 "timestamp": row["timestamp"],
                 "platform_msg_id": platform_msg_id,

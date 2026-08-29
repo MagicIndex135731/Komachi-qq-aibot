@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import yaml
 from zoneinfo import ZoneInfo
 
+from app.core.message_mentions import message_mentions_bot
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -248,6 +249,7 @@ class MemberFactRefreshService:
         settings,
         group_ids: set[int],
         bot_qq: int,
+        bot_name: str = "",
         member_allowlist: set[int] | None = None,
         interval_seconds: float = 21600.0,
         threshold: int = 50,
@@ -258,6 +260,7 @@ class MemberFactRefreshService:
         self.settings = settings
         self.group_ids = set(int(value) for value in group_ids)
         self.bot_qq = int(bot_qq)
+        self.bot_name = str(bot_name or "").strip() or str(bot_qq)
         self.member_allowlist = (
             set(int(value) for value in member_allowlist)
             if member_allowlist is not None
@@ -323,15 +326,24 @@ class MemberFactRefreshService:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
             watermark = int(state.last_msg_id or 0) if state is not None else 0
-            new_lines = _new_member_lines(
+            all_new_lines = _new_member_lines(
                 session,
                 group_id=group_id,
                 user_id=user_id,
                 watermark=watermark,
             )
+            new_lines = [
+                row
+                for row in all_new_lines
+                if not message_mentions_bot(
+                    getattr(row, "raw_json", None),
+                    bot_qq=self.bot_qq,
+                    bot_name=self.bot_name,
+                )
+            ]
             last_id = watermark
-            if new_lines:
-                last_id = max(int(row.id) for row in new_lines)
+            if all_new_lines:
+                last_id = max(int(row.id) for row in all_new_lines)
             state_repo.set_watermark(
                 group_id=group_id,
                 user_id=user_id,

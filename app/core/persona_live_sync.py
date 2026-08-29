@@ -10,6 +10,7 @@ import yaml
 from sqlalchemy import text
 
 from app.core.persona_switch import DEFAULT_PERSONA_KEY
+from app.core.message_mentions import message_mentions_bot
 from app.core.style_distill import parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
@@ -57,6 +58,10 @@ class PersonaLiveSyncService:
         self.settings = settings
         self.personas = personas
         self.manager = manager
+        default_name = str(
+            (self.personas.get(DEFAULT_PERSONA_KEY) or {}).get("name", "")
+        ).strip()
+        self.bot_name = default_name or str(settings.bot_qq)
         self.interval_seconds = max(30.0, float(interval_seconds))
         self.refresh_threshold = max(1, int(refresh_threshold))
         self.refresh_cooldown_seconds = max(3600.0, float(refresh_cooldown_seconds))
@@ -108,7 +113,12 @@ class PersonaLiveSyncService:
                 {"group_id": group_id, "watermark": watermark},
             ).mappings().all()
             rows = list(reversed(pre_rows)) + list(new_rows)
-            examples = _build_examples(rows, user_id=user_id)
+            examples = _build_examples(
+                rows,
+                user_id=user_id,
+                bot_qq=int(self.settings.bot_qq),
+                bot_name=self.bot_name,
+            )
             inserted = PersonaStyleExampleRepository(session).insert_many(examples)
             trimmed = PersonaStyleExampleRepository(session).trim_to(user_id=user_id, keep=600)
             last_id = max((int(row["id"]) for row in new_rows), default=watermark)
@@ -228,13 +238,26 @@ class PersonaLiveSyncService:
         return live_path
 
 
-def _build_examples(rows: list, *, user_id: int) -> list[dict]:
+def _build_examples(
+    rows: list,
+    *,
+    user_id: int,
+    bot_qq: int,
+    bot_name: str,
+) -> list[dict]:
     new_rows = [dict(row) for row in rows]
     by_id = {str(row.get("platform_msg_id")): row for row in new_rows if row.get("plain_text")}
     ordered = [row for row in new_rows if str(row.get("plain_text") or "").strip()]
     examples: list[dict] = []
     for index, row in enumerate(ordered):
         if int(row.get("user_id") or 0) != user_id:
+            continue
+        if message_mentions_bot(
+            row.get("raw_json"),
+            bot_qq=bot_qq,
+            bot_name=bot_name,
+        ):
+            # Human-to-AI turns must never become style samples.
             continue
         if str(row.get("msg_type") or "text") != "text":
             continue
