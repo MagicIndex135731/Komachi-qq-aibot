@@ -383,6 +383,8 @@ class PersonaLiveSyncService:
         group_id: int,
         examples: list,
         max_images: int = 8,
+        context_radius: int = 3,
+        max_lines: int = 2000,
     ) -> tuple[str, list]:
         """Render the refresh window as a chronological transcript with
         speaker labels; collect images that appear in it as visual inputs."""
@@ -421,10 +423,24 @@ class PersonaLiveSyncService:
                 ),
                 {"group_id": int(group_id), "start": start_str, "end": end_str},
             ).mappings().all()
+        target_user_id = int(user_id)
+        kept_indexes: set[int] = set()
+        for index, row in enumerate(rows):
+            if int(row.get("user_id") or 0) == target_user_id:
+                for offset in range(-int(context_radius), int(context_radius) + 1):
+                    candidate = index + offset
+                    if 0 <= candidate < len(rows):
+                        kept_indexes.add(candidate)
+        selected = [rows[index] for index in sorted(kept_indexes)]
+        if len(selected) > int(max_lines):
+            step = len(selected) / int(max_lines)
+            selected = [
+                selected[int(position * step)] for position in range(int(max_lines))
+            ]
         lines: list[str] = []
         images: list[ImageAttachment] = []
         seen_urls: set[str] = set()
-        for row in rows:
+        for row in selected:
             row_user_id = int(row.get("user_id") or 0)
             if row_user_id in self.bot_qqs:
                 continue
