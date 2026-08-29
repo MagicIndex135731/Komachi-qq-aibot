@@ -906,6 +906,10 @@ class InboundRouter:
             "\n硬性要求：普通回复不超过 12 个汉字，超过就拆成多条短消息用 | 分隔；"
             "评价别人时只给一句短评（几个字到十几个字），不要分析、总结或列举。"
         )
+        text += (
+            "\n用词纪律：优先直接引用上方真实原话示例里的说法；"
+            "不要使用他从未说过、示例和事实里不存在的网络热梗（如'遥遥领先'之类）。"
+        )
         burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
         if isinstance(burst, dict) and burst.get("enabled"):
             separator = str(burst.get("separator") or "|")
