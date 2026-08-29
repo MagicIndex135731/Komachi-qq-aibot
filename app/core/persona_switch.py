@@ -17,7 +17,12 @@ from datetime import UTC, datetime
 from sqlalchemy import text
 
 from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
-from app.storage.models import MemoryItem, MemoryItemSemanticVector, User
+from app.storage.models import (
+    MemoryItem,
+    MemoryItemSemanticVector,
+    PersonaExampleVector,
+    User,
+)
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupPersonaStateRepository,
@@ -193,12 +198,16 @@ class PersonaManager:
         vectors_by_id: dict[str, list[float]] = {}
         if cached is not None:
             entries_by_id, vectors_by_id = cached
+        elif user_id is not None:
+            vectors_by_id = self._load_persisted_example_vectors(user_id)
         bank_ids = {str(entry.get("msg_id") or "") for entry in bank if entry.get("msg_id")}
         current_ids = set(entries_by_id)
         stale_ids = current_ids - bank_ids
         for stale_id in stale_ids:
             entries_by_id.pop(stale_id, None)
             vectors_by_id.pop(stale_id, None)
+        if stale_ids and user_id is not None:
+            self._delete_persisted_example_vectors(user_id, stale_ids)
         missing = [
             entry
             for entry in bank
@@ -228,6 +237,16 @@ class PersonaManager:
             for entry, vector in zip(missing, new_vectors):
                 entries_by_id[str(entry.get("msg_id") or "")] = entry
                 vectors_by_id[str(entry.get("msg_id") or "")] = vector
+            if user_id is not None and new_vectors:
+                self._save_persisted_example_vectors(
+                    user_id,
+                    group_id,
+                    {
+                        str(entry.get("msg_id") or ""): vector
+                        for entry, vector in zip(missing, new_vectors)
+                        if vector
+                    },
+                )
         self._example_vectors[cache_key] = (entries_by_id, vectors_by_id)
         query_text = " ".join(
             str(line).split(":", 1)[-1] for line in context_lines
@@ -268,6 +287,68 @@ class PersonaManager:
             if entry_vector:
                 picked_vectors.append(entry_vector)
         return picked
+
+    def _load_persisted_example_vectors(
+        self,
+        user_id: int,
+    ) -> dict[str, list[float]]:
+        vectors: dict[str, list[float]] = {}
+        with session_scope(self.engine) as session:
+            rows = (
+                session.query(PersonaExampleVector)
+                .filter(PersonaExampleVector.user_id == int(user_id))
+                .all()
+            )
+            for row in rows:
+                try:
+                    parsed = json.loads(row.vector_json or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    parsed = []
+                if isinstance(parsed, list) and parsed:
+                    vectors[str(row.msg_id)] = [float(value) for value in parsed]
+        return vectors
+
+    def _save_persisted_example_vectors(
+        self,
+        user_id: int,
+        group_id: int,
+        vectors: dict[str, list[float]],
+    ) -> None:
+        if not vectors:
+            return
+        identity = self.embedding_provider.identity if self.embedding_provider else None
+        provider = str(getattr(identity, "provider", "") or "")
+        model = str(getattr(identity, "model", "") or "")
+        dimensions = int(getattr(identity, "dimensions", 0) or 0)
+        with session_scope(self.engine) as session:
+            for msg_id, vector in vectors.items():
+                session.merge(
+                    PersonaExampleVector(
+                        msg_id=str(msg_id),
+                        user_id=int(user_id),
+                        group_id=int(group_id),
+                        provider=provider,
+                        model=model,
+                        dimensions=dimensions,
+                        vector_json=json.dumps(
+                            [float(value) for value in vector],
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+
+    def _delete_persisted_example_vectors(
+        self,
+        user_id: int,
+        msg_ids: set[str],
+    ) -> None:
+        if not msg_ids:
+            return
+        with session_scope(self.engine) as session:
+            session.query(PersonaExampleVector).filter(
+                PersonaExampleVector.user_id == int(user_id),
+                PersonaExampleVector.msg_id.in_(sorted(msg_ids)),
+            ).delete(synchronize_session=False)
 
     @staticmethod
     def _cosine(left: list[float], right: list[float]) -> float:

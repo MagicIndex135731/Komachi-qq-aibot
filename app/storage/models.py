@@ -92,6 +92,32 @@ class PersonaStyleSyncState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
 
+class PersonaExampleVector(Base):
+    """Persistent semantic vectors for persona style examples.
+
+    Kept separate from the memory-system vector tables so the persona
+    retrieval cache survives restarts and never collides with memory
+    retrieval (retrieval_documents_vec_* / memory_items_vec).
+    """
+
+    __tablename__ = "persona_example_vectors"
+    __table_args__ = (
+        Index("ix_pev_user", "user_id"),
+    )
+
+    msg_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer)
+    group_id: Mapped[int] = mapped_column(Integer)
+    provider: Mapped[str] = mapped_column(String(64), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    dimensions: Mapped[int] = mapped_column(Integer, default=0)
+    vector_json: Mapped[str] = mapped_column(Text, default="[]")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utc_now,
+    )
+
+
 class MemberFactRefreshState(Base):
     """Independent watermark for member fact refresh.
 

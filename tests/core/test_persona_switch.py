@@ -377,3 +377,74 @@ def test_live_persona_refreshes_relationship_labels(sqlite_engine) -> None:
 
     assert live["relationships"][0]["member"] == "路人卡"
     assert live["relationships"][1]["member"] == "球友甲"
+
+
+def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None:
+    from app.core.persona_switch import PersonaManager
+    from app.storage.db import session_scope
+    from app.storage.models import PersonaExampleVector
+    from app.storage.repositories import PersonaStyleExampleRepository
+
+    class _FakeEmbedding:
+        available = True
+
+        class _Identity:
+            provider = "test"
+            model = "fake"
+            dimensions = 4
+
+        identity = _Identity()
+
+        def embed_documents(self, texts):
+            return [[1.0, 0.0, 0.0, 0.0]] * len(texts)
+
+        def embed_query(self, text):
+            return [1.0, 0.0, 0.0, 0.0]
+
+    with session_scope(sqlite_engine) as session:
+        PersonaStyleExampleRepository(session).insert_many(
+            [
+                {
+                    "group_id": 10001,
+                    "user_id": 222,
+                    "msg_id": "m-vec-1",
+                    "text": "在吗",
+                    "context_before": [],
+                    "context_after": [],
+                    "reply_target": None,
+                }
+            ]
+        )
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+        embedding_provider=_FakeEmbedding(),
+    )
+    manager.load_state()
+    manager._group_keys[10001] = "test_self"
+    picked = manager.retrieve_examples(10001, ["在吗"], limit=1)
+    assert picked
+
+    with session_scope(sqlite_engine) as session:
+        assert session.query(PersonaExampleVector).filter_by(user_id=222).count() == 1
+
+    fresh = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+        embedding_provider=_FakeEmbedding(),
+    )
+    fresh.load_state()
+    fresh._group_keys[10001] = "test_self"
+    picked_again = fresh.retrieve_examples(10001, ["在吗"], limit=1)
+    assert picked_again
