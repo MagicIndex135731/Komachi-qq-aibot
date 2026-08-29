@@ -151,13 +151,13 @@ def main() -> int:
             stream.append(_flatten_db_row(row))
         corpus = [
             {
-                "text": row["plain_text"],
+                "text": row["text"],
                 "speaker": row["speaker"],
                 "platform_msg_id": row["platform_msg_id"],
                 "timestamp": row["timestamp"],
             }
             for row in stream
-            if int(row["user_id"]) == user_id and str(row["plain_text"] or "").strip()
+            if int(row["user_id"]) == user_id and str(row["text"] or "").strip()
         ]
         stats = compute_style_stats(corpus)
         relationships = compute_relationship_map(
