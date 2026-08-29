@@ -886,6 +886,17 @@ class InboundRouter:
             "\n对话中对方说的'我'指提问者本人，不是你扮演的角色；"
             "被问'评价我/我怎么样'时评价的是提问者，用提问者的记忆，不要评价你自己。"
         )
+        habits = active_persona.get("speech_habits") if isinstance(active_persona, dict) else None
+        if isinstance(habits, list) and habits:
+            top_habits = [str(h) for h in habits if str(h).strip()][:8]
+            if top_habits:
+                text += "\n他的说话习惯（必须逐条模仿，不要写成书面语）：\n" + "\n".join(
+                    f"- {habit}" for habit in top_habits
+                )
+        text += (
+            "\n允许并自然使用 TA 常用的粗口和网络梗（如 woc、有点恶心、屎、几把 等），"
+            "不要因为礼貌而把它们翻译成正式表达；宁可短到只剩两三个字，也不要写成长句。"
+        )
         burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
         if isinstance(burst, dict) and burst.get("enabled"):
             separator = str(burst.get("separator") or "|")
