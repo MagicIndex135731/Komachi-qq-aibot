@@ -12,7 +12,11 @@ import json
 import sqlite3
 from pathlib import Path
 
-from app.core.message_mentions import message_mentions_bot
+from app.core.message_mentions import (
+    bot_mention_names,
+    collect_bot_display_names,
+    message_mentions_bot,
+)
 
 
 def _speaker_label(raw_json: str | None, user_id: int) -> str:
@@ -42,6 +46,19 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    bot_display = collect_bot_display_names(
+        row[0]
+        for row in con.execute(
+            "SELECT raw_json FROM messages WHERE user_id=? AND raw_json IS NOT NULL "
+            "ORDER BY id DESC LIMIT 3000",
+            (args.bot_qq,),
+        )
+    )
+    bot_names = bot_mention_names(
+        bot_qq=args.bot_qq,
+        default_name=args.bot_name,
+        display_names=bot_display,
+    )
     rows = con.execute(
         "SELECT platform_msg_id, timestamp, user_id, plain_text, msg_type, "
         "reply_to_msg_id, raw_json "
@@ -67,7 +84,7 @@ def main() -> int:
                 and message_mentions_bot(
                     row["raw_json"],
                     bot_qq=args.bot_qq,
-                    bot_name=args.bot_name,
+                    bot_names=bot_names,
                 )
             ):
                 # Human-to-AI turns must not enter the style corpus.

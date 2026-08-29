@@ -10,7 +10,11 @@ from pathlib import Path
 import yaml
 
 from app.config import AppSettings
-from app.core.message_mentions import message_mentions_bot
+from app.core.message_mentions import (
+    bot_mention_names,
+    collect_bot_display_names,
+    message_mentions_bot,
+)
 from app.core.style_distill import (
     assemble_persona,
     build_profile_prompt,
@@ -80,6 +84,19 @@ def main() -> int:
         (args.group_id, args.bot_qq, args.min_messages),
     ).fetchall()
     settings = AppSettings()
+    bot_display = collect_bot_display_names(
+        row[0]
+        for row in con.execute(
+            "SELECT raw_json FROM messages WHERE user_id=? AND raw_json IS NOT NULL "
+            "ORDER BY id DESC LIMIT 3000",
+            (args.bot_qq,),
+        )
+    )
+    bot_names = bot_mention_names(
+        bot_qq=args.bot_qq,
+        default_name=args.bot_name,
+        display_names=bot_display,
+    )
     for (user_id,) in members:
         user_id = int(user_id)
         if user_id in skip:
@@ -105,7 +122,7 @@ def main() -> int:
                 and message_mentions_bot(
                     row["raw_json"],
                     bot_qq=args.bot_qq,
-                    bot_name=args.bot_name,
+                    bot_names=bot_names,
                 )
             ):
                 # Human-to-AI turns must not enter the style corpus.

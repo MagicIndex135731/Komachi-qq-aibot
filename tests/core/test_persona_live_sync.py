@@ -51,8 +51,8 @@ def test_build_examples_keeps_context_and_reply_target() -> None:
     examples = _build_examples(
         rows,
         user_id=222,
-        bot_qq=1807533371,
-        bot_name="测试小町",
+        bot_qq=900001,
+        bot_names={"测试小町"},
     )
 
     assert len(examples) == 1
@@ -341,7 +341,7 @@ class _fake_settings:
     from pathlib import Path
 
     data_dir = Path("data")
-    bot_qq = 1807533371
+    bot_qq = 900001
     llm_base_url = "http://unused"
     llm_api_key = ""
     llm_model = "unused"

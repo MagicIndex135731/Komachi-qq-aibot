@@ -10,7 +10,11 @@ import yaml
 from sqlalchemy import text
 
 from app.core.persona_switch import DEFAULT_PERSONA_KEY
-from app.core.message_mentions import message_mentions_bot
+from app.core.message_mentions import (
+    bot_mention_names,
+    collect_bot_display_names,
+    message_mentions_bot,
+)
 from app.core.style_distill import parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
@@ -61,7 +65,12 @@ class PersonaLiveSyncService:
         default_name = str(
             (self.personas.get(DEFAULT_PERSONA_KEY) or {}).get("name", "")
         ).strip()
-        self.bot_name = default_name or str(settings.bot_qq)
+        self.default_name = default_name
+        self.bot_names = bot_mention_names(
+            bot_qq=int(settings.bot_qq),
+            default_name=self.default_name,
+            display_names=self._historical_bot_names(),
+        )
         self.interval_seconds = max(30.0, float(interval_seconds))
         self.refresh_threshold = max(1, int(refresh_threshold))
         self.refresh_cooldown_seconds = max(3600.0, float(refresh_cooldown_seconds))
@@ -77,6 +86,11 @@ class PersonaLiveSyncService:
             await asyncio.sleep(self.interval_seconds)
 
     def _tick(self) -> None:
+        self.bot_names = bot_mention_names(
+            bot_qq=int(self.settings.bot_qq),
+            default_name=self.default_name,
+            display_names=self._historical_bot_names(),
+        )
         for persona_key, persona in self.personas.items():
             if persona_key == DEFAULT_PERSONA_KEY:
                 continue
@@ -117,7 +131,7 @@ class PersonaLiveSyncService:
                 rows,
                 user_id=user_id,
                 bot_qq=int(self.settings.bot_qq),
-                bot_name=self.bot_name,
+                bot_names=self.bot_names,
             )
             inserted = PersonaStyleExampleRepository(session).insert_many(examples)
             trimmed = PersonaStyleExampleRepository(session).trim_to(user_id=user_id, keep=600)
@@ -139,6 +153,17 @@ class PersonaLiveSyncService:
         if inserted:
             self.manager.load_style_banks()
         return inserted
+
+    def _historical_bot_names(self) -> set[str]:
+        with session_scope(self.engine) as session:
+            rows = session.execute(
+                text(
+                    "SELECT raw_json FROM messages WHERE user_id = :bot_qq "
+                    "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
+                ),
+                {"bot_qq": int(self.settings.bot_qq)},
+            ).fetchall()
+        return collect_bot_display_names(row[0] for row in rows)
 
     def _maybe_refresh_profile(self, persona_key: str, user_id: int, group_id: int) -> None:
         now = datetime.now(UTC)
@@ -243,7 +268,7 @@ def _build_examples(
     *,
     user_id: int,
     bot_qq: int,
-    bot_name: str,
+    bot_names: set[str],
 ) -> list[dict]:
     new_rows = [dict(row) for row in rows]
     by_id = {str(row.get("platform_msg_id")): row for row in new_rows if row.get("plain_text")}
@@ -255,7 +280,7 @@ def _build_examples(
         if message_mentions_bot(
             row.get("raw_json"),
             bot_qq=bot_qq,
-            bot_name=bot_name,
+            bot_names=bot_names,
         ):
             # Human-to-AI turns must never become style samples.
             continue

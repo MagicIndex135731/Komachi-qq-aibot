@@ -11,7 +11,11 @@ from datetime import UTC, datetime
 import yaml
 from zoneinfo import ZoneInfo
 
-from app.core.message_mentions import message_mentions_bot
+from app.core.message_mentions import (
+    bot_mention_names,
+    collect_bot_display_names,
+    message_mentions_bot,
+)
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -260,7 +264,12 @@ class MemberFactRefreshService:
         self.settings = settings
         self.group_ids = set(int(value) for value in group_ids)
         self.bot_qq = int(bot_qq)
-        self.bot_name = str(bot_name or "").strip() or str(bot_qq)
+        self.bot_name = str(bot_name or "").strip()
+        self.bot_names = bot_mention_names(
+            bot_qq=int(bot_qq),
+            default_name=self.bot_name,
+            display_names=self._historical_bot_names(),
+        )
         self.member_allowlist = (
             set(int(value) for value in member_allowlist)
             if member_allowlist is not None
@@ -322,6 +331,11 @@ class MemberFactRefreshService:
                 self._refresh_member(group_id, user_id)
 
     def _refresh_member(self, group_id: int, user_id: int) -> None:
+        self.bot_names = bot_mention_names(
+            bot_qq=int(self.bot_qq),
+            default_name=self.bot_name,
+            display_names=self._historical_bot_names(),
+        )
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
@@ -338,7 +352,7 @@ class MemberFactRefreshService:
                 if not message_mentions_bot(
                     getattr(row, "raw_json", None),
                     bot_qq=self.bot_qq,
-                    bot_name=self.bot_name,
+                    bot_names=self.bot_names,
                 )
             ]
             last_id = watermark
@@ -376,6 +390,19 @@ class MemberFactRefreshService:
             len(facts),
             imported,
         )
+
+    def _historical_bot_names(self) -> set[str]:
+        from sqlalchemy import text
+
+        with session_scope(self.engine) as session:
+            rows = session.execute(
+                text(
+                    "SELECT raw_json FROM messages WHERE user_id = :bot_qq "
+                    "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
+                ),
+                {"bot_qq": int(self.bot_qq)},
+            ).fetchall()
+        return collect_bot_display_names(row[0] for row in rows)
 
 
 def _active_members(engine, *, group_id: int, bot_qq: int, min_messages: int) -> list[int]:
