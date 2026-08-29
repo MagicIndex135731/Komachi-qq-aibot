@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
 import yaml
 from sqlalchemy import text
@@ -517,8 +518,40 @@ class PersonaLiveSyncService:
                 selected[int(position * step)] for position in range(int(max_lines))
             ]
         lines: list[str] = []
-        images: list[ImageAttachment] = []
-        seen_urls: set[str] = set()
+        candidates: list[tuple[str, str | None, str | None]] = []
+        for row in selected:
+            if str(row.get("msg_type") or "") != "image":
+                continue
+            for url, local_path in _extract_image_attachments(row.get("raw_json")):
+                if not url:
+                    continue
+                candidates.append(
+                    (
+                        url,
+                        local_path,
+                        str(row.get("platform_msg_id") or "") or None,
+                    )
+                )
+        # Prefer images that are already cached locally (QQ CDN URLs expire);
+        # keep the rest only as URL fallbacks when we have room.
+        candidates.sort(
+            key=lambda item: (
+                0 if item[1] and Path(item[1]).exists() else 1,
+                item[0],
+            )
+        )
+        chosen: list[tuple[str, str | None, str | None]] = candidates[
+            : int(max_images)
+        ]
+        chosen_urls = {item[0] for item in chosen}
+        images = [
+            ImageAttachment(
+                url=url,
+                local_path=local_path,
+                source_message_id=message_id,
+            )
+            for url, local_path, message_id in chosen
+        ]
         for row in selected:
             row_user_id = int(row.get("user_id") or 0)
             if row_user_id in self.bot_qqs:
@@ -527,22 +560,15 @@ class PersonaLiveSyncService:
             timestamp = str(row.get("timestamp") or "")[:16]
             plain = str(row.get("plain_text") or "").strip()
             if str(row.get("msg_type") or "") == "image":
-                attachments = _extract_image_attachments(row.get("raw_json"))
-                if attachments:
+                urls_in_row = [
+                    url
+                    for url, _ in _extract_image_attachments(row.get("raw_json"))
+                    if url
+                ]
+                if any(url in chosen_urls for url in urls_in_row):
                     lines.append(f"[{timestamp}] {speaker}: [图片]")
-                    for url, local_path in attachments:
-                        if url and url not in seen_urls and len(images) < int(max_images):
-                            seen_urls.add(url)
-                            images.append(
-                                ImageAttachment(
-                                    url=url,
-                                    local_path=local_path,
-                                    source_message_id=str(
-                                        row.get("platform_msg_id") or ""
-                                    )
-                                    or None,
-                                )
-                            )
+                elif urls_in_row:
+                    lines.append(f"[{timestamp}] {speaker}: [图片(略)]")
                 else:
                     lines.append(f"[{timestamp}] {speaker}: [图片(无链接)]")
             elif plain:
