@@ -379,7 +379,7 @@ def test_merge_profile_unions_facts_and_external_relations() -> None:
     assert [item.get("name") for item in merged["external_relations"]] == ["灰泽满"]
 
 
-def test_image_context_block_includes_urls_and_nearby_lines(sqlite_engine) -> None:
+def test_window_transcript_block_renders_flow_and_collects_images(sqlite_engine) -> None:
     from datetime import timedelta
 
     from app.storage.repositories import MessageRepository
@@ -416,6 +416,9 @@ def test_image_context_block_includes_urls_and_nearby_lines(sqlite_engine) -> No
         )
         UserRepository(session).upsert_user(
             user_id=222, nickname="测试君", group_card=""
+        )
+        UserRepository(session).upsert_user(
+            user_id=900001, nickname="测试小町", group_card=""
         )
         messages = MessageRepository(session)
         messages.add_group_message(
@@ -467,17 +470,19 @@ def test_image_context_block_includes_urls_and_nearby_lines(sqlite_engine) -> No
             "timestamp": base + timedelta(minutes=1),
         },
     ]
-    block = service._image_context_block(
+    transcript, images = service._window_transcript_block(
         user_id=222,
         group_id=10001,
         examples=examples,
     )
-    assert "http://img/x.png" in block
-    assert "前文「路人甲: 发张图看看」" in block
-    assert "后文「路人甲: 好看」" in block
+    assert "[图片]" in transcript
+    assert "路人甲: 发张图看看" in transcript
+    assert "路人甲: 好看" in transcript
+    assert len(images) == 1
+    assert images[0].url == "http://img/x.png"
 
 
-def test_image_comment_scenes_detect_image_then_reactions(sqlite_engine) -> None:
+def test_window_transcript_skips_bot_lines(sqlite_engine) -> None:
     from datetime import timedelta
 
     from app.storage.repositories import MessageRepository
@@ -515,6 +520,9 @@ def test_image_comment_scenes_detect_image_then_reactions(sqlite_engine) -> None
         UserRepository(session).upsert_user(
             user_id=222, nickname="测试君", group_card=""
         )
+        UserRepository(session).upsert_user(
+            user_id=900001, nickname="测试小町", group_card=""
+        )
         messages = MessageRepository(session)
         messages.add_group_message(
             platform_msg_id="img-2",
@@ -541,8 +549,19 @@ def test_image_comment_scenes_detect_image_then_reactions(sqlite_engine) -> None
             reply_to_msg_id=None,
             mentioned_bot=False,
         )
+        messages.add_group_message(
+            platform_msg_id="bot-1",
+            group_id=10001,
+            user_id=900001,
+            timestamp=base + timedelta(seconds=20),
+            plain_text="机器人发言不应出现",
+            raw_json={"sender": {"nickname": "测试小町", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
         session.commit()
-    scenes = service._image_comment_scenes(
+    transcript, _ = service._window_transcript_block(
         user_id=222,
         group_id=10001,
         examples=[
@@ -558,9 +577,9 @@ def test_image_comment_scenes_detect_image_then_reactions(sqlite_engine) -> None
             }
         ],
     )
-    assert len(scenes) == 1
-    assert scenes[0]["image_url"] == "http://img/y.png"
-    assert any("这图真不错" in line for line in scenes[0]["reactions"])
+    assert "测试君: [图片]" in transcript
+    assert "路人甲: 这图真不错" in transcript
+    assert "机器人发言不应出现" not in transcript
 
 
 class _fake_settings:

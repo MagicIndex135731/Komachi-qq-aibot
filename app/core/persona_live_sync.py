@@ -312,16 +312,14 @@ class PersonaLiveSyncService:
     ) -> Path:
         from app.providers.llm_client import LlmClient
 
-        sample_block = "\n".join(
-            _format_example_line(example) for example in examples
-        )
-        image_block = self._image_context_block(
+        transcript, images = self._window_transcript_block(
             user_id=user_id,
             group_id=group_id,
             examples=examples,
         )
         prompt = (
-            "你是人设维护助手。下面是群成员最新的真实发言（含语境：上文/回复对象 + 他说的原话），"
+            "你是人设维护助手。下面是群成员最近一段时间的真实对话记录"
+            "（按时间顺序 + 发言者，[图片] 表示对话中出现的图片，图片会作为视觉输入一并提供）。"
             "以及当前的人格画像 YAML。请根据新语料增量更新画像：修正过时特质、补充新出现的口头禅/"
             "话题/关系与称呼习惯，保持 v2 字段结构（name/identity/core_traits/speaking_style/"
             "self_concept/speech_habits/style_avoid/relationships/address_rules），"
@@ -329,16 +327,13 @@ class PersonaLiveSyncService:
             "每项含 name/who/relation/attitude/evidence；高频出现的人物必须写全），"
             "并维护 facts（关于他的持久事实列表，每项含 category/fact/evidence；新增语料里的具体事实要补进去），"
             "relationships 每项必须含 member_user_id（群成员QQ号）与 member（该成员当前昵称或群名片），不要把QQ号当作 member 输出，"
-            "不要删除仍成立的条目，不要新增语料里没有的事实。只输出一个 ```yaml 代码块。\n"
+            "不要删除仍成立的条目，不要新增语料里没有的事实。\n"
+            "图片只是对话内容的一部分：请把图中反映的信息（他聊的话题、内容、兴趣）融进画像；"
+            "不要输出'他喜欢发图/分享图片'这类关于发图行为的元描述。"
+            "只输出一个 ```yaml 代码块。\n"
             f"当前画像：\n{yaml.safe_dump(current_profile, allow_unicode=True, sort_keys=False)}\n"
-            f"最新语料：\n{sample_block}"
+            f"最新对话记录：\n{transcript}"
         )
-        if image_block:
-            prompt += (
-                "\n\n该阶段他发过的图片（含发图前后语境，用于理解他的发图习惯；"
-                "图片视觉内容本身不在上下文中，不要臆测图片内容）：\n"
-                f"{image_block}"
-            )
         client = LlmClient(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -350,17 +345,11 @@ class PersonaLiveSyncService:
             timeout_seconds=180.0,
             reasoning_effort=self.settings.llm_reasoning_effort,
         )
-        generated = client.generate_text([prompt])
-        profile = parse_persona_yaml(generated)
-        image_comment_style = self._distill_image_comment_style(
-            user_id=user_id,
-            group_id=group_id,
-            examples=examples,
-            client=client,
+        generated = client.generate_text(
+            [prompt],
+            images=images or None,
         )
-        if image_comment_style:
-            profile.setdefault("image_comment_style", {})
-            profile["image_comment_style"].update(image_comment_style)
+        profile = parse_persona_yaml(generated)
         # Bind relationships by the current profile's member->id map so a
         # model that drops member_user_id cannot silently regress bindings.
         id_by_name: dict[str, int] = {}
@@ -387,15 +376,18 @@ class PersonaLiveSyncService:
             self.manager.personas[persona_key] = merged
         return live_path
 
-    def _image_comment_scenes(
+    def _window_transcript_block(
         self,
         *,
         user_id: int,
         group_id: int,
         examples: list,
-        limit: int = 5,
-    ) -> list[dict]:
-        """Find 'member sent image(s) -> others react' scenes in the window."""
+        max_images: int = 8,
+    ) -> tuple[str, list]:
+        """Render the refresh window as a chronological transcript with
+        speaker labels; collect images that appear in it as visual inputs."""
+
+        from app.core.message_content import ImageAttachment
 
         stamps = []
         for example in examples:
@@ -407,7 +399,7 @@ class PersonaLiveSyncService:
             if timestamp is not None:
                 stamps.append(timestamp)
         if not stamps:
-            return []
+            return "", []
         start = min(stamps)
         end = max(stamps)
         start_str = (
@@ -423,207 +415,35 @@ class PersonaLiveSyncService:
         with session_scope(self.engine) as session:
             rows = session.execute(
                 text(
-                    "SELECT id, user_id, timestamp, plain_text, raw_json FROM messages "
-                    "WHERE group_id = :group_id AND timestamp BETWEEN :start AND :end "
-                    "ORDER BY id"
+                    "SELECT id, user_id, timestamp, plain_text, msg_type, raw_json "
+                    "FROM messages WHERE group_id = :group_id "
+                    "AND timestamp BETWEEN :start AND :end ORDER BY id"
                 ),
                 {"group_id": int(group_id), "start": start_str, "end": end_str},
             ).mappings().all()
-        scenes: list[dict] = []
-        for index, row in enumerate(rows):
-            if int(row.get("user_id") or 0) != user_id:
-                continue
-            urls = _extract_image_urls(row.get("raw_json"))
-            if not urls:
-                continue
-            reactions = [
-                item
-                for item in rows[index + 1 : index + 4]
-                if str(item.get("plain_text") or "").strip()
-            ]
-            if not reactions:
-                continue
-            scenes.append(
-                {
-                    "image_url": urls[0],
-                    "image_time": str(row.get("timestamp") or "")[:16],
-                    "reactions": [
-                        f"{_speaker_label(item.get('raw_json'))}: "
-                        f"{str(item.get('plain_text') or '').strip()}"
-                        for item in reactions[:3]
-                    ],
-                }
-            )
-            if len(scenes) >= int(limit):
-                break
-        return scenes
-
-    def _distill_image_comment_style(
-        self,
-        *,
-        user_id: int,
-        group_id: int,
-        examples: list,
-        client,
-    ) -> dict:
-        """Second LLM round: look at the member's sent images and the group's
-        reactions, then distill how the member comments on / shares images."""
-
-        from app.core.message_content import ImageAttachment
-
-        scenes = self._image_comment_scenes(
-            user_id=user_id,
-            group_id=group_id,
-            examples=examples,
-        )
-        if not scenes:
-            return {}
-        images = [
-            ImageAttachment(url=scene["image_url"], file_id=None)
-            for scene in scenes
-        ]
-        scene_text = "\n\n".join(
-            f"图 {index + 1}（{scene['image_time']} 他发的）：\n"
-            + "\n".join(f"- 群友反应: {line}" for line in scene["reactions"])
-            for index, scene in enumerate(scenes)
-        )
-        prompt = (
-            "你是人设蒸馏专家。下面是群成员发的几张图片，以及他发图后群里紧接着的反应。\n"
-            "请提炼他分享图片/点评图片的风格：他通常发什么类型的内容、发图时会配什么话、"
-            "别人发图后他如何点评（用词、语气、梗）。\n"
-            f"场景信息：\n{scene_text}\n"
-            "只输出一个 ```json 代码块："
-            '{"image_comment_style": "他分享/点评图片的习惯（2-4句）", '
-            '"image_habits": ["3-8条具体习惯，带真实原话"]}'
-        )
-        try:
-            generated = client.generate_text(
-                [prompt],
-                images=images,
-            )
-            payload = parse_fenced_json(generated)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "persona_image_comment_distill_failed user_id=%s group_id=%s",
-                user_id,
-                group_id,
-            )
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {
-            "image_comment_style": str(
-                payload.get("image_comment_style") or ""
-            ).strip(),
-            "image_habits": [
-                str(item).strip()
-                for item in (payload.get("image_habits") or [])
-                if str(item).strip()
-            ],
-        }
-
-    def _image_context_block(
-        self,
-        *,
-        user_id: int,
-        group_id: int,
-        examples: list,
-        limit: int = 20,
-    ) -> str:
-        """Images the member sent inside the refresh window, with nearby chat
-        lines as context (URLs only; no visual content)."""
-
-        stamps = []
-        for example in examples:
-            timestamp = (
-                example.get("timestamp")
-                if isinstance(example, dict)
-                else getattr(example, "timestamp", None)
-            )
-            if timestamp is not None:
-                stamps.append(timestamp)
-        if not stamps:
-            return ""
-        start = min(stamps)
-        end = max(stamps)
-        start_local = (
-            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if start.tzinfo is not None
-            else start
-        )
-        end_local = (
-            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if end.tzinfo is not None
-            else end
-        )
-        start_str = start_local.strftime("%Y-%m-%d %H:%M:%S.%f")
-        end_str = end_local.strftime("%Y-%m-%d %H:%M:%S.%f")
-        with session_scope(self.engine) as session:
-            image_rows = session.execute(
-                text(
-                    "SELECT id, timestamp, raw_json FROM messages "
-                    "WHERE group_id = :group_id AND user_id = :user_id "
-                    "AND msg_type = 'image' AND timestamp BETWEEN :start AND :end "
-                    "ORDER BY id DESC LIMIT :limit"
-                ),
-                {
-                    "group_id": int(group_id),
-                    "user_id": int(user_id),
-                    "start": start_str,
-                    "end": end_str,
-                    "limit": int(limit),
-                },
-            ).mappings().all()
-            if not image_rows:
-                return ""
-            context_by_id: dict[int, list] = {}
-            for image_row in image_rows:
-                row_id = int(image_row["id"])
-                window = session.execute(
-                    text(
-                        "SELECT id, user_id, plain_text, raw_json FROM messages "
-                        "WHERE group_id = :group_id AND id BETWEEN :lo AND :hi "
-                        "ORDER BY id"
-                    ),
-                    {"group_id": int(group_id), "lo": row_id - 3, "hi": row_id + 3},
-                ).mappings().all()
-                context_by_id[row_id] = window
         lines: list[str] = []
-        for image_row in image_rows:
-            row_id = int(image_row["id"])
-            urls = _extract_image_urls(image_row.get("raw_json"))
-            url_text = " | ".join(urls[:3]) if urls else "(无链接)"
-            window = context_by_id.get(row_id, [])
-            before = [
-                item
-                for item in window
-                if int(item["id"]) < row_id
-                and str(item.get("plain_text") or "").strip()
-            ]
-            after = [
-                item
-                for item in window
-                if int(item["id"]) > row_id
-                and str(item.get("plain_text") or "").strip()
-            ]
-
-            def _render(items: list) -> str:
-                return " / ".join(
-                    f"{_speaker_label(item.get('raw_json'))}: "
-                    f"{str(item.get('plain_text') or '').strip()}"
-                    for item in items[-2:]
-                )
-
-            before_text = _render(before)
-            after_text = _render(after)
-            line = f"- [{str(image_row['timestamp'])[:16]}] 发图: {url_text}"
-            if before_text:
-                line += f" ｜ 前文「{before_text}」"
-            if after_text:
-                line += f" ｜ 后文「{after_text}」"
-            lines.append(line)
-        return "\n".join(lines)
-
+        images: list[ImageAttachment] = []
+        seen_urls: set[str] = set()
+        for row in rows:
+            row_user_id = int(row.get("user_id") or 0)
+            if row_user_id in self.bot_qqs:
+                continue
+            speaker = _speaker_label(row.get("raw_json")) or str(row_user_id)
+            timestamp = str(row.get("timestamp") or "")[:16]
+            plain = str(row.get("plain_text") or "").strip()
+            if str(row.get("msg_type") or "") == "image":
+                urls = _extract_image_urls(row.get("raw_json"))
+                if urls:
+                    lines.append(f"[{timestamp}] {speaker}: [图片]")
+                    for url in urls:
+                        if url and url not in seen_urls and len(images) < int(max_images):
+                            seen_urls.add(url)
+                            images.append(ImageAttachment(url=url))
+                else:
+                    lines.append(f"[{timestamp}] {speaker}: [图片(无链接)]")
+            elif plain:
+                lines.append(f"[{timestamp}] {speaker}: {plain}")
+        return "\n".join(lines), images
 
 def _build_examples(
     rows: list,
