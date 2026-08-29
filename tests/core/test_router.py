@@ -54,6 +54,40 @@ def test_should_bind_impersonated_self() -> None:
     assert _should_bind_impersonated_self("你如何评价我") is False
 
 
+def test_impersonation_facts_target_self_heuristic() -> None:
+    persona = {"name": "阿渣", "source_user_id": "999001"}
+
+    class _User:
+        def __init__(self, user_id, nickname, group_card):
+            self.user_id = user_id
+            self.nickname = nickname
+            self.group_card = group_card
+
+    users = {
+        999002: _User(999002, "不知道叫什么", "逆蝶蝶"),
+        999003: _User(999003, "加菲猫", ""),
+        999001: _User(999001, "阿渣", "喜泽满灰多"),
+    }
+    router = object.__new__(InboundRouter)
+
+    def target(query: str, requester: int = 999002) -> bool:
+        return router._impersonation_facts_target_self(
+            query,
+            persona=persona,
+            requester_user_id=requester,
+            users_by_id=users,
+            bot_qq=999000,
+        )
+
+    assert target("你最近面了哪些企业")
+    assert target("最近工作咋样")
+    assert target("你最讨厌什么动画")
+    assert target("阿渣最近面了哪些企业")
+    assert not target("如何评价我")
+    assert not target("逆蝶蝶的动画喜好是什么")
+    assert not target("你觉得加菲猫这人咋样")
+
+
 class FailingSenderOnce:
     def __init__(self) -> None:
         self.attempts = 0

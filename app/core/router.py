@@ -877,6 +877,15 @@ class InboundRouter:
             "你的回复必须极短，通常只有几个字到十几个字，像真人随手打字一样；除非对方明确要求详细解释，否则不要超过一两句。"
             "需要连续说几句时，用换行把它们拆成多条（每条几个字），或者按系统提示用 | 分隔；绝对不要写成一句长话，也不要复述或总结对方的话。"
         )
+        text += (
+            "\n当问题问的是其他群友（如'XX的动画喜好''XX这人咋样'）时，"
+            "必须先用 TA 当前的群名片点名（例如'逆蝶蝶喜欢……'），再给结论；"
+            "绝对不要说成自己的喜好或经历，也不要不带名字直接回答。"
+        )
+        text += (
+            "\n对话中对方说的'我'指提问者本人，不是你扮演的角色；"
+            "被问'评价我/我怎么样'时评价的是提问者，用提问者的记忆，不要评价你自己。"
+        )
         burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
         if isinstance(burst, dict) and burst.get("enabled"):
             separator = str(burst.get("separator") or "|")
@@ -961,6 +970,42 @@ class InboundRouter:
             "特别注意：'评价/排行低于某作品'不等于'讨厌'，讨厌类结论必须有明确的讨厌/不喜欢依据）：\n"
             + "\n".join(lines)
         )
+
+    def _impersonation_facts_target_self(
+        self,
+        query: str,
+        *,
+        persona: dict,
+        requester_user_id: int,
+        users_by_id: dict[int, object],
+        bot_qq: int,
+    ) -> bool:
+        """Decide whether persona facts should be injected for this query.
+
+        Facts describe the impersonated member. When the question clearly
+        targets the requester ("如何评价我") or another named member
+        ("逆蝶蝶的动画喜好"), injecting the impersonated member's facts makes
+        the model answer about itself. In those cases skip persona facts and
+        let the shared-memory retrieval answer for the real subject.
+        """
+
+        persona_name = str(persona.get("name") or "").strip()
+        persona_user_id = int(persona.get("source_user_id") or 0)
+        if persona_name and persona_name in query:
+            return True
+        for user in users_by_id.values():
+            user_id = int(getattr(user, "user_id", 0) or 0)
+            if user_id in (bot_qq, persona_user_id):
+                continue
+            for alias in (
+                str(getattr(user, "group_card", "") or "").strip(),
+                str(getattr(user, "nickname", "") or "").strip(),
+            ):
+                if len(alias) >= 2 and alias in query:
+                    return False
+        if "我" in query and "你" not in query:
+            return False
+        return True
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:
         labels = {str(self.runtime.persona.get("name", "") or "").strip()}
@@ -1814,9 +1859,16 @@ class InboundRouter:
                     f"{self._member_label_for_user(user_id=event.user_id, users_by_id=users_by_id, group_id=event.group_id)}: {event.plain_text}",
                     *recent_lines,
                 ]
-                persona_text = self._with_relevant_facts(
-                    persona_text, active_persona, query_lines, event.group_id
-                )
+                if self._impersonation_facts_target_self(
+                    event.plain_text,
+                    persona=active_persona,
+                    requester_user_id=int(event.user_id),
+                    users_by_id=users_by_id,
+                    bot_qq=int(self.runtime.settings.bot_qq),
+                ):
+                    persona_text = self._with_relevant_facts(
+                        persona_text, active_persona, query_lines, event.group_id
+                    )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,

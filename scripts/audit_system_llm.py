@@ -124,7 +124,7 @@ SCENARIOS: list[dict[str, Any]] = [
         "nickname": "不知道叫什么",
         "criteria": (
             "1. 必须把'逆蝶蝶'绑定到群成员本人并从记忆中回答。\n"
-            "2. 回答应包含具体的动画/作品喜好，不能泛泛而谈或说不知道。\n"
+            "2. 回答应点名'逆蝶蝶'并包含至少一个具体作品/喜好；阿渣风格允许极短，不需要展开。\n"
             "3. 不能把阿渣自己的喜好说成逆蝶蝶的。"
         ),
     },
@@ -339,6 +339,8 @@ def main() -> int:
     runtime = load_runtime_config(settings)
     engine = build_engine(settings.sqlite_path)
     llm_client = build_llm_client(settings=settings, engine=engine)
+    # The audit process must not race the production writer for usage rows.
+    llm_client.usage_recorder = lambda usage: None  # type: ignore[assignment]
     memory_runtime = build_memory_runtime(
         settings=settings,
         engine=engine,
