@@ -86,6 +86,36 @@ def _extract_image_urls(raw_json: object) -> list[str]:
     return urls
 
 
+def _extract_image_attachments(raw_json: object) -> list[tuple[str, str | None]]:
+    """Extract (url, local_path) pairs for image items.
+
+    ``local_path`` is set when the message handler cached the image locally;
+    refreshing should prefer it because QQ CDN URLs expire quickly.
+    """
+
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if not isinstance(raw_json, dict):
+        return []
+    message = raw_json.get("message")
+    if not isinstance(message, list):
+        return []
+    attachments: list[tuple[str, str | None]] = []
+    for item in message:
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        url = str(data.get("url") or data.get("file") or "").strip()
+        if not url:
+            continue
+        local_path = str(data.get("local_path") or "").strip() or None
+        attachments.append((url, local_path))
+    return attachments
+
+
 class PersonaLiveSyncService:
     def __init__(
         self,
@@ -497,15 +527,16 @@ class PersonaLiveSyncService:
             timestamp = str(row.get("timestamp") or "")[:16]
             plain = str(row.get("plain_text") or "").strip()
             if str(row.get("msg_type") or "") == "image":
-                urls = _extract_image_urls(row.get("raw_json"))
-                if urls:
+                attachments = _extract_image_attachments(row.get("raw_json"))
+                if attachments:
                     lines.append(f"[{timestamp}] {speaker}: [图片]")
-                    for url in urls:
+                    for url, local_path in attachments:
                         if url and url not in seen_urls and len(images) < int(max_images):
                             seen_urls.add(url)
                             images.append(
                                 ImageAttachment(
                                     url=url,
+                                    local_path=local_path,
                                     source_message_id=str(
                                         row.get("platform_msg_id") or ""
                                     )
