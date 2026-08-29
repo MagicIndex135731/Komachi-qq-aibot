@@ -185,6 +185,11 @@ IMPERSONATION_CONTAMINANT_MARKERS = (
 )
 
 
+_PACKED_LINE_SPEAKER_PATTERN = re.compile(
+    r"^\[[^\]]*\]\s*([^(\[]+?)\s*\(uin:"
+)
+
+
 def _scrub_impersonation_reply(text: str) -> str:
     """Deterministic backstop for impersonation replies.
 
@@ -1042,8 +1047,12 @@ class InboundRouter:
             if any(marker in text for marker in IMPERSONATION_CONTAMINANT_MARKERS):
                 continue
             head, separator, tail = text.partition(":")
+            packed_match = _PACKED_LINE_SPEAKER_PATTERN.match(text)
+            if packed_match:
+                head = packed_match.group(1)
             is_bot_line = separator and (
                 "（小町扮演）" in head
+                or "（小町扮演）" in text
                 or (default_bot_name and head.strip() == default_bot_name)
             )
             if is_bot_line:
