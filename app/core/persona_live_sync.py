@@ -325,13 +325,18 @@ def _build_examples(
             continue
         context_before = []
         for other in ordered[max(0, index - 4) : index]:
+            if int(other.get("user_id") or 0) in bot_qqs:
+                continue
             label = _speaker_label(other.get("raw_json")) or str(other.get("user_id"))
             context_before.append(
                 {"speaker": label, "text": str(other.get("plain_text") or "").strip()}
             )
         reply_target = None
         quoted = by_id.get(str(row.get("reply_to_msg_id") or ""))
-        if quoted is not None:
+        if (
+            quoted is not None
+            and int(quoted.get("user_id") or 0) not in bot_qqs
+        ):
             label = _speaker_label(quoted.get("raw_json")) or str(quoted.get("user_id"))
             reply_target = f"{label}: {str(quoted.get('plain_text') or '').strip()}"
         examples.append(

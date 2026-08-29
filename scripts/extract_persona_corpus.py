@@ -100,6 +100,11 @@ def main() -> int:
                 continue
             seen_ids.add(platform_msg_id)
             text = str(row["plain_text"] or "").strip()
+            if int(row["user_id"]) in bot_ids:
+                # Bot output must never appear in the distillation stream:
+                # while impersonating it is labelled with the member's name
+                # and would be mistaken for the member's real voice.
+                continue
             if (
                 int(row["user_id"]) == args.user_id
                 and message_mentions_bot(

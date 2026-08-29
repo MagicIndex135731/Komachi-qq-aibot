@@ -138,6 +138,11 @@ def main() -> int:
             "reply_to_msg_id, raw_json FROM messages WHERE group_id=? ORDER BY timestamp, id",
             (args.group_id,),
         ):
+            if int(row["user_id"]) in bot_ids:
+                # Bot output must never enter the distillation stream: while
+                # impersonating it carries the member's name and would be
+                # mistaken for the member's real voice.
+                continue
             if (
                 int(row["user_id"]) == user_id
                 and message_mentions_bot(
