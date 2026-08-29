@@ -357,8 +357,11 @@ async def run() -> None:
     persona_prewarm_task = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
+        logging.info("startup_step build_engine done")
         await asyncio.to_thread(create_all, engine)
+        logging.info("startup_step create_all done")
         await asyncio.to_thread(sync_history_archives, engine, runtime)
+        logging.info("startup_step sync_history done")
 
         gateway = NapCatGateway(
             ws_url=settings.napcat_ws_url,
@@ -394,6 +397,7 @@ async def run() -> None:
                 )
             ),
         )
+        logging.info("startup_step build_memory_runtime done")
         await asyncio.to_thread(
             _prewarm_memory_embedding,
             log_dir=settings.log_dir,
