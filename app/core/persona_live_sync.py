@@ -139,12 +139,24 @@ class PersonaLiveSyncService:
             )
             inserted = PersonaStyleExampleRepository(session).insert_many(examples)
             trimmed = PersonaStyleExampleRepository(session).trim_to(user_id=user_id, keep=600)
+            new_target_count = sum(
+                1
+                for row in new_rows
+                if int(row.get("user_id") or 0) == user_id
+                and str(row.get("plain_text") or "").strip()
+                and str(row.get("msg_type") or "text") == "text"
+                and not message_mentions_bot(
+                    row.get("raw_json"),
+                    bot_qqs=self.bot_qqs,
+                    bot_text_names=self.bot_text_names,
+                )
+            )
             last_id = max((int(row["id"]) for row in new_rows), default=watermark)
             state_repo.set_watermark(
                 group_id=group_id,
                 user_id=user_id,
                 last_msg_id=str(last_id),
-                new_count=len(examples),
+                new_count=new_target_count,
             )
         if inserted or trimmed:
             logger.info(
