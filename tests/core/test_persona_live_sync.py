@@ -168,6 +168,45 @@ def test_refresh_gate_skips_below_threshold(sqlite_engine) -> None:
     assert not (settings.data_dir / "personas" / "test_self.live.yaml").exists()
 
 
+def test_tick_only_refreshes_personas_with_live_refresh_flag(
+    sqlite_engine, monkeypatch
+) -> None:
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "live_self": {
+            "name": "直播君",
+            "live_refresh": True,
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+        "member_self": {
+            "name": "成员君",
+            "source_user_id": 333,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    synced = []
+    monkeypatch.setattr(service, "_sync_examples", lambda key, uid, gid: synced.append(key))
+    monkeypatch.setattr(service, "_maybe_refresh_profile", lambda key, uid, gid: None)
+
+    service._tick()
+
+    assert synced == ["live_self"]
+
+
 def test_refresh_triggers_on_threshold_and_overdue(
     sqlite_engine, monkeypatch
 ) -> None:

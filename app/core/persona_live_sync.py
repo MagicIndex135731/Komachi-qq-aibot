@@ -75,6 +75,8 @@ class PersonaLiveSyncService:
         for persona_key, persona in self.personas.items():
             if persona_key == DEFAULT_PERSONA_KEY:
                 continue
+            if not bool(persona.get("live_refresh")):
+                continue
             user_id = _positive_int(persona.get("source_user_id"))
             group_id = _positive_int(persona.get("source_group_id"))
             if user_id is None or group_id is None:
@@ -194,6 +196,7 @@ class PersonaLiveSyncService:
             "外加 external_relations（他反复关注/转发/维护的群外人物：虚拟主播、球星、up主等，"
             "每项含 name/who/relation/attitude/evidence；高频出现的人物必须写全），"
             "并维护 facts（关于他的持久事实列表，每项含 category/fact/evidence；新增语料里的具体事实要补进去），"
+            "relationships 每项必须含 member_user_id（群成员QQ号）与 member（该成员当前昵称或群名片），不要把QQ号当作 member 输出，"
             "不要删除仍成立的条目，不要新增语料里没有的事实。只输出一个 ```yaml 代码块。\n"
             f"当前画像：\n{yaml.safe_dump(current_profile, allow_unicode=True, sort_keys=False)}\n"
             f"最新语料：\n{sample_block}"

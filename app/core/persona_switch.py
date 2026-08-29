@@ -12,6 +12,8 @@ import logging
 import re
 import time
 
+from sqlalchemy import text
+
 from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
 from app.storage.models import MemoryItem, User
 from app.storage.db import session_scope
@@ -277,7 +279,30 @@ class PersonaManager:
                         user.nickname or ""
                     ).strip()
                     if label:
-                        aliases[int(user.user_id)] = label
+                        aliases.setdefault(int(user.user_id), label)
+                seen: set[int] = set()
+                rows = session.execute(
+                    text(
+                        "SELECT user_id, raw_json FROM messages "
+                        "WHERE raw_json IS NOT NULL ORDER BY id DESC"
+                    )
+                ).fetchall()
+                for user_id, raw_json in rows:
+                    uid = int(user_id)
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    try:
+                        payload = json.loads(raw_json or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                    sender = payload.get("sender") if isinstance(payload, dict) else {}
+                    sender = sender if isinstance(sender, dict) else {}
+                    card = str(sender.get("card") or "").strip()
+                    nickname = str(sender.get("nickname") or "").strip()
+                    label = card or nickname
+                    if label:
+                        aliases.setdefault(uid, label)
             self._member_aliases = aliases
             self._member_aliases_loaded_at = now
         return self._member_aliases
@@ -289,6 +314,10 @@ class PersonaManager:
         persona = self.active_persona(group_id)
         live = copy.deepcopy(persona)
         aliases = self._member_alias_map()
+        alias_to_user: dict[str, int] = {}
+        for user_id, label in aliases.items():
+            if label:
+                alias_to_user.setdefault(label, int(user_id))
         relationships = live.get("relationships")
         if not isinstance(relationships, list):
             return live
@@ -296,6 +325,10 @@ class PersonaManager:
             if not isinstance(rel, dict):
                 continue
             user_id = rel.get("member_user_id")
+            if user_id is None:
+                user_id = alias_to_user.get(str(rel.get("member") or ""))
+                if user_id is not None:
+                    rel["member_user_id"] = user_id
             if user_id is None and str(rel.get("member") or "").isdigit():
                 user_id = int(rel["member"])
             if user_id is None:
