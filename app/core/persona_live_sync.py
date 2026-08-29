@@ -17,7 +17,7 @@ from app.core.message_mentions import (
     message_mentions_bot,
 )
 from app.core.time_utils import ASIA_SHANGHAI
-from app.core.style_distill import parse_persona_yaml
+from app.core.style_distill import parse_fenced_json, parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -352,6 +352,15 @@ class PersonaLiveSyncService:
         )
         generated = client.generate_text([prompt])
         profile = parse_persona_yaml(generated)
+        image_comment_style = self._distill_image_comment_style(
+            user_id=user_id,
+            group_id=group_id,
+            examples=examples,
+            client=client,
+        )
+        if image_comment_style:
+            profile.setdefault("image_comment_style", {})
+            profile["image_comment_style"].update(image_comment_style)
         # Bind relationships by the current profile's member->id map so a
         # model that drops member_user_id cannot silently regress bindings.
         id_by_name: dict[str, int] = {}
@@ -377,6 +386,141 @@ class PersonaLiveSyncService:
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
+
+    def _image_comment_scenes(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        limit: int = 5,
+    ) -> list[dict]:
+        """Find 'member sent image(s) -> others react' scenes in the window."""
+
+        stamps = []
+        for example in examples:
+            timestamp = (
+                example.get("timestamp")
+                if isinstance(example, dict)
+                else getattr(example, "timestamp", None)
+            )
+            if timestamp is not None:
+                stamps.append(timestamp)
+        if not stamps:
+            return []
+        start = min(stamps)
+        end = max(stamps)
+        start_str = (
+            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if start.tzinfo is not None
+            else start
+        ).strftime("%Y-%m-%d %H:%M:%S.%f")
+        end_str = (
+            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if end.tzinfo is not None
+            else end
+        ).strftime("%Y-%m-%d %H:%M:%S.%f")
+        with session_scope(self.engine) as session:
+            rows = session.execute(
+                text(
+                    "SELECT id, user_id, timestamp, plain_text, raw_json FROM messages "
+                    "WHERE group_id = :group_id AND timestamp BETWEEN :start AND :end "
+                    "ORDER BY id"
+                ),
+                {"group_id": int(group_id), "start": start_str, "end": end_str},
+            ).mappings().all()
+        scenes: list[dict] = []
+        for index, row in enumerate(rows):
+            if int(row.get("user_id") or 0) != user_id:
+                continue
+            urls = _extract_image_urls(row.get("raw_json"))
+            if not urls:
+                continue
+            reactions = [
+                item
+                for item in rows[index + 1 : index + 4]
+                if str(item.get("plain_text") or "").strip()
+            ]
+            if not reactions:
+                continue
+            scenes.append(
+                {
+                    "image_url": urls[0],
+                    "image_time": str(row.get("timestamp") or "")[:16],
+                    "reactions": [
+                        f"{_speaker_label(item.get('raw_json'))}: "
+                        f"{str(item.get('plain_text') or '').strip()}"
+                        for item in reactions[:3]
+                    ],
+                }
+            )
+            if len(scenes) >= int(limit):
+                break
+        return scenes
+
+    def _distill_image_comment_style(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        client,
+    ) -> dict:
+        """Second LLM round: look at the member's sent images and the group's
+        reactions, then distill how the member comments on / shares images."""
+
+        from app.core.message_content import ImageAttachment
+
+        scenes = self._image_comment_scenes(
+            user_id=user_id,
+            group_id=group_id,
+            examples=examples,
+        )
+        if not scenes:
+            return {}
+        images = [
+            ImageAttachment(url=scene["image_url"], file_id=None)
+            for scene in scenes
+        ]
+        scene_text = "\n\n".join(
+            f"图 {index + 1}（{scene['image_time']} 他发的）：\n"
+            + "\n".join(f"- 群友反应: {line}" for line in scene["reactions"])
+            for index, scene in enumerate(scenes)
+        )
+        prompt = (
+            "你是人设蒸馏专家。下面是群成员发的几张图片，以及他发图后群里紧接着的反应。\n"
+            "请提炼他分享图片/点评图片的风格：他通常发什么类型的内容、发图时会配什么话、"
+            "别人发图后他如何点评（用词、语气、梗）。\n"
+            f"场景信息：\n{scene_text}\n"
+            "只输出一个 ```json 代码块："
+            '{"image_comment_style": "他分享/点评图片的习惯（2-4句）", '
+            '"image_habits": ["3-8条具体习惯，带真实原话"]}'
+        )
+        try:
+            generated = client.generate_text(
+                [prompt],
+                images=images,
+            )
+            payload = parse_fenced_json(generated)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "persona_image_comment_distill_failed user_id=%s group_id=%s",
+                user_id,
+                group_id,
+            )
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            "image_comment_style": str(
+                payload.get("image_comment_style") or ""
+            ).strip(),
+            "image_habits": [
+                str(item).strip()
+                for item in (payload.get("image_habits") or [])
+                if str(item).strip()
+            ],
+        }
 
     def _image_context_block(
         self,
@@ -412,8 +556,8 @@ class PersonaLiveSyncService:
             if end.tzinfo is not None
             else end
         )
-        start_str = str(start_local)[:19]
-        end_str = str(end_local)[:19]
+        start_str = start_local.strftime("%Y-%m-%d %H:%M:%S.%f")
+        end_str = end_local.strftime("%Y-%m-%d %H:%M:%S.%f")
         with session_scope(self.engine) as session:
             image_rows = session.execute(
                 text(

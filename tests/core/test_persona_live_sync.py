@@ -477,6 +477,92 @@ def test_image_context_block_includes_urls_and_nearby_lines(sqlite_engine) -> No
     assert "后文「路人甲: 好看」" in block
 
 
+def test_image_comment_scenes_detect_image_then_reactions(sqlite_engine) -> None:
+    from datetime import timedelta
+
+    from app.storage.repositories import MessageRepository
+
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    base = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001, group_name="test", enabled=True, speak_enabled=True
+        )
+        UserRepository(session).upsert_user(
+            user_id=111, nickname="路人甲", group_card=""
+        )
+        UserRepository(session).upsert_user(
+            user_id=222, nickname="测试君", group_card=""
+        )
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="img-2",
+            group_id=10001,
+            user_id=222,
+            timestamp=base,
+            plain_text="",
+            raw_json={
+                "sender": {"nickname": "测试君", "card": ""},
+                "message": [{"type": "image", "data": {"url": "http://img/y.png"}}],
+            },
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="react-1",
+            group_id=10001,
+            user_id=111,
+            timestamp=base + timedelta(seconds=10),
+            plain_text="这图真不错",
+            raw_json={"sender": {"nickname": "路人甲", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.commit()
+    scenes = service._image_comment_scenes(
+        user_id=222,
+        group_id=10001,
+        examples=[
+            {
+                "msg_id": "img-2",
+                "text": "",
+                "timestamp": base,
+            },
+            {
+                "msg_id": "react-1",
+                "text": "这图真不错",
+                "timestamp": base + timedelta(seconds=10),
+            }
+        ],
+    )
+    assert len(scenes) == 1
+    assert scenes[0]["image_url"] == "http://img/y.png"
+    assert any("这图真不错" in line for line in scenes[0]["reactions"])
+
+
 class _fake_settings:
     from pathlib import Path
 
