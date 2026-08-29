@@ -402,17 +402,25 @@ class PersonaLiveSyncService:
                 stamps.append(timestamp)
         if not stamps:
             return "", []
+        from datetime import timedelta
+
         start = min(stamps)
         end = max(stamps)
         start_str = (
-            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if start.tzinfo is not None
-            else start
+            (
+                start.astimezone(ASIA_SHANGHAI)
+                if start.tzinfo is not None
+                else start
+            )
+            - timedelta(minutes=30)
         ).strftime("%Y-%m-%d %H:%M:%S.%f")
         end_str = (
-            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
-            if end.tzinfo is not None
-            else end
+            (
+                end.astimezone(ASIA_SHANGHAI)
+                if end.tzinfo is not None
+                else end
+            )
+            + timedelta(minutes=15)
         ).strftime("%Y-%m-%d %H:%M:%S.%f")
         with session_scope(self.engine) as session:
             rows = session.execute(
