@@ -2389,6 +2389,7 @@ class InboundRouter:
                             user_id=event.user_id,
                             plain_text=event.plain_text,
                             users_by_id=users_by_id,
+                            group_id=event.group_id,
                         ),
                         recent_messages=recent_lines,
                         proactive_turn=not addressed_turn,
@@ -2528,6 +2529,7 @@ class InboundRouter:
                     user_id=event.user_id,
                     plain_text=prompt_target_text,
                     users_by_id=users_by_id,
+                    group_id=event.group_id,
                 ),
                 packed_memory_context=packed_memory_context,
             )
@@ -2593,6 +2595,7 @@ class InboundRouter:
                             user_id=event.user_id,
                             plain_text=prompt_target_text,
                             users_by_id=users_by_id,
+                            group_id=event.group_id,
                         ),
                         packed_memory_context=packed_memory_context,
                     )
@@ -2625,6 +2628,7 @@ class InboundRouter:
                                 user_id=event.user_id,
                                 plain_text=prompt_target_text,
                                 users_by_id=users_by_id,
+                                group_id=event.group_id,
                             ),
                             packed_memory_context=packed_memory_context,
                         )
