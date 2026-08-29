@@ -343,7 +343,7 @@ class PersonaLiveSyncService:
             responses_model=self.settings.llm_model,
             max_output_tokens=16000,
             timeout_seconds=180.0,
-            reasoning_effort=self.settings.llm_reasoning_effort,
+            reasoning_effort="low",
         )
         generated = client.generate_text(
             [prompt],
