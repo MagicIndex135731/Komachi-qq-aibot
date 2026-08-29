@@ -902,6 +902,10 @@ class InboundRouter:
             "\n允许并自然使用 TA 常用的粗口和网络梗（如 woc、有点恶心、屎、几把 等），"
             "不要因为礼貌而把它们翻译成正式表达；宁可短到只剩两三个字，也不要写成长句。"
         )
+        text += (
+            "\n硬性要求：普通回复不超过 12 个汉字，超过就拆成多条短消息用 | 分隔；"
+            "评价别人时只给一句短评（几个字到十几个字），不要分析、总结或列举。"
+        )
         burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
         if isinstance(burst, dict) and burst.get("enabled"):
             separator = str(burst.get("separator") or "|")
