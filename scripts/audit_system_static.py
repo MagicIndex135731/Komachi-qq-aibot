@@ -43,9 +43,9 @@ def main() -> int:
         label = str(card or "").strip() or str(nickname or "").strip()
         if label:
             member_labels[int(user_id)] = label
-    for user_id, raw_json in con.execute(
-        "SELECT user_id, raw_json FROM messages WHERE raw_json IS NOT NULL "
-        "ORDER BY id DESC"
+    for user_id, msg_group_id, raw_json in con.execute(
+        "SELECT user_id, group_id, raw_json FROM messages "
+        "WHERE raw_json IS NOT NULL ORDER BY id DESC"
     ).fetchall():
         uid = int(user_id)
         if uid in seen_users:
@@ -67,7 +67,7 @@ def main() -> int:
                 user_id=uid,
                 nickname=str(sender.get("nickname") or "").strip(),
                 group_card=str(sender.get("card") or "").strip(),
-                in_scope=True,
+                in_scope=int(msg_group_id or 0) == int(args.group_id),
             )
         )
     member_count = con.execute(
@@ -152,6 +152,7 @@ def main() -> int:
             recent_messages=(),
             group_members=members,
             requester_id=999999,
+            excluded_member_ids={int(args.bot_qq)},
         )
         if kind == "self_hint" and not result.subject_ids:
             note("ERROR", "binding", f"{query} 未绑定主体", result=result.subject_ids)
