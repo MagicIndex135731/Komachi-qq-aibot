@@ -69,42 +69,50 @@ def sync_group_message_archives_from_db(
     if not allowed_group_ids:
         return {}
 
-    grouped_records: dict[int, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     counts: dict[int, int] = defaultdict(int)
 
     with session_scope(engine) as session:
-        stmt = (
-            select(Message, User)
-            .join(User, Message.user_id == User.user_id)
-            .where(Message.group_id.in_(allowed_group_ids))
-            .order_by(Message.group_id.asc(), Message.timestamp.asc(), Message.id.asc())
-        )
-        rows = session.execute(stmt).all()
-
-    for message, user in rows:
-        if message.group_id is None or _is_reserved_outbound(message):
-            continue
-        record = _record_from_db_message(message=message, user=user)
-        archive_day = record["timestamp"][:10]
-        grouped_records[int(message.group_id)][archive_day].append(record)
-        counts[int(message.group_id)] += 1
-
-    for group_id in allowed_group_ids:
-        group_dir = history_dir / f"group-{group_id}"
-        if group_dir.exists():
-            for existing in group_dir.glob("*.jsonl"):
-                existing.unlink()
-        else:
+        for group_id in allowed_group_ids:
+            group_dir = history_dir / f"group-{group_id}"
             group_dir.mkdir(parents=True, exist_ok=True)
-
-    for group_id, day_records in grouped_records.items():
-        group_dir = history_dir / f"group-{group_id}"
-        for archive_day, records in day_records.items():
-            archive_path = group_dir / f"{archive_day}.jsonl"
-            deduped_records = _dedupe_records(records)
-            with archive_path.open("w", encoding="utf-8") as handle:
-                for record in deduped_records:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            watermark_path = group_dir / ".watermark"
+            watermark = 0
+            if watermark_path.exists():
+                try:
+                    watermark = int(watermark_path.read_text(encoding="utf-8").strip() or 0)
+                except (ValueError, OSError):
+                    watermark = 0
+            stmt = (
+                select(Message, User)
+                .join(User, Message.user_id == User.user_id)
+                .where(
+                    Message.group_id == int(group_id),
+                    Message.id > watermark,
+                )
+                .order_by(Message.timestamp.asc(), Message.id.asc())
+            )
+            rows = session.execute(stmt).all()
+            if not rows:
+                continue
+            if watermark == 0:
+                # First sync (or archive reset): rebuild the whole day files.
+                for existing in group_dir.glob("*.jsonl"):
+                    existing.unlink()
+            day_records: dict[str, list[dict]] = defaultdict(list)
+            for message, user in rows:
+                if message.group_id is None or _is_reserved_outbound(message):
+                    continue
+                record = _record_from_db_message(message=message, user=user)
+                day_records[record["timestamp"][:10]].append(record)
+            for archive_day, records in day_records.items():
+                archive_path = group_dir / f"{archive_day}.jsonl"
+                mode = "w" if watermark == 0 else "a"
+                with archive_path.open(mode, encoding="utf-8") as handle:
+                    for record in _dedupe_records(records):
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            last_id = max(int(message.id) for message, _ in rows)
+            watermark_path.write_text(str(last_id), encoding="utf-8")
+            counts[int(group_id)] = len(rows)
 
     return dict(counts)
 

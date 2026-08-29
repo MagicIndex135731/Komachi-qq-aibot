@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.core.message_archive import append_group_message_archive, sync_group_message_archives_from_db
 from app.storage.db import session_scope
+from app.storage.models import Message
 from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
 
 
@@ -205,3 +206,58 @@ def test_sync_group_message_archives_from_db_rebuilds_allowed_group_history_from
     assert first["group_card"] == "A-card"
     assert second["platform_msg_id"] == "bot-reply-m-1"
     assert second["direction"] == "outbound"
+
+
+def test_archive_sync_is_incremental_after_first_run(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001, group_name="test", enabled=True, speak_enabled=True
+        )
+        UserRepository(session).upsert_user(
+            user_id=111, nickname="路人甲", group_card=""
+        )
+        MessageRepository(session).add_group_message(
+            platform_msg_id="a1",
+            group_id=10001,
+            user_id=111,
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+            plain_text="第一条",
+            raw_json={"sender": {"nickname": "路人甲", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.commit()
+    sync_group_message_archives_from_db(
+        engine=sqlite_engine,
+        history_dir=tmp_path,
+        allowed_group_ids={10001},
+    )
+    day_file = tmp_path / "group-10001" / "2026-05-09.jsonl"
+    assert "第一条" in day_file.read_text(encoding="utf-8")
+
+    with session_scope(sqlite_engine) as session:
+        MessageRepository(session).add_group_message(
+            platform_msg_id="a2",
+            group_id=10001,
+            user_id=111,
+            timestamp=datetime(2026, 5, 9, 13, 0, tzinfo=UTC),
+            plain_text="第二条",
+            raw_json={"sender": {"nickname": "路人甲", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.commit()
+    sync_group_message_archives_from_db(
+        engine=sqlite_engine,
+        history_dir=tmp_path,
+        allowed_group_ids={10001},
+    )
+    content = day_file.read_text(encoding="utf-8")
+    assert "第一条" in content
+    assert "第二条" in content
+    assert content.count("第一条") == 1
