@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from app.core.message_mentions import (
-    bot_mention_names,
+    bot_text_mention_names,
     collect_bot_display_names,
     message_mentions_bot,
 )
@@ -46,18 +46,39 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    bot_ids = {int(args.bot_qq)}
+    for user_id, nickname, card in con.execute(
+        "SELECT user_id, nickname, group_card FROM users"
+    ):
+        label = str(card or "").strip() or str(nickname or "").strip()
+        if "小町" in label:
+            bot_ids.add(int(user_id))
+    ids_param = sorted(bot_ids)
+    placeholders = ",".join("?" for _ in ids_param)
     bot_display = collect_bot_display_names(
         row[0]
         for row in con.execute(
-            "SELECT raw_json FROM messages WHERE user_id=? AND raw_json IS NOT NULL "
+            f"SELECT raw_json FROM messages WHERE user_id IN ({placeholders}) AND raw_json IS NOT NULL "
             "ORDER BY id DESC LIMIT 3000",
-            (args.bot_qq,),
+            ids_param,
         )
     )
-    bot_names = bot_mention_names(
-        bot_qq=args.bot_qq,
+    member_display: set[str] = set()
+    for card, nickname in con.execute(
+        f"SELECT DISTINCT json_extract(raw_json, '$.sender.card'), "
+        f"json_extract(raw_json, '$.sender.nickname') FROM messages "
+        f"WHERE raw_json IS NOT NULL AND user_id NOT IN ({placeholders})",
+        ids_param,
+    ):
+        for value in (card, nickname):
+            cleaned = str(value or "").strip()
+            if cleaned:
+                member_display.add(cleaned)
+    bot_text_names = bot_text_mention_names(
+        bot_qqs=bot_ids,
         default_name=args.bot_name,
-        display_names=bot_display,
+        bot_display_names=bot_display,
+        member_display_names=member_display,
     )
     rows = con.execute(
         "SELECT platform_msg_id, timestamp, user_id, plain_text, msg_type, "
@@ -83,8 +104,8 @@ def main() -> int:
                 int(row["user_id"]) == args.user_id
                 and message_mentions_bot(
                     row["raw_json"],
-                    bot_qq=args.bot_qq,
-                    bot_names=bot_names,
+                    bot_qqs=bot_ids,
+                    bot_text_names=bot_text_names,
                 )
             ):
                 # Human-to-AI turns must not enter the style corpus.

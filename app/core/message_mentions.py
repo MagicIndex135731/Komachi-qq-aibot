@@ -9,15 +9,17 @@ from typing import Any, Iterable
 def message_mentions_bot(
     raw_json: dict[str, Any] | str | None,
     *,
-    bot_qq: int,
-    bot_names: Iterable[str] = (),
+    bot_qqs: Iterable[int],
+    bot_text_names: Iterable[str] = (),
 ) -> bool:
-    """True when the message @-mentions or names the bot.
+    """True when the message @-mentions or names one of the bot accounts.
 
     Messages addressed to the bot are human-to-AI turns: their wording and
     content are shaped by the fact that a bot is being addressed, so they
     must never be used as style samples, distillation corpus, or fact
-    evidence for the member.
+    evidence for the member. The QQ at-type match is exact; the text
+    ``@name`` match only fires for names that are bot-exclusive (no real
+    member shares the name), so ``@阿渣`` aimed at the real member is kept.
     """
 
     if isinstance(raw_json, str):
@@ -28,13 +30,13 @@ def message_mentions_bot(
     if not isinstance(raw_json, dict):
         return False
     message = raw_json.get("message", raw_json.get("raw_message", ""))
-    at_target = str(bot_qq)
+    at_targets = {str(int(qq)) for qq in bot_qqs}
     if isinstance(message, list):
         for item in message:
             if (
                 isinstance(item, dict)
                 and item.get("type") == "at"
-                and str((item.get("data") or {}).get("qq", "")) == at_target
+                and str((item.get("data") or {}).get("qq", "")) in at_targets
             ):
                 return True
         text = "".join(
@@ -45,11 +47,13 @@ def message_mentions_bot(
     else:
         text = str(message or "")
     normalized = str(text or "").lstrip()
-    if normalized.startswith(f"@{at_target}"):
+    if any(normalized.startswith(f"@{at_target}") for at_target in at_targets):
         return True
-    if f"[CQ:at,qq={at_target}]" in normalized:
+    if any(f"[CQ:at,qq={at_target}]" in normalized for at_target in at_targets):
         return True
-    for bot_label in {str(name).strip() for name in bot_names if str(name).strip()}:
+    for bot_label in {
+        str(name).strip() for name in bot_text_names if str(name).strip()
+    }:
         if bot_label and normalized.startswith(f"@{bot_label}"):
             return True
     return False
@@ -81,20 +85,29 @@ def collect_bot_display_names(
     return names
 
 
-def bot_mention_names(
+def bot_text_mention_names(
     *,
-    bot_qq: int,
+    bot_qqs: Iterable[int],
     default_name: str = "",
-    display_names: Iterable[str] = (),
+    bot_display_names: Iterable[str] = (),
+    member_display_names: Iterable[str] = (),
 ) -> set[str]:
-    """Full mention-name set: QQ, default persona name, historical cards,
-    plus the short form when any known name contains 小町."""
+    """Text mention names that unambiguously address the bot.
 
-    names: set[str] = {str(bot_qq)}
-    for value in (*display_names, default_name):
+    Every bot card (比企谷小町/阿渣/逆蝶蝶) may collide with a real member's
+    name; only names absent from the real-member set are safe to filter on
+    text form. The short form 小町 is added only when no real member uses it.
+    """
+
+    member_names = {str(name).strip() for name in member_display_names if str(name).strip()}
+    names: set[str] = set()
+    for value in (*bot_display_names, default_name):
         cleaned = str(value or "").strip()
-        if cleaned:
+        if cleaned and cleaned not in member_names:
             names.add(cleaned)
-    if any("小町" in name for name in names):
+    if (
+        any("小町" in name for name in (*bot_display_names, default_name))
+        and "小町" not in member_names
+    ):
         names.add("小町")
     return names

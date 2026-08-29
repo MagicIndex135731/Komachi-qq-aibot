@@ -51,8 +51,8 @@ def test_build_examples_keeps_context_and_reply_target() -> None:
     examples = _build_examples(
         rows,
         user_id=222,
-        bot_qq=900001,
-        bot_names={"测试小町"},
+        bot_qqs={900001},
+        bot_text_names={"测试小町"},
     )
 
     assert len(examples) == 1

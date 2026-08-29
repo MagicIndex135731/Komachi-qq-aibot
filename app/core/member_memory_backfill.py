@@ -12,7 +12,7 @@ import yaml
 from zoneinfo import ZoneInfo
 
 from app.core.message_mentions import (
-    bot_mention_names,
+    bot_text_mention_names,
     collect_bot_display_names,
     message_mentions_bot,
 )
@@ -265,11 +265,8 @@ class MemberFactRefreshService:
         self.group_ids = set(int(value) for value in group_ids)
         self.bot_qq = int(bot_qq)
         self.bot_name = str(bot_name or "").strip()
-        self.bot_names = bot_mention_names(
-            bot_qq=int(bot_qq),
-            default_name=self.bot_name,
-            display_names=self._historical_bot_names(),
-        )
+        self.bot_qqs: set[int] = {int(bot_qq)}
+        self.bot_text_names: set[str] = set()
         self.member_allowlist = (
             set(int(value) for value in member_allowlist)
             if member_allowlist is not None
@@ -331,11 +328,7 @@ class MemberFactRefreshService:
                 self._refresh_member(group_id, user_id)
 
     def _refresh_member(self, group_id: int, user_id: int) -> None:
-        self.bot_names = bot_mention_names(
-            bot_qq=int(self.bot_qq),
-            default_name=self.bot_name,
-            display_names=self._historical_bot_names(),
-        )
+        self._refresh_bot_names()
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
@@ -351,8 +344,8 @@ class MemberFactRefreshService:
                 for row in all_new_lines
                 if not message_mentions_bot(
                     getattr(row, "raw_json", None),
-                    bot_qq=self.bot_qq,
-                    bot_names=self.bot_names,
+                    bot_qqs=self.bot_qqs,
+                    bot_text_names=self.bot_text_names,
                 )
             ]
             last_id = watermark
@@ -391,18 +384,57 @@ class MemberFactRefreshService:
             imported,
         )
 
-    def _historical_bot_names(self) -> set[str]:
-        from sqlalchemy import text
+    def _refresh_bot_names(self) -> None:
+        from sqlalchemy import bindparam, text
 
         with session_scope(self.engine) as session:
-            rows = session.execute(
+            user_rows = session.execute(
+                text("SELECT user_id, nickname, group_card FROM users")
+            ).fetchall()
+            bot_ids = {int(self.bot_qq)}
+            for user_id, nickname, card in user_rows:
+                label = str(card or "").strip() or str(nickname or "").strip()
+                if "小町" in label:
+                    bot_ids.add(int(user_id))
+            ids_param = list(bot_ids)
+            bot_rows = session.execute(
                 text(
                     "SELECT raw_json FROM messages WHERE user_id = :bot_qq "
                     "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
                 ),
-                {"bot_qq": int(self.bot_qq)},
+                {"bot_qq": ids_param[0]},
             ).fetchall()
-        return collect_bot_display_names(row[0] for row in rows)
+            if len(ids_param) > 1:
+                extra_rows = session.execute(
+                    text(
+                        "SELECT raw_json FROM messages WHERE user_id IN :bot_ids "
+                        "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
+                    ).bindparams(bindparam("bot_ids", expanding=True)),
+                    {"bot_ids": ids_param[1:]},
+                ).fetchall()
+                bot_rows = [*bot_rows, *extra_rows]
+            member_rows = session.execute(
+                text(
+                    "SELECT DISTINCT json_extract(raw_json, '$.sender.card') AS card, "
+                    "json_extract(raw_json, '$.sender.nickname') AS nickname "
+                    "FROM messages WHERE raw_json IS NOT NULL AND user_id NOT IN :bot_ids"
+                ).bindparams(bindparam("bot_ids", expanding=True)),
+                {"bot_ids": ids_param},
+            ).fetchall()
+        bot_display = collect_bot_display_names(row[0] for row in bot_rows)
+        member_display: set[str] = set()
+        for card, nickname in member_rows:
+            for value in (card, nickname):
+                cleaned = str(value or "").strip()
+                if cleaned:
+                    member_display.add(cleaned)
+        self.bot_qqs = bot_ids
+        self.bot_text_names = bot_text_mention_names(
+            bot_qqs=bot_ids,
+            default_name=self.bot_name,
+            bot_display_names=bot_display,
+            member_display_names=member_display,
+        )
 
 
 def _active_members(engine, *, group_id: int, bot_qq: int, min_messages: int) -> list[int]:

@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from app.core.persona_switch import DEFAULT_PERSONA_KEY
 from app.core.message_mentions import (
-    bot_mention_names,
+    bot_text_mention_names,
     collect_bot_display_names,
     message_mentions_bot,
 )
@@ -66,11 +66,8 @@ class PersonaLiveSyncService:
             (self.personas.get(DEFAULT_PERSONA_KEY) or {}).get("name", "")
         ).strip()
         self.default_name = default_name
-        self.bot_names = bot_mention_names(
-            bot_qq=int(settings.bot_qq),
-            default_name=self.default_name,
-            display_names=self._historical_bot_names(),
-        )
+        self.bot_qqs: set[int] = {int(settings.bot_qq)}
+        self.bot_text_names: set[str] = set()
         self.interval_seconds = max(30.0, float(interval_seconds))
         self.refresh_threshold = max(1, int(refresh_threshold))
         self.refresh_cooldown_seconds = max(3600.0, float(refresh_cooldown_seconds))
@@ -86,11 +83,7 @@ class PersonaLiveSyncService:
             await asyncio.sleep(self.interval_seconds)
 
     def _tick(self) -> None:
-        self.bot_names = bot_mention_names(
-            bot_qq=int(self.settings.bot_qq),
-            default_name=self.default_name,
-            display_names=self._historical_bot_names(),
-        )
+        self._refresh_bot_names()
         for persona_key, persona in self.personas.items():
             if persona_key == DEFAULT_PERSONA_KEY:
                 continue
@@ -130,8 +123,8 @@ class PersonaLiveSyncService:
             examples = _build_examples(
                 rows,
                 user_id=user_id,
-                bot_qq=int(self.settings.bot_qq),
-                bot_names=self.bot_names,
+                bot_qqs=self.bot_qqs,
+                bot_text_names=self.bot_text_names,
             )
             inserted = PersonaStyleExampleRepository(session).insert_many(examples)
             trimmed = PersonaStyleExampleRepository(session).trim_to(user_id=user_id, keep=600)
@@ -154,16 +147,57 @@ class PersonaLiveSyncService:
             self.manager.load_style_banks()
         return inserted
 
-    def _historical_bot_names(self) -> set[str]:
+    def _refresh_bot_names(self) -> None:
+        from sqlalchemy import bindparam
+
         with session_scope(self.engine) as session:
-            rows = session.execute(
+            user_rows = session.execute(
+                text("SELECT user_id, nickname, group_card FROM users")
+            ).fetchall()
+            bot_ids = {int(self.settings.bot_qq)}
+            for user_id, nickname, card in user_rows:
+                label = str(card or "").strip() or str(nickname or "").strip()
+                if "小町" in label:
+                    bot_ids.add(int(user_id))
+            ids_param = list(bot_ids)
+            bot_rows = session.execute(
                 text(
                     "SELECT raw_json FROM messages WHERE user_id = :bot_qq "
                     "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
                 ),
-                {"bot_qq": int(self.settings.bot_qq)},
+                {"bot_qq": ids_param[0]},
             ).fetchall()
-        return collect_bot_display_names(row[0] for row in rows)
+            if len(ids_param) > 1:
+                extra_rows = session.execute(
+                    text(
+                        "SELECT raw_json FROM messages WHERE user_id IN :bot_ids "
+                        "AND raw_json IS NOT NULL ORDER BY id DESC LIMIT 3000"
+                    ).bindparams(bindparam("bot_ids", expanding=True)),
+                    {"bot_ids": ids_param[1:]},
+                ).fetchall()
+                bot_rows = [*bot_rows, *extra_rows]
+            member_rows = session.execute(
+                text(
+                    "SELECT DISTINCT json_extract(raw_json, '$.sender.card') AS card, "
+                    "json_extract(raw_json, '$.sender.nickname') AS nickname "
+                    "FROM messages WHERE raw_json IS NOT NULL AND user_id NOT IN :bot_ids"
+                ).bindparams(bindparam("bot_ids", expanding=True)),
+                {"bot_ids": ids_param},
+            ).fetchall()
+        bot_display = collect_bot_display_names(row[0] for row in bot_rows)
+        member_display: set[str] = set()
+        for card, nickname in member_rows:
+            for value in (card, nickname):
+                cleaned = str(value or "").strip()
+                if cleaned:
+                    member_display.add(cleaned)
+        self.bot_qqs = bot_ids
+        self.bot_text_names = bot_text_mention_names(
+            bot_qqs=bot_ids,
+            default_name=self.default_name,
+            bot_display_names=bot_display,
+            member_display_names=member_display,
+        )
 
     def _maybe_refresh_profile(self, persona_key: str, user_id: int, group_id: int) -> None:
         now = datetime.now(UTC)
@@ -267,8 +301,8 @@ def _build_examples(
     rows: list,
     *,
     user_id: int,
-    bot_qq: int,
-    bot_names: set[str],
+    bot_qqs: set[int],
+    bot_text_names: set[str],
 ) -> list[dict]:
     new_rows = [dict(row) for row in rows]
     by_id = {str(row.get("platform_msg_id")): row for row in new_rows if row.get("plain_text")}
@@ -279,8 +313,8 @@ def _build_examples(
             continue
         if message_mentions_bot(
             row.get("raw_json"),
-            bot_qq=bot_qq,
-            bot_names=bot_names,
+            bot_qqs=bot_qqs,
+            bot_text_names=bot_text_names,
         ):
             # Human-to-AI turns must never become style samples.
             continue
