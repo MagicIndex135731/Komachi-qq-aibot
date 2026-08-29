@@ -588,6 +588,101 @@ def test_window_transcript_skips_bot_lines(sqlite_engine) -> None:
     assert "img-2" in window_ids
 
 
+def test_image_scenes_prefer_member_sent_and_commented(sqlite_engine) -> None:
+    from datetime import timedelta
+
+    from app.storage.repositories import MessageRepository
+
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    base = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001, group_name="test", enabled=True, speak_enabled=True
+        )
+        UserRepository(session).upsert_user(
+            user_id=111, nickname="路人甲", group_card=""
+        )
+        UserRepository(session).upsert_user(
+            user_id=222, nickname="测试君", group_card=""
+        )
+        messages = MessageRepository(session)
+        # 别人发图，测试君随后点评 -> 应选中（他点评的图）
+        messages.add_group_message(
+            platform_msg_id="other-img",
+            group_id=10001,
+            user_id=111,
+            timestamp=base,
+            plain_text="",
+            raw_json={
+                "sender": {"nickname": "路人甲", "card": ""},
+                "message": [{"type": "image", "data": {"url": "http://img/other.png"}}],
+            },
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        messages.add_group_message(
+            platform_msg_id="comment",
+            group_id=10001,
+            user_id=222,
+            timestamp=base + timedelta(seconds=5),
+            plain_text="这图不错",
+            raw_json={"sender": {"nickname": "测试君", "card": ""}},
+            msg_type="text",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        # 测试君自己发图 -> 应选中
+        messages.add_group_message(
+            platform_msg_id="own-img",
+            group_id=10001,
+            user_id=222,
+            timestamp=base + timedelta(seconds=10),
+            plain_text="",
+            raw_json={
+                "sender": {"nickname": "测试君", "card": ""},
+                "message": [{"type": "image", "data": {"url": "http://img/own.png"}}],
+            },
+            msg_type="image",
+            reply_to_msg_id=None,
+            mentioned_bot=False,
+        )
+        session.commit()
+    scenes = service._image_scenes_for_member(
+        user_id=222,
+        group_id=10001,
+        examples=[
+            {"msg_id": "other-img", "text": "", "timestamp": base},
+            {"msg_id": "comment", "text": "这图不错", "timestamp": base + timedelta(seconds=5)},
+            {"msg_id": "own-img", "text": "", "timestamp": base + timedelta(seconds=10)},
+        ],
+    )
+    urls = {scene["image"].url for scene in scenes}
+    assert "http://img/other.png" in urls
+    assert "http://img/own.png" in urls
+
+
 class _fake_settings:
     from pathlib import Path
 

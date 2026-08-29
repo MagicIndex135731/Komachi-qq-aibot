@@ -353,14 +353,15 @@ class PersonaLiveSyncService:
     ) -> Path:
         from app.providers.llm_client import LlmClient
 
-        transcript, images, window_image_ids = self._window_transcript_block(
+        transcript, _, window_image_ids = self._window_transcript_block(
             user_id=user_id,
             group_id=group_id,
             examples=examples,
         )
         prompt = (
             "你是人设维护助手。下面是群成员最近一段时间的真实对话记录"
-            "（按时间顺序 + 发言者，[图片] 表示对话中出现的图片，图片会作为视觉输入一并提供）。"
+            "（按时间顺序 + 发言者，[图片] 表示对话中出现的图片，"
+            "本阶段不提供图片视觉内容，只按文本蒸馏）。"
             "以及当前的人格画像 YAML。请根据新语料增量更新画像：修正过时特质、补充新出现的口头禅/"
             "话题/关系与称呼习惯，保持 v2 字段结构（name/identity/core_traits/speaking_style/"
             "self_concept/speech_habits/style_avoid/relationships/address_rules），"
@@ -369,8 +370,6 @@ class PersonaLiveSyncService:
             "并维护 facts（关于他的持久事实列表，每项含 category/fact/evidence；新增语料里的具体事实要补进去），"
             "relationships 每项必须含 member_user_id（群成员QQ号）与 member（该成员当前昵称或群名片），不要把QQ号当作 member 输出，"
             "不要删除仍成立的条目，不要新增语料里没有的事实。\n"
-            "图片只是对话内容的一部分：请把图中反映的信息（他聊的话题、内容、兴趣）融进画像；"
-            "不要输出'他喜欢发图/分享图片'这类关于发图行为的元描述。"
             "只输出一个 ```yaml 代码块。\n"
             f"当前画像：\n{yaml.safe_dump(current_profile, allow_unicode=True, sort_keys=False)}\n"
             f"最新对话记录：\n{transcript}"
@@ -386,11 +385,35 @@ class PersonaLiveSyncService:
             timeout_seconds=180.0,
             reasoning_effort="low",
         )
-        generated = client.generate_text(
-            [prompt],
-            images=images or None,
-        )
+        generated = client.generate_text([prompt])
         profile = parse_persona_yaml(generated)
+        supplement = self._distill_image_supplement(
+            user_id=user_id,
+            group_id=group_id,
+            examples=examples,
+            client=client,
+        )
+        if supplement:
+            existing_habits = {
+                str(item).strip()
+                for item in (profile.get("speech_habits") or [])
+                if str(item).strip()
+            }
+            existing_traits = {
+                str(item).strip()
+                for item in (profile.get("core_traits") or [])
+                if str(item).strip()
+            }
+            for habit in supplement.get("habits") or []:
+                cleaned = str(habit).strip()
+                if cleaned and cleaned not in existing_habits:
+                    profile.setdefault("speech_habits", []).append(cleaned)
+                    existing_habits.add(cleaned)
+            for trait in supplement.get("traits") or []:
+                cleaned = str(trait).strip()
+                if cleaned and cleaned not in existing_traits:
+                    profile.setdefault("core_traits", []).append(cleaned)
+                    existing_traits.add(cleaned)
         # Bind relationships by the current profile's member->id map so a
         # model that drops member_user_id cannot silently regress bindings.
         id_by_name: dict[str, int] = {}
@@ -417,6 +440,161 @@ class PersonaLiveSyncService:
         if hasattr(self.manager, "personas"):
             self.manager.personas[persona_key] = merged
         return live_path
+
+    def _image_scenes_for_member(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Images directly tied to the member: ones he sent, plus images he
+        commented on (an image with his text within +-2 messages)."""
+
+        from app.core.message_content import ImageAttachment
+
+        stamps = []
+        for example in examples:
+            timestamp = (
+                example.get("timestamp")
+                if isinstance(example, dict)
+                else getattr(example, "timestamp", None)
+            )
+            if timestamp is not None:
+                stamps.append(timestamp)
+        if not stamps:
+            return []
+        start = min(stamps)
+        end = max(stamps)
+        start_str = (
+            start.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if start.tzinfo is not None
+            else start
+        ).strftime("%Y-%m-%d %H:%M:%S.%f")
+        end_str = (
+            end.astimezone(ASIA_SHANGHAI).replace(tzinfo=None)
+            if end.tzinfo is not None
+            else end
+        ).strftime("%Y-%m-%d %H:%M:%S.%f")
+        with session_scope(self.engine) as session:
+            rows = session.execute(
+                text(
+                    "SELECT id, platform_msg_id, user_id, timestamp, plain_text, "
+                    "msg_type, raw_json FROM messages "
+                    "WHERE group_id = :group_id AND timestamp BETWEEN :start AND :end "
+                    "ORDER BY id"
+                ),
+                {"group_id": int(group_id), "start": start_str, "end": end_str},
+            ).mappings().all()
+        scenes: list[dict] = []
+        seen_urls: set[str] = set()
+        for index, row in enumerate(rows):
+            if str(row.get("msg_type") or "") != "image":
+                continue
+            row_user_id = int(row.get("user_id") or 0)
+            nearby = rows[max(0, index - 2) : index + 3]
+            member_nearby = any(
+                int(item.get("user_id") or 0) == int(user_id)
+                and str(item.get("plain_text") or "").strip()
+                for item in nearby
+            )
+            if row_user_id != int(user_id) and not member_nearby:
+                continue
+            attachments = _extract_image_attachments(row.get("raw_json"))
+            if not attachments:
+                continue
+            url, local_path = attachments[0]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            reactions = [
+                f"{_speaker_label(item.get('raw_json'))}: "
+                f"{str(item.get('plain_text') or '').strip()}"
+                for item in nearby
+                if str(item.get("plain_text") or "").strip()
+            ]
+            scenes.append(
+                {
+                    "image": ImageAttachment(
+                        url=url,
+                        local_path=local_path,
+                        source_message_id=str(
+                            row.get("platform_msg_id") or ""
+                        )
+                        or None,
+                    ),
+                    "time": str(row.get("timestamp") or "")[:16],
+                    "sent_by_member": row_user_id == int(user_id),
+                    "context": reactions[:5],
+                }
+            )
+            if len(scenes) >= int(limit):
+                break
+        return scenes
+
+    def _distill_image_supplement(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        client,
+    ) -> dict:
+        """Second round: show a few images tied to the member and fold what he
+        cares about into normal speech habits / core traits (no separate
+        image field, no 'he likes posting images' meta descriptions)."""
+
+        scenes = self._image_scenes_for_member(
+            user_id=user_id,
+            group_id=group_id,
+            examples=examples,
+        )
+        if not scenes:
+            return {}
+        scene_text = "\n\n".join(
+            f"图 {index + 1}（{scene['time']}"
+            f"{'，他发的' if scene['sent_by_member'] else '，他在现场'}）：\n"
+            + "\n".join(f"- {line}" for line in scene["context"])
+            for index, scene in enumerate(scenes)
+        )
+        prompt = (
+            "你是人设蒸馏专家。下面是群成员参与对话时出现的几张图片"
+            "（他发的，或他在场讨论的），以及图片前后的聊天内容。\n"
+            "图片是这段对话的一部分。请只输出：从这些内容里能看出的"
+            "他的说话习惯补充与性格特质补充（他关注什么内容、如何评价这些内容、"
+            "用什么词），并融入普通说话习惯，不要提'发图/分享图片'这个行为。\n"
+            f"场景：\n{scene_text}\n"
+            '只输出一个 ```json 代码块：{"habits": ["3-6条具体习惯，带原话"], '
+            '"traits": ["1-3条内容/性格特质"]}'
+        )
+        try:
+            generated = client.generate_text(
+                [prompt],
+                images=[scene["image"] for scene in scenes],
+            )
+            payload = parse_fenced_json(generated)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "persona_image_supplement_failed user_id=%s group_id=%s",
+                user_id,
+                group_id,
+            )
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            "habits": [
+                str(item).strip()
+                for item in (payload.get("habits") or [])
+                if str(item).strip()
+            ],
+            "traits": [
+                str(item).strip()
+                for item in (payload.get("traits") or [])
+                if str(item).strip()
+            ],
+        }
 
     def _cleanup_refresh_images(
         self,
