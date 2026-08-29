@@ -230,7 +230,7 @@ def test_router_formats_clean_bot_label_for_prompt_lines(sqlite_engine) -> None:
         group_id=10001,
     )
 
-    assert line == "测试君: 来了"
+    assert line == "测试君（Mira扮演）: 来了"
 
 
 def test_router_appends_relevant_examples_while_impersonating(sqlite_engine) -> None:

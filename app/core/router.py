@@ -1020,10 +1020,11 @@ class InboundRouter:
 
         In impersonation mode the injected context must not teach the model
         any previous bot persona: drop lines mentioning 小町/AI/主人 markers,
-        and scrub honorifics from the bot's own historical lines.
+        and drop the bot's own historical lines entirely (they are AI output,
+        not the member's real voice, and may mimic the member imperfectly).
         """
 
-        bot_labels = self._impersonation_bot_labels(group_id)
+        default_bot_name = str(self.runtime.persona.get("name", "") or "").strip()
         sanitized: list[str] = []
         for line in lines:
             text = str(line)
@@ -1031,14 +1032,12 @@ class InboundRouter:
                 continue
             head, separator, tail = text.partition(":")
             is_bot_line = separator and (
-                head.strip() in bot_labels or "（小町扮演）" in head
+                "（小町扮演）" in head
+                or (default_bot_name and head.strip() == default_bot_name)
             )
             if is_bot_line:
-                text = (
-                    f"{head}:"
-                    f"{scrub_banned_address_terms(tail, BANNED_ADDRESS_TERMS)}"
-                )
-            sanitized.append(text)
+                continue
+            sanitized.append(scrub_banned_address_terms(text, BANNED_ADDRESS_TERMS))
         return sanitized
 
     def _sanitize_packed_context(self, packed, *, group_id: int):
@@ -1112,7 +1111,7 @@ class InboundRouter:
             and group_id is not None
             and self.persona_manager is not None
         ):
-            label = self.persona_manager.active_name(group_id)
+            label = self.persona_manager.bot_transcript_label(group_id)
         else:
             label = self._member_label_for_user(
                 user_id=user_id, users_by_id=users_by_id, group_id=group_id
