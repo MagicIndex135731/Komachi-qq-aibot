@@ -58,6 +58,28 @@ def test_build_style_samples_filters_target_and_keeps_context() -> None:
     assert [item["text"] for item in sample["context_after"]] == ["好的", "无关"]
 
 
+def test_build_style_samples_covers_whole_history() -> None:
+    records = [
+        {
+            "user_id": 7,
+            "text": f"消息{i}",
+            "platform_msg_id": f"m{i}",
+            "timestamp": f"2026-08-{1 + i // 10:02d}",
+            "reply_to_msg_id": None,
+        }
+        for i in range(200)
+    ]
+    samples = build_style_samples(
+        records=records,
+        user_id=7,
+        max_samples=20,
+    )
+    assert len(samples) == 20
+    assert samples[0]["timestamp"] == "2026-08-01"
+    assert samples[-1]["timestamp"] == "2026-08-20"
+    assert len({sample["timestamp"] for sample in samples}) >= 15
+
+
 def test_speaker_label_prefers_group_card() -> None:
     assert speaker_label({"nickname": "昵称", "group_card": "名片", "user_id": 1}) == "名片"
     assert speaker_label({"nickname": "昵称", "group_card": "", "user_id": 1}) == "昵称"

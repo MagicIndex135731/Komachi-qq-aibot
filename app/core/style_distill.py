@@ -78,12 +78,20 @@ def build_style_samples(
 
     target_user_id = int(user_id)
     samples: list[dict] = []
+    target_rows: list[tuple[int, dict]] = []
     for index, item in enumerate(records):
         if int(item.get("user_id", 0) or 0) != target_user_id:
             continue
         text = str(item.get("text") or item.get("plain_text") or "").strip()
         if len(text) < min_chars:
             continue
+        target_rows.append((index, item))
+    if len(target_rows) > max_samples:
+        # Uniformly cover the whole history instead of only the earliest N
+        # messages, so recent style changes are represented too.
+        step = len(target_rows) / max_samples
+        target_rows = [target_rows[int(position * step)] for position in range(max_samples)]
+    for index, item in target_rows:
         context_before_lines: list[dict] = []
         for other in records[max(0, index - context_before) : index]:
             other_text = str(other.get("text") or other.get("plain_text") or "").strip()
@@ -109,8 +117,6 @@ def build_style_samples(
                 "context_after": context_after_lines,
             }
         )
-        if len(samples) >= max_samples:
-            break
     return samples
 
 
