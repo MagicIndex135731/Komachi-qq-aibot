@@ -76,7 +76,38 @@ SIM_QUESTIONS = [
     ("你最喜欢什么动画", "anime"),
     ("如何评价我", "interaction"),
     ("周末要不要一起打游戏", "game"),
+    ("刚才那球居然输了，气死我了", "emotion"),
+    ("你玩过彩虹六号吗", "niche"),
+    ("（你刚说'魔法少女小圆吧'）那《少女歌剧》呢，你咋看", "followup"),
 ]
+
+
+def embedding_similarity(provider, samples: list[dict], reply: str) -> float | None:
+    """Objective style distance: mean cosine between the reply and the
+    member's real utterances, as a second signal alongside the judge."""
+
+    if provider is None or not getattr(provider, "available", False):
+        return None
+    texts = [sample["text"] for sample in samples[:30] if sample.get("text")]
+    if not texts:
+        return None
+    try:
+        sample_vectors = provider.embed_documents(texts)
+        query_vector = provider.embed_query(reply or "")
+    except Exception:  # noqa: BLE001
+        return None
+    if not query_vector:
+        return None
+    scores = []
+    for vector in sample_vectors:
+        if not vector:
+            continue
+        dot = sum(a * b for a, b in zip(query_vector, vector))
+        norm_q = sum(v * v for v in query_vector) ** 0.5
+        norm_s = sum(v * v for v in vector) ** 0.5
+        if norm_q and norm_s:
+            scores.append(dot / (norm_q * norm_s))
+    return round(sum(scores) / len(scores), 3) if scores else None
 
 
 def load_real_samples(*, db_path, user_id: int, group_id: int, limit: int = 30) -> list[dict]:
@@ -271,11 +302,17 @@ def main() -> int:
                 question=question,
                 reply=reply,
             )
+            sim = embedding_similarity(
+                memory_runtime.embedding_provider,
+                samples,
+                reply,
+            )
             results.append(
                 {
                     "tag": tag,
                     "question": question,
                     "reply": reply,
+                    "embedding_similarity": sim,
                     "judge": judge,
                 }
             )
@@ -318,6 +355,7 @@ def main() -> int:
         judge = result["judge"]
         print(
             f"{result['tag']}|overall={judge.get('overall')}|"
+            f"emb={result.get('embedding_similarity')}|"
             f"{'|'.join(judge.get('gaps') or [])}"
         )
     return 0

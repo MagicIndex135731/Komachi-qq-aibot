@@ -1,5 +1,6 @@
 from app.core.chat_style import (
     build_human_chat_style_lines,
+    format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_chat_reply_burst_aware,
@@ -17,6 +18,19 @@ def test_build_human_chat_style_lines_blocks_markdownish_formatting() -> None:
     assert any("Do not use Markdown" in line for line in lines)
     assert any("real person" in line for line in lines)
     assert any("not a dislike" in line for line in lines)
+
+
+def test_format_example_pairs_includes_context_after() -> None:
+    entries = [
+        {
+            "text": "来了",
+            "reply_target": "加菲猫: 上号",
+            "context_before": [{"speaker": "加菲猫", "text": "上号"}],
+            "context_after": [{"speaker": "逆蝶蝶", "text": "人呢"}],
+        }
+    ]
+    rendered = format_example_pairs(entries)
+    assert "上文「加菲猫: 上号」→ 他回「来了」→ 下文「人呢」" in rendered
 
 
 def test_build_human_chat_style_lines_for_proactive_turn_pushes_short_human_interjections() -> None:

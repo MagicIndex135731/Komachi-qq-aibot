@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
@@ -88,7 +88,7 @@ class FakeLlmClient:
         self.images_calls: list[list[ImageAttachment] | None] = []
         self.conversation_keys: list[str | None] = []
 
-    def generate_text(self, prompt_lines, *, images=None, conversation_key=None):
+    def generate_text(self, prompt_lines, *, images=None, conversation_key=None, temperature=None):
         self.prompts.append(list(prompt_lines))
         self.images_calls.append(None if images is None else list(images))
         self.conversation_keys.append(conversation_key)
@@ -100,7 +100,7 @@ class SearchAwareFakeLlmClient:
         self.prompts: list[list[str]] = []
         self.search_decision_calls = 0
 
-    def generate_text(self, prompt_lines, *, images=None, conversation_key=None):
+    def generate_text(self, prompt_lines, *, images=None, conversation_key=None, temperature=None):
         del images
         del conversation_key
         self.prompts.append(list(prompt_lines))
@@ -118,7 +118,7 @@ class IntentRoutingFakeLlmClient:
         self.prompts: list[list[str]] = []
         self.intent_calls = 0
 
-    def generate_text(self, prompt_lines, *, images=None, conversation_key=None):
+    def generate_text(self, prompt_lines, *, images=None, conversation_key=None, temperature=None):
         del images
         del conversation_key
         self.prompts.append(list(prompt_lines))

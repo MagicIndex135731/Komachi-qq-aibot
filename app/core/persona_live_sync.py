@@ -138,7 +138,9 @@ class PersonaLiveSyncService:
                 bot_text_names=self.bot_text_names,
             )
             inserted = PersonaStyleExampleRepository(session).insert_many(examples)
-            trimmed = PersonaStyleExampleRepository(session).trim_to(user_id=user_id, keep=600)
+            trimmed = PersonaStyleExampleRepository(session).trim_to(
+                user_id=user_id, keep=1800
+            )
             new_target_count = sum(
                 1
                 for row in new_rows
@@ -306,6 +308,19 @@ class PersonaLiveSyncService:
         )
         generated = client.generate_text([prompt])
         profile = parse_persona_yaml(generated)
+        # Bind relationships by the current profile's member->id map so a
+        # model that drops member_user_id cannot silently regress bindings.
+        id_by_name: dict[str, int] = {}
+        for rel in current_profile.get("relationships") or []:
+            if (
+                isinstance(rel, dict)
+                and rel.get("member")
+                and rel.get("member_user_id")
+            ):
+                id_by_name[str(rel["member"])] = int(rel["member_user_id"])
+        for rel in profile.get("relationships") or []:
+            if isinstance(rel, dict) and not rel.get("member_user_id"):
+                rel["member_user_id"] = id_by_name.get(str(rel.get("member") or ""))
         live_dir = self.settings.data_dir / "personas"
         live_dir.mkdir(parents=True, exist_ok=True)
         live_path = live_dir / f"{persona_key}.live.yaml"
@@ -354,6 +369,14 @@ def _build_examples(
             context_before.append(
                 {"speaker": label, "text": str(other.get("plain_text") or "").strip()}
             )
+        context_after = []
+        for other in ordered[index + 1 : index + 1 + 2]:
+            if int(other.get("user_id") or 0) in bot_qqs:
+                continue
+            label = _speaker_label(other.get("raw_json")) or str(other.get("user_id"))
+            context_after.append(
+                {"speaker": label, "text": str(other.get("plain_text") or "").strip()}
+            )
         reply_target = None
         quoted = by_id.get(str(row.get("reply_to_msg_id") or ""))
         if (
@@ -369,6 +392,7 @@ def _build_examples(
                 "msg_id": str(row.get("platform_msg_id")),
                 "text": text,
                 "context_before": context_before,
+                "context_after": context_after,
                 "reply_target": reply_target,
                 "timestamp": _parse_timestamp(row.get("timestamp")),
             }
@@ -392,8 +416,31 @@ def _merge_profile(base: dict, overlay: dict) -> dict:
     for key, value in overlay.items():
         if key in {"facts", "external_relations"} and isinstance(value, list):
             merged[key] = merge_persona_lists(merged.get(key), value)
+        elif (
+            key in {"speech_habits", "core_traits", "style_avoid", "address_rules"}
+            and isinstance(value, list)
+        ):
+            merged[key] = _union_strings(merged.get(key), value, limit=40)
         elif isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _merge_profile(merged[key], value)
         else:
             merged[key] = value
     return merged
+
+
+def _union_strings(
+    base: object,
+    overlay: list,
+    *,
+    limit: int,
+) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in [*([str(item).strip() for item in (base or []) if str(item).strip()]), *[str(item).strip() for item in overlay if str(item).strip()]]:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result

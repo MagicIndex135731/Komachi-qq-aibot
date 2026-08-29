@@ -82,6 +82,28 @@ def test_build_examples_drops_bot_lines_from_context() -> None:
     assert [item["speaker"] for item in example["context_before"]] == ["路人甲"]
 
 
+def test_build_examples_keeps_context_after() -> None:
+    rows = [
+        _row(1, "m1", 111, "在吗", card="路人甲"),
+        _row(2, "m2", 222, "老哥我在", card="测试君"),
+        _row(3, "m3", 111, "好", card="路人甲"),
+        _row(4, "m4", 333, "那就这么定了", card="路人乙"),
+    ]
+
+    examples = _build_examples(
+        rows,
+        user_id=222,
+        bot_qqs={900001},
+        bot_text_names={"测试小町"},
+    )
+
+    assert len(examples) == 1
+    assert [item["text"] for item in examples[0]["context_after"]] == [
+        "好",
+        "那就这么定了",
+    ]
+
+
 def test_sync_service_collects_and_deduplicates(sqlite_engine) -> None:
     settings = _fake_settings()
     personas = {

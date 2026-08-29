@@ -410,15 +410,24 @@ def retrieve_relevant_examples(
 def format_example_pairs(entries: list[dict], *, max_pairs: int = 4) -> str:
     """Render retrieved examples as context→reply pairs."""
 
+    def _text(value: object) -> str:
+        if isinstance(value, dict):
+            return str(value.get("text") or "").strip()
+        return str(value or "").strip()
+
     pairs: list[str] = []
     for entry in entries[: max(0, max_pairs)]:
-        lead = entry.get("reply_target") or (
-            (entry.get("context_before") or [""])[-1]
-        )
-        if lead:
-            pairs.append(f"上文「{lead}」→ 他回「{entry.get('text')}」")
+        before = entry.get("context_before") or []
+        after = entry.get("context_after") or []
+        lead = _text(entry.get("reply_target")) or _text(before[-1] if before else "")
+        after_lead = _text(after[-1] if after else "")
+        text = _text(entry.get("text"))
+        if lead and after_lead:
+            pairs.append(f"上文「{lead}」→ 他回「{text}」→ 下文「{after_lead}」")
+        elif lead:
+            pairs.append(f"上文「{lead}」→ 他回「{text}」")
         else:
-            pairs.append(f"他回「{entry.get('text')}」")
+            pairs.append(f"他回「{text}」")
     return "；".join(pairs)
 
 

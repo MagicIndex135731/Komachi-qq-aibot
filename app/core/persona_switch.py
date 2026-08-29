@@ -12,11 +12,12 @@ import json
 import logging
 import re
 import time
+from datetime import UTC, datetime
 
 from sqlalchemy import text
 
 from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
-from app.storage.models import MemoryItem, User
+from app.storage.models import MemoryItem, MemoryItemSemanticVector, User
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupPersonaStateRepository,
@@ -121,7 +122,7 @@ class PersonaManager:
                 continue
             with session_scope(self.engine) as session:
                 repo = PersonaStyleExampleRepository(session)
-                rows = repo.load_active(user_id=user_id, limit=600)
+                rows = repo.load_active(user_id=user_id, limit=1800)
                 if not rows:
                     baked = [
                         str(value).strip()
@@ -145,9 +146,12 @@ class PersonaManager:
                         rows = repo.load_active(user_id=user_id, limit=600)
                 self._style_banks[user_id] = [
                     {
+                        "msg_id": row.msg_id,
                         "text": row.text,
                         "context_before": row.context_before or [],
+                        "context_after": row.context_after or [],
                         "reply_target": row.reply_target,
+                        "timestamp": row.timestamp,
                     }
                     for row in rows
                 ]
@@ -159,11 +163,13 @@ class PersonaManager:
             return list(self._style_banks[user_id])
         return [
             {
+                "msg_id": f"baked-{index}",
                 "text": str(value).strip(),
                 "context_before": [],
+                "context_after": [],
                 "reply_target": None,
             }
-            for value in (persona.get("example_bank") or [])
+            for index, value in enumerate(persona.get("example_bank") or [])
             if str(value).strip()
         ]
 
@@ -182,12 +188,23 @@ class PersonaManager:
         persona = self.active_persona(group_id)
         user_id = _as_positive_int(persona.get("source_user_id"))
         cache_key = int(user_id) if user_id is not None else hash(repr(persona.get("name")))
-        signature = "|".join(
-            f"{entry.get('text')}\u241f{entry.get('reply_target') or ''}"
-            for entry in bank[:80]
-        )
         cached = self._example_vectors.get(cache_key)
-        if cached is None or cached[0] != signature:
+        entries_by_id: dict[str, dict] = {}
+        vectors_by_id: dict[str, list[float]] = {}
+        if cached is not None:
+            entries_by_id, vectors_by_id = cached
+        bank_ids = {str(entry.get("msg_id") or "") for entry in bank if entry.get("msg_id")}
+        current_ids = set(entries_by_id)
+        stale_ids = current_ids - bank_ids
+        for stale_id in stale_ids:
+            entries_by_id.pop(stale_id, None)
+            vectors_by_id.pop(stale_id, None)
+        missing = [
+            entry
+            for entry in bank
+            if str(entry.get("msg_id") or "") not in entries_by_id
+        ]
+        if missing:
             texts = [
                 " ".join(
                     [
@@ -198,27 +215,59 @@ class PersonaManager:
                             for item in (entry.get("context_before") or [])[-2:]
                             if isinstance(item, dict)
                         ],
+                        *[
+                            str(item.get("text") or "")
+                            for item in (entry.get("context_after") or [])[:1]
+                            if isinstance(item, dict)
+                        ],
                     ]
                 )
-                for entry in bank
+                for entry in missing
             ]
-            vectors = self.embedding_provider.embed_documents(texts)
-            cached = (signature, vectors, bank)
-            self._example_vectors[cache_key] = cached
-        _, vectors, entries = cached
+            new_vectors = self.embedding_provider.embed_documents(texts)
+            for entry, vector in zip(missing, new_vectors):
+                entries_by_id[str(entry.get("msg_id") or "")] = entry
+                vectors_by_id[str(entry.get("msg_id") or "")] = vector
+        self._example_vectors[cache_key] = (entries_by_id, vectors_by_id)
         query_text = " ".join(
             str(line).split(":", 1)[-1] for line in context_lines
         )
         query_vector = self.embedding_provider.embed_query(query_text)
-        if not vectors or query_vector is None:
+        if not vectors_by_id or query_vector is None:
             return retrieve_relevant_examples(bank, context_lines, limit=limit)
-        scored = [
-            (self._cosine(query_vector, vector), entry)
-            for vector, entry in zip(vectors, entries)
-            if vector
-        ]
+        now = datetime.now(UTC)
+        scored: list[tuple[float, dict]] = []
+        for msg_id, vector in vectors_by_id.items():
+            if not vector:
+                continue
+            entry = entries_by_id[msg_id]
+            base = self._cosine(query_vector, vector)
+            age_days = 0.0
+            timestamp = entry.get("timestamp")
+            if isinstance(timestamp, datetime):
+                ts = timestamp
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+            decay = 1.0 / (1.0 + age_days / 45.0)
+            scored.append((base * decay, entry))
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [entry for _, entry in scored[: max(0, limit)]]
+        picked: list[dict] = []
+        picked_vectors: list[list[float]] = []
+        for _, entry in scored:
+            if len(picked) >= max(0, limit):
+                break
+            entry_vector = vectors_by_id.get(str(entry.get("msg_id") or ""))
+            if any(
+                self._cosine(entry_vector, existing) > 0.92
+                for existing in picked_vectors
+                if entry_vector
+            ):
+                continue
+            picked.append(entry)
+            if entry_vector:
+                picked_vectors.append(entry_vector)
+        return picked
 
     @staticmethod
     def _cosine(left: list[float], right: list[float]) -> float:
@@ -256,11 +305,61 @@ class PersonaManager:
                 )
                 .all()
             )
+            vectors: dict[int, list[float]] = {}
+            if rows and self.embedding_provider is not None:
+                row_ids = [row.id for row in rows]
+                vector_rows = session.query(MemoryItemSemanticVector).filter(
+                    MemoryItemSemanticVector.memory_id.in_(row_ids)
+                ).all()
+                for vector_row in vector_rows:
+                    try:
+                        parsed = json.loads(vector_row.vector_json or "[]")
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = []
+                    if isinstance(parsed, list) and parsed:
+                        vectors[int(vector_row.memory_id)] = [
+                            float(value) for value in parsed
+                        ]
         bank = [
-            {"category": str(row.predicate or "fact"), "fact": str(row.content or "")}
+            {
+                "memory_id": int(row.id),
+                "category": str(row.predicate or "fact"),
+                "fact": str(row.content or ""),
+            }
             for row in rows
             if str(row.content or "").strip()
         ]
+        if self.embedding_provider is not None and vectors:
+            query_text = " ".join(
+                str(line).split(":", 1)[-1] for line in context_lines
+            )
+            query_vector = self.embedding_provider.embed_query(query_text)
+            if query_vector:
+                keyword_scores = retrieve_relevant_facts(
+                    bank, context_lines, limit=len(bank)
+                )
+                keyword_rank = {
+                    str(item["fact"]): index
+                    for index, item in enumerate(keyword_scores)
+                }
+                scored: list[tuple[float, dict]] = []
+                for item in bank:
+                    vector = vectors.get(int(item["memory_id"]))
+                    semantic = (
+                        self._cosine(query_vector, vector)
+                        if vector
+                        else 0.0
+                    )
+                    keyword = 1.0 - (
+                        keyword_rank.get(str(item["fact"]), len(bank))
+                        / max(1, len(bank))
+                    )
+                    scored.append((0.7 * semantic + 0.3 * keyword, item))
+                scored.sort(key=lambda entry: entry[0], reverse=True)
+                return [
+                    {"category": item["category"], "fact": item["fact"]}
+                    for _, item in scored[: max(0, limit)]
+                ]
         return retrieve_relevant_facts(bank, context_lines, limit=limit)
 
     def active_key(self, group_id: int) -> str:
@@ -370,6 +469,16 @@ class PersonaManager:
         """Latest display name for one user inside one group, or None."""
 
         return self._member_alias_map(group_id=group_id).get(int(user_id))
+
+    def prewarm_examples(self, group_id: int, persona_key: str) -> int:
+        """Build the example vector cache for one persona (memory-only)."""
+
+        self._group_keys[int(group_id)] = persona_key
+        bank = self.style_bank(int(group_id))
+        if not bank or self.embedding_provider is None:
+            return 0
+        picked = self.retrieve_examples(int(group_id), ["预热示例向量"], limit=1)
+        return len(bank)
 
     def active_name(self, group_id: int) -> str:
         name = str(self.active_persona(group_id).get("name", "") or "").strip()

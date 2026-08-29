@@ -149,6 +149,14 @@ if [[ "${embedding_prewarm_ok}" != true ]]; then
   exit 1
 fi
 
+echo "Persona embedding prewarm:"
+persona_prewarm_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/persona.embedding.ready.json 2>/dev/null || true)"
+if [[ -z "${persona_prewarm_payload}" ]]; then
+  echo "  (background prewarm in progress or not yet written; startup is not blocked)"
+else
+  echo "  ${persona_prewarm_payload}"
+fi
+
 echo "Local group policy probe:"
 if ! docker exec -i "${bot_container_name}" python - <<'PY'
 from pathlib import Path

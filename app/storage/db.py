@@ -195,6 +195,15 @@ def _apply_schema_migrations(connection) -> None:
             )
         )
 
+    if "persona_style_examples" in table_names:
+        _add_missing_columns(
+            connection,
+            "persona_style_examples",
+            {
+                "context_after": "JSON NOT NULL DEFAULT '[]'",
+            },
+        )
+
     if "memory_items" in table_names:
         _add_missing_columns(
             connection,

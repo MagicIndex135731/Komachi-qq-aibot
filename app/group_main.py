@@ -136,6 +136,49 @@ def _prewarm_memory_embedding(
     )
 
 
+def _prewarm_persona_example_vectors(
+    manager,
+    personas: dict,
+    *,
+    log_dir: Path,
+) -> None:
+    """Warm the persona example vector caches for live-refresh personas."""
+
+    marker = Path(log_dir) / "persona.embedding.ready.json"
+    marker.unlink(missing_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        prewarmed: list[str] = []
+        for persona_key, persona in personas.items():
+            if not isinstance(persona, dict) or not persona.get("live_refresh"):
+                continue
+            try:
+                group_id = int(persona.get("source_group_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if group_id <= 0:
+                continue
+            count = manager.prewarm_examples(int(group_id), persona_key)
+            prewarmed.append(f"{persona_key}={count}")
+            logging.info(
+                "persona_embedding_prewarm persona=%s samples=%s",
+                persona_key,
+                count,
+            )
+        payload = {
+            "state": "ready",
+            "personas": prewarmed,
+            "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
+        }
+    except Exception:
+        logging.exception("persona_embedding_prewarm_failed")
+        payload = {"state": "failed"}
+    marker.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def _max_message_id(engine) -> int:
     with session_scope(engine) as session:
         row = session.execute(
@@ -311,6 +354,7 @@ async def run() -> None:
     memory_compaction_service = None
     persona_sync_task = None
     member_fact_refresh_task = None
+    persona_prewarm_task = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
         await asyncio.to_thread(create_all, engine)
@@ -371,6 +415,14 @@ async def run() -> None:
             embedding_provider=memory_runtime.embedding_provider,
         )
         await asyncio.to_thread(persona_manager.load_state)
+        persona_prewarm_task = asyncio.create_task(
+            asyncio.to_thread(
+                _prewarm_persona_example_vectors,
+                persona_manager,
+                getattr(runtime, "personas", {}) or {},
+                log_dir=settings.log_dir,
+            )
+        )
         persona_switch_service = PersonaSwitchService(
             manager=persona_manager,
             sender=sender,
@@ -479,6 +531,8 @@ async def run() -> None:
     finally:
         if member_fact_refresh_task is not None:
             member_fact_refresh_task.cancel()
+        if persona_prewarm_task is not None:
+            persona_prewarm_task.cancel()
         if persona_sync_task is not None:
             persona_sync_task.cancel()
         if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:

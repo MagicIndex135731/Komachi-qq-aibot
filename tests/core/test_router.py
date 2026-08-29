@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import logging
 import threading
@@ -154,7 +154,7 @@ class FakeLlm:
         self.calls = []
         self.conversation_keys: list[str | None] = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         if any("Reply with exactly three lines in this grammar" in line for line in prompt_lines):
             return "SEARCH: no\nQUERY: \nREASON: answer-from-context"
         self.calls.append(prompt_lines)
@@ -167,7 +167,7 @@ class LongReplyLlm:
         self.reply_text = reply_text
         self.calls = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         del conversation_key
         self.calls.append(prompt_lines)
         return self.reply_text
@@ -177,7 +177,7 @@ class MarkdownReplyLlm:
     def __init__(self) -> None:
         self.calls = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         self.calls.append(prompt_lines)
         return "### 先说结论\n- 这个可以\n- 你现在就去改"
 
@@ -187,7 +187,7 @@ class InspectingLlm:
         self.sqlite_engine = sqlite_engine
         self.seen_messages_at_call: list[str] = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         del prompt_lines
         with session_scope(self.sqlite_engine) as session:
             messages = session.execute(select(Message).order_by(Message.id)).scalars().all()
@@ -226,7 +226,7 @@ class SearchAwareLlm:
         self.search_decision_calls = 0
         self.reply_calls = 0
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         self.calls.append(prompt_lines)
         joined = "\n".join(prompt_lines)
         if "Reply with exactly three lines in this grammar" in joined:
@@ -290,7 +290,7 @@ class SearchDecisionFailingLlm:
         self.search_decision_calls = 0
         self.reply_calls = 0
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         joined = "\n".join(prompt_lines)
         if "Reply with exactly three lines in this grammar" in joined:
             self.search_decision_calls += 1
@@ -305,7 +305,7 @@ class LocalLookupPromptInspectingLlm:
         self.reply_calls = 0
         self.calls: list[list[str]] = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         joined = "\n".join(prompt_lines)
         if "Reply with exactly three lines in this grammar" in joined:
             self.search_decision_calls += 1
@@ -321,7 +321,7 @@ class RuntimeFactsInspectingLlm:
         self.reply_calls = 0
         self.calls: list[list[str]] = []
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         self.calls.append(prompt_lines)
         joined = "\n".join(prompt_lines)
         if "Reply with exactly three lines in this grammar" in joined:
@@ -376,7 +376,7 @@ class RelativeYearSearchLlm:
         self.search_decision_calls = 0
         self.reply_calls = 0
 
-    def generate_text(self, prompt_lines: list[str], *, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, conversation_key=None, temperature=None) -> str:
         self.calls.append(prompt_lines)
         joined = "\n".join(prompt_lines)
         if "Reply with exactly three lines in this grammar" in joined:
@@ -390,7 +390,7 @@ class ImageCapturingLlm:
     def __init__(self) -> None:
         self.calls = []
 
-    def generate_text(self, prompt_lines: list[str], *, images=None, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, images=None, conversation_key=None, temperature=None) -> str:
         self.calls.append({"prompt_lines": prompt_lines, "images": images})
         return "I can see it."
 
@@ -415,7 +415,7 @@ class FailingReplyLlm:
     def __init__(self) -> None:
         self.calls = []
 
-    def generate_text(self, prompt_lines: list[str], *, images=None, conversation_key=None) -> str:
+    def generate_text(self, prompt_lines: list[str], *, images=None, conversation_key=None, temperature=None) -> str:
         self.calls.append({"prompt_lines": prompt_lines, "images": images})
         raise RuntimeError("llm unavailable")
 

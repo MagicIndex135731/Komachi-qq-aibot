@@ -72,6 +72,7 @@ class PersonaStyleExample(Base):
     msg_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     text: Mapped[str] = mapped_column(Text, default="")
     context_before: Mapped[list] = mapped_column(JSON, default=list)
+    context_after: Mapped[list] = mapped_column(JSON, default=list)
     reply_target: Mapped[str | None] = mapped_column(String(512), nullable=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 

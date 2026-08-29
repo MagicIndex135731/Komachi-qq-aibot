@@ -20,7 +20,7 @@ class FakeSender:
 
 
 class FakeLlm:
-    def generate_text(self, prompt_lines, *, images=None, conversation_key=None):
+    def generate_text(self, prompt_lines, *, images=None, conversation_key=None, temperature=None):
         del prompt_lines, images, conversation_key
         return "unused"
 

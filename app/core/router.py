@@ -3031,6 +3031,8 @@ class InboundRouter:
             and bool(getattr(self.llm_client, "supports_forced_web_search", False))
         )
         generation_kwargs = {}
+        if self._impersonating(event.group_id):
+            generation_kwargs["temperature"] = 1.05
         if bool(getattr(self.llm_client, "supports_selective_web_search", False)):
             generation_kwargs["allow_web_search"] = prepared_reply.allow_web_search
         if force_web_search:

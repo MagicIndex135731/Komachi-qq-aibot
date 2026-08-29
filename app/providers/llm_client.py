@@ -97,6 +97,7 @@ class LlmClient:
         web_search_context_size: str = "high",
         reasoning_effort: str = "",
         max_output_tokens: int = 8192,
+        temperature: float | None = None,
         timeout_seconds: float = 30.0,
         http_client: httpx.Client | None = None,
         usage_recorder=None,
@@ -123,6 +124,9 @@ class LlmClient:
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.max_output_tokens = max(1, int(max_output_tokens))
+        self.temperature = (
+            float(temperature) if temperature is not None else None
+        )
         total_timeout = max(10.0, float(timeout_seconds))
         # Cap each retry attempt's silent window (read) below the total so a
         # stalled upstream burns at most ~90s per attempt instead of the full
@@ -210,6 +214,7 @@ class LlmClient:
         max_output_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         extra_input_items: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
             {
@@ -246,6 +251,11 @@ class LlmClient:
             payload["reasoning"] = {"effort": self.reasoning_effort}
         if max_output_tokens is not None:
             payload["max_output_tokens"] = max_output_tokens
+        resolved_temperature = (
+            self.temperature if temperature is None else float(temperature)
+        )
+        if resolved_temperature is not None:
+            payload["temperature"] = resolved_temperature
         if tools is not None:
             resolved_tools = list(tools)
             if self.builtin_web_search and (
@@ -1626,6 +1636,7 @@ class LlmClient:
         max_output_tokens: int | None = None,
         force_web_search: bool = False,
         allow_web_search: bool | None = None,
+        temperature: float | None = None,
     ) -> str:
         """Run a bounded Responses function-calling loop and return final text.
 
@@ -1640,6 +1651,7 @@ class LlmClient:
                 conversation_key=conversation_key,
                 force_web_search=force_web_search,
                 allow_web_search=allow_web_search,
+                temperature=temperature,
             )
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
         effective_rounds = max(1, int(max_tool_rounds))
@@ -1660,6 +1672,7 @@ class LlmClient:
                     max_output_tokens=output_tokens,
                     tools=tools,
                     extra_input_items=extra_input_items,
+                    temperature=temperature,
                 ),
                 model=model,
             )
@@ -1816,6 +1829,7 @@ class LlmClient:
         conversation_key: str | None = None,
         force_web_search: bool = False,
         allow_web_search: bool | None = None,
+        temperature: float | None = None,
     ) -> str:
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
 
@@ -1830,6 +1844,7 @@ class LlmClient:
                 force_web_search=force_web_search,
                 allow_web_search=allow_web_search,
                 max_output_tokens=self.max_output_tokens,
+                temperature=temperature,
             )
             try:
                 responses_result = self._request_responses_stream_result(
