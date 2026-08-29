@@ -234,7 +234,12 @@ def _find_source_id(session, *, group_id: int, user_id: int, evidence: str) -> s
 
 
 class MemberFactRefreshService:
-    """Daily fact refresh for every active member, with semantic review."""
+    """Daily fact refresh for maintained members, with semantic review.
+
+    ``member_allowlist`` restricts refresh to the personas that are actually
+    maintained (live_refresh-enabled). When None, every active member is
+    refreshed (legacy behavior).
+    """
 
     def __init__(
         self,
@@ -243,6 +248,7 @@ class MemberFactRefreshService:
         settings,
         group_ids: set[int],
         bot_qq: int,
+        member_allowlist: set[int] | None = None,
         interval_seconds: float = 21600.0,
         threshold: int = 50,
         cooldown_seconds: float = 86400.0,
@@ -252,6 +258,11 @@ class MemberFactRefreshService:
         self.settings = settings
         self.group_ids = set(int(value) for value in group_ids)
         self.bot_qq = int(bot_qq)
+        self.member_allowlist = (
+            set(int(value) for value in member_allowlist)
+            if member_allowlist is not None
+            else None
+        )
         self.interval_seconds = max(1800.0, float(interval_seconds))
         self.threshold = max(10, int(threshold))
         self.cooldown_seconds = max(3600.0, float(cooldown_seconds))
@@ -275,6 +286,12 @@ class MemberFactRefreshService:
                 bot_qq=self.bot_qq,
                 min_messages=self.min_member_messages,
             )
+            if self.member_allowlist is not None:
+                members = [
+                    user_id
+                    for user_id in members
+                    if int(user_id) in self.member_allowlist
+                ]
             due: list[tuple[int, int]] = []
             now = datetime.now(UTC)
             with session_scope(self.engine) as session:

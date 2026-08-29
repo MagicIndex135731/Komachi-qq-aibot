@@ -396,6 +396,13 @@ async def run() -> None:
             settings=settings,
             group_ids=memory_group_ids,
             bot_qq=settings.bot_qq,
+            member_allowlist={
+                int(persona["source_user_id"])
+                for persona in getattr(runtime, "personas", {}).values()
+                if isinstance(persona, dict)
+                and persona.get("live_refresh")
+                and str(persona.get("source_user_id") or "").isdigit()
+            },
         )
         member_fact_refresh_task = asyncio.create_task(
             member_fact_refresh_service.run()
