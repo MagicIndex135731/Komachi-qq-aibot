@@ -185,6 +185,18 @@ IMPERSONATION_CONTAMINANT_MARKERS = (
 )
 
 
+def _scrub_impersonation_reply(text: str) -> str:
+    """Deterministic backstop for impersonation replies.
+
+    Removes maid-style address terms (主人/您/大人...) that leak from model
+    habit or memory, replacing them with "你" so the line still reads as
+    direct speech to the group.
+    """
+
+    cleaned = scrub_banned_address_terms(str(text or ""), BANNED_ADDRESS_TERMS)
+    return cleaned.strip()
+
+
 def _should_bind_impersonated_self(text: str) -> bool:
     """True when the query addresses the bot as 'you' and is not first-person
     about the requester (whose '我' must stay bound to the requester)."""
@@ -860,10 +872,20 @@ class InboundRouter:
         text += (
             f"\n你正在完整扮演群成员 {name}：你就是 TA 本人，不是 AI，也不是任何其他身份。"
             "不要沿用任何属于 AI 或其他身份的设定与记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
+            "禁止使用任何敬语称呼（主人、您、大人、老板、少爷、小姐等），直接叫名字或直接说事。"
             "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
             "你的回复必须极短，通常只有几个字到十几个字，像真人随手打字一样；除非对方明确要求详细解释，否则不要超过一两句。"
             "需要连续说几句时，用换行把它们拆成多条（每条几个字），或者按系统提示用 | 分隔；绝对不要写成一句长话，也不要复述或总结对方的话。"
         )
+        burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
+        if isinstance(burst, dict) and burst.get("enabled"):
+            separator = str(burst.get("separator") or "|")
+            max_messages = max(1, min(6, int(burst.get("max_messages") or 3)))
+            text += (
+                f"\n你支持短句连发：当想连说几句话时，用 {separator} 分隔每条，"
+                f"一次最多 {max_messages} 条，每条几个字（如：来了{separator}几点{separator}上号）。"
+                "系统会把每条拆成独立消息发送，不要自己加序号或列表。"
+            )
         return text
 
     def _safety_lines_for(self, *, impersonating: bool) -> list[str]:
@@ -926,7 +948,8 @@ class InboundRouter:
         if not picked:
             return persona_text
         lines = [
-            f"- [{fact.get('category') or '事实'}] {fact.get('fact')}"
+            f"- [{fact.get('category') or '事实'}] "
+            f"{scrub_banned_address_terms(str(fact.get('fact') or ''), BANNED_ADDRESS_TERMS)}"
             for fact in picked
             if isinstance(fact, dict)
         ]
@@ -2212,10 +2235,15 @@ class InboundRouter:
                     *group_policy_lines,
                     MEMORY_TOOL_EFFICIENCY_INSTRUCTION,
                 ]
-            addressing_rule_lines = self._active_addressing_rules_for_user(
-                group_id=event.group_id,
-                user_id=event.user_id,
-            )
+            addressing_rule_lines: list[str] = []
+            if not impersonating:
+                # Addressing rules (e.g. "call this user 主人") belong to the
+                # default Komachi persona. While impersonating another member
+                # they would poison the reply with forbidden address terms.
+                addressing_rule_lines = self._active_addressing_rules_for_user(
+                    group_id=event.group_id,
+                    user_id=event.user_id,
+                )
             if addressing_rule_lines:
                 group_policy_lines = [*group_policy_lines, *addressing_rule_lines]
             packed_blocked_output_present = (
@@ -2964,6 +2992,8 @@ class InboundRouter:
                 conversation_key=conversation_key,
                 **generation_kwargs,
             )
+        if self._impersonating(event.group_id):
+            raw_reply = _scrub_impersonation_reply(raw_reply)
         if prepared_reply.proactive_turn:
             return normalize_brief_group_interjection_reply(raw_reply)
         active_persona = self._active_persona(event.group_id)

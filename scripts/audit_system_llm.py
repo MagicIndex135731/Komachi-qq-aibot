@@ -6,7 +6,7 @@ with the official DeepSeek API (deepseek-v4-flash, minimal reasoning).
 
 Usage (inside xiaomachi-bot container):
     DEEPSEEK_API_KEY=sk-... python scripts/audit_system_llm.py \
-        --group-id 515267906 --bot-qq 1807533371
+        --group-id <GROUP_ID> --bot-qq <BOT_QQ>
 """
 
 from __future__ import annotations
@@ -34,16 +34,16 @@ from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.core.time_utils import ASIA_SHANGHAI
 from app.main import build_llm_client, build_memory_runtime
-from app.storage.db import build_engine, create_all
+from app.storage.db import build_engine
 
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("audit_system_llm")
 
 
-GROUP_ID = 515267906
-BOT_QQ = 1807533371
-REQUESTER_QQ = 1357318398
+GROUP_ID = 0
+BOT_QQ = 0
+REQUESTER_QQ = 0
 PERSONA_KEY = "azha"
 
 
@@ -123,7 +123,7 @@ SCENARIOS: list[dict[str, Any]] = [
         "card": "逆蝶蝶",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 必须把'逆蝶蝶'绑定到群成员本人（QQ 1357318398）并从记忆中回答。\n"
+            "1. 必须把'逆蝶蝶'绑定到群成员本人并从记忆中回答。\n"
             "2. 回答应包含具体的动画/作品喜好，不能泛泛而谈或说不知道。\n"
             "3. 不能把阿渣自己的喜好说成逆蝶蝶的。"
         ),
@@ -288,7 +288,9 @@ def run_scenario(
     manager: PersonaManager,
     scenario: dict[str, Any],
 ) -> tuple[str, list[str]]:
-    manager.set_persona_key(GROUP_ID, scenario["persona_key"])
+    # In-memory switch only: the audit must not fight the production writer
+    # for the persona-state row, and it must never leave the group switched.
+    manager._group_keys[int(GROUP_ID)] = scenario["persona_key"]
     event = build_event(
         group_id=GROUP_ID,
         user_id=REQUESTER_QQ,
@@ -313,9 +315,9 @@ def run_scenario(
 def main() -> int:
     global GROUP_ID, BOT_QQ, REQUESTER_QQ, PERSONA_KEY
     parser = argparse.ArgumentParser()
-    parser.add_argument("--group-id", type=int, default=GROUP_ID)
-    parser.add_argument("--bot-qq", type=int, default=BOT_QQ)
-    parser.add_argument("--requester-qq", type=int, default=REQUESTER_QQ)
+    parser.add_argument("--group-id", type=int, required=True)
+    parser.add_argument("--bot-qq", type=int, required=True)
+    parser.add_argument("--requester-qq", type=int, required=True)
     parser.add_argument("--persona-key", default=PERSONA_KEY)
     parser.add_argument("--out", default="/workspace/data/personas/azha/eval/audit_llm.json")
     parser.add_argument("--skip-generate", action="store_true")
@@ -336,7 +338,6 @@ def main() -> int:
     settings = AppSettings()
     runtime = load_runtime_config(settings)
     engine = build_engine(settings.sqlite_path)
-    create_all(engine)
     llm_client = build_llm_client(settings=settings, engine=engine)
     memory_runtime = build_memory_runtime(
         settings=settings,
@@ -427,7 +428,7 @@ def main() -> int:
             )
             time.sleep(0.5)
     finally:
-        manager.set_persona_key(GROUP_ID, original_key)
+        manager._group_keys[int(GROUP_ID)] = original_key
 
     passed = sum(1 for item in results if item["judge"].get("pass"))
     summary = {

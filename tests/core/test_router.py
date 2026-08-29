@@ -778,6 +778,77 @@ async def test_router_scrubs_honorifics_while_impersonating(sqlite_engine) -> No
 
 
 @pytest.mark.asyncio
+async def test_router_skips_addressing_rules_while_impersonating(
+    sqlite_engine,
+) -> None:
+    sender = FakeSender()
+    llm = LongReplyLlm("随便回一句")
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+    )
+    with session_scope(sqlite_engine) as session:
+        session.add(
+            MemoryItem(
+                scope_type="group",
+                scope_id="10001",
+                subject_type="user",
+                subject_id="20001",
+                memory_kind="preference",
+                predicate="称呼",
+                object_text="主人",
+                content="称呼该用户为主人。",
+                importance=4,
+                confidence=0.9,
+                source_msg_id="m-rule",
+                valid_from=datetime(2026, 5, 1, tzinfo=UTC),
+                status="active",
+            )
+        )
+        session.commit()
+    router.persona_manager.personas["test_self"] = {
+        "name": "测试君",
+        "identity": "group member",
+        "core_traits": ["casual"],
+        "speaking_style": {"tone": "natural"},
+    }
+    router.persona_manager.set_persona_key(10001, "test_self")
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 你好",
+            user_id=20001,
+            nickname="Alice",
+            group_card="Alice",
+        )
+    )
+
+    assert llm.calls
+    impersonation_prompt = "\n".join(llm.calls[0])
+    assert "Active addressing rule" not in impersonation_prompt
+    assert "称呼该用户为主人" not in impersonation_prompt
+
+    router.persona_manager.set_persona_key(10001, "default")
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 你好",
+            message_id="m-2",
+            user_id=20001,
+            nickname="Alice",
+            group_card="Alice",
+        )
+    )
+    assert len(llm.calls) >= 2
+    default_prompt = "\n".join(llm.calls[1])
+    assert "Active addressing rule" in default_prompt
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "query",
     ("@Mira 你是谁", "@Mira 我问的是你是谁，不是我是谁"),
