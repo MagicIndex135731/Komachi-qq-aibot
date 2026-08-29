@@ -1081,6 +1081,13 @@ class InboundRouter:
                 return self.persona_manager.bot_transcript_label(group_id)
             persona_name = str(self.runtime.persona.get("name", "Bot")).strip()
             return persona_name or "Bot"
+        if group_id is not None and self.persona_manager is not None:
+            group_label = self.persona_manager.member_label_for_user(
+                int(user_id),
+                int(group_id),
+            )
+            if group_label:
+                return group_label
         user = users_by_id.get(user_id)
         if user is None:
             return str(user_id)

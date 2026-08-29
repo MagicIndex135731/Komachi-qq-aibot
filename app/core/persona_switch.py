@@ -90,7 +90,7 @@ class PersonaManager:
         self._card_snapshots: dict[int, str] = {}
         self._account_avatar_snapshot: str | None = None
         self._style_banks: dict[int, list[dict]] = {}
-        self._member_aliases: dict[int, str] = {}
+        self._member_aliases: dict[int | None, dict[int, str]] = {}
         self._member_aliases_loaded_at: float = 0.0
         self.embedding_provider = embedding_provider
         self._example_vectors: dict[
@@ -270,23 +270,42 @@ class PersonaManager:
         key = self.active_key(group_id)
         return self.personas.get(key) or self.default_persona
 
-    def _member_alias_map(self, *, max_age_seconds: float = 300.0) -> dict[int, str]:
+    def _member_alias_map(
+        self,
+        *,
+        max_age_seconds: float = 300.0,
+        group_id: int | None = None,
+    ) -> dict[int, str]:
+        """Map user ids to their latest display name inside one group.
+
+        Group cards are per-group; the shared ``users`` table only keeps one
+        card and gets overwritten across groups. Filtering the message sender
+        snapshots by ``group_id`` prevents a card from another group (e.g.
+        "周奕辰" in group A) leaking into this group's labels.
+        """
+
+        group_id = int(group_id) if group_id is not None else None
         now = time.monotonic()
         if now - self._member_aliases_loaded_at > max_age_seconds:
-            aliases: dict[int, str] = {}
+            self._member_aliases_loaded_at = now
+            grouped_aliases: dict[int | None, dict[int, str]] = {}
             with session_scope(self.engine) as session:
                 for user in session.query(User).all():
                     label = str(user.group_card or "").strip() or str(
                         user.nickname or ""
                     ).strip()
                     if label:
-                        aliases.setdefault(int(user.user_id), label)
+                        grouped_aliases.setdefault(None, {}).setdefault(
+                            int(user.user_id), label
+                        )
                 seen: set[int] = set()
                 rows = session.execute(
                     text(
                         "SELECT user_id, raw_json FROM messages "
-                        "WHERE raw_json IS NOT NULL ORDER BY id DESC"
-                    )
+                        "WHERE raw_json IS NOT NULL AND group_id = :group_id "
+                        "ORDER BY id DESC"
+                    ),
+                    {"group_id": group_id},
                 ).fetchall()
                 for user_id, raw_json in rows:
                     uid = int(user_id)
@@ -303,10 +322,18 @@ class PersonaManager:
                     nickname = str(sender.get("nickname") or "").strip()
                     label = card or nickname
                     if label:
-                        aliases.setdefault(uid, label)
-            self._member_aliases = aliases
-            self._member_aliases_loaded_at = now
-        return self._member_aliases
+                        grouped_aliases.setdefault(group_id, {}).setdefault(
+                            uid, label
+                        )
+                # users table is a cross-group fallback: group-specific sender
+                # snapshots win when both exist for the same user.
+                if group_id is not None:
+                    grouped_aliases[group_id] = {
+                        **grouped_aliases.setdefault(None, {}),
+                        **grouped_aliases.setdefault(group_id, {}),
+                    }
+            self._member_aliases = grouped_aliases
+        return self._member_aliases.get(group_id) or {}
 
     def live_persona(self, group_id: int) -> dict:
         """Return the active persona with relationship labels pointing at the
@@ -314,7 +341,7 @@ class PersonaManager:
 
         persona = self.active_persona(group_id)
         live = copy.deepcopy(persona)
-        aliases = self._member_alias_map()
+        aliases = self._member_alias_map(group_id=group_id)
         alias_to_user: dict[str, int] = {}
         for user_id, label in aliases.items():
             if label:
@@ -338,6 +365,11 @@ class PersonaManager:
             if label:
                 rel["member"] = label
         return live
+
+    def member_label_for_user(self, user_id: int, group_id: int) -> str | None:
+        """Latest display name for one user inside one group, or None."""
+
+        return self._member_alias_map(group_id=group_id).get(int(user_id))
 
     def active_name(self, group_id: int) -> str:
         name = str(self.active_persona(group_id).get("name", "") or "").strip()
