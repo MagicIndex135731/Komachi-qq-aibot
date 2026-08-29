@@ -18,10 +18,8 @@ from app.core.message_mentions import (
 )
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
-from app.storage.repositories import (
-    MemoryRepository,
-    PersonaStyleSyncStateRepository,
-)
+from app.storage.models import MemberFactRefreshState
+from app.storage.repositories import MemoryRepository
 
 
 logger = logging.getLogger(__name__)
@@ -304,10 +302,12 @@ class MemberFactRefreshService:
             due: list[tuple[int, int]] = []
             now = datetime.now(UTC)
             with session_scope(self.engine) as session:
-                state_repo = PersonaStyleSyncStateRepository(session)
                 for user_id in members:
-                    state = state_repo.get(group_id=group_id, user_id=user_id)
-                    new_count = int(state.new_since_refresh or 0) if state else 0
+                    state = session.get(
+                        MemberFactRefreshState,
+                        (int(group_id), int(user_id)),
+                    )
+                    new_count = 0
                     last_refresh = state.last_refresh_at if state else None
                     overdue = False
                     due_today = True
@@ -330,8 +330,10 @@ class MemberFactRefreshService:
     def _refresh_member(self, group_id: int, user_id: int) -> None:
         self._refresh_bot_names()
         with session_scope(self.engine) as session:
-            state_repo = PersonaStyleSyncStateRepository(session)
-            state = state_repo.get(group_id=group_id, user_id=user_id)
+            state = session.get(
+                MemberFactRefreshState,
+                (int(group_id), int(user_id)),
+            )
             watermark = int(state.last_msg_id or 0) if state is not None else 0
             all_new_lines = _new_member_lines(
                 session,
@@ -351,11 +353,13 @@ class MemberFactRefreshService:
             last_id = watermark
             if all_new_lines:
                 last_id = max(int(row.id) for row in all_new_lines)
-            state_repo.set_watermark(
-                group_id=group_id,
-                user_id=user_id,
-                last_msg_id=str(last_id),
-                new_count=0,
+            session.merge(
+                MemberFactRefreshState(
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    last_msg_id=str(last_id),
+                    last_refresh_at=datetime.now(UTC),
+                )
             )
         if not new_lines:
             return
@@ -371,10 +375,13 @@ class MemberFactRefreshService:
             facts=facts,
         )
         with session_scope(self.engine) as session:
-            PersonaStyleSyncStateRepository(session).mark_refreshed(
-                group_id=group_id,
-                user_id=user_id,
-                when=datetime.now(UTC),
+            session.merge(
+                MemberFactRefreshState(
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    last_msg_id=str(last_id),
+                    last_refresh_at=datetime.now(UTC),
+                )
             )
         logger.info(
             "member_fact_refresh group_id=%s user_id=%s facts=%s imported=%s",

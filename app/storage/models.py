@@ -91,6 +91,24 @@ class PersonaStyleSyncState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
 
+class MemberFactRefreshState(Base):
+    """Independent watermark for member fact refresh.
+
+    Kept separate from persona_style_sync_state so fact refresh can never
+    advance (and thereby suppress) the style-sample sync watermark.
+    """
+
+    __tablename__ = "member_fact_refresh_state"
+
+    group_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_msg_id: Mapped[str] = mapped_column(String(128), default="")
+    last_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (

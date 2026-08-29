@@ -7,8 +7,8 @@ simulated voice is to the real one.
 
 Usage (inside xiaomachi-bot container):
     DEEPSEEK_API_KEY=sk-... python scripts/audit_similarity_llm.py \
-        --group-id 515267906 --bot-qq 1807533371 \
-        --persona-key 1357318398 --requester-qq 1357318398
+        --group-id <GROUP_ID> --bot-qq <BOT_QQ> \
+        --persona-key <PERSONA_KEY> --requester-qq <REQUESTER_QQ>
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ def main() -> int:
     parser.add_argument("--requester-qq", type=int, required=True)
     parser.add_argument(
         "--out",
-        default="/workspace/data/personas/1357318398/eval/similarity_audit.json",
+        default="",
     )
     parser.add_argument("--sample-limit", type=int, default=30)
     args = parser.parse_args()
@@ -292,7 +292,10 @@ def main() -> int:
         else 0,
         "scores": overall_scores,
     }
-    out = Path(args.out)
+    out = Path(
+        args.out
+        or f"/workspace/data/personas/{args.persona_key}/eval/similarity_audit.json"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         json.dumps(

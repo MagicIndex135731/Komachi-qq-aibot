@@ -27,6 +27,17 @@ from app.storage.repositories import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _positive_int(value: object) -> int | None:
     try:
         resolved = int(value)
@@ -347,6 +358,7 @@ def _build_examples(
                 "text": text,
                 "context_before": context_before,
                 "reply_target": reply_target,
+                "timestamp": _parse_timestamp(row.get("timestamp")),
             }
         )
     return examples
