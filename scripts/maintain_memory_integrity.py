@@ -45,6 +45,44 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 return -1
             return _scalar(connection, statement)
 
+        retrieval_fts_stale = -1
+        retrieval_fts_missing = -1
+        if {
+            "retrieval_documents_fts",
+            "retrieval_documents",
+        }.issubset(table_names):
+            active_retrieval_pairs = {
+                (int(document_id), str(content_hash or ""))
+                for document_id, content_hash in connection.execute(
+                    text(
+                        "SELECT id,content_hash FROM retrieval_documents "
+                        "WHERE status='active'"
+                    )
+                )
+            }
+            retrieval_fts_rows = [
+                (int(document_id), str(content_hash or ""))
+                for document_id, content_hash in connection.execute(
+                    text(
+                        "SELECT document_id,content_hash "
+                        "FROM retrieval_documents_fts"
+                    )
+                )
+                if str(document_id or "").isdigit()
+            ]
+            active_retrieval_fts_pairs = set(retrieval_fts_rows).intersection(
+                active_retrieval_pairs
+            )
+            # There must be exactly one FTS row per active document/hash pair.
+            # Count malformed, inactive and duplicate rows as stale so repair is
+            # deterministic and index-state totals cannot drift above reality.
+            retrieval_fts_stale = len(retrieval_fts_rows) - len(
+                active_retrieval_fts_pairs
+            )
+            retrieval_fts_missing = len(
+                active_retrieval_pairs - active_retrieval_fts_pairs
+            )
+
         return {
             "missing_optional_schema_tables": sum(
                 table not in table_names
@@ -161,22 +199,8 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 "OR indexed_documents>total_documents)",
                 "retrieval_index_state",
             ),
-            "retrieval_fts_rows_for_nonactive_documents": optional_scalar(
-                "SELECT COUNT(*) FROM retrieval_documents_fts f "
-                "LEFT JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
-                "AND d.content_hash=f.content_hash "
-                "WHERE d.id IS NULL OR d.status<>'active'",
-                "retrieval_documents_fts",
-                "retrieval_documents",
-            ),
-            "active_documents_missing_retrieval_fts": optional_scalar(
-                "SELECT COUNT(*) FROM retrieval_documents d WHERE d.status='active' "
-                "AND NOT EXISTS (SELECT 1 FROM retrieval_documents_fts f "
-                "WHERE f.document_id=CAST(d.id AS TEXT) "
-                "AND f.content_hash=d.content_hash)",
-                "retrieval_documents_fts",
-                "retrieval_documents",
-            ),
+            "retrieval_fts_rows_for_nonactive_documents": retrieval_fts_stale,
+            "active_documents_missing_retrieval_fts": retrieval_fts_missing,
         }
 
 
@@ -349,55 +373,64 @@ def repair_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
         )
         repaired["inserted_missing_fts_rows"] = before_missing
 
-        stale_retrieval_fts = session.execute(
-            text(
-                "DELETE FROM retrieval_documents_fts WHERE rowid IN ("
-                "SELECT f.rowid FROM retrieval_documents_fts f "
-                "LEFT JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
-                "AND d.content_hash=f.content_hash "
-                "WHERE d.id IS NULL OR d.status<>'active')"
+        active_documents = {
+            (int(row.id), str(row.content_hash or "")): row
+            for row in session.scalars(
+                select(RetrievalDocument).where(
+                    RetrievalDocument.status == "active"
+                )
             )
-        )
-        repaired["deleted_stale_retrieval_fts_rows"] = int(
-            stale_retrieval_fts.rowcount or 0
-        )
-        missing_retrieval_fts = int(
+        }
+        retrieval_fts_rows = list(
             session.execute(
                 text(
-                    "SELECT COUNT(*) FROM retrieval_documents d WHERE d.status='active' "
-                    "AND NOT EXISTS (SELECT 1 FROM retrieval_documents_fts f "
-                    "WHERE f.document_id=CAST(d.id AS TEXT) "
-                    "AND f.content_hash=d.content_hash)"
+                    "SELECT rowid,document_id,content_hash "
+                    "FROM retrieval_documents_fts"
                 )
-            ).scalar_one()
-            or 0
-        )
-        session.execute(
-            text(
-                "INSERT INTO retrieval_documents_fts(content,group_id,document_id,content_hash) "
-                "SELECT d.content,CAST(d.group_id AS TEXT),CAST(d.id AS TEXT),d.content_hash "
-                "FROM retrieval_documents d WHERE d.status='active' AND NOT EXISTS ("
-                "SELECT 1 FROM retrieval_documents_fts f "
-                "WHERE f.document_id=CAST(d.id AS TEXT) AND f.content_hash=d.content_hash)"
             )
         )
-        repaired["inserted_missing_retrieval_fts_rows"] = missing_retrieval_fts
-        active_documents = int(
-            session.execute(
-                text("SELECT COUNT(*) FROM retrieval_documents WHERE status='active'")
-            ).scalar_one()
-            or 0
-        )
-        indexed_documents = int(
+        active_pairs = set(active_documents)
+        existing_active_pairs: set[tuple[int, str]] = set()
+        stale_rowids: list[int] = []
+        for rowid, document_id, content_hash in retrieval_fts_rows:
+            if not str(document_id or "").isdigit():
+                stale_rowids.append(int(rowid))
+                continue
+            pair = (int(document_id), str(content_hash or ""))
+            if pair in active_pairs and pair not in existing_active_pairs:
+                existing_active_pairs.add(pair)
+            else:
+                stale_rowids.append(int(rowid))
+        for offset in range(0, len(stale_rowids), 500):
             session.execute(
                 text(
-                    "SELECT COUNT(DISTINCT f.document_id) FROM retrieval_documents_fts f "
-                    "JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
-                    "AND d.content_hash=f.content_hash WHERE d.status='active'"
-                )
-            ).scalar_one()
-            or 0
-        )
+                    "DELETE FROM retrieval_documents_fts WHERE rowid IN :rowids"
+                ).bindparams(bindparam("rowids", expanding=True)),
+                {"rowids": tuple(stale_rowids[offset : offset + 500])},
+            )
+        repaired["deleted_stale_retrieval_fts_rows"] = len(stale_rowids)
+
+        missing_pairs = active_pairs - existing_active_pairs
+        if missing_pairs:
+            session.execute(
+                text(
+                    "INSERT INTO retrieval_documents_fts"
+                    "(content,group_id,document_id,content_hash) "
+                    "VALUES (:content,:group_id,:document_id,:content_hash)"
+                ),
+                [
+                    {
+                        "content": active_documents[pair].content,
+                        "group_id": str(active_documents[pair].group_id),
+                        "document_id": str(pair[0]),
+                        "content_hash": pair[1],
+                    }
+                    for pair in sorted(missing_pairs)
+                ],
+            )
+        repaired["inserted_missing_retrieval_fts_rows"] = len(missing_pairs)
+        active_document_count = len(active_pairs)
+        indexed_document_count = len(active_pairs)
         refreshed_state = session.execute(
             text(
                 "UPDATE retrieval_index_state SET total_documents=:total_documents,"
@@ -406,8 +439,8 @@ def repair_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 "total_documents<>:total_documents OR indexed_documents<>:indexed_documents)"
             ),
             {
-                "total_documents": active_documents,
-                "indexed_documents": indexed_documents,
+                "total_documents": active_document_count,
+                "indexed_documents": indexed_document_count,
                 "updated_at": now.astimezone(UTC).replace(tzinfo=None),
             },
         )

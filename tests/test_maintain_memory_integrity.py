@@ -128,6 +128,13 @@ def _seed_drift(engine) -> None:
             ),
             {"document_id": str(stale_document.id)},
         )
+        session.execute(
+            text(
+                "INSERT INTO retrieval_documents_fts(content,group_id,document_id,content_hash) "
+                "VALUES ('duplicate','900000001',:document_id,'stale-doc')"
+            ),
+            {"document_id": str(stale_document.id)},
+        )
         session.add(
             Summary(
                 scope_type="group",
@@ -189,14 +196,14 @@ def test_audit_and_repair_memory_integrity_are_idempotent(sqlite_engine) -> None
     assert before["active_docs_for_nonactive_memories"] == 1
     assert before["active_memories_missing_fts"] == 1
     assert before["fts_rows_for_nonactive_memories"] == 1
-    assert before["retrieval_fts_rows_for_nonactive_documents"] == 0
+    assert before["retrieval_fts_rows_for_nonactive_documents"] == 1
 
     repaired = repair_memory_integrity(sqlite_engine, now=NOW)
     assert repaired["expired_memories"] == 1
     assert repaired["normalized_summaries"] == 1
     assert repaired["deactivated_legacy_summaries"] == 1
     assert repaired["cancelled_legacy_jobs"] == 1
-    assert repaired["deleted_stale_retrieval_fts_rows"] == 1
+    assert repaired["deleted_stale_retrieval_fts_rows"] == 2
 
     after = audit_memory_integrity(sqlite_engine, now=NOW)
     for key in (
