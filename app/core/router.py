@@ -1758,7 +1758,18 @@ class InboundRouter:
                             )
                         ),
                     )
-            if self.runtime.settings.memory_compaction_enabled:
+            # V3 owns episode derivation through MemoryBackgroundService.  The
+            # old batch compaction queue must only be fed when its legacy
+            # worker is actually enabled; otherwise jobs accumulate forever.
+            legacy_compaction_enabled = bool(
+                self.runtime.settings.memory_compaction_enabled
+                and getattr(
+                    self.memory_compaction_service,
+                    "legacy_enabled",
+                    False,
+                )
+            )
+            if legacy_compaction_enabled:
                 batch_size = max(10, int(self.runtime.settings.memory_compaction_batch_size))
                 if message_count > 0 and message_count % batch_size == 0:
                     compaction_messages = messages.list_recent_group_inbound_messages(

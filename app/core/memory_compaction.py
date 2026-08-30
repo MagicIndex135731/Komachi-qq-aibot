@@ -56,6 +56,7 @@ _ADDRESSING_TARGET_QQ_PATTERN = re.compile(r"(?:对用户|对|针对)\s*[“\"']
 
 _MAX_SUMMARY_CHARS = 2_000
 _MAX_FIELD_CHARS = 600
+_MAX_PERSON_ACTION_FACT_CHARS = 320
 _MAX_FACTS = 64
 _MAX_INVALIDATIONS = 32
 _ROLLING_PREFIX = re.compile(
@@ -68,6 +69,9 @@ _DIGEST_SUMMARY = re.compile(
 )
 _WHITESPACE = re.compile(r"\s+")
 _COLLECTIVE_PATTERN = re.compile(r"(?:大家|我们|群里|群内|全员|\bwe\b|\bour\b|\bgroup\b|\beveryone\b)", re.IGNORECASE)
+_ENUMERATION_MARKER = re.compile(
+    r"(?:^|\s)(?:\d{1,3}\s*[.、:：)）]|[一二三四五六七八九十]{1,3}\s*[.、:：)）])"
+)
 _SINGLE_VALUE_PROFILE_ATTRIBUTE_ALIASES = {
     "age": frozenset({"age", "年龄", "岁数"}),
     "nationality": frozenset({"nationality", "国籍"}),
@@ -649,6 +653,27 @@ def _parse_fact(
             object_text=object_text,
             content=content,
             source_texts=source_texts,
+        ):
+            return None
+    if kind in {"plan", "decision"} and subject_id != "group":
+        # Long enumerations and article-sized prose are usually forwarded or
+        # pasted material, not one member's own plan/decision.  Fail closed
+        # here instead of letting a truncated paragraph pollute the profile.
+        supporting_text = (
+            " ".join(
+                str(source_contents.get(source, "") or "")
+                for source in source_ids
+            )
+            if source_contents is not None
+            else ""
+        )
+        if (
+            len(content) > _MAX_PERSON_ACTION_FACT_CHARS
+            or len(object_text) > _MAX_PERSON_ACTION_FACT_CHARS
+            or (
+                len(supporting_text) > 1_200
+                and len(_ENUMERATION_MARKER.findall(supporting_text)) >= 4
+            )
         ):
             return None
     if candidate.get("valid_until") is not None and valid_until is None:

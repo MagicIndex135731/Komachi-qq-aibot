@@ -28,6 +28,7 @@ from app.storage.repositories import (
     GroupRepository,
     MemoryRepository,
     MessageRepository,
+    JobRepository,
     UserRepository,
 )
 
@@ -2929,6 +2930,43 @@ def test_router_ingests_historical_group_message_without_replying(sqlite_engine)
     assert sender.sent == []
     assert llm.calls == []
     assert [message.platform_msg_id for message in stored_messages] == ["history-only-1"]
+
+
+@pytest.mark.parametrize(
+    ("legacy_enabled", "expected_jobs"),
+    [(False, 0), (True, 1)],
+)
+def test_router_only_enqueues_compaction_when_legacy_worker_can_consume_it(
+    sqlite_engine,
+    legacy_enabled: bool,
+    expected_jobs: int,
+) -> None:
+    from types import SimpleNamespace
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_compaction_service=SimpleNamespace(legacy_enabled=legacy_enabled),
+    )
+    router.runtime.settings.memory_compaction_enabled = True
+    router.runtime.settings.memory_compaction_batch_size = 10
+
+    for index in range(10):
+        assert router.ingest_historical_group_message(
+            make_event(
+                group_id=10001,
+                mentioned_bot=False,
+                message_id=f"legacy-boundary-{index}",
+            )
+        )
+
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session).list_jobs(
+            job_type="memory_compaction",
+            statuses=["queued"],
+        )
+    assert len(jobs) == expected_jobs
 
 
 def test_router_skips_image_cache_downloads_during_historical_ingest(sqlite_engine, monkeypatch) -> None:

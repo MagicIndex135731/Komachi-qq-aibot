@@ -90,7 +90,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ids,
                 valid_until=now,
             )
-            MemoryRepository(session).delete_memory_item_semantic_vectors(ids)
         print(f"deactivated={deactivated} candidates={len(ids)}")
         return 0
     finally:

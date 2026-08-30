@@ -1115,6 +1115,7 @@ def build_memory_runtime(
             rows = SummaryRepository(session).list_group_summaries(
                 scope_id=str(group_id),
                 limit=settings.context_summary_limit * 3,
+                require_source_ids=True,
                 start_at=(time_range.start if time_range is not None else None),
                 end_at=(time_range.end if time_range is not None else None),
                 **summary_kwargs,

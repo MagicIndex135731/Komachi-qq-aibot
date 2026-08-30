@@ -65,6 +65,23 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _episode_summary_bounds(
+    messages: Sequence[BackgroundMessage],
+) -> tuple[BackgroundMessage, BackgroundMessage]:
+    """Return chronological source bounds independent of episode ordinal."""
+    if not messages:
+        raise ValueError("episode summary bounds require at least one message")
+    start_message = min(
+        messages,
+        key=lambda item: (item.timestamp, int(item.id)),
+    )
+    end_message = max(
+        messages,
+        key=lambda item: (item.timestamp, int(item.id)),
+    )
+    return start_message, end_message
+
+
 @dataclass(frozen=True, slots=True)
 class BackgroundMessage:
     id: int
@@ -1366,6 +1383,7 @@ class SqlAlchemyMemoryBackgroundStore:
                         )
 
                 if messages and derivation.summary.strip():
+                    start_message, end_message = _episode_summary_bounds(messages)
                     summary = SummaryRepository(session).upsert_summary(
                         scope_type="group",
                         scope_id=str(episode.group_id),
@@ -1374,12 +1392,12 @@ class SqlAlchemyMemoryBackgroundStore:
                             f"episode:{episode.id}:"
                             f"{expected_compaction_generation}"
                         ),
-                        start_at=messages[0].timestamp,
-                        end_at=messages[-1].timestamp,
+                        start_at=start_message.timestamp,
+                        end_at=end_message.timestamp,
                         content=derivation.summary,
                         source_count=len(messages),
-                        source_start_msg_id=messages[0].platform_msg_id,
-                        source_end_msg_id=messages[-1].platform_msg_id,
+                        source_start_msg_id=start_message.platform_msg_id,
+                        source_end_msg_id=end_message.platform_msg_id,
                     )
                     session.flush()
                     documents.upsert_document(
@@ -1390,8 +1408,8 @@ class SqlAlchemyMemoryBackgroundStore:
                         document_kind="episode_summary",
                         source_table="summaries",
                         source_id=str(summary.id),
-                        start_at=messages[0].timestamp,
-                        end_at=messages[-1].timestamp,
+                        start_at=start_message.timestamp,
+                        end_at=end_message.timestamp,
                         content=derivation.summary,
                         metadata_json={
                             "episode_id": episode.id,
@@ -1457,7 +1475,8 @@ class SqlAlchemyMemoryBackgroundStore:
                         valid_from=episode.ended_at or now,
                         valid_until=_parse_timestamp(fact.valid_until),
                         replace_previous=(
-                            (
+                            fact.kind == "current"
+                            or (
                                 fact.kind == "preference"
                                 and is_addressing_rule(
                                     fact.predicate,
@@ -1808,11 +1827,14 @@ class MemoryBackgroundService:
             return 0
         try:
             with session_scope(engine) as session:
-                return MemoryRepository(session).expire_stale_current_memories(
+                expired = MemoryRepository(session).expire_stale_memories(
                     now=now
                 )
+                if expired:
+                    logger.info("memory_expiry_completed expired_count=%s", expired)
+                return expired
         except Exception:
-            logger.exception("memory_current_expiry_failed")
+            logger.exception("memory_expiry_failed")
             return 0
 
     def enqueue_raw_message_index(

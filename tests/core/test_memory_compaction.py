@@ -63,6 +63,56 @@ def test_parser_filters_fields_and_deduplicates_source_backed_facts() -> None:
     }
 
 
+def test_parser_rejects_article_sized_member_plan_without_model_judging() -> None:
+    copied_list = " ".join(
+        f"{index}. 这是复制文章中的第{index}条说明"
+        for index in range(1, 30)
+    )
+    result = parse_memory_compaction_response(
+        {
+            "summary": "copied material",
+            "facts": [
+                _fact(
+                    kind="plan",
+                    predicate="打算",
+                    object_text="复制文章中的整段计划" * 30,
+                    content="成员计划：" + "很长的复制内容" * 60,
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"Alice"},
+        source_subject_ids={"m-1": "Alice"},
+        source_contents={"m-1": copied_list},
+    )
+
+    assert result.facts == ()
+    assert result.rejected_fact_count == 1
+
+
+def test_parser_keeps_short_direct_member_plan() -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "Alice plans to travel.",
+            "facts": [
+                _fact(
+                    kind="plan",
+                    predicate="plans",
+                    object_text="travel tomorrow",
+                    content="Alice plans to travel tomorrow.",
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"Alice"},
+        source_subject_ids={"m-1": "Alice"},
+        source_contents={"m-1": "I plan to travel tomorrow."},
+    )
+
+    assert len(result.facts) == 1
+    assert result.facts[0].kind == "plan"
+
+
 def test_parser_quality_gate_rejects_preference_fragments() -> None:
     result = parse_memory_compaction_response(
         {

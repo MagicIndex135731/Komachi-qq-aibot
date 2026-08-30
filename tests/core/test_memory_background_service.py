@@ -21,6 +21,7 @@ from app.core.memory_background_service import (
     ShadowJobRequest,
     SqlAlchemyMemoryBackgroundStore,
     _compatible_segmentation_generation,
+    _episode_summary_bounds,
 )
 from app.storage.db import (
     activate_retrieval_vector_generation,
@@ -42,6 +43,20 @@ from app.storage.repositories import (
 
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+
+
+def test_episode_summary_bounds_use_timestamps_not_episode_ordinals() -> None:
+    messages = [
+        _message(1, minute=30),
+        _message(2, minute=5),
+        _message(3, minute=20),
+    ]
+
+    start, end = _episode_summary_bounds(messages)
+
+    assert start.platform_msg_id == "m-2"
+    assert end.platform_msg_id == "m-1"
+    assert start.timestamp <= end.timestamp
 
 
 class FakeStore:

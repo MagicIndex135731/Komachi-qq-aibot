@@ -704,6 +704,9 @@ def test_v3_observability_logs_metrics_without_query_or_message_content(
     assert "candidate_units=2" in metrics
     assert "recent_messages=0" in metrics
     assert "history_messages=0" in metrics
+    assert "selected_facts=" in metrics
+    assert "selected_segments=" in metrics
+    assert "selected_summaries=" in metrics
     assert "recent_tokens=0" in metrics
     assert "history_tokens=0" in metrics
     assert sensitive_query not in metrics

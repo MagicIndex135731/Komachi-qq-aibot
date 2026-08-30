@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.storage.db import session_scope
+from app.storage.models import MemoryItem
 from app.storage.repositories import (
     GroupRepository,
     MemoryRepository,
@@ -111,7 +112,7 @@ def test_semantic_vector_upsert_load_delete_and_deactivate(sqlite_engine) -> Non
             valid_until=datetime.now(UTC),
         )
         assert deactivated == 1
-        assert memories.delete_memory_item_semantic_vectors([memory_ids[0]]) == 1
+        assert memories.delete_memory_item_semantic_vectors([memory_ids[0]]) == 0
         remaining = memories.load_memory_item_semantic_vectors(
             memory_ids,
             provider="fake",
@@ -128,3 +129,21 @@ def test_semantic_vector_upsert_load_delete_and_deactivate(sqlite_engine) -> Non
             limit=10,
         )
         assert [int(row.id) for row in rows] == [memory_ids[1]]
+
+
+def test_expiry_deactivates_every_memory_kind(sqlite_engine) -> None:
+    memory_ids = _seed(sqlite_engine)
+    now = datetime(2026, 8, 30, 8, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        rows = [session.get(MemoryItem, memory_id) for memory_id in memory_ids]
+        assert all(row is not None for row in rows)
+        for row in rows:
+            row.valid_until = now - timedelta(seconds=1)
+            row.expires_at = row.valid_until
+
+    with session_scope(sqlite_engine) as session:
+        memories = MemoryRepository(session)
+        assert memories.expire_stale_memories(now=now) == 2
+        remaining = memories.list_active_memory_items_for_indexing(limit=10)
+        assert remaining == []

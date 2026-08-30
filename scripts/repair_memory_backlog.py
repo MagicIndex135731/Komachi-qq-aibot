@@ -26,6 +26,7 @@ from app.core.memory_compaction import canonical_key
 from app.core.memory_background_service import SqlAlchemyMemoryBackgroundStore
 from app.storage.db import build_engine, session_scope
 from app.storage.models import MemoryItem
+from app.storage.repositories import JobRepository
 
 
 def _store(engine):
@@ -38,23 +39,19 @@ def _store(engine):
 
 def cleanup_jobs(engine, dry_run: bool) -> int:
     with session_scope(engine) as session:
-        rows = session.execute(
-            text(
-                "SELECT id FROM jobs WHERE job_type='memory_compaction' "
-                "AND status IN ('queued', 'failed')"
-            )
-        ).all()
-        ids = [int(row[0]) for row in rows]
-        if dry_run or not ids:
-            return len(ids)
-        session.execute(
-            text(
-                "UPDATE jobs SET status='completed', completed_at=:now "
-                "WHERE job_type='memory_compaction' AND status IN ('queued', 'failed')"
-            ),
-            {"now": datetime.now(UTC).isoformat()},
+        statuses = ["queued", "running", "failed"]
+        jobs = JobRepository(session)
+        count = jobs.count_active_jobs(
+            job_type="memory_compaction",
+            statuses=statuses,
         )
-        return len(ids)
+        if dry_run or not count:
+            return count
+        return jobs.cancel_jobs(
+            job_type="memory_compaction",
+            statuses=statuses,
+            now=datetime.now(UTC),
+        )
 
 
 def requeue_episodes(engine, dry_run: bool) -> int:

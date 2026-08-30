@@ -1274,6 +1274,7 @@ class SummaryRepository:
         summary_key: str | None = None,
         start_at: datetime | None = None,
         end_at: datetime | None = None,
+        require_source_ids: bool = False,
     ) -> list[Summary]:
         if limit <= 0:
             return []
@@ -1282,6 +1283,13 @@ class SummaryRepository:
             filters.append(Summary.summary_level.in_(summary_levels))
         if summary_key is not None:
             filters.append(Summary.summary_key == summary_key)
+        if require_source_ids:
+            filters.append(
+                or_(
+                    Summary.source_start_msg_id.is_not(None),
+                    Summary.source_end_msg_id.is_not(None),
+                )
+            )
         if start_at is not None:
             filters.append(
                 Summary.end_at >= _normalize_utc_sqlite_timestamp(start_at)
@@ -1554,6 +1562,7 @@ class MemoryRepository:
             memory.valid_until = valid_until
             memory.expires_at = valid_until
         self._sync_memory_indexes(memory)
+        self.delete_memory_item_semantic_vectors([int(memory.id)])
         _deactivate_memory_retrieval_documents(
             self.session,
             memory_id=memory.id,
@@ -2168,20 +2177,23 @@ class MemoryRepository:
             row.status = "inactive"
             row.valid_until = valid_until
             row.expires_at = valid_until
+            self._sync_memory_indexes(row)
             _deactivate_memory_retrieval_documents(
                 self.session,
                 memory_id=int(row.id),
             )
+        self.delete_memory_item_semantic_vectors(
+            [int(row.id) for row in rows]
+        )
         self.session.flush()
         return len(rows)
 
-    def expire_stale_current_memories(self, *, now: datetime) -> int:
-        """Deactivate current-state memories whose validity window has passed."""
+    def expire_stale_memories(self, *, now: datetime) -> int:
+        """Deactivate every active memory whose validity window has passed."""
         normalized_now = _normalize_utc_sqlite_timestamp(now)
         rows = list(
             self.session.scalars(
                 select(MemoryItem.id).where(
-                    MemoryItem.memory_kind == "current",
                     MemoryItem.status == "active",
                     MemoryItem.valid_until.is_not(None),
                     MemoryItem.valid_until < normalized_now,
@@ -2190,13 +2202,14 @@ class MemoryRepository:
         )
         if not rows:
             return 0
-        deactivated = self.deactivate_memory_items(
+        return self.deactivate_memory_items(
             rows,
             valid_until=normalized_now,
         )
-        if deactivated:
-            self.delete_memory_item_semantic_vectors(rows)
-        return deactivated
+
+    def expire_stale_current_memories(self, *, now: datetime) -> int:
+        """Compatibility wrapper for the now kind-agnostic expiry pass."""
+        return self.expire_stale_memories(now=now)
 
     def _sync_memory_indexes(self, memory: MemoryItem) -> None:
         self._sync_fts(memory)
@@ -5175,6 +5188,37 @@ class JobRepository:
             .order_by(Job.id.asc())
         )
         return list(self.session.scalars(stmt))
+
+    def cancel_jobs(
+        self,
+        *,
+        job_type: str,
+        statuses: Sequence[str],
+        now: datetime,
+    ) -> int:
+        """Cancel a bounded job family and release any stale lease state."""
+        normalized_statuses = tuple(
+            dict.fromkeys(str(status) for status in statuses if str(status))
+        )
+        if not normalized_statuses:
+            return 0
+        rows = list(
+            self.session.scalars(
+                select(Job).where(
+                    Job.job_type == job_type,
+                    Job.status.in_(normalized_statuses),
+                )
+            )
+        )
+        completed_at = _normalize_utc_sqlite_timestamp(now)
+        for row in rows:
+            row.status = "cancelled"
+            row.locked_by = None
+            row.locked_at = None
+            row.lease_until = None
+            row.completed_at = completed_at
+        self.session.flush()
+        return len(rows)
 
     def claim_oldest_queued_job(self, *, job_type: str, now: datetime | None = None) -> Job | None:
         run_before = _normalize_utc_sqlite_timestamp(now or datetime.now().astimezone())

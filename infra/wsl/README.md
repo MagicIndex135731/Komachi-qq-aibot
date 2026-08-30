@@ -162,9 +162,21 @@ python -m scripts.backfill_memory_item_semantic_vectors --database /workspace/da
 # 历史噪音清理（plan -> 备份 -> run；可恢复）
 python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
 python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
+# 全系统一致性审计（只读、只输出计数，不调用外部模型）
+python -m scripts.maintain_memory_integrity audit --database /workspace/data/bot.db
+# 确定性修复：必须显式 --apply，执行前自动创建 SQLite online backup
+python -m scripts.maintain_memory_integrity repair --apply \
+  --database /workspace/data/bot.db \
+  --backup-dir /workspace/data/backups
 # 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
 python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id <GROUP_ID> --dry-run
 ```
+
+一致性修复仅处理可机械证明的状态：过期 active 记忆、倒置摘要时间、无来源旧
+`window` 摘要、legacy compaction 积压、非 active 记忆残留向量/FTS/检索文档，
+以及 active 记忆缺失的 FTS 行。它不会判断聊天内容真假，也不会自动改写人物画像。
+修复后应再次运行 `audit`，要求上述可修复计数归零，并执行数据库
+`PRAGMA integrity_check`。
 
 发布只重建 `xiaomachi`，绝不重启 `xiaomachi-llbot`。
 

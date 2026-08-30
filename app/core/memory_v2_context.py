@@ -346,6 +346,7 @@ class MemoryV2ContextProvider:
                 "pin_counts=%s pin_overflow=%s "
                 "candidate_units=%s expanded_sources=%s rejected_sources=%s "
                 "selected_source_count=%s recent_messages=%s history_messages=%s "
+                "selected_facts=%s selected_segments=%s selected_summaries=%s "
                 "effective_budget=%s recent_tokens=%s history_tokens=%s total_tokens=%s "
                 "spillover=%s degradation_reason=%s "
                 "resolve_ms=%.3f retrieval_ms=%.3f expansion_ms=%.3f "
@@ -391,6 +392,9 @@ class MemoryV2ContextProvider:
                 len(packed.source_msg_ids),
                 len(packed.recent_messages),
                 sum(len(segment.messages) for segment in packed.evidence_segments),
+                len(packed.facts),
+                len(packed.evidence_segments),
+                len(packed.summaries),
                 packed.budget,
                 packed.recent_estimated_tokens,
                 packed.history_estimated_tokens,
