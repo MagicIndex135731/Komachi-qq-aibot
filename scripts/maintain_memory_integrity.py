@@ -45,6 +45,72 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 return -1
             return _scalar(connection, statement)
 
+        active_memory_ids = {
+            int(memory_id)
+            for memory_id in connection.execute(
+                text("SELECT id FROM memory_items WHERE status='active'")
+            ).scalars()
+        }
+
+        active_docs_for_nonactive_memories = -1
+        active_memories_without_active_docs = -1
+        active_memories_only_with_inactive_docs = -1
+        if "retrieval_documents" in table_names:
+            active_memory_document_ids: set[int] = set()
+            inactive_memory_document_ids: set[int] = set()
+            active_docs_for_nonactive_memories = 0
+            for source_id, status in connection.execute(
+                text(
+                    "SELECT source_id,status FROM retrieval_documents "
+                    "WHERE document_kind='memory' AND source_table='memory_items'"
+                )
+            ):
+                normalized_source_id = str(source_id or "")
+                memory_id = (
+                    int(normalized_source_id)
+                    if normalized_source_id.isdigit()
+                    else None
+                )
+                if status == "active":
+                    if memory_id is None or memory_id not in active_memory_ids:
+                        active_docs_for_nonactive_memories += 1
+                    elif memory_id is not None:
+                        active_memory_document_ids.add(memory_id)
+                elif memory_id is not None:
+                    inactive_memory_document_ids.add(memory_id)
+            active_memories_without_active_docs = len(
+                active_memory_ids - active_memory_document_ids
+            )
+            active_memories_only_with_inactive_docs = len(
+                (active_memory_ids & inactive_memory_document_ids)
+                - active_memory_document_ids
+            )
+
+        active_memories_missing_fts = -1
+        fts_rows_for_nonactive_memories = -1
+        if "memory_items_fts" in table_names:
+            memory_fts_ids: list[int | None] = []
+            for memory_id in connection.execute(
+                text("SELECT memory_id FROM memory_items_fts")
+            ).scalars():
+                normalized_memory_id = str(memory_id or "")
+                memory_fts_ids.append(
+                    int(normalized_memory_id)
+                    if normalized_memory_id.isdigit()
+                    else None
+                )
+            active_memory_fts_ids = {
+                memory_id
+                for memory_id in memory_fts_ids
+                if memory_id in active_memory_ids
+            }
+            active_memories_missing_fts = len(
+                active_memory_ids - active_memory_fts_ids
+            )
+            fts_rows_for_nonactive_memories = sum(
+                memory_id not in active_memory_ids for memory_id in memory_fts_ids
+            )
+
         retrieval_fts_stale = -1
         retrieval_fts_missing = -1
         if {
@@ -94,10 +160,7 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                     "retrieval_index_state",
                 )
             ),
-            "active_memories": _scalar(
-                connection,
-                "SELECT COUNT(*) FROM memory_items WHERE status='active'",
-            ),
+            "active_memories": len(active_memory_ids),
             "expired_active_memories": int(
                 connection.execute(
                     text(
@@ -137,42 +200,13 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 "WHERE v.memory_id=m.id)",
                 "memory_item_semantic_vectors",
             ),
-            "active_docs_for_nonactive_memories": optional_scalar(
-                "SELECT COUNT(*) FROM retrieval_documents d "
-                "LEFT JOIN memory_items m ON m.id=CAST(d.source_id AS INTEGER) "
-                "WHERE d.document_kind='memory' AND d.source_table='memory_items' "
-                "AND d.status='active' AND (m.id IS NULL OR m.status<>'active')",
-                "retrieval_documents",
+            "active_docs_for_nonactive_memories": active_docs_for_nonactive_memories,
+            "active_memories_without_active_docs": active_memories_without_active_docs,
+            "active_memories_only_with_inactive_docs": (
+                active_memories_only_with_inactive_docs
             ),
-            "active_memories_without_active_docs": optional_scalar(
-                "SELECT COUNT(*) FROM memory_items m WHERE m.status='active' "
-                "AND NOT EXISTS (SELECT 1 FROM retrieval_documents d "
-                "WHERE d.document_kind='memory' AND d.source_table='memory_items' "
-                "AND d.source_id=CAST(m.id AS TEXT) AND d.status='active')",
-                "retrieval_documents",
-            ),
-            "active_memories_only_with_inactive_docs": optional_scalar(
-                "SELECT COUNT(*) FROM memory_items m WHERE m.status='active' "
-                "AND EXISTS (SELECT 1 FROM retrieval_documents d "
-                "WHERE d.document_kind='memory' AND d.source_table='memory_items' "
-                "AND d.source_id=CAST(m.id AS TEXT) AND d.status<>'active') "
-                "AND NOT EXISTS (SELECT 1 FROM retrieval_documents d "
-                "WHERE d.document_kind='memory' AND d.source_table='memory_items' "
-                "AND d.source_id=CAST(m.id AS TEXT) AND d.status='active')",
-                "retrieval_documents",
-            ),
-            "active_memories_missing_fts": optional_scalar(
-                "SELECT COUNT(*) FROM memory_items m WHERE m.status='active' "
-                "AND NOT EXISTS (SELECT 1 FROM memory_items_fts f "
-                "WHERE f.memory_id=CAST(m.id AS TEXT))",
-                "memory_items_fts",
-            ),
-            "fts_rows_for_nonactive_memories": optional_scalar(
-                "SELECT COUNT(*) FROM memory_items_fts f "
-                "LEFT JOIN memory_items m ON CAST(m.id AS TEXT)=f.memory_id "
-                "WHERE m.id IS NULL OR m.status<>'active'",
-                "memory_items_fts",
-            ),
+            "active_memories_missing_fts": active_memories_missing_fts,
+            "fts_rows_for_nonactive_memories": fts_rows_for_nonactive_memories,
             "duplicate_active_memory_excess": _scalar(
                 connection,
                 "SELECT COALESCE(SUM(n-1),0) FROM ("
