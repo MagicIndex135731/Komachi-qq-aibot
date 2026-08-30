@@ -53,7 +53,12 @@ def test_persona_aliases_include_short_cjk_suffix() -> None:
     assert "小町" in persona_aliases({"name": "测试小町"})
 
 
-def test_persona_manager_persists_per_group_keys(sqlite_engine) -> None:
+def test_persona_manager_resets_keys_on_restart_but_preserves_snapshots(
+    sqlite_engine,
+) -> None:
+    from app.storage.db import session_scope
+    from app.storage.repositories import GroupPersonaStateRepository
+
     personas = _personas()
     manager = PersonaManager(
         engine=sqlite_engine,
@@ -74,11 +79,32 @@ def test_persona_manager_persists_per_group_keys(sqlite_engine) -> None:
         default_persona=personas["default"],
     )
     reloaded.load_state()
-    assert reloaded.active_key(10001) == "test_self"
-    assert reloaded.active_name(10001) == "测试君"
+    assert reloaded.active_key(10001) == DEFAULT_PERSONA_KEY
+    assert reloaded.active_name(10001) == "测试小町"
     assert reloaded.card_snapshot(10001) == "原名"
     assert reloaded.account_avatar_snapshot() == "avatar://original"
     assert reloaded.active_key(10002) == DEFAULT_PERSONA_KEY
+    with session_scope(sqlite_engine) as session:
+        state = GroupPersonaStateRepository(session).get(10001)
+        assert state is not None
+        assert state.persona_key == DEFAULT_PERSONA_KEY
+
+
+def test_persona_prewarm_does_not_change_active_persona(sqlite_engine) -> None:
+    personas = _personas()
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+
+    assert manager.prewarm_examples(10001, "test_self") == 0
+    assert manager.active_key(10001) == DEFAULT_PERSONA_KEY
+
+    manager.set_persona_key(10001, "test_self")
+    assert manager.prewarm_examples(10001, DEFAULT_PERSONA_KEY) == 0
+    assert manager.active_key(10001) == "test_self"
 
 
 def test_persona_manager_bot_label_marked_when_impersonating(sqlite_engine) -> None:

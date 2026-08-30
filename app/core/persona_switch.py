@@ -104,13 +104,20 @@ class PersonaManager:
         ] = {}
 
     def load_state(self) -> None:
+        self._group_keys.clear()
+        self._card_snapshots.clear()
+        self._account_avatar_snapshot = None
         with session_scope(self.engine) as session:
             repo = GroupPersonaStateRepository(session)
             for group_id, state in repo.load_all().items():
                 if group_id == ACCOUNT_STATE_GROUP_ID:
                     self._account_avatar_snapshot = state.avatar_snapshot
                     continue
-                self._group_keys[group_id] = state.persona_key or DEFAULT_PERSONA_KEY
+                # Persona switches are deliberately process-local: every startup
+                # begins as Komachi, while display snapshots still survive restarts.
+                self._group_keys[group_id] = DEFAULT_PERSONA_KEY
+                if state.persona_key != DEFAULT_PERSONA_KEY:
+                    repo.set_persona_key(group_id, DEFAULT_PERSONA_KEY)
                 if state.card_snapshot is not None:
                     self._card_snapshots[group_id] = state.card_snapshot
         self.load_style_banks()
@@ -161,8 +168,13 @@ class PersonaManager:
                     for row in rows
                 ]
 
-    def style_bank(self, group_id: int) -> list[dict]:
-        persona = self.active_persona(group_id)
+    def style_bank(
+        self,
+        group_id: int,
+        *,
+        persona_key: str | None = None,
+    ) -> list[dict]:
+        persona = self._resolve_persona(group_id, persona_key)
         user_id = _as_positive_int(persona.get("source_user_id"))
         if user_id is not None and self._style_banks.get(user_id):
             return list(self._style_banks[user_id])
@@ -184,13 +196,14 @@ class PersonaManager:
         context_lines: list[str],
         *,
         limit: int = 6,
+        persona_key: str | None = None,
     ) -> list[dict]:
         """Retrieve examples by embedding similarity when available."""
 
-        bank = self.style_bank(group_id)
+        bank = self.style_bank(group_id, persona_key=persona_key)
         if not bank or self.embedding_provider is None:
             return retrieve_relevant_examples(bank, context_lines, limit=limit)
-        persona = self.active_persona(group_id)
+        persona = self._resolve_persona(group_id, persona_key)
         user_id = _as_positive_int(persona.get("source_user_id"))
         cache_key = int(user_id) if user_id is not None else hash(repr(persona.get("name")))
         cached = self._example_vectors.get(cache_key)
@@ -553,12 +566,21 @@ class PersonaManager:
     def prewarm_examples(self, group_id: int, persona_key: str) -> int:
         """Build the example vector cache for one persona (memory-only)."""
 
-        self._group_keys[int(group_id)] = persona_key
-        bank = self.style_bank(int(group_id))
+        bank = self.style_bank(int(group_id), persona_key=persona_key)
         if not bank or self.embedding_provider is None:
             return 0
-        picked = self.retrieve_examples(int(group_id), ["预热示例向量"], limit=1)
+        self.retrieve_examples(
+            int(group_id),
+            ["预热示例向量"],
+            limit=1,
+            persona_key=persona_key,
+        )
         return len(bank)
+
+    def _resolve_persona(self, group_id: int, persona_key: str | None) -> dict:
+        if persona_key is None:
+            return self.active_persona(group_id)
+        return self.personas.get(persona_key) or self.default_persona
 
     def active_name(self, group_id: int) -> str:
         name = str(self.active_persona(group_id).get("name", "") or "").strip()
