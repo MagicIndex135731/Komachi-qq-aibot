@@ -51,6 +51,7 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 for table in (
                     "memory_item_semantic_vectors",
                     "retrieval_documents",
+                    "retrieval_documents_fts",
                     "memory_items_fts",
                     "retrieval_index_state",
                 )
@@ -160,6 +161,22 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 "OR indexed_documents>total_documents)",
                 "retrieval_index_state",
             ),
+            "retrieval_fts_rows_for_nonactive_documents": optional_scalar(
+                "SELECT COUNT(*) FROM retrieval_documents_fts f "
+                "LEFT JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
+                "AND d.content_hash=f.content_hash "
+                "WHERE d.id IS NULL OR d.status<>'active'",
+                "retrieval_documents_fts",
+                "retrieval_documents",
+            ),
+            "active_documents_missing_retrieval_fts": optional_scalar(
+                "SELECT COUNT(*) FROM retrieval_documents d WHERE d.status='active' "
+                "AND NOT EXISTS (SELECT 1 FROM retrieval_documents_fts f "
+                "WHERE f.document_id=CAST(d.id AS TEXT) "
+                "AND f.content_hash=d.content_hash)",
+                "retrieval_documents_fts",
+                "retrieval_documents",
+            ),
         }
 
 
@@ -187,6 +204,9 @@ def repair_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
         "deactivated_orphan_memory_docs": 0,
         "deleted_stale_fts_rows": 0,
         "inserted_missing_fts_rows": 0,
+        "deleted_stale_retrieval_fts_rows": 0,
+        "inserted_missing_retrieval_fts_rows": 0,
+        "refreshed_fts_index_states": 0,
     }
     with session_scope(engine) as session:
         memories = MemoryRepository(session)
@@ -298,6 +318,7 @@ def repair_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
             document.status = "inactive"
             document.embedding_status = "stale"
         repaired["deactivated_orphan_memory_docs"] = len(documents)
+        session.flush()
 
         stale_fts = session.execute(
             text(
@@ -327,6 +348,70 @@ def repair_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
             )
         )
         repaired["inserted_missing_fts_rows"] = before_missing
+
+        stale_retrieval_fts = session.execute(
+            text(
+                "DELETE FROM retrieval_documents_fts WHERE rowid IN ("
+                "SELECT f.rowid FROM retrieval_documents_fts f "
+                "LEFT JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
+                "AND d.content_hash=f.content_hash "
+                "WHERE d.id IS NULL OR d.status<>'active')"
+            )
+        )
+        repaired["deleted_stale_retrieval_fts_rows"] = int(
+            stale_retrieval_fts.rowcount or 0
+        )
+        missing_retrieval_fts = int(
+            session.execute(
+                text(
+                    "SELECT COUNT(*) FROM retrieval_documents d WHERE d.status='active' "
+                    "AND NOT EXISTS (SELECT 1 FROM retrieval_documents_fts f "
+                    "WHERE f.document_id=CAST(d.id AS TEXT) "
+                    "AND f.content_hash=d.content_hash)"
+                )
+            ).scalar_one()
+            or 0
+        )
+        session.execute(
+            text(
+                "INSERT INTO retrieval_documents_fts(content,group_id,document_id,content_hash) "
+                "SELECT d.content,CAST(d.group_id AS TEXT),CAST(d.id AS TEXT),d.content_hash "
+                "FROM retrieval_documents d WHERE d.status='active' AND NOT EXISTS ("
+                "SELECT 1 FROM retrieval_documents_fts f "
+                "WHERE f.document_id=CAST(d.id AS TEXT) AND f.content_hash=d.content_hash)"
+            )
+        )
+        repaired["inserted_missing_retrieval_fts_rows"] = missing_retrieval_fts
+        active_documents = int(
+            session.execute(
+                text("SELECT COUNT(*) FROM retrieval_documents WHERE status='active'")
+            ).scalar_one()
+            or 0
+        )
+        indexed_documents = int(
+            session.execute(
+                text(
+                    "SELECT COUNT(DISTINCT f.document_id) FROM retrieval_documents_fts f "
+                    "JOIN retrieval_documents d ON CAST(d.id AS TEXT)=f.document_id "
+                    "AND d.content_hash=f.content_hash WHERE d.status='active'"
+                )
+            ).scalar_one()
+            or 0
+        )
+        refreshed_state = session.execute(
+            text(
+                "UPDATE retrieval_index_state SET total_documents=:total_documents,"
+                "indexed_documents=:indexed_documents,updated_at=:updated_at "
+                "WHERE channel='fts' AND is_active=1 AND ("
+                "total_documents<>:total_documents OR indexed_documents<>:indexed_documents)"
+            ),
+            {
+                "total_documents": active_documents,
+                "indexed_documents": indexed_documents,
+                "updated_at": now.astimezone(UTC).replace(tzinfo=None),
+            },
+        )
+        repaired["refreshed_fts_index_states"] = int(refreshed_state.rowcount or 0)
     return repaired
 
 
