@@ -37,6 +37,10 @@ shared_runtime="${shared_dir}/runtime"
 shared_config_dir="${shared_dir}/configs"
 shared_groups_config="${shared_config_dir}/groups.local.yaml"
 previous_release="$(readlink -f "${INSTALL_ROOT}/current" 2>/dev/null || true)"
+memory_audit_timer_was_enabled=false
+if systemctl is-enabled --quiet xiaomachi-memory-audit.timer 2>/dev/null; then
+  memory_audit_timer_was_enabled=true
+fi
 if [[ ! -e "${shared_dir}/.install-complete" ]]; then
   previous_release=""
 fi
@@ -67,6 +71,11 @@ restore_previous_runtime() {
   fi
   if [[ "${activation_started}" != true ]]; then
     return
+  fi
+  if [[ "${memory_audit_timer_was_enabled}" != true \
+      && ( -z "${previous_release}" \
+        || ! -f "${previous_release}/infra/wsl/scripts/run_memory_integrity_audit.sh" ) ]]; then
+    systemctl disable --now xiaomachi-memory-audit.timer >/dev/null 2>&1 || true
   fi
   systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
   if [[ -n "${previous_release}" && -d "${previous_release}" ]]; then
@@ -226,9 +235,14 @@ install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-watchdog.se
   "${SYSTEMD_DIR}/xiaomachi-watchdog.service"
 install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-mihomo.service" \
   "${SYSTEMD_DIR}/xiaomachi-mihomo.service"
+install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-memory-audit.service" \
+  "${SYSTEMD_DIR}/xiaomachi-memory-audit.service"
+install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-memory-audit.timer" \
+  "${SYSTEMD_DIR}/xiaomachi-memory-audit.timer"
 
 systemctl daemon-reload
 systemctl disable xiaomachi-watchdog.service xiaomachi-stack.service >/dev/null 2>&1 || true
+systemctl enable xiaomachi-memory-audit.timer
 if [[ -x /usr/local/bin/mihomo && -s "${shared_dir}/mihomo/config.yaml" ]]; then
   /usr/local/bin/mihomo -t -d "${shared_dir}/mihomo"
   systemctl enable --now xiaomachi-mihomo.service
@@ -242,6 +256,7 @@ else
   systemctl start xiaomachi-stack.service
 fi
 systemctl start xiaomachi-watchdog.service
+systemctl restart xiaomachi-memory-audit.timer
 
 # Keep the immediately previous release for rollback and discard older code.
 mapfile -t old_releases < <(find "${releases_dir}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \

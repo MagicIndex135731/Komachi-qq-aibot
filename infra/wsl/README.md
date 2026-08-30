@@ -172,6 +172,22 @@ python -m scripts.maintain_memory_integrity repair --apply \
 python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id <GROUP_ID> --dry-run
 ```
 
+正式安装会启用 `xiaomachi-memory-audit.timer`，每天上海时间 04:15–04:20
+运行一次只读审计，并在开机错过计划时间时补跑。定时任务绝不执行
+`repair --apply`，也不调用外部模型。最新报告与按行历史分别保存在：
+
+- `/opt/xiaomachi/shared/runtime/logs/memory-integrity-audit.latest.json`
+- `/opt/xiaomachi/shared/runtime/logs/memory-integrity-audit.jsonl`
+
+关键一致性指标非零时，`xiaomachi-memory-audit.service` 以退出码 2 失败并向
+journal 写入 `memory_integrity_audit_alert`；缺少语义向量、缺少投影文档、重复
+候选和旧式非结构化记录仍作为观察指标，不触发告警。查看最近结果：
+
+```bash
+systemctl status xiaomachi-memory-audit.timer --no-pager
+journalctl -u xiaomachi-memory-audit.service -n 20 --no-pager
+```
+
 一致性修复仅处理可机械证明的状态：过期 active 记忆、倒置摘要时间、无来源旧
 `window` 摘要、legacy compaction 积压、非 active 记忆残留向量/FTS/检索文档，
 以及 active 记忆缺失的 FTS 行。它不会判断聊天内容真假，也不会自动改写人物画像。

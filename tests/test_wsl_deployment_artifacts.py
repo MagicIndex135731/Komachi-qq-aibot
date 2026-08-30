@@ -29,8 +29,11 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/scripts/anchor.sh",
         "infra/wsl/scripts/xiaomachi-wsl-entry.sh",
         "infra/wsl/scripts/install_linux_runtime.sh",
+        "infra/wsl/scripts/run_memory_integrity_audit.sh",
         "infra/wsl/systemd/xiaomachi-stack.service",
         "infra/wsl/systemd/xiaomachi-watchdog.service",
+        "infra/wsl/systemd/xiaomachi-memory-audit.service",
+        "infra/wsl/systemd/xiaomachi-memory-audit.timer",
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
@@ -196,6 +199,38 @@ def test_systemd_uses_persistent_supervision_without_windows_autostart() -> None
     assert "while systemctl is-active --quiet xiaomachi-stack.service" in anchor
     assert "systemctl is-active --quiet xiaomachi-stack.service" in entry
     assert "Xiaomachi systemd supervision is not active." in entry
+
+
+def test_memory_integrity_audit_is_daily_read_only_and_alerts_without_repair() -> None:
+    installer = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
+        encoding="utf-8"
+    )
+    runner = (
+        REPO_ROOT / "infra/wsl/scripts/run_memory_integrity_audit.sh"
+    ).read_text(encoding="utf-8")
+    service = (
+        REPO_ROOT / "infra/wsl/systemd/xiaomachi-memory-audit.service"
+    ).read_text(encoding="utf-8")
+    timer = (
+        REPO_ROOT / "infra/wsl/systemd/xiaomachi-memory-audit.timer"
+    ).read_text(encoding="utf-8")
+
+    assert "OnCalendar=*-*-* 04:15:00 Asia/Shanghai" in timer
+    assert "Persistent=true" in timer
+    assert "AccuracySec=1s" in timer
+    assert "RandomizedDelaySec=5min" in timer
+    assert "WantedBy=timers.target" in timer
+    assert "run_memory_integrity_audit.sh" in service
+    assert "Type=oneshot" in service
+    assert "TimeoutStartSec=2min" in service
+    assert "scripts.maintain_memory_integrity audit" in runner
+    assert "--fail-on-critical" in runner
+    assert " repair " not in runner
+    assert "memory-integrity-audit.latest.json" in runner
+    assert "memory-integrity-audit.jsonl" in runner
+    assert "memory_integrity_audit_alert" in runner
+    assert "systemctl enable xiaomachi-memory-audit.timer" in installer
+    assert "systemctl restart xiaomachi-memory-audit.timer" in installer
 
 
 def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() -> None:

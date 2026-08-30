@@ -25,6 +25,30 @@ from app.storage.repositories import EpisodeRepository, JobRepository, MemoryRep
 
 _EPISODE_SUMMARY_KEY = re.compile(r"^episode:(\d+):")
 
+CRITICAL_AUDIT_METRICS = (
+    "missing_optional_schema_tables",
+    "expired_active_memories",
+    "inverted_active_summaries",
+    "provenance_less_legacy_summaries",
+    "legacy_compaction_jobs_needing_cleanup",
+    "semantic_vectors_for_nonactive_memories",
+    "active_docs_for_nonactive_memories",
+    "active_memories_missing_fts",
+    "fts_rows_for_nonactive_memories",
+    "active_index_states_with_impossible_counts",
+    "retrieval_fts_rows_for_nonactive_documents",
+    "active_documents_missing_retrieval_fts",
+)
+
+
+def critical_audit_findings(report: dict[str, int]) -> dict[str, int]:
+    """Return actionable invariant drift, excluding advisory coverage metrics."""
+    return {
+        metric: int(report.get(metric, 0))
+        for metric in CRITICAL_AUDIT_METRICS
+        if int(report.get(metric, 0)) > 0
+    }
+
 
 def _scalar(connection, statement: str) -> int:
     return int(connection.execute(text(statement)).scalar_one() or 0)
@@ -488,6 +512,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--backup-dir", type=Path)
+    parser.add_argument(
+        "--fail-on-critical",
+        action="store_true",
+        help="exit 2 when an audit finds actionable invariant drift",
+    )
     return parser
 
 
@@ -500,6 +529,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("repair requires explicit --apply")
     if args.command == "audit" and args.apply:
         raise SystemExit("--apply is only valid with repair")
+    if args.command != "audit" and args.fail_on_critical:
+        raise SystemExit("--fail-on-critical is only valid with audit")
 
     backup = None
     if args.command == "repair":
@@ -515,6 +546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         after = audit_memory_integrity(engine, now=now) if args.command == "repair" else before
     finally:
         engine.dispose()
+    critical_findings = critical_audit_findings(after)
     print(
         json.dumps(
             {
@@ -523,12 +555,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "before": before,
                 "repaired": repaired,
                 "after": after,
+                "critical_findings": critical_findings,
             },
             ensure_ascii=False,
             sort_keys=True,
         )
     )
-    return 0
+    return 2 if args.fail_on_critical and critical_findings else 0
 
 
 if __name__ == "__main__":

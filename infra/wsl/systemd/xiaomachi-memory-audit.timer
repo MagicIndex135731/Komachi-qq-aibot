@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Xiaomachi memory integrity audit daily
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1s
+RandomizedDelaySec=5min
+Unit=xiaomachi-memory-audit.service
+
+[Install]
+WantedBy=timers.target

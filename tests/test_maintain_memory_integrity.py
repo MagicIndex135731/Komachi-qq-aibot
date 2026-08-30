@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 import sqlite3
 
@@ -17,6 +18,8 @@ from app.storage.repositories import (
 from scripts.maintain_memory_integrity import (
     audit_memory_integrity,
     backup_database,
+    critical_audit_findings,
+    main,
     repair_memory_integrity,
 )
 
@@ -240,3 +243,51 @@ def test_backup_database_uses_online_backup(sqlite_engine, tmp_path: Path) -> No
     assert backup.is_file()
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_critical_audit_findings_exclude_advisory_coverage_metrics() -> None:
+    findings = critical_audit_findings(
+        {
+            "expired_active_memories": 2,
+            "retrieval_fts_rows_for_nonactive_documents": 3,
+            "active_memories_missing_semantic_vectors": 100,
+            "active_memories_without_active_docs": 50,
+            "duplicate_active_memory_excess": 4,
+            "long_member_plan_or_decision": 14,
+            "unstructured_plan_or_decision": 198,
+        }
+    )
+
+    assert findings == {
+        "expired_active_memories": 2,
+        "retrieval_fts_rows_for_nonactive_documents": 3,
+    }
+
+
+def test_audit_cli_can_fail_only_for_critical_findings(
+    sqlite_engine,
+    capsys,
+    monkeypatch,
+) -> None:
+    _seed_drift(sqlite_engine)
+    database = Path(str(sqlite_engine.url.database))
+    monkeypatch.setattr(
+        "scripts.maintain_memory_integrity.build_engine",
+        lambda *_args, **_kwargs: sqlite_engine,
+    )
+
+    exit_code = main(
+        [
+            "audit",
+            "--database",
+            str(database),
+            "--fail-on-critical",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert payload["critical_findings"]["expired_active_memories"] == 1
+    assert "active_memories_missing_semantic_vectors" not in payload[
+        "critical_findings"
+    ]

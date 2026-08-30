@@ -1,0 +1,13 @@
+[Unit]
+Description=Xiaomachi daily read-only memory integrity audit
+After=docker.service xiaomachi-stack.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/xiaomachi/current/infra/wsl/scripts/run_memory_integrity_audit.sh
+SyslogIdentifier=xiaomachi-memory-audit
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2min
