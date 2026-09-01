@@ -158,6 +158,16 @@ class FakeImageSearchClient:
         return list(self.image_results)
 
 
+class FakeImageReferencePlanner:
+    def __init__(self, result: str) -> None:
+        self.result = result
+        self.prompts: list[list[str]] = []
+
+    def generate_text(self, prompt_lines: list[str]) -> str:
+        self.prompts.append(list(prompt_lines))
+        return self.result
+
+
 class FakeAdapterImage:
     def __init__(self, *, b64_json: str | None = None, url: str | None = None, output_format: str | None = None) -> None:
         self.b64_json = b64_json
@@ -541,6 +551,35 @@ async def test_group_image_service_combines_searched_character_refs_with_existin
     ]
     assert len(sender.image_calls) == 1
     assert sender.text_calls[-1]["text"] == "[CQ:at,qq=20001] \u56fe\u597d\u4e86"
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_plans_independent_reference_queries(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    search_client = FakeImageSearchClient(
+        image_results=[ImageAttachment(url="https://img.example.test/ref.png", file_id="ref.png")]
+    )
+    planner = FakeImageReferencePlanner('["真绯瑠 官方角色立绘", "弥希 官方角色立绘"]')
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-5.6-sol",
+        web_search_client=search_client,
+        image_reference_planner_client=planner,
+    )
+
+    result = await service.enqueue(make_request("draw-planned-1", web_search_query="真绯瑠和弥希"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert search_client.queries == [
+        ("真绯瑠 官方角色立绘", 2),
+        ("弥希 官方角色立绘", 2),
+    ]
+    assert len(planner.prompts) == 1
+    assert len(llm.edit_calls) == 1
 
 
 @pytest.mark.asyncio

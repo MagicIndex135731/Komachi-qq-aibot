@@ -319,7 +319,7 @@ LOOKUP_NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?�
 
 
 AUTO_WEB_REFERENCE_QUERY_PATTERN = re.compile(
-    r"(?:先)?(?:去)?(?:网上|上网|联网)?(?:找|搜一下|搜索一下|搜索|搜)(?P<query>.+?)(?:的人设图|人设图|设定图|参考图)",
+    r"(?:先)?(?:去)?(?:网上|上网|联网)?(?:找|搜一下|搜索一下|搜索|搜)(?P<query>.+?)(?:的人设图|人设图|设定图|参考图|的图片|图片|的照片|照片|的图像|图像)",
     re.IGNORECASE,
 )
 AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN = re.compile(r"^(?:然后|再|并且|并|再去|接着|随后)+")
@@ -1249,6 +1249,8 @@ class InboundRouter:
         if match is None:
             return None
         query = str(match.group("query") or "").strip(" \t,，。.!?？；;:：")
+        if query.endswith("的"):
+            query = query[:-1].rstrip()
         return query or None
 
     def _build_auto_web_reference_prompt(self, *, stripped_text: str, query: str) -> str:

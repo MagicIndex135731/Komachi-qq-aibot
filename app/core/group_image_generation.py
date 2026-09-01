@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,7 @@ class GroupImageGenerationService:
         llm_client,
         sender,
         web_search_client=None,
+        image_reference_planner_client=None,
         output_dir: Path,
         model: str,
         engine: Engine | None = None,
@@ -90,6 +92,7 @@ class GroupImageGenerationService:
         self.llm_client = llm_client
         self.sender = sender
         self.web_search_client = web_search_client
+        self.image_reference_planner_client = image_reference_planner_client
         self.output_dir = output_dir
         self.model = model
         self.engine = engine
@@ -391,11 +394,59 @@ class GroupImageGenerationService:
             return combined
         if self.web_search_client is None or not hasattr(self.web_search_client, "image_search"):
             raise RuntimeError("web reference image search is not configured")
-        search_results = self.web_search_client.image_search(query=query, max_results=3)
+        search_queries = self._plan_reference_search_queries(request=request, query=query)
+        search_results: list[ImageAttachment] = []
+        per_query_limit = 2 if self.image_reference_planner_client is not None else 3
+        for search_query in search_queries:
+            search_results.extend(
+                self.web_search_client.image_search(query=search_query, max_results=per_query_limit)
+            )
+            if len(search_results) >= 4:
+                break
+        search_results = self._deduplicate_reference_images(search_results)[:4]
         if not search_results:
             raise RuntimeError("web reference image search returned no usable images")
         combined.extend(search_results)
         return self._deduplicate_reference_images(combined)
+
+    def _plan_reference_search_queries(
+        self,
+        *,
+        request: GroupImageGenerationRequest,
+        query: str,
+    ) -> list[str]:
+        planner = self.image_reference_planner_client
+        if planner is None or not hasattr(planner, "generate_text"):
+            return [query]
+
+        prompt_lines = [
+            "You plan image-reference searches. Return JSON only: an array of 1 to 3 concise search queries.",
+            "Prefer one query per named person or character, including role/official reference terms when useful.",
+            "Do not include instructions for image generation and do not add commentary.",
+            f"Names or search subject: {query}",
+            f"Generation request: {request.prompt}",
+        ]
+        try:
+            raw = str(planner.generate_text(prompt_lines)).strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").removeprefix("json").strip()
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = parsed.get("queries")
+            if not isinstance(parsed, list):
+                return [query]
+            queries: list[str] = []
+            seen: set[str] = set()
+            for item in parsed:
+                value = str(item or "").strip()
+                if not value or value in seen or len(value) > 160:
+                    continue
+                seen.add(value)
+                queries.append(value)
+            return queries[:3] or [query]
+        except Exception:
+            logger.warning("image_reference_query_planning_failed", exc_info=True)
+            return [query]
 
     def _deduplicate_reference_images(self, images: list[ImageAttachment]) -> list[ImageAttachment]:
         deduped: list[ImageAttachment] = []

@@ -24,6 +24,7 @@ from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.main import (
     build_group_image_llm_client,
+    build_group_image_reference_planner_client,
     build_group_image_service,
     build_llm_client,
     build_memory_runtime,
@@ -376,11 +377,16 @@ async def run() -> None:
         )
         group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
         web_search_client = build_web_search_client(settings)
+        image_reference_planner_client = build_group_image_reference_planner_client(
+            settings=settings,
+            llm_client=llm_client,
+        )
         group_image_service = build_group_image_service(
             settings=settings,
             llm_client=group_image_llm_client,
             sender=sender,
             web_search_client=web_search_client,
+            image_reference_planner_client=image_reference_planner_client,
         )
         memory_runtime = await asyncio.to_thread(
             build_memory_runtime,

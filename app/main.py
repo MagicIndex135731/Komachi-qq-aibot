@@ -411,17 +411,38 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     )
 
 
+def build_group_image_reference_planner_client(*, settings: AppSettings, llm_client):
+    """Build the low-effort Luna planner used only to refine web image queries."""
+    if not all(hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")):
+        return None
+    planner_model = "gpt-5.6-luna"
+    return LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=planner_model,
+        responses_model=planner_model,
+        responses_only=True,
+        reasoning_effort="low",
+        max_output_tokens=256,
+        timeout_seconds=min(settings.llm_timeout_seconds, 90.0),
+        http_client=llm_client.http_client,
+        usage_recorder=getattr(llm_client, "usage_recorder", None),
+    )
+
+
 def build_group_image_service(
     *,
     settings: AppSettings,
     llm_client,
     sender,
     web_search_client=None,
+    image_reference_planner_client=None,
 ) -> GroupImageGenerationService:
     return GroupImageGenerationService(
         llm_client=llm_client,
         sender=sender,
         web_search_client=web_search_client,
+        image_reference_planner_client=image_reference_planner_client,
         output_dir=settings.data_dir / "generated_images",
         model=settings.group_image_model,
         size=settings.group_image_size,
@@ -1468,11 +1489,16 @@ async def run() -> None:
         )
         group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
         web_search_client = build_web_search_client(settings)
+        image_reference_planner_client = build_group_image_reference_planner_client(
+            settings=settings,
+            llm_client=llm_client,
+        )
         group_image_service = build_group_image_service(
             settings=settings,
             llm_client=group_image_llm_client,
             sender=sender,
             web_search_client=web_search_client,
+            image_reference_planner_client=image_reference_planner_client,
         )
         memory_runtime = build_memory_runtime(
             settings=settings,

@@ -1855,6 +1855,60 @@ async def test_router_enqueues_auto_web_character_reference_request_for_search_t
 
 
 @pytest.mark.asyncio
+async def test_router_recognizes_search_images_then_generate_phrase(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 网络搜索真绯瑠和弥希的图片，然后生成她们的合照",
+            message_id="draw-auto-web-images-1",
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].web_search_query == "真绯瑠和弥希"
+    assert "生成她们的合照" in image_service.requests[0].prompt
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_invent_web_search_for_plain_generation_request(sqlite_engine) -> None:
+    sender = FakeSender()
+    llm = FakeLlm()
+    image_service = FakeGroupImageService(accepted=True, queue_position=1)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        group_image_service=image_service,
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            plain_text="@Mira 生成一张真绯瑠和弥希的合照，不要搜索网络",
+            message_id="draw-no-auto-web-1",
+        )
+    )
+
+    assert len(image_service.requests) == 1
+    assert image_service.requests[0].web_search_query is None
+    assert image_service.requests[0].prompt == "真绯瑠和弥希的合照，不要搜索网络"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_router_keeps_normal_image_question_on_recognition_path(sqlite_engine) -> None:
     sender = FakeSender()
     llm = ImageCapturingLlm()

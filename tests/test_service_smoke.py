@@ -10,6 +10,7 @@ import pytest
 from app.config import AppSettings
 from app.main import (
     build_group_image_llm_client,
+    build_group_image_reference_planner_client,
     build_web_search_client,
     create_runtime_banner,
     sync_history_archives,
@@ -95,6 +96,24 @@ def test_build_group_image_llm_client_reuses_chat_nova_responses_transport() -> 
     assert client.image_responses_model == "gpt-5.6-sol"
     assert client.responses_only is True
     assert client.http_client is primary_client.http_client
+
+
+def test_build_group_image_reference_planner_uses_luna_low_reasoning() -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    primary_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model="gpt-5.6-luna",
+        responses_model="gpt-5.6-luna",
+    )
+
+    planner = build_group_image_reference_planner_client(settings=settings, llm_client=primary_client)
+
+    assert planner is not None
+    assert planner.model == "gpt-5.6-luna"
+    assert planner.responses_model == "gpt-5.6-luna"
+    assert planner.reasoning_effort == "low"
+    assert planner.max_output_tokens == 256
 
 
 def test_build_group_image_service_uses_dedicated_image_model_and_finite_timeout(monkeypatch) -> None:
@@ -372,7 +391,7 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     monkeypatch.setattr(
         app_main,
         "build_group_image_service",
-        lambda *, settings, llm_client, sender, web_search_client=None: built_group_image_service,
+        lambda *, settings, llm_client, sender, web_search_client=None, image_reference_planner_client=None: built_group_image_service,
     )
     monkeypatch.setattr(app_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(app_main, "ContextBuilder", lambda: object())
