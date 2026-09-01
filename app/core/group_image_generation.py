@@ -441,7 +441,8 @@ class GroupImageGenerationService:
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 return (bool(query), [query] if query else [])
-            should_search = bool(parsed.get("should_search", False))
+            should_search_value = parsed.get("should_search", False)
+            should_search = should_search_value if isinstance(should_search_value, bool) else False
             planned_queries = parsed.get("queries")
             if not isinstance(planned_queries, list):
                 planned_queries = []
