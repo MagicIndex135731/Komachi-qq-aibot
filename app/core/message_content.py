@@ -14,6 +14,7 @@ class ImageAttachment:
     source_user_id: int | None = None
     source_nickname: str | None = None
     source_group_card: str | None = None
+    reference_subject: str | None = None
 
 
 def extract_images_from_message(

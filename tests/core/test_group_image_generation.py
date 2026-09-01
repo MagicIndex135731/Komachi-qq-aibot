@@ -149,13 +149,19 @@ class ReferenceAwareImageLlm:
 
 
 class FakeImageSearchClient:
-    def __init__(self, *, image_results: list[ImageAttachment]) -> None:
+    def __init__(
+        self,
+        *,
+        image_results: list[ImageAttachment],
+        image_results_by_query: dict[str, list[ImageAttachment]] | None = None,
+    ) -> None:
         self.image_results = list(image_results)
+        self.image_results_by_query = dict(image_results_by_query or {})
         self.queries: list[tuple[str, int]] = []
 
     def image_search(self, query: str, max_results: int = 3) -> list[ImageAttachment]:
         self.queries.append((query, max_results))
-        return list(self.image_results)
+        return list(self.image_results_by_query.get(query, self.image_results))
 
 
 class FakeImageReferencePlanner:
@@ -558,10 +564,21 @@ async def test_group_image_service_plans_independent_reference_queries(tmp_path)
     sender = FakeGroupImageSender()
     llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
     search_client = FakeImageSearchClient(
-        image_results=[ImageAttachment(url="https://img.example.test/ref.png", file_id="ref.png")]
+        image_results=[],
+        image_results_by_query={
+            "真绯瑠 官方角色立绘": [
+                ImageAttachment(url="https://img.example.test/mahirus.png", file_id="mahirus.png")
+            ],
+            "弥希 官方角色立绘": [
+                ImageAttachment(url="https://img.example.test/miki.png", file_id="miki.png")
+            ],
+        },
     )
     planner = FakeImageReferencePlanner(
-        '{"should_search": true, "queries": ["真绯瑠 官方角色立绘", "弥希 官方角色立绘"]}'
+        '{"should_search": true, "references": ['
+        '{"subject": "真绯瑠", "queries": ["真绯瑠 官方角色立绘"]},'
+        '{"subject": "弥希", "queries": ["弥希 官方角色立绘"]}'
+        ']}'
     )
     service = GroupImageGenerationService(
         llm_client=llm,
@@ -580,8 +597,87 @@ async def test_group_image_service_plans_independent_reference_queries(tmp_path)
         ("真绯瑠 官方角色立绘", 2),
         ("弥希 官方角色立绘", 2),
     ]
+    assert [image.reference_subject for image in llm.edit_calls[0]["images"]] == ["真绯瑠", "弥希"]
     assert len(planner.prompts) == 1
     assert len(llm.edit_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_accepts_legacy_flat_reference_queries(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    search_client = FakeImageSearchClient(
+        image_results=[ImageAttachment(url="https://img.example.test/legacy.png", file_id="legacy.png")]
+    )
+    planner = FakeImageReferencePlanner(
+        '{"should_search": true, "queries": ["旧格式 角色参考图"]}'
+    )
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        web_search_client=search_client,
+        image_reference_planner_client=planner,
+    )
+
+    result = await service.enqueue(make_request("draw-legacy-planned", web_search_query="旧格式角色"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert search_client.queries == [("旧格式 角色参考图", 2)]
+    assert llm.edit_calls[0]["images"][0].reference_subject is None
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_falls_back_for_malformed_search_decision(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    search_client = FakeImageSearchClient(
+        image_results=[ImageAttachment(url="https://img.example.test/fallback.png", file_id="fallback.png")]
+    )
+    planner = FakeImageReferencePlanner(
+        '{"should_search": "yes", "references": [{"subject": "角色", "queries": ["角色 官方图"]}]}'
+    )
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        web_search_client=search_client,
+        image_reference_planner_client=planner,
+    )
+
+    result = await service.enqueue(make_request("draw-malformed-plan", web_search_query="明确搜索对象"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert search_client.queries == [("明确搜索对象", 2)]
+    assert llm.edit_calls[0]["images"][0].reference_subject is None
+
+
+def test_group_image_service_round_trips_reference_subject_in_job_payload(tmp_path) -> None:
+    service = GroupImageGenerationService(
+        llm_client=StaticImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii")),
+        sender=FakeGroupImageSender(),
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+    )
+    request = make_request(
+        "draw-persisted-reference",
+        reference_images=[
+            ImageAttachment(
+                url="https://img.example.test/mahiru.png",
+                file_id="mahiru.png",
+                fallback_url="https://thumb.example.test/mahiru.png",
+                reference_subject="真绯瑠",
+            )
+        ],
+    )
+
+    restored = service._deserialize_request(service._serialize_request(request))
+
+    assert restored.reference_images == request.reference_images
 
 
 @pytest.mark.asyncio

@@ -1589,6 +1589,69 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     assert result.images == [{"b64_json": "ZWRpdGVk"}]
 
 
+def test_llm_client_interleaves_labeled_references_before_final_prompt(tmp_path) -> None:
+    captured = {}
+    mahiru_path = tmp_path / "mahiru.png"
+    miki_path = tmp_path / "miki.png"
+    mahiru_path.write_bytes(b"mahiru-reference")
+    miki_path.write_bytes(b"miki-reference")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_image_stream_body(response_id="resp_labeled_edit", image_b64="ZWRpdGVk"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        responses_model="gpt-5.6-luna",
+        image_responses_model="gpt-image-2",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    client.edit_image(
+        prompt="让弥希坐在书桌前，真绯瑠俯身靠近弥希",
+        model="gpt-image-2",
+        images=[
+            ImageAttachment(
+                url="",
+                local_path=str(mahiru_path),
+                file_id="mahiru.png",
+                reference_subject="真绯瑠",
+            ),
+            ImageAttachment(
+                url="",
+                local_path=str(miki_path),
+                file_id="miki.png",
+                reference_subject="弥希",
+            ),
+        ],
+        quality="high",
+    )
+
+    content = captured["payload"]["input"][0]["content"]
+    assert content == [
+        {"type": "input_text", "text": "这是“真绯瑠”的参考图。"},
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64," + base64.b64encode(b"mahiru-reference").decode("ascii"),
+            "detail": "high",
+        },
+        {"type": "input_text", "text": "这是“弥希”的参考图。"},
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64," + base64.b64encode(b"miki-reference").decode("ascii"),
+            "detail": "high",
+        },
+        {"type": "input_text", "text": "让弥希坐在书桌前，真绯瑠俯身靠近弥希"},
+    ]
+
+
 def test_llm_client_uses_reference_fallback_url_when_primary_download_fails() -> None:
     captured = {}
 
@@ -1628,6 +1691,53 @@ def test_llm_client_uses_reference_fallback_url_when_primary_download_fails() ->
     assert captured["payload"]["input"][0]["content"][1]["image_url"].endswith(
         base64.b64encode(b"fallback-bytes").decode("ascii")
     )
+
+
+def test_llm_client_preserves_reference_subject_after_remote_download() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                request=request,
+                content=b"remote-reference",
+                headers={"content-type": "image/png"},
+            )
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_image_stream_body(response_id="resp_remote_label", image_b64="ZWRpdGVk"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        responses_model="gpt-5.6-luna",
+        image_responses_model="gpt-image-2",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    client.edit_image(
+        prompt="保持角色身份并生成新场景",
+        model="gpt-image-2",
+        images=[
+            ImageAttachment(
+                url="https://img.example.test/mahiru.png",
+                file_id="mahiru.png",
+                reference_subject="真绯瑠",
+            )
+        ],
+    )
+
+    content = captured["payload"]["input"][0]["content"]
+    assert content[0] == {"type": "input_text", "text": "这是“真绯瑠”的参考图。"}
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"].endswith(base64.b64encode(b"remote-reference").decode("ascii"))
+    assert content[2] == {"type": "input_text", "text": "保持角色身份并生成新场景"}
 
 
 def test_llm_client_fails_closed_when_all_responses_reference_downloads_fail() -> None:

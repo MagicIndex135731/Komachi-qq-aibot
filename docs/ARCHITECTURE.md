@@ -195,7 +195,7 @@ Responses 模式使用原生 `instructions` 保持人格、安全和引用约束
 
 ### 5.3 图片生成
 
-群聊生图复用聊天使用的 Nova Responses 中转（`LLM_BASE_URL`、`LLM_API_KEY`）。每个生图请求先交给 `gpt-5.6-luna`（low reasoning）判断是否确实需要联网参考图；需要时再把人物拆成独立搜图关键词，由 DDGS 获取参考图，最后使用 `GROUP_IMAGE_MODEL=gpt-image-2` 通过 `image_generation` 工具请求文生图和参考图生图。`gpt-image-2` 是参考图生图的默认和回退模型；模型判断失败时，仅对用户明确提出的搜图请求启用本地兜底，不会让普通生图误触发搜索；尺寸默认 `auto`、质量默认 `high`。`GroupImageGenerationService` 负责队列容量、超时、搜索决策、参考图、输出文件和 QQ 发送。旧的 `GROUP_IMAGE_*` endpoint 配置仍保留给未注入具体聊天客户端的兼容调用方。
+群聊生图复用聊天使用的 Nova Responses 中转（`LLM_BASE_URL`、`LLM_API_KEY`）。每个生图请求先交给 `gpt-5.6-luna`（low reasoning）判断是否确实需要联网参考图；需要时规划器按“角色名 → 独立搜图关键词”输出分组计划，由 DDGS 获取参考图并保留角色标签。调用 `GROUP_IMAGE_MODEL=gpt-image-2` 的 `image_generation` 工具时，Responses 内容按 `input_text(这是“角色名”的参考图) → input_image` 逐组交错，用户的最终生图提示词放在所有已标注参考图之后，避免多角色参考图身份串位。旧版规划器的扁平 `queries` 输出仍可兼容。`gpt-image-2` 是参考图生图的默认和回退模型；模型判断失败时，仅对用户明确提出的搜图请求启用本地兜底，不会让普通生图误触发搜索；尺寸默认 `auto`、质量默认 `high`。`GroupImageGenerationService` 负责队列容量、超时、搜索决策、参考图、输出文件和 QQ 发送。旧的 `GROUP_IMAGE_*` endpoint 配置仍保留给未注入具体聊天客户端的兼容调用方。
 
 图片任务使用独立队列与超时预算，失败不会阻塞普通文本消息处理；成本和供应商由 Nova 的统一中转配置管理。
 

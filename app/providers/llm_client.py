@@ -217,14 +217,27 @@ class LlmClient:
         temperature: float | None = None,
         preloaded_image_parts: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        content: list[dict[str, Any]] = [
-            {
-                "type": "input_text",
-                "text": "\n\n".join(input_lines),
-            }
-        ]
+        prompt_part: dict[str, Any] = {
+            "type": "input_text",
+            "text": "\n\n".join(input_lines),
+        }
+        content: list[dict[str, Any]] = []
         image_parts = preloaded_image_parts if preloaded_image_parts is not None else self._load_input_images(images or [])
+        has_labeled_references = any(
+            str(image_part.get("reference_subject", "") or "").strip()
+            for image_part in image_parts
+        )
+        if not has_labeled_references:
+            content.append(prompt_part)
         for image_part in image_parts:
+            subject = str(image_part.get("reference_subject", "") or "").strip()
+            if subject:
+                content.append(
+                    {
+                        "type": "input_text",
+                        "text": f"这是“{subject}”的参考图。",
+                    }
+                )
             data_url = f"data:{image_part['media_type']};base64,{image_part['data']}"
             content.append(
                 {
@@ -232,6 +245,8 @@ class LlmClient:
                     "image_url": data_url,
                 }
             )
+        if has_labeled_references:
+            content.append(prompt_part)
         user_item: dict[str, Any] = {
             "role": "user",
             "content": content,
@@ -491,12 +506,13 @@ class LlmClient:
             logger.warning("llm_input_image_local_empty_body local_path=%s file_id=%s", local_path, file_id)
             return None
 
-        optimized = optimize_image_bytes(image_bytes, media_type=media_type)
+        resolved_media_type: str = media_type
+        optimized = optimize_image_bytes(image_bytes, media_type=resolved_media_type)
         if optimized is not None:
-            image_bytes, media_type = optimized
+            image_bytes, resolved_media_type = optimized
 
         return {
-            "media_type": media_type,
+            "media_type": resolved_media_type,
             "data": base64.b64encode(image_bytes).decode("ascii"),
         }
 
@@ -511,7 +527,7 @@ class LlmClient:
                     file_id=image.file_id,
                 )
                 if local_image is not None:
-                    encoded_images.append(local_image)
+                    encoded_images.append({**local_image, "reference_subject": image.reference_subject or ""})
                     continue
 
             candidate_urls = [image.url.strip()]
@@ -544,13 +560,15 @@ class LlmClient:
                 continue
 
             content = response.content
-            optimized = optimize_image_bytes(content, media_type=media_type)
+            resolved_media_type: str = media_type
+            optimized = optimize_image_bytes(content, media_type=resolved_media_type)
             if optimized is not None:
-                content, media_type = optimized
+                content, resolved_media_type = optimized
             encoded_images.append(
                 {
-                    "media_type": media_type,
+                    "media_type": resolved_media_type,
                     "data": base64.b64encode(content).decode("ascii"),
+                    "reference_subject": image.reference_subject or "",
                 }
             )
         return encoded_images

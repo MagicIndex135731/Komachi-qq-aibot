@@ -4,7 +4,7 @@ import asyncio
 import base64
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import logging
@@ -64,6 +64,12 @@ class ImageJobResult:
     notice_text: str
     image_path: Path | None = None
     failure_reason: str = ""
+
+
+@dataclass(slots=True)
+class ImageReferenceSearchPlan:
+    subject: str
+    query: str
 
 
 class GroupImageGenerationService:
@@ -404,14 +410,15 @@ class GroupImageGenerationService:
             if not query:
                 return combined
             raise RuntimeError("web reference image search is not configured")
-        should_search, search_queries = self._plan_reference_search_queries(request=request, query=query)
+        should_search, search_plans = self._plan_reference_search_queries(request=request, query=query)
         if not should_search:
             return combined
         search_results: list[ImageAttachment] = []
         per_query_limit = 2 if planner is not None else 3
-        for search_query in search_queries:
+        for plan in search_plans:
             search_results.extend(
-                self.web_search_client.image_search(query=search_query, max_results=per_query_limit)
+                replace(image, reference_subject=plan.subject or None)
+                for image in self.web_search_client.image_search(query=plan.query, max_results=per_query_limit)
             )
             if len(search_results) >= 4:
                 break
@@ -426,14 +433,14 @@ class GroupImageGenerationService:
         *,
         request: GroupImageGenerationRequest,
         query: str,
-    ) -> tuple[bool, list[str]]:
+    ) -> tuple[bool, list[ImageReferenceSearchPlan]]:
         planner = self.image_reference_planner_client
         if planner is None or not hasattr(planner, "generate_text"):
-            return (bool(query), [query] if query else [])
+            return (bool(query), [ImageReferenceSearchPlan(subject="", query=query)] if query else [])
 
         prompt_lines = [
             "Decide whether this image request needs internet image references, then plan searches.",
-            'Return JSON only: {"should_search": true|false, "queries": ["..."]}.',
+            'Return JSON only: {"should_search": true|false, "references": [{"subject": "角色名", "queries": ["..."]}]}.',
             "Set should_search=false for ordinary creative generation when no real person/character reference is requested.",
             "Set should_search=true when the user asks to search/find online images, use a real person/character as reference, or requests current/external visual facts.",
             "Prefer one query per named person or character, including role/official reference terms when useful.",
@@ -447,26 +454,46 @@ class GroupImageGenerationService:
                 raw = raw.strip("`").removeprefix("json").strip()
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
-                return (bool(query), [query] if query else [])
+                return (bool(query), [ImageReferenceSearchPlan(subject="", query=query)] if query else [])
             should_search_value = parsed.get("should_search", False)
-            should_search = should_search_value if isinstance(should_search_value, bool) else False
-            planned_queries = parsed.get("queries")
-            if not isinstance(planned_queries, list):
-                planned_queries = []
-            queries: list[str] = []
-            seen: set[str] = set()
-            for item in planned_queries:
-                value = str(item or "").strip()
-                if not value or value in seen or len(value) > 160:
-                    continue
-                seen.add(value)
-                queries.append(value)
-            if should_search and not queries and query:
-                queries = [query]
-            return (should_search and bool(queries), queries[:3])
+            if not isinstance(should_search_value, bool):
+                raise ValueError("image reference planner returned a non-boolean should_search")
+            should_search = should_search_value
+            plans: list[ImageReferenceSearchPlan] = []
+            references = parsed.get("references")
+            seen: set[tuple[str, str]] = set()
+            if isinstance(references, list):
+                for reference in references:
+                    if not isinstance(reference, dict):
+                        continue
+                    raw_subject = reference.get("subject", "")
+                    subject = " ".join(raw_subject.split())[:80] if isinstance(raw_subject, str) else ""
+                    planned_queries = reference.get("queries")
+                    if not isinstance(planned_queries, list):
+                        continue
+                    for item in planned_queries:
+                        if not isinstance(item, str):
+                            continue
+                        value = item.strip()
+                        key = (subject, value)
+                        if not value or key in seen or len(value) > 160:
+                            continue
+                        seen.add(key)
+                        plans.append(ImageReferenceSearchPlan(subject=subject, query=value))
+            # Accept the previous flat-array response during rolling upgrades.
+            if not plans and isinstance(parsed.get("queries"), list):
+                for item in parsed["queries"]:
+                    if not isinstance(item, str):
+                        continue
+                    value = item.strip()
+                    if value and len(value) <= 160 and not any(plan.query == value for plan in plans):
+                        plans.append(ImageReferenceSearchPlan(subject="", query=value))
+            if should_search and not plans and query:
+                plans = [ImageReferenceSearchPlan(subject="", query=query)]
+            return (should_search and bool(plans), plans[:3])
         except Exception:
             logger.warning("image_reference_query_planning_failed", exc_info=True)
-            return (bool(query), [query] if query else [])
+            return (bool(query), [ImageReferenceSearchPlan(subject="", query=query)] if query else [])
 
     def _deduplicate_reference_images(self, images: list[ImageAttachment]) -> list[ImageAttachment]:
         deduped: list[ImageAttachment] = []
@@ -575,6 +602,7 @@ class GroupImageGenerationService:
             "file_id": str(image.file_id or "").strip(),
             "local_path": str(image.local_path or "").strip(),
             "fallback_url": str(image.fallback_url or "").strip(),
+            "reference_subject": str(image.reference_subject or "").strip(),
         }
 
     def _deserialize_image_attachment(self, payload: dict[str, Any]) -> ImageAttachment:
@@ -583,6 +611,7 @@ class GroupImageGenerationService:
             file_id=str(payload.get("file_id", "") or "").strip() or None,
             local_path=str(payload.get("local_path", "") or "").strip() or None,
             fallback_url=str(payload.get("fallback_url", "") or "").strip() or None,
+            reference_subject=str(payload.get("reference_subject", "") or "").strip() or None,
         )
 
     def _optional_payload_text(self, value: object) -> str | None:
