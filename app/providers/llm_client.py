@@ -1289,6 +1289,8 @@ class LlmClient:
         attempt_limit = max(1, int(max_attempts or 1))
 
         for attempt in range(1, attempt_limit + 1):
+            content_type = ""
+            response_text: str | None = None
             try:
                 request_kwargs: dict[str, Any] = {
                     "headers": {"Authorization": f"Bearer {self.api_key}"},
@@ -1296,11 +1298,51 @@ class LlmClient:
                 }
                 if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
                     request_kwargs["timeout"] = timeout_seconds
-                response = self.http_client.post(
-                    f"{self.base_url}/responses",
-                    **request_kwargs,
-                )
-                response.raise_for_status()
+
+                # Image responses can be multi-megabyte SSE bodies.  Reading
+                # them through ``post()`` makes httpx discard all partial
+                # bytes when a proxy closes the final chunk early.  The real
+                # client therefore streams and can still parse a complete
+                # image event that arrived before the truncated terminator.
+                if hasattr(self.http_client, "stream"):
+                    with self.http_client.stream(
+                        "POST",
+                        f"{self.base_url}/responses",
+                        **request_kwargs,
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("content-type", "")
+                        chunks: list[str] = []
+                        try:
+                            for chunk in response.iter_text():
+                                chunks.append(chunk)
+                        except httpx.RemoteProtocolError:
+                            partial_text = "".join(chunks)
+                            if "text/event-stream" in content_type and partial_text:
+                                try:
+                                    salvaged = self._extract_responses_image_result_from_sse(
+                                        partial_text,
+                                        model=model,
+                                    )
+                                except ValueError:
+                                    pass
+                                else:
+                                    logger.warning(
+                                        "responses_image_salvaged_after_incomplete_stream attempt=%s bytes=%s",
+                                        attempt,
+                                        len(partial_text.encode("utf-8")),
+                                    )
+                                    return salvaged
+                            raise
+                        response_text = "".join(chunks)
+                else:
+                    response = self.http_client.post(
+                        f"{self.base_url}/responses",
+                        **request_kwargs,
+                    )
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    response_text = response.text
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
                 logger.warning(
@@ -1319,11 +1361,10 @@ class LlmClient:
                 self._sleep_before_retry(attempt=attempt, max_attempts=attempt_limit)
                 continue
 
-            content_type = response.headers.get("content-type", "")
             try:
                 if "text/event-stream" in content_type:
-                    return self._extract_responses_image_result_from_sse(response.text, model=model)
-                response_data = response.json()
+                    return self._extract_responses_image_result_from_sse(response_text or "", model=model)
+                response_data = json.loads(response_text or "")
                 if not isinstance(response_data, dict):
                     raise ValueError("responses image generation returned a non-object response")
                 usage = self._extract_responses_usage(response_data, model=model)

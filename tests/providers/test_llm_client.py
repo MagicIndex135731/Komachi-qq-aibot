@@ -1589,6 +1589,48 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     assert result.images == [{"b64_json": "ZWRpdGVk"}]
 
 
+def test_llm_client_salvages_image_from_incomplete_sse_stream() -> None:
+    body = _responses_image_stream_body(response_id="resp_salvaged", image_b64="c2FsdmFnZWQ=")
+
+    class BrokenStreamResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_text(self):
+            midpoint = body.rfind("\n\n")
+            yield body[:midpoint]
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+
+    class BrokenStreamClient:
+        def stream(self, method, url, **kwargs):
+            del method, url, kwargs
+
+            class Context:
+                def __enter__(self):
+                    return BrokenStreamResponse()
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return Context()
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-sol",
+        responses_model="gpt-5.6-sol",
+        image_responses_model="gpt-5.6-sol",
+        http_client=BrokenStreamClient(),
+    )
+
+    result = client.generate_image(prompt="draw a cat", model="gpt-image-2")
+
+    assert result.images == [{"b64_json": "c2FsdmFnZWQ="}]
+
+
 def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:
     captured = {}
 
