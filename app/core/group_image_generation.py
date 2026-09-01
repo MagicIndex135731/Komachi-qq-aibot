@@ -390,13 +390,18 @@ class GroupImageGenerationService:
     def _resolve_reference_images(self, request: GroupImageGenerationRequest) -> list[ImageAttachment]:
         combined = list(request.reference_images)
         query = str(getattr(request, "web_search_query", "") or "").strip()
-        if not query:
+        planner = self.image_reference_planner_client
+        if planner is None and not query:
             return combined
         if self.web_search_client is None or not hasattr(self.web_search_client, "image_search"):
+            if not query:
+                return combined
             raise RuntimeError("web reference image search is not configured")
-        search_queries = self._plan_reference_search_queries(request=request, query=query)
+        should_search, search_queries = self._plan_reference_search_queries(request=request, query=query)
+        if not should_search:
+            return combined
         search_results: list[ImageAttachment] = []
-        per_query_limit = 2 if self.image_reference_planner_client is not None else 3
+        per_query_limit = 2 if planner is not None else 3
         for search_query in search_queries:
             search_results.extend(
                 self.web_search_client.image_search(query=search_query, max_results=per_query_limit)
@@ -414,16 +419,19 @@ class GroupImageGenerationService:
         *,
         request: GroupImageGenerationRequest,
         query: str,
-    ) -> list[str]:
+    ) -> tuple[bool, list[str]]:
         planner = self.image_reference_planner_client
         if planner is None or not hasattr(planner, "generate_text"):
-            return [query]
+            return (bool(query), [query] if query else [])
 
         prompt_lines = [
-            "You plan image-reference searches. Return JSON only: an array of 1 to 3 concise search queries.",
+            "Decide whether this image request needs internet image references, then plan searches.",
+            'Return JSON only: {"should_search": true|false, "queries": ["..."]}.',
+            "Set should_search=false for ordinary creative generation when no real person/character reference is requested.",
+            "Set should_search=true when the user asks to search/find online images, use a real person/character as reference, or requests current/external visual facts.",
             "Prefer one query per named person or character, including role/official reference terms when useful.",
             "Do not include instructions for image generation and do not add commentary.",
-            f"Names or search subject: {query}",
+            f"Possible explicit search subject: {query or '(none)' }",
             f"Generation request: {request.prompt}",
         ]
         try:
@@ -431,22 +439,26 @@ class GroupImageGenerationService:
             if raw.startswith("```"):
                 raw = raw.strip("`").removeprefix("json").strip()
             parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                parsed = parsed.get("queries")
-            if not isinstance(parsed, list):
-                return [query]
+            if not isinstance(parsed, dict):
+                return (bool(query), [query] if query else [])
+            should_search = bool(parsed.get("should_search", False))
+            planned_queries = parsed.get("queries")
+            if not isinstance(planned_queries, list):
+                planned_queries = []
             queries: list[str] = []
             seen: set[str] = set()
-            for item in parsed:
+            for item in planned_queries:
                 value = str(item or "").strip()
                 if not value or value in seen or len(value) > 160:
                     continue
                 seen.add(value)
                 queries.append(value)
-            return queries[:3] or [query]
+            if should_search and not queries and query:
+                queries = [query]
+            return (should_search and bool(queries), queries[:3])
         except Exception:
             logger.warning("image_reference_query_planning_failed", exc_info=True)
-            return [query]
+            return (bool(query), [query] if query else [])
 
     def _deduplicate_reference_images(self, images: list[ImageAttachment]) -> list[ImageAttachment]:
         deduped: list[ImageAttachment] = []

@@ -560,7 +560,9 @@ async def test_group_image_service_plans_independent_reference_queries(tmp_path)
     search_client = FakeImageSearchClient(
         image_results=[ImageAttachment(url="https://img.example.test/ref.png", file_id="ref.png")]
     )
-    planner = FakeImageReferencePlanner('["真绯瑠 官方角色立绘", "弥希 官方角色立绘"]')
+    planner = FakeImageReferencePlanner(
+        '{"should_search": true, "queries": ["真绯瑠 官方角色立绘", "弥希 官方角色立绘"]}'
+    )
     service = GroupImageGenerationService(
         llm_client=llm,
         sender=sender,
@@ -580,6 +582,32 @@ async def test_group_image_service_plans_independent_reference_queries(tmp_path)
     ]
     assert len(planner.prompts) == 1
     assert len(llm.edit_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_image_service_model_can_decline_search_for_ordinary_generation(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png-bytes").decode("ascii"))
+    search_client = FakeImageSearchClient(
+        image_results=[ImageAttachment(url="https://img.example.test/should-not-use.png", file_id="no.png")]
+    )
+    planner = FakeImageReferencePlanner('{"should_search": false, "queries": []}')
+    service = GroupImageGenerationService(
+        llm_client=llm,
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-5.6-sol",
+        web_search_client=search_client,
+        image_reference_planner_client=planner,
+    )
+
+    result = await service.enqueue(make_request("draw-no-search", prompt="生成一张未来城市夜景"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert search_client.queries == []
+    assert len(llm.generate_calls) == 1
+    assert len(planner.prompts) == 1
 
 
 @pytest.mark.asyncio
