@@ -92,9 +92,9 @@ def test_build_group_image_llm_client_reuses_chat_nova_responses_transport() -> 
 
     assert client.base_url == settings.llm_base_url
     assert client.api_key == settings.llm_api_key
-    assert client.model == "gpt-5.6-sol"
-    assert client.responses_model == "gpt-5.6-sol"
-    assert client.image_responses_model == "gpt-5.6-sol"
+    assert client.model == "gpt-image-2"
+    assert client.responses_model == "gpt-image-2"
+    assert client.image_responses_model == "gpt-image-2"
     assert client.responses_only is True
     assert client.http_client is primary_client.http_client
 

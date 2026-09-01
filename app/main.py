@@ -378,7 +378,7 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     # proxy's supported ``image_generation`` tool format instead of going to a
     # separate, often unavailable ``/images/generations`` service.
     if all(hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")):
-        image_model = (settings.group_image_model or "gpt-5.6-sol").strip() or "gpt-5.6-sol"
+        image_model = (settings.group_image_model or "gpt-image-2").strip() or "gpt-image-2"
         image_model = resolve_primary_chat_completions_model(
             model=image_model,
             fallback_model="",
