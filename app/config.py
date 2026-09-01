@@ -41,7 +41,7 @@ class AppSettings(BaseSettings):
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
     group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")
     group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
-    group_image_model: str = Field(default="", alias="GROUP_IMAGE_MODEL")
+    group_image_model: str = Field(default="gpt-5.6-sol", alias="GROUP_IMAGE_MODEL")
     group_image_generations_endpoint: str = Field(
         default="/images/generations",
         alias="GROUP_IMAGE_GENERATIONS_ENDPOINT",
