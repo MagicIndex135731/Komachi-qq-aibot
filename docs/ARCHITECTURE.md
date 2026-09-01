@@ -195,9 +195,9 @@ Responses 模式使用原生 `instructions` 保持人格、安全和引用约束
 
 ### 5.3 图片生成
 
-群聊生图使用独立的 OpenAI 兼容图片服务配置：`GROUP_IMAGE_BASE_URL`、`GROUP_IMAGE_API_KEY`、`GROUP_IMAGE_MODEL` 及 generations/edits endpoint。`GroupImageGenerationService` 负责队列容量、超时、参考图、输出文件和 QQ 发送。
+群聊生图复用聊天使用的 Nova Responses 中转（`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`），通过 `image_generation` 工具请求文生图和参考图生图；`GroupImageGenerationService` 负责队列容量、超时、参考图、输出文件和 QQ 发送。旧的 `GROUP_IMAGE_*` 配置仍保留给未注入具体聊天客户端的兼容调用方。
 
-独立 key 让图片成本、超时和供应商故障与主文本模型隔离。图片任务失败不会阻塞普通文本消息处理。
+图片任务使用独立队列与超时预算，失败不会阻塞普通文本消息处理；成本和供应商由 Nova 的统一中转配置管理。
 
 ## 6. Memory V3 的构成与原理
 

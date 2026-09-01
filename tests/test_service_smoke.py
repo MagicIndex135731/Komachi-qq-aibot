@@ -16,6 +16,7 @@ from app.main import (
     should_ingest_group_message,
     should_speak_in_group,
 )
+from app.providers.llm_client import LlmClient
 from app.providers.web_search import WebSearchClient
 from scripts.backfill_summaries import backfill_lines
 from scripts.import_history import load_export
@@ -70,6 +71,29 @@ def test_build_group_image_llm_client_uses_dedicated_direct_image_endpoint() -> 
     assert client.image_responses_model == ""
     assert client.image_generations_endpoint == "/images/generations"
     assert client.image_edits_endpoint == "/images/edits"
+
+
+def test_build_group_image_llm_client_reuses_chat_nova_responses_transport() -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_model = "gpt-5.6-luna"
+    settings.llm_reasoning_effort = "low"
+    primary_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        responses_model=settings.llm_model,
+        image_responses_model=settings.llm_model,
+    )
+
+    client = build_group_image_llm_client(settings=settings, engine=object(), llm_client=primary_client)
+
+    assert client.base_url == settings.llm_base_url
+    assert client.api_key == settings.llm_api_key
+    assert client.model == "gpt-5.6-luna"
+    assert client.responses_model == "gpt-5.6-luna"
+    assert client.image_responses_model == "gpt-5.6-luna"
+    assert client.responses_only is True
+    assert client.http_client is primary_client.http_client
 
 
 def test_build_group_image_service_uses_dedicated_image_model_and_finite_timeout(monkeypatch) -> None:

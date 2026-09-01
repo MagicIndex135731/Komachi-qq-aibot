@@ -358,7 +358,34 @@ def build_memory_compaction_client(*, settings: AppSettings, llm_client, engine=
 
 
 def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
-    del llm_client
+    # Nova exposes image generation through the same Responses endpoint used
+    # for chat.  Reuse the chat transport/model so image requests carry the
+    # proxy's supported ``image_generation`` tool format instead of going to a
+    # separate, often unavailable ``/images/generations`` service.
+    if all(hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")):
+        chat_model = resolve_primary_chat_completions_model(
+            model=settings.llm_model,
+            fallback_model=settings.llm_fallback_model,
+        )
+        return LlmClient(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=chat_model,
+            fallback_model="",
+            vision_model="",
+            responses_model=chat_model,
+            responses_only=True,
+            image_responses_model=chat_model,
+            builtin_web_search=False,
+            reasoning_effort=settings.llm_reasoning_effort,
+            max_output_tokens=settings.llm_max_output_tokens,
+            timeout_seconds=settings.group_image_timeout_seconds,
+            http_client=llm_client.http_client,
+            usage_recorder=getattr(llm_client, "usage_recorder", None) or build_usage_recorder(engine),
+        )
+
+    # Keep dependency-injected test fakes and legacy callers working when no
+    # concrete chat client is available at composition time.
     required = {
         "GROUP_IMAGE_BASE_URL": settings.group_image_base_url.strip(),
         "GROUP_IMAGE_API_KEY": settings.group_image_api_key.strip(),
