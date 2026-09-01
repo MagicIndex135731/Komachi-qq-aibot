@@ -1589,6 +1589,75 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     assert result.images == [{"b64_json": "ZWRpdGVk"}]
 
 
+def test_llm_client_uses_reference_fallback_url_when_primary_download_fails() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if request.url.host == "primary.example.test":
+                return httpx.Response(567, request=request)
+            return httpx.Response(200, request=request, content=b"fallback-bytes", headers={"content-type": "image/png"})
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_image_stream_body(response_id="resp_fallback", image_b64="ZWRpdGVk"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-sol",
+        responses_model="gpt-5.6-sol",
+        image_responses_model="gpt-5.6-sol",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    client.edit_image(
+        prompt="use the reference",
+        model="gpt-image-2",
+        images=[
+            ImageAttachment(
+                url="https://primary.example.test/image.png",
+                fallback_url="https://fallback.example.test/image.png",
+            )
+        ],
+    )
+
+    assert captured["payload"]["input"][0]["content"][1]["image_url"].endswith(
+        base64.b64encode(b"fallback-bytes").decode("ascii")
+    )
+
+
+def test_llm_client_fails_closed_when_all_responses_reference_downloads_fail() -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(567, request=request)
+        return httpx.Response(500, request=request)
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-sol",
+        responses_model="gpt-5.6-sol",
+        image_responses_model="gpt-5.6-sol",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="could not download any usable reference image"):
+        client.edit_image(
+            prompt="use the reference",
+            model="gpt-image-2",
+            images=[ImageAttachment(url="https://primary.example.test/image.png")],
+        )
+
+    assert all(request.method == "GET" for request in requests)
+
+
 def test_llm_client_salvages_image_from_incomplete_sse_stream() -> None:
     body = _responses_image_stream_body(response_id="resp_salvaged", image_b64="c2FsdmFnZWQ=")
 

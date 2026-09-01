@@ -9,6 +9,7 @@ class ImageAttachment:
     url: str
     file_id: str | None = None
     local_path: str | None = None
+    fallback_url: str | None = None
     source_message_id: str | None = None
     source_user_id: int | None = None
     source_nickname: str | None = None

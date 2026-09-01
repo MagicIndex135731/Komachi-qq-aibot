@@ -215,6 +215,7 @@ class LlmClient:
         tools: list[dict[str, Any]] | None = None,
         extra_input_items: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        preloaded_image_parts: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
             {
@@ -222,7 +223,7 @@ class LlmClient:
                 "text": "\n\n".join(input_lines),
             }
         ]
-        image_parts = self._load_input_images(images or [])
+        image_parts = preloaded_image_parts if preloaded_image_parts is not None else self._load_input_images(images or [])
         for image_part in image_parts:
             data_url = f"data:{image_part['media_type']};base64,{image_part['data']}"
             content.append(
@@ -290,11 +291,21 @@ class LlmClient:
         size: str | None = None,
         quality: str | None = None,
     ) -> dict[str, Any]:
+        image_parts = self._load_input_images(images or [])
+        if images and not image_parts:
+            raise ValueError("image edit request could not download any usable reference image")
+        if images and len(image_parts) < len(images):
+            logger.warning(
+                "llm_input_image_partial_success requested=%s loaded=%s",
+                len(images),
+                len(image_parts),
+            )
         payload = self._build_responses_payload(
             model=self.image_responses_model,
             instructions=[],
             input_lines=[prompt],
             images=images,
+            preloaded_image_parts=image_parts,
         )
         if images:
             for content in payload["input"][0]["content"]:
@@ -503,11 +514,20 @@ class LlmClient:
                     encoded_images.append(local_image)
                     continue
 
-            image_url = image.url.strip()
-            if not image_url:
+            candidate_urls = [image.url.strip()]
+            if image.fallback_url and image.fallback_url.strip() and image.fallback_url.strip() not in candidate_urls:
+                candidate_urls.append(image.fallback_url.strip())
+            candidate_urls = [url for url in candidate_urls if url]
+            if not candidate_urls:
                 logger.warning("llm_input_image_missing_url file_id=%s", image.file_id)
                 continue
-            response = self._download_input_image(image_url=image_url, file_id=image.file_id)
+            response = None
+            image_url = candidate_urls[0]
+            for candidate_url in candidate_urls:
+                response = self._download_input_image(image_url=candidate_url, file_id=image.file_id)
+                if response is not None:
+                    image_url = candidate_url
+                    break
             if response is None:
                 continue
 
@@ -581,11 +601,20 @@ class LlmClient:
                     )
                     continue
 
-            image_url = image.url.strip()
-            if not image_url:
+            candidate_urls = [image.url.strip()]
+            if image.fallback_url and image.fallback_url.strip() and image.fallback_url.strip() not in candidate_urls:
+                candidate_urls.append(image.fallback_url.strip())
+            candidate_urls = [url for url in candidate_urls if url]
+            if not candidate_urls:
                 logger.warning("llm_input_image_missing_url file_id=%s", image.file_id)
                 continue
-            response = self._download_input_image(image_url=image_url, file_id=image.file_id)
+            response = None
+            image_url = candidate_urls[0]
+            for candidate_url in candidate_urls:
+                response = self._download_input_image(image_url=candidate_url, file_id=image.file_id)
+                if response is not None:
+                    image_url = candidate_url
+                    break
             if response is None:
                 continue
 

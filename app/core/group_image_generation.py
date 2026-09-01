@@ -336,6 +336,13 @@ class GroupImageGenerationService:
 
     def _generate_and_store_image(self, request: GroupImageGenerationRequest) -> Path:
         reference_images = self._resolve_reference_images(request)
+        logger.info(
+            "image_reference_images_resolved scope_id=%s msg_id=%s count=%s searched=%s",
+            getattr(request, "group_id", getattr(request, "user_id", "")),
+            request.trigger_message_id,
+            len(reference_images),
+            bool(str(getattr(request, "web_search_query", "") or "").strip()),
+        )
         resolved_size = self._resolve_image_size(prompt=request.prompt)
         if reference_images:
             result = self.llm_client.edit_image(
@@ -520,6 +527,8 @@ class GroupImageGenerationService:
             return "我去网上找这组参考图，但这次没找到能直接拿来出图的图片"
         if message == "web reference image search is not configured":
             return "这次自动上网找参考图的链路还没接好"
+        if "could not download any usable reference image" in message:
+            return "参考图找到了，但图片下载失败了，我先不拿空参考图硬画"
         if isinstance(cause, (httpx.ReadTimeout, httpx.RemoteProtocolError)):
             return "这张超时了，你把描述再收短点，少点人物我再画"
         return self.failure_reply_text
@@ -565,6 +574,7 @@ class GroupImageGenerationService:
             "url": str(image.url or "").strip(),
             "file_id": str(image.file_id or "").strip(),
             "local_path": str(image.local_path or "").strip(),
+            "fallback_url": str(image.fallback_url or "").strip(),
         }
 
     def _deserialize_image_attachment(self, payload: dict[str, Any]) -> ImageAttachment:
@@ -572,6 +582,7 @@ class GroupImageGenerationService:
             url=str(payload.get("url", "") or "").strip(),
             file_id=str(payload.get("file_id", "") or "").strip() or None,
             local_path=str(payload.get("local_path", "") or "").strip() or None,
+            fallback_url=str(payload.get("fallback_url", "") or "").strip() or None,
         )
 
     def _optional_payload_text(self, value: object) -> str | None:

@@ -336,8 +336,15 @@ class WebSearchClient:
             image_url = str(item.get("image", "") or item.get("thumbnail", "")).strip()
             if not image_url:
                 continue
+            thumbnail_url = str(item.get("thumbnail", "")).strip()
             file_id = str(item.get("title", "")).strip() or f"search-image-{index}"
-            images.append(ImageAttachment(url=image_url, file_id=file_id))
+            images.append(
+                ImageAttachment(
+                    url=image_url,
+                    file_id=file_id,
+                    fallback_url=thumbnail_url if thumbnail_url and thumbnail_url != image_url else None,
+                )
+            )
             if len(images) >= max_results:
                 break
         return images
