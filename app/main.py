@@ -162,6 +162,21 @@ def build_web_search_client(settings: AppSettings) -> WebSearchClient | None:
     )
 
 
+def build_image_reference_search_client(settings: AppSettings) -> WebSearchClient | None:
+    """Build external image search independently of chat built-in search."""
+    provider = settings.search_provider.strip().lower()
+    if provider != "ddgs" and not settings.search_api_key.strip():
+        return None
+    return WebSearchClient(
+        provider=provider,
+        base_url=settings.search_base_url,
+        api_key=settings.search_api_key,
+        timeout_seconds=settings.search_timeout_seconds,
+        region=settings.search_region,
+        backend=settings.search_backend,
+    )
+
+
 def build_usage_recorder(engine):
     def recorder(usage) -> None:
         with session_scope(engine) as session:
@@ -1489,6 +1504,7 @@ async def run() -> None:
         )
         group_image_llm_client = build_group_image_llm_client(settings=settings, engine=engine, llm_client=llm_client)
         web_search_client = build_web_search_client(settings)
+        image_reference_search_client = build_image_reference_search_client(settings)
         image_reference_planner_client = build_group_image_reference_planner_client(
             settings=settings,
             llm_client=llm_client,
@@ -1497,7 +1513,7 @@ async def run() -> None:
             settings=settings,
             llm_client=group_image_llm_client,
             sender=sender,
-            web_search_client=web_search_client,
+            web_search_client=image_reference_search_client,
             image_reference_planner_client=image_reference_planner_client,
         )
         memory_runtime = build_memory_runtime(

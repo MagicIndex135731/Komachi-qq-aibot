@@ -9,6 +9,7 @@ import pytest
 
 from app.config import AppSettings
 from app.main import (
+    build_image_reference_search_client,
     build_group_image_llm_client,
     build_group_image_reference_planner_client,
     build_web_search_client,
@@ -273,6 +274,17 @@ def test_build_web_search_client_is_disabled_when_builtin_llm_web_search_is_enab
     settings.llm_text_endpoint = "responses"
 
     assert build_web_search_client(settings) is None
+
+
+def test_build_image_reference_search_client_ignores_builtin_chat_search_switch() -> None:
+    settings = _settings_for_search(provider="ddgs", search_api_key="   ")
+    settings.llm_builtin_web_search = True
+    settings.llm_text_endpoint = "responses"
+
+    client = build_image_reference_search_client(settings)
+
+    assert isinstance(client, WebSearchClient)
+    assert client.provider == "ddgs"
 
 
 def test_build_llm_client_preserves_primary_model_and_exposes_distinct_fallback(monkeypatch) -> None:
