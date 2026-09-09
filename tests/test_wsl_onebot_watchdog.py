@@ -576,6 +576,59 @@ def test_llbot_signing_failure_is_detected_without_exposing_logs(
     assert calls == [["docker", "logs", "--tail", "200", "xiaomachi-llbot"]]
 
 
+def test_llbot_guid_resync_detection_uses_only_the_safe_log_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    monkeypatch.setattr(
+        watchdog,
+        "_llbot_recent_logs",
+        lambda *_: "[sign] sign-proxy setMachineGuid is unavailable",
+    )
+
+    assert watchdog.llbot_guid_resync_required() is True
+
+
+def test_llbot_guid_resync_restarts_once_before_normal_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    restarts: list[str] = []
+
+    async def probe_onebot(_: str) -> tuple[bool | None, bool | None, str]:
+        return False, False, "get_group_list_not_ok"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", probe_onebot)
+    monkeypatch.setattr(watchdog, "llbot_signing_backend_unavailable", lambda: False)
+    monkeypatch.setattr(watchdog, "llbot_guid_resync_required", lambda: True)
+    monkeypatch.setattr(
+        watchdog,
+        "restart_service",
+        lambda _compose, service: (restarts.append(service) is None, "started"),
+    )
+    monkeypatch.setattr(watchdog.time, "time", lambda: 10.0)
+
+    kwargs = {
+        "ws_url": "ws://fake",
+        "state_file": tmp_path / "state.json",
+        "log_file": tmp_path / "watchdog.log",
+        "compose_file": tmp_path / "docker-compose.llbot.yml",
+        "notifier": tmp_path / "notify.ps1",
+        "service_name": "llbot",
+        "platform": "llbot",
+    }
+    watchdog.run_once(**kwargs)
+    watchdog.run_once(**kwargs)
+
+    state = watchdog.load_state(kwargs["state_file"])
+    assert restarts == ["llbot"]
+    assert state.restart_attempts == 1
+    assert state.llbot_guid_resync_restart_used is True
+    assert "llbot_guid_resync_restart_requested" in kwargs["log_file"].read_text(
+        encoding="utf-8"
+    )
+
+
 def test_notify_windows_uses_absolute_powershell_when_systemd_path_has_no_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

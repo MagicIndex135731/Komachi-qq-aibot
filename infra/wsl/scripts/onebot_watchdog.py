@@ -57,6 +57,7 @@ class WatchdogState:
     restart_used: bool = False
     restart_attempts: int = 0
     restart_requested_at: float = 0.0
+    llbot_guid_resync_restart_used: bool = False
     alerted: bool = False
     webui_alerted: bool = False
     isLogin: bool | None = None
@@ -117,6 +118,7 @@ def evaluate_state(
     offline_threshold: int = OFFLINE_THRESHOLD,
     recovery_grace_seconds: int = RECOVERY_GRACE_SECONDS,
     max_recovery_restarts: int = 1,
+    llbot_guid_resync_required: bool = False,
 ) -> tuple[WatchdogState, str]:
     unhealthy = online is False or active_session_ok is False
     recovered = online is True and active_session_ok is True
@@ -128,6 +130,22 @@ def evaluate_state(
         next_state = state
 
     restart_attempts = max(int(next_state.restart_attempts), int(next_state.restart_used))
+    if (
+        unhealthy
+        and llbot_guid_resync_required
+        and not next_state.llbot_guid_resync_restart_used
+        and restart_attempts < max(1, int(max_recovery_restarts))
+    ):
+        return (
+            replace(
+                next_state,
+                restart_used=True,
+                restart_attempts=restart_attempts + 1,
+                restart_requested_at=now,
+                llbot_guid_resync_restart_used=True,
+            ),
+            ACTION_RESTART,
+        )
     if (
         unhealthy
         and next_state.offline_checks >= offline_threshold
@@ -168,6 +186,9 @@ def load_state(path: Path) -> WatchdogState:
             restart_used=restart_used or restart_attempts > 0,
             restart_attempts=max(0, restart_attempts),
             restart_requested_at=float(payload.get("restart_requested_at", 0.0)),
+            llbot_guid_resync_restart_used=bool(
+                payload.get("llbot_guid_resync_restart_used", False)
+            ),
             alerted=bool(payload.get("alerted", False)),
             webui_alerted=bool(payload.get("webui_alerted", False)),
             isLogin=payload.get("isLogin") if isinstance(payload.get("isLogin"), bool) else None,
@@ -328,8 +349,8 @@ def restart_napcat(compose_file: Path) -> tuple[bool, str]:
     return restart_service(compose_file, "napcat")
 
 
-def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -> bool:
-    """Detect the known LLBot signing outage without persisting raw logs."""
+def _llbot_recent_logs(container_name: str = "xiaomachi-llbot") -> str:
+    """Read the small diagnostic tail without persisting raw gateway logs."""
     try:
         result = subprocess.run(
             ["docker", "logs", "--tail", "200", container_name],
@@ -339,12 +360,22 @@ def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    output = f"{result.stdout}\n{result.stderr}".lower()
+        return ""
+    return f"{result.stdout}\n{result.stderr}".lower()
+
+
+def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -> bool:
+    """Detect the known LLBot signing outage without persisting raw logs."""
+    output = _llbot_recent_logs(container_name)
     return (
         "replay protection unavailable" in output
         or "sign 未初始化" in output
     )
+
+
+def llbot_guid_resync_required(container_name: str = "xiaomachi-llbot") -> bool:
+    """Detect a 1001-kick GUID change that an old native signer cannot absorb."""
+    return "setmachineguid" in _llbot_recent_logs(container_name).lower()
 
 
 def _windows_powershell_path() -> str | None:
@@ -419,6 +450,12 @@ async def run_check(
         and online is not True
         and llbot_signing_backend_unavailable()
     )
+    llbot_guid_resync_needed = (
+        platform == "llbot"
+        and online is not True
+        and not llbot_signing_error
+        and llbot_guid_resync_required()
+    )
     webui_login_error = is_explicit_webui_login_error(webui_status) or llbot_signing_error
     # Restarting LLBot cannot repair an unavailable external signing service.
     # Treat it as an explicit login error so the user is notified immediately,
@@ -432,6 +469,7 @@ async def run_check(
         webui_login_error=webui_login_error,
         now=time.time(),
         max_recovery_restarts=(LLBOT_MAX_RECOVERY_RESTARTS if platform == "llbot" else 1),
+        llbot_guid_resync_required=llbot_guid_resync_needed,
     )
     next_state = replace(
         next_state,
@@ -455,7 +493,17 @@ async def run_check(
             if service_name == "napcat"
             else restart_service(compose_file, service_name)
         )
-        append_log(log_file, f"{service_name}_restart_requested" if ok else f"{service_name}_restart_failed", detail)
+        restart_event = (
+            f"{service_name}_guid_resync_restart_requested"
+            if llbot_guid_resync_needed
+            else f"{service_name}_restart_requested"
+        )
+        failed_event = (
+            f"{service_name}_guid_resync_restart_failed"
+            if llbot_guid_resync_needed
+            else f"{service_name}_restart_failed"
+        )
+        append_log(log_file, restart_event if ok else failed_event, detail)
         if not ok:
             failed_state = replace(next_state, alerted=True)
             save_state(state_file, failed_state)
