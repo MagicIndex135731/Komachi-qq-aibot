@@ -780,7 +780,8 @@ def test_llbot_runtime_uses_current_patch_and_survives_process_exit() -> None:
     start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
     status_script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
 
-    assert "linyuchen/llbot:8.0.14" in compose
+    assert "linyuchen/llbot:8.1.10@sha256:" in compose
+    assert "AUTO_LOGIN_QQ=${BOT_QQ:-}" in compose
     assert 'restart: "unless-stopped"' in compose
     assert "replay protection unavailable" in start_script
     assert status_script.count("replay protection unavailable") >= 2

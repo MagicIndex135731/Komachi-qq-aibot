@@ -22,7 +22,12 @@ def test_llbot_compose_uses_pinned_image_host_network_and_persistent_data() -> N
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
     llbot = compose["services"]["llbot"]
 
-    assert llbot["image"] == "linyuchen/llbot:8.0.14"
+    assert llbot["image"] == (
+        "linyuchen/llbot:8.1.10@sha256:"
+        "067159e742b529dedba5f0b2987290fb34b4627a1f605b83119e36ef76a81467"
+    )
+    assert "build" not in llbot
+    assert "AUTO_LOGIN_QQ=${BOT_QQ:-}" in llbot["environment"]
     assert llbot["restart"] == "unless-stopped"
     assert llbot["network_mode"] == "host"
     assert "ports" not in llbot

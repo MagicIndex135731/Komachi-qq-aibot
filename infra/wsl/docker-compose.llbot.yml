@@ -2,13 +2,13 @@ name: xiaomachi-linux-stack
 
 services:
   llbot:
-    image: linyuchen/llbot:8.0.14
+    image: linyuchen/llbot:8.1.10@sha256:067159e742b529dedba5f0b2987290fb34b4627a1f605b83119e36ef76a81467
     container_name: xiaomachi-llbot
     restart: "unless-stopped"
     network_mode: host
     environment:
       - TZ=${TZ:-Asia/Shanghai}
-      - QQ=${BOT_QQ:-}
+      - AUTO_LOGIN_QQ=${BOT_QQ:-}
       - WEBUI_PORT=3080
       - HTTP_PROXY=${DOCKER_HTTP_PROXY:-}
       - HTTPS_PROXY=${DOCKER_HTTPS_PROXY:-}
