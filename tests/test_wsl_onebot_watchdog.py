@@ -4,6 +4,7 @@ import importlib.util
 import asyncio
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -652,6 +653,365 @@ def test_notify_windows_uses_absolute_powershell_when_systemd_path_has_no_window
 
     assert watchdog.notify_windows(notifier, "llbot_signing_backend_unavailable") == (True, "started")
     assert popen_calls[0][0] == "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def test_llbot_kick_signature_hashes_the_newest_1001_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    kick = '[w] core [kick] code=1001 title="下线通知" desc="你的账号当前登录已失效，请重新登录。"'
+    monkeypatch.setattr(
+        watchdog,
+        "_llbot_recent_logs",
+        lambda *_, **__: (
+            f"2026-09-10t01:52:41.000000000z {kick}\n"
+            f"2026-09-10t08:29:39.367488742z {kick}"
+        ),
+    )
+
+    signature = watchdog.llbot_kick_signature()
+
+    assert signature
+    assert kick not in signature
+    assert len(signature) == 16
+    assert signature == watchdog.llbot_kick_signature()
+
+
+def test_llbot_kick_signature_reads_the_timestamped_log_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="2026-09-09T15:30:48.000000000Z [W] core [Kick] code=1001",
+            stderr="",
+        )
+
+    monkeypatch.setattr(watchdog.subprocess, "run", run)
+
+    assert watchdog.llbot_kick_signature() == watchdog.llbot_kick_signature()
+    assert calls == [
+        ["docker", "logs", "--tail", "200", "--timestamps", "xiaomachi-llbot"],
+        ["docker", "logs", "--tail", "200", "--timestamps", "xiaomachi-llbot"],
+    ]
+
+
+def test_llbot_kick_signature_separates_repeated_identical_kick_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # QQ repeats one fixed kick text; only the docker log timestamp tells two
+    # incidents apart, otherwise the later kick is dropped as a duplicate.
+    watchdog = load_watchdog()
+    kick = '[w] core [kick] code=1001 title="下线通知" desc="你的账号当前登录已失效，请重新登录。"'
+    lines = [
+        f"2026-09-09t11:30:48.000000000z {kick}",
+        f"2026-09-09t15:30:48.000000000z {kick}",
+    ]
+
+    monkeypatch.setattr(watchdog, "_llbot_recent_logs", lambda *_, **__: lines[0])
+    first_signature = watchdog.llbot_kick_signature()
+    monkeypatch.setattr(watchdog, "_llbot_recent_logs", lambda *_, **__: lines[1])
+    second_signature = watchdog.llbot_kick_signature()
+
+    assert first_signature != second_signature
+
+
+def test_llbot_kick_signature_is_empty_without_a_kick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    monkeypatch.setattr(
+        watchdog, "_llbot_recent_logs", lambda *_, **__: "[i] onebot11-adapter ready"
+    )
+
+    assert watchdog.llbot_kick_signature() == ""
+
+
+def test_llbot_kick_forensics_records_once_per_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    forensics_file = tmp_path / "logs" / "llbot-kick-forensics.jsonl"
+    kick_lines = ["aaaaaaaaaaaaaaa1"]
+    seen: list[str] = []
+
+    async def probe_onebot(_: str) -> tuple[bool | None, bool | None, str]:
+        return False, False, "ConnectionRefusedError"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", probe_onebot)
+    monkeypatch.setattr(watchdog, "llbot_signing_backend_unavailable", lambda: True)
+    monkeypatch.setattr(watchdog, "llbot_kick_signature", lambda *_: kick_lines[0])
+    monkeypatch.setattr(
+        watchdog,
+        "_forensic_container_info",
+        lambda *_: {"id_prefix": "abc123", "proxy_class": "direct"},
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "_forensic_device_info",
+        lambda *_: {
+            "guid_fingerprint": "beef",
+            "guid_mtime": "2026-09-10T08:29:39Z",
+            "session_present": True,
+            "session_saved_at": "2026-09-10T15:11:28Z",
+            "signer_set_machine_guid": False,
+        },
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "_forensic_egress_fingerprint",
+        lambda *_: {"fingerprint": "cafe", "probe": "ok"},
+    )
+    monkeypatch.setattr(watchdog, "notify_windows", lambda *_: (True, "started"))
+    monkeypatch.setattr(
+        watchdog,
+        "restart_service",
+        lambda *_args, **_kwargs: (seen.append("restart") is not None, "ok"),
+    )
+    kwargs = {
+        "ws_url": "ws://fake",
+        "state_file": tmp_path / "state.json",
+        "log_file": tmp_path / "logs" / "watchdog.log",
+        "compose_file": tmp_path / "docker-compose.llbot.yml",
+        "notifier": tmp_path / "notify.ps1",
+        "service_name": "llbot",
+        "platform": "llbot",
+        "forensics_file": forensics_file,
+    }
+    watchdog.run_once(**kwargs)
+    watchdog.run_once(**kwargs)
+
+    records = [
+        json.loads(line)
+        for line in forensics_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["event"] == "llbot_kick_1001"
+    assert records[0]["kick_signature"] == "aaaaaaaaaaaaaaa1"
+    assert records[0]["device"]["guid_fingerprint"] == "beef"
+    assert records[0]["container"]["proxy_class"] == "direct"
+    assert records[0]["egress"] == {"fingerprint": "cafe", "probe": "ok"}
+
+    kick_lines[0] = "aaaaaaaaaaaaaaa2"
+    watchdog.run_once(**kwargs)
+
+    records = [
+        json.loads(line)
+        for line in forensics_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [record["kick_signature"] for record in records] == [
+        "aaaaaaaaaaaaaaa1",
+        "aaaaaaaaaaaaaaa2",
+    ]
+
+
+def test_llbot_kick_forensics_survives_recovery_without_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    forensics_file = tmp_path / "logs" / "llbot-kick-forensics.jsonl"
+    signatures = iter(["sig-1", "sig-1"])
+
+    async def healthy_probe(_: str) -> tuple[bool | None, bool | None, str]:
+        return True, True, "get_group_list"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", healthy_probe)
+    monkeypatch.setattr(watchdog, "llbot_kick_signature", lambda *_: next(signatures))
+    monkeypatch.setattr(watchdog, "_forensic_container_info", lambda *_: {})
+    monkeypatch.setattr(watchdog, "_forensic_device_info", lambda *_: {})
+    monkeypatch.setattr(
+        watchdog,
+        "_forensic_egress_fingerprint",
+        lambda *_: {"fingerprint": "", "probe": "unavailable"},
+    )
+    kwargs = {
+        "ws_url": "ws://fake",
+        "state_file": tmp_path / "state.json",
+        "log_file": tmp_path / "logs" / "watchdog.log",
+        "compose_file": tmp_path / "docker-compose.llbot.yml",
+        "notifier": tmp_path / "notify.ps1",
+        "service_name": "llbot",
+        "platform": "llbot",
+        "forensics_file": forensics_file,
+    }
+    watchdog.run_once(**kwargs)
+    watchdog.run_once(**kwargs)
+
+    state = watchdog.load_state(tmp_path / "state.json")
+    assert state.llbot_kick_signature == "sig-1"
+    assert len(forensics_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_llbot_kick_forensics_skips_other_platforms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    forensics_file = tmp_path / "logs" / "llbot-kick-forensics.jsonl"
+
+    async def probe_onebot(_: str) -> tuple[bool | None, bool | None, str]:
+        return False, False, "ConnectionRefusedError"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", probe_onebot)
+    monkeypatch.setattr(
+        watchdog,
+        "llbot_kick_signature",
+        lambda *_: pytest.fail("napcat runs must not read LLBot kick markers"),
+    )
+
+    watchdog.run_once(
+        ws_url="ws://fake",
+        state_file=tmp_path / "state.json",
+        log_file=tmp_path / "logs" / "watchdog.log",
+        compose_file=tmp_path / "docker-compose.yml",
+        notifier=tmp_path / "notify.ps1",
+        forensics_file=forensics_file,
+    )
+
+    assert not forensics_file.exists()
+
+
+def test_llbot_forensic_file_stays_bounded(tmp_path: Path) -> None:
+    watchdog = load_watchdog()
+    forensics_file = tmp_path / "llbot-kick-forensics.jsonl"
+
+    for index in range(40):
+        watchdog.append_jsonl_bounded(
+            forensics_file,
+            {"event": "llbot_kick_1001", "index": index, "padding": "x" * 200},
+            max_bytes=4096,
+            keep_lines=10,
+        )
+
+    lines = forensics_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) <= 10
+    assert json.loads(lines[-1])["index"] == 39
+
+
+def test_forensic_egress_fingerprint_is_salted_and_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    salt_file = tmp_path / "llbot-forensics-salt.bin"
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return b"203.0.113.7"
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        watchdog, "_open_without_redirects", lambda *args, **kwargs: FakeResponse()
+    )
+
+    first = watchdog._forensic_egress_fingerprint(salt_file)
+    second = watchdog._forensic_egress_fingerprint(salt_file)
+
+    assert first == second
+    assert first["probe"] == "ok"
+    assert first["fingerprint"]
+    assert "203.0.113.7" not in json.dumps(first)
+    assert salt_file.exists()
+    if os.name != "nt":
+        assert oct(salt_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_proxy_class_never_returns_the_configured_address() -> None:
+    watchdog = load_watchdog()
+
+    assert watchdog._proxy_class(["HTTP_PROXY=", "HTTPS_PROXY="]) == "direct"
+    assert (
+        watchdog._proxy_class(["HTTP_PROXY=http://127.0.0.1:7890", "HTTPS_PROXY="])
+        == "loopback"
+    )
+    assert (
+        watchdog._proxy_class(["HTTPS_PROXY=http://user:pass@proxy.example:8080"])
+        == "remote"
+    )
+
+
+def test_forensic_signer_probe_selects_the_matching_architecture() -> None:
+    watchdog = load_watchdog()
+
+    script = watchdog._LLBOT_FORENSICS_NODE_SCRIPT
+
+    # The image ships both arm64 and x64 native modules; picking by name order
+    # loads the wrong one and silently reports "no capability".
+    assert "process.arch" in script
+    assert "sign-proxy." in script
+    assert "machine_guid.bin" in script
+    assert "enc" not in script
+
+
+def test_forensic_egress_probe_falls_back_to_the_next_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+    salt_file = tmp_path / "llbot-forensics-salt.bin"
+    responses: list[str] = ["<html>blocked</html>", "198.51.100.9"]
+
+    class FakeResponse:
+        def __init__(self, body: str) -> None:
+            self.body = body
+
+        def read(self) -> bytes:
+            return self.body.encode("utf-8")
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_open(request: Request, timeout: float) -> FakeResponse:
+        return FakeResponse(responses.pop(0))
+
+    monkeypatch.setattr(watchdog, "_open_without_redirects", fake_open)
+
+    result = watchdog._forensic_egress_fingerprint(salt_file)
+
+    assert result["probe"] == "ok"
+    assert result["fingerprint"]
+    assert responses == []
+
+
+def test_forensic_egress_probe_rejects_non_address_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = load_watchdog()
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return b"<html>captcha required</html>"
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        watchdog, "_open_without_redirects", lambda *args, **kwargs: FakeResponse()
+    )
+
+    result = watchdog._forensic_egress_fingerprint(tmp_path / "salt.bin")
+
+    assert result == {"fingerprint": "", "probe": "unavailable"}
+    assert watchdog._looks_like_address("198.51.100.9") is True
+    assert watchdog._looks_like_address("999.1.1.1") is False
+    assert watchdog._looks_like_address("2001:db8::1") is True
+    assert watchdog._looks_like_address(":::") is False
+    assert watchdog._looks_like_address("dead:beef") is False
 
 
 def test_llbot_signing_outage_notifies_without_restarting(

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import shutil
@@ -24,6 +25,76 @@ ACTION_NOTIFY = "notify"
 OFFLINE_THRESHOLD = 3
 RECOVERY_GRACE_SECONDS = 120
 LLBOT_MAX_RECOVERY_RESTARTS = 2
+LLBOT_FORENSICS_FILENAME = "llbot-kick-forensics.jsonl"
+LLBOT_FORENSICS_MAX_BYTES = 262_144
+LLBOT_FORENSICS_KEEP_LINES = 200
+# Several public echo services, tried in order.  api.ipify.org is first for
+# most networks but is refused on some Chinese ISP paths, so a single hard-coded
+# endpoint would silently disable the egress fingerprint.
+FORENSIC_EGRESS_URLS = (
+    "https://icanhazip.com",
+    "https://ifconfig.me/ip",
+    "https://ipinfo.io/ip",
+    "https://api.ipify.org",
+)
+# The watchdog shares one event loop with the 60-second probe cadence, so the
+# whole egress lookup is capped instead of costing one timeout per endpoint.
+FORENSIC_EGRESS_BUDGET_SECONDS = 12.0
+
+# One read-only probe collects every device/session fact we need without ever
+# reading the credential itself.  Only fingerprints and timestamps leave the
+# container.
+_LLBOT_FORENSICS_NODE_SCRIPT = """
+const fs = require('fs');
+const crypto = require('crypto');
+const out = {
+  guid_fingerprint: '',
+  guid_mtime: '',
+  session_present: false,
+  session_saved_at: '',
+  signer_set_machine_guid: null,
+};
+const dataDir = '/app/llbot/data';
+try {
+  const guidPath = dataDir + '/machine_guid.bin';
+  const guid = fs.readFileSync(guidPath);
+  out.guid_fingerprint = crypto.createHash('sha256').update(guid).digest('hex').slice(0, 16);
+  out.guid_mtime = fs.statSync(guidPath).mtime.toISOString();
+} catch (error) {
+  out.guid_fingerprint = '';
+}
+try {
+  const sessions = fs
+    .readdirSync(dataDir)
+    .filter((name) => /^qq-session-[0-9]+\\.json$/.test(name))
+    .sort();
+  if (sessions.length > 0) {
+    out.session_present = true;
+    const payload = JSON.parse(fs.readFileSync(dataDir + '/' + sessions[sessions.length - 1], 'utf8'));
+    const savedAt = Number(payload.savedAt);
+    if (Number.isFinite(savedAt) && savedAt > 0) {
+      out.session_saved_at = new Date(savedAt > 1e12 ? savedAt : savedAt * 1000).toISOString();
+    }
+  }
+} catch (error) {
+  out.session_present = false;
+}
+try {
+  const candidates = fs
+    .readdirSync('/app/llbot')
+    .filter((name) => name.startsWith('sign-proxy.') && name.endsWith('.node'))
+    .sort();
+  const selected =
+    candidates.find((name) => name.includes('-' + process.arch + '-')) || candidates[0];
+  if (selected) {
+    const signer = require('/app/llbot/' + selected);
+    out.signer_set_machine_guid = Object.prototype.hasOwnProperty.call(signer, 'setMachineGuid');
+  }
+} catch (error) {
+  out.signer_set_machine_guid = null;
+}
+process.stdout.write(JSON.stringify(out));
+"""
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -58,6 +129,7 @@ class WatchdogState:
     restart_attempts: int = 0
     restart_requested_at: float = 0.0
     llbot_guid_resync_restart_used: bool = False
+    llbot_kick_signature: str = ""
     alerted: bool = False
     webui_alerted: bool = False
     isLogin: bool | None = None
@@ -123,7 +195,12 @@ def evaluate_state(
     unhealthy = online is False or active_session_ok is False
     recovered = online is True and active_session_ok is True
     if recovered:
-        next_state = WatchdogState(webui_alerted=state.webui_alerted if webui_login_error else False)
+        # The kick signature survives recovery so a kick line that is still in
+        # the log tail cannot produce a duplicate forensic record.
+        next_state = WatchdogState(
+            webui_alerted=state.webui_alerted if webui_login_error else False,
+            llbot_kick_signature=state.llbot_kick_signature,
+        )
     elif unhealthy:
         next_state = replace(state, offline_checks=state.offline_checks + 1)
     else:
@@ -188,6 +265,11 @@ def load_state(path: Path) -> WatchdogState:
             restart_requested_at=float(payload.get("restart_requested_at", 0.0)),
             llbot_guid_resync_restart_used=bool(
                 payload.get("llbot_guid_resync_restart_used", False)
+            ),
+            llbot_kick_signature=(
+                payload.get("llbot_kick_signature")
+                if isinstance(payload.get("llbot_kick_signature"), str)
+                else ""
             ),
             alerted=bool(payload.get("alerted", False)),
             webui_alerted=bool(payload.get("webui_alerted", False)),
@@ -349,11 +431,20 @@ def restart_napcat(compose_file: Path) -> tuple[bool, str]:
     return restart_service(compose_file, "napcat")
 
 
-def _llbot_recent_logs(container_name: str = "xiaomachi-llbot") -> str:
+def _llbot_recent_logs(
+    container_name: str = "xiaomachi-llbot", *, timestamps: bool = False
+) -> str:
     """Read the small diagnostic tail without persisting raw gateway logs."""
+    command = ["docker", "logs", "--tail", "200"]
+    if timestamps:
+        # ``docker logs`` prints the application line on its own, so the log
+        # driver timestamp is the only stable per-incident identity a repeated
+        # QQ kick text has.
+        command.append("--timestamps")
+    command.append(container_name)
     try:
         result = subprocess.run(
-            ["docker", "logs", "--tail", "200", container_name],
+            command,
             capture_output=True,
             text=True,
             timeout=10,
@@ -376,6 +467,242 @@ def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -
 def llbot_guid_resync_required(container_name: str = "xiaomachi-llbot") -> bool:
     """Detect a 1001-kick GUID change that an old native signer cannot absorb."""
     return "setmachineguid" in _llbot_recent_logs(container_name).lower()
+
+
+def llbot_kick_signature(container_name: str = "xiaomachi-llbot") -> str:
+    """Fingerprint the newest QQ 1001 kick line without persisting it.
+
+    The kick line carries no credentials, but the watchdog contract forbids
+    storing raw gateway logs.  A hash over the newest matching line is stable
+    for a given incident and changes as soon as QQ reports another kick.
+    QQ reuses one fixed kick text, so the docker log timestamp is part of the
+    hashed line; without it two kicks days apart collapse into one signature
+    and the later incident is dropped as a duplicate.
+    """
+    lines = [
+        line.strip()
+        for line in _llbot_recent_logs(container_name, timestamps=True).splitlines()
+        if "code=1001" in line
+    ]
+    if not lines:
+        return ""
+    return hashlib.sha256(lines[-1].encode("utf-8")).hexdigest()[:16]
+
+
+def _forensic_salt(salt_file: Path) -> bytes:
+    """Return a per-installation salt so egress fingerprints stay private."""
+    try:
+        salt = salt_file.read_bytes()
+        if len(salt) >= 16:
+            return salt
+    except OSError:
+        pass
+    salt = os.urandom(32)
+    salt_file.parent.mkdir(parents=True, exist_ok=True)
+    salt_file.write_bytes(salt)
+    try:
+        salt_file.chmod(0o600)
+    except OSError:
+        pass
+    return salt
+
+
+def _forensic_container_info(container_name: str) -> dict[str, Any]:
+    """Read container identity plus the proxy class, never the proxy value."""
+    info: dict[str, Any] = {
+        "id_prefix": "",
+        "started_at": "",
+        "restart_count": None,
+        "image": "",
+        "proxy_class": "unknown",
+    }
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                container_name,
+                "--format",
+                "{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.Config.Image}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return info
+    if result.returncode == 0 and result.stdout.strip():
+        parts = result.stdout.strip().split("|")
+        if len(parts) >= 4:
+            info["id_prefix"] = parts[0][:12]
+            info["started_at"] = parts[1]
+            info["restart_count"] = int(parts[2]) if parts[2].isdigit() else None
+            info["image"] = parts[3]
+    try:
+        env_result = subprocess.run(
+            ["docker", "inspect", container_name, "--format", "{{json .Config.Env}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if env_result.returncode == 0 and env_result.stdout.strip():
+            entries = json.loads(env_result.stdout)
+            if isinstance(entries, list):
+                info["proxy_class"] = _proxy_class(entries)
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return info
+    return info
+
+
+def _proxy_class(env_entries: list[Any]) -> str:
+    """Classify QQ egress routing without persisting any proxy address."""
+    values: dict[str, str] = {}
+    for entry in env_entries:
+        if isinstance(entry, str) and "=" in entry:
+            key, _, value = entry.partition("=")
+            values[key.strip()] = value.strip()
+    configured = [values.get("HTTP_PROXY", ""), values.get("HTTPS_PROXY", "")]
+    if not any(configured):
+        return "direct"
+    for value in configured:
+        if not value:
+            continue
+        if urlsplit(value).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return "remote"
+    return "loopback"
+
+
+def _forensic_device_info(container_name: str) -> dict[str, Any]:
+    """Probe device/session fingerprints and signer capability read-only."""
+    info: dict[str, Any] = {
+        "guid_fingerprint": "",
+        "guid_mtime": "",
+        "session_present": None,
+        "session_saved_at": "",
+        "signer_set_machine_guid": None,
+    }
+    try:
+        result = subprocess.run(
+            ["docker", "exec", container_name, "node", "-e", _LLBOT_FORENSICS_NODE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return info
+    if result.returncode != 0 or not result.stdout.strip():
+        return info
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return info
+    if not isinstance(payload, dict):
+        return info
+    for key in info:
+        if key in payload:
+            info[key] = payload[key]
+    return info
+
+
+def _forensic_egress_fingerprint(salt_file: Path) -> dict[str, str]:
+    """Fingerprint the public egress address with a per-installation salt."""
+    salt = _forensic_salt(salt_file)
+    address = ""
+    deadline = time.monotonic() + FORENSIC_EGRESS_BUDGET_SECONDS
+    for url in FORENSIC_EGRESS_URLS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with _open_without_redirects(Request(url), timeout=min(8.0, remaining)) as response:
+                candidate = response.read().decode("utf-8", "replace").strip()
+        except Exception:
+            continue
+        if _looks_like_address(candidate):
+            address = candidate
+            break
+    if not address:
+        return {"fingerprint": "", "probe": "unavailable"}
+    digest = hashlib.sha256(salt + b"\0" + address.encode("utf-8")).hexdigest()
+    return {"fingerprint": digest[:16], "probe": "ok"}
+
+
+def _looks_like_address(value: str) -> bool:
+    """Accept only a bare IP literal so no provider text is ever hashed."""
+    if not value or len(value) > 45:
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def build_llbot_kick_forensics(
+    *,
+    container_name: str = "xiaomachi-llbot",
+    kick_signature: str = "",
+    state: WatchdogState | None = None,
+    forensics_file: Path = Path("llbot-kick-forensics.jsonl"),
+    now: float | None = None,
+    container_probe: Callable[..., dict[str, Any]] | None = None,
+    device_probe: Callable[..., dict[str, Any]] | None = None,
+    egress_probe: Callable[..., dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Compose one credential-free snapshot for a QQ 1001 kick incident."""
+    timestamp = time.time() if now is None else now
+    salt_file = forensics_file.parent / "llbot-forensics-salt.bin"
+    container = (container_probe or _forensic_container_info)(container_name)
+    device = (device_probe or _forensic_device_info)(container_name)
+    egress = (egress_probe or _forensic_egress_fingerprint)(salt_file)
+    return {
+        "event": "llbot_kick_1001",
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(timestamp)),
+        "observed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+        "kick_signature": kick_signature,
+        "container": container,
+        "device": {
+            "guid_fingerprint": device.get("guid_fingerprint", ""),
+            "guid_mtime": device.get("guid_mtime", ""),
+            "signer_set_machine_guid": device.get("signer_set_machine_guid"),
+        },
+        "session": {
+            "present": device.get("session_present"),
+            "saved_at": device.get("session_saved_at", ""),
+        },
+        "egress": egress,
+        "watchdog": {
+            "offline_checks": getattr(state, "offline_checks", 0),
+            "restart_attempts": getattr(state, "restart_attempts", 0),
+            "guid_resync_restart_used": getattr(state, "llbot_guid_resync_restart_used", False),
+        },
+    }
+
+
+def append_jsonl_bounded(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    max_bytes: int = LLBOT_FORENSICS_MAX_BYTES,
+    keep_lines: int = LLBOT_FORENSICS_KEEP_LINES,
+) -> None:
+    """Append one record and keep the forensic file strictly bounded."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n")
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > keep_lines:
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text("\n".join(lines[-keep_lines:]) + "\n", encoding="utf-8")
+            temporary.replace(path)
+    except OSError:
+        return
 
 
 def _windows_powershell_path() -> str | None:
@@ -435,9 +762,31 @@ async def run_check(
     platform: str = "napcat",
     webui_config: Path | None = None,
     webui_url: str = "http://127.0.0.1:6099",
+    forensics_file: Path | None = None,
 ) -> int:
     state = load_state(state_file)
     online, active_session_ok, probe_detail = await probe_onebot(ws_url)
+    kick_signature = llbot_kick_signature() if platform == "llbot" else ""
+    if kick_signature and kick_signature != state.llbot_kick_signature:
+        record_path = forensics_file or (log_file.parent / LLBOT_FORENSICS_FILENAME)
+        try:
+            # Container inspection and the egress lookup block on subprocess
+            # and network I/O; keep the shared probe cadence responsive.
+            record = await asyncio.to_thread(
+                build_llbot_kick_forensics,
+                kick_signature=kick_signature,
+                state=state,
+                forensics_file=record_path,
+            )
+            append_jsonl_bounded(record_path, record)
+            append_log(
+                log_file,
+                "llbot_kick_1001_recorded",
+                f"signature={kick_signature}",
+            )
+        except Exception as exc:
+            # Forensics must never change restart or notification behaviour.
+            append_log(log_file, "llbot_kick_1001_record_failed", type(exc).__name__)
     webui_status = (
         probe_webui(
             webui_config or compose_file.parent / "runtime/napcat/config/webui.json", webui_url
@@ -475,6 +824,7 @@ async def run_check(
         next_state,
         isLogin=webui_status["isLogin"],
         isOffline=webui_status["isOffline"],
+        llbot_kick_signature=kick_signature or next_state.llbot_kick_signature,
         webui_login_error=webui_login_error,
         webui_login_error_kind=(
             "llbot_signing_backend_unavailable"
@@ -612,6 +962,11 @@ def main() -> int:
     parser.add_argument("--notifier", type=Path, default=script_dir / "notify_windows.ps1")
     parser.add_argument("--webui-config", type=Path, default=wsl_dir / "runtime/napcat/config/webui.json")
     parser.add_argument("--webui-url", default="http://127.0.0.1:6099")
+    parser.add_argument(
+        "--forensics-file",
+        type=Path,
+        default=wsl_dir / "runtime/logs" / LLBOT_FORENSICS_FILENAME,
+    )
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("--interval must be greater than zero")
@@ -630,6 +985,7 @@ def main() -> int:
             "platform": args.platform,
             "webui_config": args.webui_config,
             "webui_url": args.webui_url,
+            "forensics_file": args.forensics_file,
         }
         if args.daemon:
             return asyncio.run(run_daemon(interval=args.interval, **run_kwargs))
