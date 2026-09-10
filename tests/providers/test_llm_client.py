@@ -1810,6 +1810,85 @@ def test_llm_client_salvages_image_from_incomplete_sse_stream() -> None:
     assert result.images == [{"b64_json": "c2FsdmFnZWQ="}]
 
 
+def _search_model_capture() -> tuple[dict[str, object], "httpx.MockTransport"]:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_swap_1", text="ok"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    return captured, httpx.MockTransport(handler)
+
+
+def test_llm_client_swaps_to_search_model_only_when_search_is_eligible() -> None:
+    captured, transport = _search_model_capture()
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    client.generate_text(["Target message: Alice: 今天有什么新闻"], allow_web_search=True)
+
+    assert captured["payload"]["model"] == "deepseek-v4-pro"
+    assert captured["payload"]["tools"] == [
+        {"type": "web_search", "search_context_size": client.web_search_context_size}
+    ]
+
+
+def test_llm_client_never_attaches_search_tool_to_a_model_that_cannot_search() -> None:
+    # A dedicated search model is configured, so an unmarked request keeps the
+    # default chat model and must not advertise a tool it cannot execute.
+    captured, transport = _search_model_capture()
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        http_client=httpx.Client(transport=transport),
+    )
+
+    client.generate_text(["Target message: Alice: 在干嘛"])
+
+    assert captured["payload"]["model"] == "deepseek-flash"
+    assert "tools" not in captured["payload"]
+
+
+def test_llm_client_drops_search_tool_for_image_turns() -> None:
+    captured, transport = _search_model_capture()
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        vision_model="deepseek-flash",
+        http_client=httpx.Client(transport=transport),
+    )
+    image = ImageAttachment(url="https://img.example.test/cat.png", file_id="cat.png")
+
+    client.generate_text(
+        ["Target message: Alice: 这张图好看吗"],
+        images=[image],
+        allow_web_search=True,
+    )
+
+    assert captured["payload"]["model"] == "deepseek-flash"
+    assert "tools" not in captured["payload"]
+
+
 def test_llm_client_can_attach_builtin_web_search_tool_to_responses() -> None:
     captured = {}
 
@@ -2027,6 +2106,123 @@ def test_llm_client_passes_high_and_extra_high_reasoning_effort(effort) -> None:
 
     assert text == "deep reply"
     assert captured["payload"]["reasoning"] == {"effort": effort}
+
+
+def test_llm_client_uses_dedicated_web_search_model_for_search_turns() -> None:
+    models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content.decode("utf-8"))["model"])
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_search_model", text="grounded reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text(["Target message: Alice: 联网查台风"], allow_web_search=True)
+
+    assert text == "grounded reply"
+    assert models == ["deepseek-v4-pro"]
+
+
+def test_llm_client_keeps_chat_model_when_turn_is_not_search_eligible() -> None:
+    models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content.decode("utf-8"))["model"])
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_chat_model", text="chat reply"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text(["Target message: Alice: 在干嘛"], allow_web_search=False)
+
+    assert text == "chat reply"
+    assert models == ["deepseek-flash"]
+
+
+def test_llm_client_tool_rounds_use_dedicated_web_search_model() -> None:
+    models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content.decode("utf-8"))["model"])
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_tools_search_model", text="grounded"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+        builtin_web_search=True,
+        web_search_model="deepseek-v4-pro",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text_with_tools(
+        ["Target message: Alice: 联网搜索最新台风"],
+        tools=MEMORY_TOOLS,
+        tool_executor=lambda _name, _args: "tool result",
+        allow_web_search=True,
+        force_web_search=True,
+    )
+
+    assert text == "grounded"
+    assert models == ["deepseek-v4-pro"]
+
+
+def test_llm_client_without_web_search_model_keeps_responses_model() -> None:
+    models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        models.append(json.loads(request.content.decode("utf-8"))["model"])
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="resp_default_model", text="grounded"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.4",
+        responses_model="gpt-5.4",
+        builtin_web_search=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text(["Target message: Alice: 联网查天气"], force_web_search=True)
+
+    assert text == "grounded"
+    assert models == ["gpt-5.4"]
 
 
 def test_llm_client_logs_responses_tool_events_from_sse(caplog) -> None:

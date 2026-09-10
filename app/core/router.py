@@ -2029,10 +2029,26 @@ class InboundRouter:
             forced_search_request = addressed_turn and (
                 explicit_search_request or reference_search_request or external_lookup_search_request
             )
+            # A dedicated search model (LLM_WEB_SEARCH_MODEL) makes built-in
+            # search more expensive: those turns leave the default chat model.
+            # When one is configured, keep built-in search for turns that
+            # actually need fresh information; without it, keep the original
+            # "any addressed turn may search" behaviour.
+            scoped_builtin_search = bool(
+                (self.runtime.settings.llm_web_search_model or "").strip()
+            )
             builtin_web_search_eligible = (
                 self.web_search_client is None
                 and (
-                    (addressed_turn and not is_search_verification_query(event.plain_text))
+                    (
+                        addressed_turn
+                        and not is_search_verification_query(event.plain_text)
+                        and (
+                            not scoped_builtin_search
+                            or time_sensitive
+                            or forced_search_request
+                        )
+                    )
                     or proactive_time_sensitive_turn
                 )
             )

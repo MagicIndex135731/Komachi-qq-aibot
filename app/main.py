@@ -239,6 +239,7 @@ def build_llm_client(*, settings: AppSettings, engine) -> LlmClient:
         image_responses_model=chat_model,
         builtin_web_search=settings.llm_builtin_web_search,
         web_search_context_size=settings.llm_builtin_web_search_context_size,
+        web_search_model=settings.llm_web_search_model,
         reasoning_effort=settings.llm_reasoning_effort,
         max_output_tokens=settings.llm_max_output_tokens,
         timeout_seconds=settings.llm_timeout_seconds,
@@ -383,9 +384,14 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
             model=image_model,
             fallback_model="",
         )
+        # Image generation can stay on a different provider than the chat
+        # model: GROUP_IMAGE_CHAT_* pins the transport that serves the image
+        # model, and an unset value keeps sharing the chat transport.
+        image_chat_base_url = (settings.group_image_chat_base_url or "").strip() or settings.llm_base_url
+        image_chat_api_key = (settings.group_image_chat_api_key or "").strip() or settings.llm_api_key
         return LlmClient(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            base_url=image_chat_base_url,
+            api_key=image_chat_api_key,
             model=image_model,
             fallback_model="",
             vision_model="",
@@ -427,10 +433,18 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
 
 
 def build_group_image_reference_planner_client(*, settings: AppSettings, llm_client):
-    """Build the low-effort Luna planner used only to refine web image queries."""
+    """Build the low-effort chat-model planner used only to refine web image queries.
+
+    The planner follows the configured chat provider instead of pinning a
+    single upstream model name, so provider switches keep working without a
+    code change.
+    """
     if not all(hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")):
         return None
-    planner_model = "gpt-5.6-luna"
+    planner_model = resolve_primary_chat_completions_model(
+        model=settings.llm_model,
+        fallback_model="",
+    )
     return LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,

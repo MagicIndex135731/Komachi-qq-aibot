@@ -175,7 +175,8 @@ watchdog 还会周期性调用 `get_status` 和 `get_group_list(no_cache=true)`�
 
 - `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
 - `LLM_TEXT_ENDPOINT=responses|chat_completions`；
-- `LLM_REASONING_EFFORT`、上下文窗口和输出预算；
+- `LLM_REASONING_EFFORT`（`minimal|low|medium|high|xhigh|max`）、上下文窗口和输出预算；
+- `LLM_WEB_SEARCH_MODEL`：命中搜索资格的轮次改用该模型，留空则复用 `LLM_MODEL`；
 - 可选视觉模型与模型 fallback。
 
 Responses 模式使用原生 `instructions` 保持人格、安全和引用约束的高优先级，并可携带图片、内置 `web_search` 与 `image_generation` 工具。客户端解析 SSE 流，提取文本、工具事件和 token usage。
@@ -193,11 +194,15 @@ Responses 模式使用原生 `instructions` 保持人格、安全和引用约束
 
 只有明确联网请求或策略允许时才提供搜索能力。搜索结果是不可信外部资料，必须作为引用上下文而不是系统指令。
 
+DeepSeek 官方接口的两个模型能力互斥，配置时必须成对考虑：`deepseek-flash` 支持图片输入但不能执行服务端搜索，`deepseek-v4-pro` 支持 `web_search` 工具但不支持图片输入。因此 `LLM_WEB_SEARCH_MODEL` 只在“需要时效信息”的轮次接管：命中时间敏感或明确联网请求的回合使用搜索模型并挂载 `web_search` 工具，普通闲聊留在 `LLM_MODEL`；带图轮次始终保留视觉模型，不会切到搜索模型。未配置 `LLM_WEB_SEARCH_MODEL` 时保持原有“所有点名轮次都可搜索”的行为。
+
+给不支持搜索的模型挂载 `web_search` 工具会得到“我无法联网”的拒绝文本，所以搜索工具与搜索模型必须同时启用或同时禁用；`LlmClient` 与 `InboundRouter` 共享同一判定，避免出现“声明可搜索但实际搜不了”的回合。
+
 ### 5.3 图片生成
 
-群聊生图复用聊天使用的 Nova Responses 中转（`LLM_BASE_URL`、`LLM_API_KEY`）。每个生图请求先交给 `gpt-5.6-luna`（low reasoning）判断是否确实需要联网参考图；需要时规划器按“角色名 → 独立搜图关键词”输出分组计划，由 DDGS 获取参考图并保留角色标签。调用 `GROUP_IMAGE_MODEL=gpt-image-2` 的 `image_generation` 工具时，Responses 内容按 `input_text(这是“角色名”的参考图) → input_image` 逐组交错，用户的最终生图提示词放在所有已标注参考图之后，避免多角色参考图身份串位。旧版规划器的扁平 `queries` 输出仍可兼容。`gpt-image-2` 是参考图生图的默认和回退模型；模型判断失败时，仅对用户明确提出的搜图请求启用本地兜底，不会让普通生图误触发搜索；尺寸默认 `auto`、质量默认 `high`。`GroupImageGenerationService` 负责队列容量、超时、搜索决策、参考图、输出文件和 QQ 发送。旧的 `GROUP_IMAGE_*` endpoint 配置仍保留给未注入具体聊天客户端的兼容调用方。
+群聊生图复用 Responses 中转：默认沿用聊天传输（`LLM_BASE_URL`、`LLM_API_KEY`），需要把生图留在其他供应商时用 `GROUP_IMAGE_CHAT_BASE_URL`、`GROUP_IMAGE_CHAT_API_KEY` 固定生图传输。每个生图请求先交给当前配置的聊天模型（low reasoning）判断是否确实需要联网参考图；需要时规划器按“角色名 → 独立搜图关键词”输出分组计划，由 DDGS 获取参考图并保留角色标签。调用 `GROUP_IMAGE_MODEL=gpt-image-2` 的 `image_generation` 工具时，Responses 内容按 `input_text(这是“角色名”的参考图) → input_image` 逐组交错，用户的最终生图提示词放在所有已标注参考图之后，避免多角色参考图身份串位。旧版规划器的扁平 `queries` 输出仍可兼容。`gpt-image-2` 是参考图生图的默认和回退模型；模型判断失败时，仅对用户明确提出的搜图请求启用本地兜底，不会让普通生图误触发搜索；尺寸默认 `auto`、质量默认 `high`。`GroupImageGenerationService` 负责队列容量、超时、搜索决策、参考图、输出文件和 QQ 发送。旧的 `GROUP_IMAGE_*` endpoint 配置仍保留给未注入具体聊天客户端的兼容调用方。
 
-图片任务使用独立队列与超时预算，失败不会阻塞普通文本消息处理；成本和供应商由 Nova 的统一中转配置管理。
+图片任务使用独立队列与超时预算，失败不会阻塞普通文本消息处理；文本与生图可以分别挂在不同的供应商中转上。
 
 ## 6. Memory V3 的构成与原理
 

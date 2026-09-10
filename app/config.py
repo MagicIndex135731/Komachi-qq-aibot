@@ -11,6 +11,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.core.style_distill import merge_persona_lists
 
 
+# Reasoning votes accepted by every upstream-model call site.  The provider
+# switch to DeepSeek introduced ``xhigh``/``max``; ``LlmClient`` already
+# normalizes the same vocabulary before sending it upstream.
+ReasoningEffort = Literal["", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -28,7 +34,8 @@ class AppSettings(BaseSettings):
         default="medium",
         alias="LLM_BUILTIN_WEB_SEARCH_CONTEXT_SIZE",
     )
-    llm_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+    llm_web_search_model: str = Field(default="", alias="LLM_WEB_SEARCH_MODEL")
+    llm_reasoning_effort: ReasoningEffort = Field(
         default="",
         alias="LLM_REASONING_EFFORT",
     )
@@ -41,6 +48,8 @@ class AppSettings(BaseSettings):
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
     group_image_base_url: str = Field(default="", alias="GROUP_IMAGE_BASE_URL")
     group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
+    group_image_chat_base_url: str = Field(default="", alias="GROUP_IMAGE_CHAT_BASE_URL")
+    group_image_chat_api_key: str = Field(default="", alias="GROUP_IMAGE_CHAT_API_KEY")
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
     group_image_generations_endpoint: str = Field(
         default="/images/generations",
@@ -70,7 +79,7 @@ class AppSettings(BaseSettings):
     memory_compaction_max_facts: int = Field(default=24, alias="MEMORY_COMPACTION_MAX_FACTS")
     memory_compaction_retry_limit: int = Field(default=3, alias="MEMORY_COMPACTION_RETRY_LIMIT")
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
-    memory_compaction_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+    memory_compaction_reasoning_effort: ReasoningEffort = Field(
         default="low",
         alias="MEMORY_COMPACTION_REASONING_EFFORT",
     )
@@ -129,7 +138,7 @@ class AppSettings(BaseSettings):
         le=20,
         alias="MEMORY_EPISODE_TOPIC_JUDGE_INTERVAL",
     )
-    memory_episode_topic_judge_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+    memory_episode_topic_judge_reasoning_effort: ReasoningEffort = Field(
         default="low",
         alias="MEMORY_EPISODE_TOPIC_JUDGE_REASONING_EFFORT",
     )
@@ -149,7 +158,7 @@ class AppSettings(BaseSettings):
         le=120,
         alias="MEMORY_EPISODE_POST_SEGMENT_MIN_MESSAGES",
     )
-    memory_episode_post_segment_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+    memory_episode_post_segment_reasoning_effort: ReasoningEffort = Field(
         default="low",
         alias="MEMORY_EPISODE_POST_SEGMENT_REASONING_EFFORT",
     )
@@ -240,7 +249,7 @@ class AppSettings(BaseSettings):
         default="",
         alias="PROACTIVE_JUDGE_MODEL",
     )
-    proactive_judge_reasoning_effort: Literal["", "minimal", "low", "medium", "high"] = Field(
+    proactive_judge_reasoning_effort: ReasoningEffort = Field(
         default="low",
         alias="PROACTIVE_JUDGE_REASONING_EFFORT",
     )

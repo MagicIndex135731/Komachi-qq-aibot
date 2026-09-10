@@ -95,6 +95,7 @@ class LlmClient:
         image_edits_endpoint: str = "/images/edits",
         builtin_web_search: bool = False,
         web_search_context_size: str = "high",
+        web_search_model: str | None = None,
         reasoning_effort: str = "",
         max_output_tokens: int = 8192,
         temperature: float | None = None,
@@ -122,6 +123,7 @@ class LlmClient:
         )
         self.builtin_web_search = bool(builtin_web_search)
         self.web_search_context_size = self._normalize_web_search_context_size(web_search_context_size)
+        self.web_search_model = (web_search_model or "").strip()
         self.reasoning_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.max_output_tokens = max(1, int(max_output_tokens))
         self.temperature = (
@@ -274,8 +276,11 @@ class LlmClient:
             payload["temperature"] = resolved_temperature
         if tools is not None:
             resolved_tools = list(tools)
-            if self.builtin_web_search and (
-                allow_web_search is not False or force_web_search
+            if self._builtin_web_search_active(
+                model=model,
+                has_images=bool(images),
+                force_web_search=force_web_search,
+                allow_web_search=allow_web_search,
             ):
                 resolved_tools.append(
                     {
@@ -287,7 +292,12 @@ class LlmClient:
             payload["tool_choice"] = (
                 {"type": "web_search"} if force_web_search else "auto"
             )
-        elif self.builtin_web_search and (allow_web_search is not False or force_web_search):
+        elif self._builtin_web_search_active(
+            model=model,
+            has_images=bool(images),
+            force_web_search=force_web_search,
+            allow_web_search=allow_web_search,
+        ):
             payload["tools"] = [
                 {
                     "type": "web_search",
@@ -1126,6 +1136,58 @@ class LlmClient:
         vision_model = (self.vision_model or "").strip()
         return vision_model or default_model
 
+    def _web_search_chat_model(
+        self,
+        *,
+        default_model: str,
+        force_web_search: bool = False,
+        allow_web_search: bool | None = None,
+        has_images: bool = False,
+    ) -> str:
+        """Use the dedicated search model only for search-enabled requests.
+
+        Providers can expose built-in web search on a different model than the
+        default chat model (for example flash chat + pro search).  When no
+        dedicated model is configured, or the caller did not mark the request
+        as search-enabled, the default model is kept so existing deployments
+        are unchanged.
+
+        Vision wins over search: an image turn keeps the vision model, because
+        a text-only search model cannot see the picture.
+        """
+        web_search_model = (self.web_search_model or "").strip()
+        if has_images or not web_search_model or web_search_model == default_model:
+            return default_model
+        if not self.builtin_web_search:
+            return default_model
+        if force_web_search or allow_web_search:
+            return web_search_model
+        return default_model
+
+    def _builtin_web_search_active(
+        self,
+        *,
+        model: str,
+        has_images: bool,
+        force_web_search: bool,
+        allow_web_search: bool | None,
+    ) -> bool:
+        """Decide whether this exact request may carry the ``web_search`` tool.
+
+        The tool and the model that can execute it must travel together: a
+        provider that serves built-in search on a different model would
+        otherwise hand the tool to a model that can only answer "I cannot
+        browse the web".
+        """
+        if not self.builtin_web_search or has_images:
+            return False
+        web_search_model = (self.web_search_model or "").strip()
+        if web_search_model:
+            # Only the request that actually runs on the search model may ask
+            # for search, including the fallback retry payload.
+            return model == web_search_model
+        return allow_web_search is not False or force_web_search
+
     def _request_chat_completions_json(
         self,
         *,
@@ -1766,17 +1828,22 @@ class LlmClient:
             )
 
         extra_input_items: list[dict[str, Any]] = []
+        request_model = self._web_search_chat_model(
+            default_model=self.responses_model,
+            force_web_search=force_web_search,
+            allow_web_search=allow_web_search,
+        )
         for round_index in range(effective_rounds + 1):
             try:
-                responses_result = request_with_tools(model=self.responses_model)
+                responses_result = request_with_tools(model=request_model)
             except ValueError as exc:
                 fallback_model = self._distinct_responses_fallback_model(
-                    primary_model=self.responses_model
+                    primary_model=request_model
                 )
                 if fallback_model:
                     logger.warning(
                         "responses_tools_model_fallback primary_model=%s fallback_model=%s reason=%s",
-                        self.responses_model,
+                        request_model,
                         fallback_model,
                         type(exc.__cause__ or exc).__name__,
                     )
@@ -1922,7 +1989,15 @@ class LlmClient:
         instructions, input_lines = self._split_prompt_lines(prompt_lines)
 
         if self._responses_enabled():
-            responses_model = self._image_chat_model(default_model=self.responses_model) if images else self.responses_model
+            responses_model = self.responses_model
+            if images:
+                responses_model = self._image_chat_model(default_model=responses_model)
+            else:
+                responses_model = self._web_search_chat_model(
+                    default_model=responses_model,
+                    force_web_search=force_web_search,
+                    allow_web_search=allow_web_search,
+                )
             responses_payload = self._build_responses_payload(
                 model=responses_model,
                 instructions=instructions,

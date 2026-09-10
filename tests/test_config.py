@@ -92,6 +92,9 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     monkeypatch.delenv("CONTEXT_HISTORY_LIMIT", raising=False)
     monkeypatch.delenv("LLM_FALLBACK_MODEL", raising=False)
     monkeypatch.delenv("LLM_TEXT_ENDPOINT", raising=False)
+    monkeypatch.delenv("LLM_WEB_SEARCH_MODEL", raising=False)
+    monkeypatch.delenv("GROUP_IMAGE_CHAT_BASE_URL", raising=False)
+    monkeypatch.delenv("GROUP_IMAGE_CHAT_API_KEY", raising=False)
 
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
@@ -109,6 +112,32 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.llm_model == "gpt-5.4-mini"
     assert settings.llm_fallback_model == "gpt-5.4"
     assert settings.llm_text_endpoint == "chat_completions"
+    assert settings.llm_web_search_model == ""
+    assert settings.group_image_chat_base_url == ""
+    assert settings.group_image_chat_api_key == ""
+
+
+def test_app_settings_accepts_extra_high_and_max_reasoning_effort(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.deepseek.test")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_WEB_SEARCH_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("MEMORY_COMPACTION_REASONING_EFFORT", "max")
+    monkeypatch.setenv("MEMORY_EPISODE_TOPIC_JUDGE_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("MEMORY_EPISODE_POST_SEGMENT_REASONING_EFFORT", "max")
+    monkeypatch.setenv("PROACTIVE_JUDGE_REASONING_EFFORT", "xhigh")
+
+    settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
+
+    assert settings.llm_reasoning_effort == "max"
+    assert settings.memory_compaction_reasoning_effort == "max"
+    assert settings.memory_episode_topic_judge_reasoning_effort == "xhigh"
+    assert settings.memory_episode_post_segment_reasoning_effort == "max"
+    assert settings.proactive_judge_reasoning_effort == "xhigh"
+    assert settings.llm_web_search_model == "deepseek-v4-pro"
 
 
 def test_app_settings_exposes_private_chat_whitelist(tmp_path, monkeypatch) -> None:

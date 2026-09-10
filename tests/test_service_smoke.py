@@ -99,20 +99,43 @@ def test_build_group_image_llm_client_reuses_chat_nova_responses_transport() -> 
     assert client.http_client is primary_client.http_client
 
 
-def test_build_group_image_reference_planner_uses_luna_low_reasoning() -> None:
+def test_build_group_image_llm_client_prefers_dedicated_image_chat_transport() -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_base_url = "https://api.deepseek.test"
+    settings.llm_api_key = "deepseek-key"
+    settings.group_image_chat_base_url = "https://image-chat.example.test"
+    settings.group_image_chat_api_key = "image-chat-key"
     primary_client = LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
-        model="gpt-5.6-luna",
-        responses_model="gpt-5.6-luna",
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
+    )
+
+    client = build_group_image_llm_client(settings=settings, engine=object(), llm_client=primary_client)
+
+    assert client.base_url == "https://image-chat.example.test"
+    assert client.api_key == "image-chat-key"
+    assert client.model == "gpt-image-2"
+    assert client.responses_model == "gpt-image-2"
+    assert client.http_client is primary_client.http_client
+
+
+def test_build_group_image_reference_planner_uses_configured_chat_model() -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.llm_model = "deepseek-flash"
+    primary_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model="deepseek-flash",
+        responses_model="deepseek-flash",
     )
 
     planner = build_group_image_reference_planner_client(settings=settings, llm_client=primary_client)
 
     assert planner is not None
-    assert planner.model == "gpt-5.6-luna"
-    assert planner.responses_model == "gpt-5.6-luna"
+    assert planner.model == "deepseek-flash"
+    assert planner.responses_model == "deepseek-flash"
     assert planner.reasoning_effort == "low"
     assert planner.max_output_tokens == 256
 
@@ -330,6 +353,7 @@ def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> 
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
     settings.llm_text_endpoint = "responses"
     settings.llm_reasoning_effort = "medium"
+    settings.llm_web_search_model = "gpt-5.6-terra"
     captured: dict[str, object] = {}
     built_client = object()
 
@@ -339,6 +363,7 @@ def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> 
 
     assert result is built_client
     assert captured["reasoning_effort"] == "medium"
+    assert captured["web_search_model"] == "gpt-5.6-terra"
 
 
 @pytest.mark.asyncio

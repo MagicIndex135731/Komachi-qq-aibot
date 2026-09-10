@@ -52,6 +52,7 @@ data/personas/
 
 # WSL/Docker deployment runtime state
 infra/wsl/.env
+infra/wsl/.env.backup*
 infra/wsl/runtime/
 infra/wsl/.cache/
 infra/wsl/mihomo/

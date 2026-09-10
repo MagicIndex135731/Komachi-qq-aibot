@@ -4531,6 +4531,88 @@ async def test_router_skips_search_decision_call_when_no_search_client(sqlite_en
 
 
 @pytest.mark.asyncio
+async def test_router_scopes_builtin_search_when_a_search_model_is_configured(
+    sqlite_engine, monkeypatch
+) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+    )
+    router.runtime.settings.llm_builtin_web_search = True
+    router.runtime.settings.llm_web_search_model = "deepseek-v4-pro"
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    # Casual addressed chat must stay on the default chat model: built-in
+    # search is not offered at all, so the caller never swaps models.
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="scoped-casual-1",
+            plain_text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert llm.reply_kwargs[-1]["allow_web_search"] is False
+    assert llm.reply_kwargs[-1].get("force_web_search") is not True
+
+    # Fresh-information turns keep built-in search (and therefore the
+    # search-capable model).
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="scoped-fresh-1",
+            plain_text="今天有什么动画新闻",
+        )
+    )
+
+    assert llm.reply_kwargs[-1]["allow_web_search"] is True
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_wide_builtin_search_without_a_search_model(
+    sqlite_engine, monkeypatch
+) -> None:
+    sender = FakeSender()
+    llm = BuiltinSearchAwareLlm()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=sender,
+        llm_client=llm,
+        web_search_client=None,
+    )
+    router.runtime.settings.llm_builtin_web_search = True
+    router.runtime.settings.llm_web_search_model = ""
+
+    monkeypatch.setattr(
+        router_module,
+        "detect_address_intent",
+        lambda **kwargs: AddressDecision(True, "named_bot", 10),
+    )
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=False,
+            message_id="wide-casual-1",
+            plain_text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert llm.reply_kwargs[-1]["allow_web_search"] is True
+
+
+@pytest.mark.asyncio
 async def test_router_attaches_builtin_web_search_for_addressed_turn_without_time_keywords(
     sqlite_engine, monkeypatch
 ) -> None:
