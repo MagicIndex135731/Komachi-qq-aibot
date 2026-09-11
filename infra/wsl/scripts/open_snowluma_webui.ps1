@@ -40,18 +40,40 @@ function Get-SnowLumaWebUiPassword {
     return ""
 }
 
+function Get-SnowLumaWebUiState {
+    # mustChangePassword=false means the operator already rotated the one-time
+    # token, so the value still visible in the logs is stale and must not be
+    # copied to the clipboard as if it were the current credential.
+    try {
+        $json = (wsl.exe --user root --exec bash -lc 'cat /var/lib/docker/volumes/xiaomachi-snowluma-data/_data/config/webui.json 2>/dev/null') -join ""
+        if ($json.Trim()) {
+            return ($json | ConvertFrom-Json)
+        }
+    } catch {
+    }
+    return $null
+}
+
 # Reachability is proven by the launcher (curl.exe against the WSL address);
 # probing again from PowerShell would use the WinHTTP/IE proxy.
-$password = Get-SnowLumaWebUiPassword
-if ($password) {
-    try {
-        Set-Clipboard -Value $password
-        Write-Host "SnowLuma WebUI password copied to the clipboard (user: admin)."
-    } catch {
-        Write-Warning "Could not copy the SnowLuma WebUI password to the clipboard."
-    }
+$state = Get-SnowLumaWebUiState
+if ($state -and -not $state.mustChangePassword) {
+    Write-Host "SnowLuma WebUI token was already rotated, so the bootstrap token in the logs is stale."
+    Write-Host "Use the token you generated in the WebUI; to reset it, delete"
+    Write-Host "  /var/lib/docker/volumes/xiaomachi-snowluma-data/_data/config/webui.json"
+    Write-Host "and restart the container - a fresh one-time token is printed to the logs."
 } else {
-    Write-Host "SnowLuma WebUI password is not in the container logs; check the WebUI account you set on first login."
+    $password = Get-SnowLumaWebUiPassword
+    if ($password) {
+        try {
+            Set-Clipboard -Value $password
+            Write-Host "SnowLuma WebUI one-time token copied to the clipboard (it must be rotated after login)."
+        } catch {
+            Write-Warning "Could not copy the SnowLuma WebUI token to the clipboard."
+        }
+    } else {
+        Write-Host "SnowLuma one-time token is not in the container logs; open the WebUI and use the token you set."
+    }
 }
 
 Write-Host "SnowLuma WebUI: $url"
