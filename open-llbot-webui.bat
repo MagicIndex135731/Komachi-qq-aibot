@@ -1,12 +1,14 @@
 @echo off
 setlocal
 set "WEBUI_PORT=3080"
+set "PS_SCRIPT=%~dp0infra\wsl\scripts\open_llbot_webui.ps1"
 
 rem LLBot uses WSL host networking. Windows localhost forwarding is not
 rem available on every WSL network configuration, so prove readiness inside
 rem WSL first and then open the current WSL IPv4 address from Windows.
-wsl.exe --user root --exec bash -lc "curl -fsS --max-time 3 http://127.0.0.1:%WEBUI_PORT%/ > /dev/null"
-if errorlevel 1 goto unavailable
+set "WEBUI_CODE="
+for /f "usebackq delims=" %%C in (`wsl.exe --user root --exec bash -lc "curl -s -o /dev/null -w %%{http_code} --max-time 3 http://127.0.0.1:%WEBUI_PORT%/"`) do set "WEBUI_CODE=%%C"
+if not "%WEBUI_CODE%"=="200" goto unavailable
 
 for /f "tokens=1" %%I in ('wsl.exe --user root --exec hostname -I') do (
   if not defined WSL_WEBUI_IP set "WSL_WEBUI_IP=%%I"
@@ -17,16 +19,26 @@ set "WEBUI_URL=http://%WSL_WEBUI_IP%:%WEBUI_PORT%/"
 curl.exe --silent --show-error --fail --max-time 3 "%WEBUI_URL%" >nul 2>nul
 if errorlevel 1 goto forwarding_unavailable
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0infra\wsl\scripts\open_llbot_webui.ps1" -WebUiUrl "%WEBUI_URL%"
-exit /b %errorlevel%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" -WebUiUrl "%WEBUI_URL%"
+if errorlevel 1 goto open_failed
+exit /b 0
 
 :unavailable
-echo LLBot WebUI is not available. Run start-xiaomachi-wsl.bat first.
+echo LLBot WebUI is not answering inside WSL (http=%WEBUI_CODE%).
+if "%WEBUI_CODE%"=="500" echo The WebUI server is running but its page failed to load. Rebuild the LLBot image - see infra\wsl\README.md.
+echo Run start-xiaomachi-wsl.bat first, or inspect: wsl.exe --user root --exec docker logs --tail 50 xiaomachi-llbot
 pause
 exit /b 1
 
 :forwarding_unavailable
 echo LLBot WebUI is running inside WSL, but Windows cannot reach its current WSL address.
 echo Restart WSL networking, then run this shortcut again.
+pause
+exit /b 1
+
+:open_failed
+echo The LLBot WebUI is reachable but the browser could not be opened.
+echo Open this address manually: %WEBUI_URL%
+echo The WebUI password is copied to the clipboard when available.
 pause
 exit /b 1

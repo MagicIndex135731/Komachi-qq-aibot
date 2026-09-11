@@ -5,25 +5,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
-$tokenPath = Join-Path $repoRoot "infra\wsl\runtime\llbot\data\webui_token.txt"
+$legacyTokenPath = Join-Path $repoRoot "infra\wsl\runtime\llbot\data\webui_token.txt"
 $url = ""
 
 function Get-LLBotWebUiToken {
     param([Parameter(Mandatory = $true)][string]$SourceTokenPath)
 
+    # The live password lives in the Linux runtime data volume; the
+    # /opt/xiaomachi/shared copy covers older layouts and the Windows-side file
+    # is the last fallback.
+    foreach ($command in @(
+            'cat /var/lib/docker/volumes/xiaomachi-llbot-data/_data/webui_token.txt',
+            'cat /opt/xiaomachi/shared/runtime/llbot/data/webui_token.txt'
+        )) {
+        try {
+            $token = (wsl.exe --user root --exec bash -lc $command 2>$null) -join ""
+            if ($token -and $token.Trim()) {
+                return $token.Trim()
+            }
+        } catch {
+        }
+    }
     if (Test-Path -LiteralPath $SourceTokenPath) {
         return (Get-Content -Raw -LiteralPath $SourceTokenPath).Trim()
     }
-
-    # Immutable WSL releases keep the login state in /opt/xiaomachi/shared,
-    # not beside the Windows source checkout that launched this script.
-    try {
-        $token = wsl.exe --user root --exec bash -lc 'cat /opt/xiaomachi/shared/runtime/llbot/data/webui_token.txt' 2>$null
-        return $token.Trim()
-    }
-    catch {
-        return ""
-    }
+    return ""
 }
 
 try {
@@ -32,12 +38,16 @@ try {
         throw "Invalid LLBot WebUI URL."
     }
     $url = $uri.AbsoluteUri
-    Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 3 | Out-Null
 } catch {
+    Write-Host "Invalid LLBot WebUI URL: $WebUiUrl"
     exit 1
 }
 
-$token = Get-LLBotWebUiToken -SourceTokenPath $tokenPath
+# Reachability is already proven by the launcher (curl.exe against the WSL
+# address).  Probing again from PowerShell would go through the WinHTTP/IE
+# proxy, which rejects the private WSL address on some machines and used to
+# abort this script silently.
+$token = Get-LLBotWebUiToken -SourceTokenPath $legacyTokenPath
 if ($token) {
     try {
         Set-Clipboard -Value $token
@@ -47,4 +57,9 @@ if ($token) {
     }
 }
 
-Start-Process $url
+try {
+    Start-Process $url
+} catch {
+    Write-Host "Could not open a browser for $url"
+    exit 1
+}

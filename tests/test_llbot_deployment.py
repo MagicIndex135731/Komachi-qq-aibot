@@ -159,7 +159,14 @@ def test_open_llbot_webui_shortcut_uses_the_current_wsl_address_without_starting
     assert "start-xiaomachi-wsl.bat" in shortcut
     assert "pause" in shortcut
     assert "wsl.exe" in shortcut.lower()
-    assert "docker" not in shortcut.lower()
+    # The shortcut may print a read-only docker logs hint, but it must never
+    # start or recreate the stack itself.
+    assert "docker compose" not in shortcut.lower()
+    assert "docker logs" in shortcut.lower()
+    # Every failure path reports the HTTP status and stops with a pause, so a
+    # broken WebUI can no longer flash and disappear.
+    assert "WEBUI_CODE" in shortcut
+    assert shortcut.count("pause") >= 3
     assert '"http://127.0.0.1:3080/"' in launcher
     assert "WebUiUrl" in launcher
     assert "Invalid LLBot WebUI URL" in launcher
@@ -169,6 +176,9 @@ def test_open_llbot_webui_shortcut_uses_the_current_wsl_address_without_starting
     assert "wsl.exe --user root --exec bash" in launcher
     assert "Could not copy the LLBot WebUI password" in launcher
     assert "Start-Process" in launcher
+    # The launcher used to re-probe the WSL address through PowerShell's proxy
+    # handling and exit 1 silently; the shortcut already proved reachability.
+    assert "Invoke-WebRequest" not in launcher
 
 
 def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> None:

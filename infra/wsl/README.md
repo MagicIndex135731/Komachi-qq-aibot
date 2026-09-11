@@ -95,6 +95,11 @@ LLBot/NapCat 不读取 `XIAOMACHI_*`，QQ 与 OneBot 始终直连。修改 `.env
 重建 LLBot。订阅更新后重新运行同步脚本即可，脚本会先渲染和校验新配置，再
 重启 Mihomo。
 
+Windows 快捷方式（`*.bat`）必须保持 CRLF 行尾：cmd.exe 无法解析 LF-only 脚本里的
+`goto` 标签，错误分支会变成"闪退"（看不到任何提示）。`.gitattributes` 已用
+`*.bat text eol=crlf` 固定这一点；改动这些脚本后如果 Windows 端仍是 LF，重新
+检出一次即可。
+
 LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发送过程中断线时，
 系统会将本次投递标记为“结果未确认”。由于 QQ 可能已经收到消息，机器人不会自动重试、
 切片补发或发送额外失败提示，以避免同一回复重复出现。该记录保留在近期上下文中以维持
@@ -108,18 +113,25 @@ LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `late
 `sign-proxy 未导出 setMachineGuid (老版 .node), GUID 切换不会生效`。该 sign-proxy 由上游
 私有仓库构建、未发布到 npm，仓库内无法自行升级；等上游新版 release 后换回官方 digest。
 
-由于 8.1.10 早于会话过期修复（PR #856），生产当前运行的是**上游 main 的源码构建**：
+由于 8.1.10 早于会话过期修复（PR #856），生产当前运行的是**上游 main 的源码构建**，
+用仓库自带脚本重建（脚本会解析 commit、走代理下载、构建并校验产物）：
 
 ```bash
-# 在 WSL 内（需要走代理，否则 GitHub 直连很慢）
-curl -sL -x http://127.0.0.1:7897 -o /root/llbot-main.tar.gz \
-  https://codeload.github.com/LLOneBot/LuckyLilliaBot/tar.gz/refs/heads/main
-mkdir -p /root/llbot-main && tar -xzf /root/llbot-main.tar.gz -C /root/llbot-main --strip-components=1
-mkdir -p /root/llbot-main/.yarn   # 该目录被 gitignore，构建需要它存在
-cd /root/llbot-main
-docker build -f docker/Dockerfile.local --network=host \
-  --build-arg BUILD_PROXY=http://127.0.0.1:7897 -t xiaomachi-llbot:main-<commit> .
+# 在 WSL 内（需要走代理，否则 GitHub 直连只有几十 KB/s）
+LLBOT_IMAGE_TAG=xiaomachi-llbot:main-<commit> \
+  bash infra/wsl/scripts/build_llbot_from_source.sh main
 ```
+
+校验项包括：`/app/llbot/webui/index.html`、`llbot.js`（`node --check` 通过且含
+`session-expired` 修复）、以及 `sign-proxy.*-musl.node`。任一项缺失即构建失败，
+镜像不会带病上线。
+
+**不要直接用上游的 `docker/Dockerfile.local`**：它把 `yarn build-webui` 放在
+`yarn build` 之前，而主 bundle 的 vite 构建会先清空 `dist/`，把刚生成的
+`dist/webui` 删掉，结果镜像里没有 `/app/llbot/webui/index.html`，WebUI 直接
+HTTP 500（`open-llbot-webui.bat` 会因此报错打不开）。上游自己的 publish
+workflow 是先 `yarn build` 再 `yarn build-webui`，顺序才对；
+`infra/wsl/Dockerfile.llbot-source` 采用正确顺序并带断言。
 
 v8.1.10 → main 的运行时代码差异只有会话鉴权/登录恢复这一组修复（`direct.ts`、
 `direct-lib/client.ts`、`direct-lib/login.ts`、`base.ts`、`emailNotification.ts`、

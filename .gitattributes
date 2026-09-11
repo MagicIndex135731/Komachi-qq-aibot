@@ -12,3 +12,8 @@
 # with a global core.autocrlf=true setting.
 *.sh text eol=lf
 *.service text eol=lf
+
+# Windows batch files must keep CRLF: cmd.exe cannot resolve `goto` labels in
+# LF-only scripts, so every error path in a .bat turns into a silent
+# flash-and-exit (the LOGIN/WebUI shortcuts hit this).
+*.bat text eol=crlf

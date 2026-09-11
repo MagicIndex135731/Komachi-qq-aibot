@@ -1,0 +1,77 @@
+# Source build of LLBot (upstream main) used by build_llbot_from_source.sh.
+#
+# Derived from upstream docker/Dockerfile.local with one correction: upstream
+# runs `yarn build-webui` BEFORE `yarn build`, but the main vite build empties
+# dist/ and deletes the freshly built webui, so the resulting image serves
+# HTTP 500 from a missing /app/llbot/webui/index.html. Upstream's own publish
+# workflow builds the main bundle first and the webui second; this file does
+# the same and asserts both artifacts exist.
+#
+# Build it from an upstream source tree:
+#   docker build -f docker/Dockerfile.local.patched --network=host \
+#     --build-arg BUILD_PROXY=http://127.0.0.1:7897 -t xiaomachi-llbot:<tag> .
+
+FROM node:24-bookworm-slim AS builder
+
+ARG BUILD_PROXY
+
+WORKDIR /app
+
+RUN corepack enable && corepack prepare yarn@4.12.0 --activate
+
+COPY package.json yarn.lock .yarnrc.yml ./
+COPY .yarn .yarn
+# The FE package.json must exist before yarn install: the root postinstall runs
+# npm --prefix src/webui/FE install and exits 254 without that directory.
+COPY src/webui/FE/package.json src/webui/FE/
+
+RUN export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" \
+        HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY"; \
+    yarn install --immutable
+
+RUN export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" \
+        HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY"; \
+    cd src/webui/FE && npm install
+
+COPY . .
+
+RUN export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" \
+        HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY"; \
+    yarn build
+
+# The webui must be built after the main bundle: vite empties dist/ first.
+RUN export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" \
+        HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY"; \
+    yarn build-webui \
+    && test -s dist/webui/index.html \
+    && test -s dist/llbot.js
+
+
+FROM node:24-alpine AS production
+
+RUN set -eux; \
+    apk add --no-cache ffmpeg tzdata; \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
+    echo "Asia/Shanghai" > /etc/timezone
+
+ENV TZ=Asia/Shanghai
+
+WORKDIR /app/llbot
+
+COPY --from=builder /app/dist .
+
+# alpine loads only the musl signer; drop the other platforms and prove that
+# both the bundle and the WebUI page reached the runtime stage.
+RUN for f in sign-proxy.*.node; do case "$f" in *-musl.node) ;; *) rm -f "$f" ;; esac; done; \
+    test -s /app/llbot/webui/index.html; \
+    test -s /app/llbot/llbot.js; \
+    ls /app/llbot >/dev/null
+
+COPY docker/startup.sh /startup.sh
+RUN chmod +x /startup.sh
+
+RUN touch /.dockerenv
+
+VOLUME ["/app/llbot/data"]
+
+ENTRYPOINT ["/startup.sh"]
