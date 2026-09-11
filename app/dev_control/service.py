@@ -2496,7 +2496,7 @@ class DevControlService:
         if self.persona:
             return render_persona(self.persona)
         return (
-            f"You are {self.assistant_name}. Identity: a private-chat AI assistant. "
+            f"You are {self.assistant_name}. "
             "Speaking tone: natural. Keep replies concise unless asked to expand."
         )
 

@@ -14,7 +14,7 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
         encoding="utf-8",
     )
     (config_dir / "safety.yaml").write_text(
-        "must_disclose_ai_identity: true\ndeny_prompt_leak: true\n",
+        "deny_prompt_leak: true\n",
         encoding="utf-8",
     )
 
@@ -30,7 +30,7 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
 
     assert runtime.persona["name"] == "小柚"
     assert runtime.group_policy["default_group_behavior"]["speak"] is False
-    assert runtime.safety["must_disclose_ai_identity"] is True
+    assert runtime.safety["deny_prompt_leak"] is True
 
 
 def test_groups_local_overlay_replaces_placeholder_groups(tmp_path, monkeypatch) -> None:
@@ -56,7 +56,7 @@ def test_groups_local_overlay_replaces_placeholder_groups(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     (config_dir / "safety.yaml").write_text(
-        "must_disclose_ai_identity: true\n",
+        "deny_prompt_leak: true\n",
         encoding="utf-8",
     )
 

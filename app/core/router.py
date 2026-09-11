@@ -462,7 +462,6 @@ class InboundRouter:
             },
             },
             safety={
-                "must_disclose_ai_identity": True,
                 "deny_prompt_leak": True,
             },
         )
@@ -927,16 +926,8 @@ class InboundRouter:
             )
         return text
 
-    def _safety_lines_for(self, *, impersonating: bool) -> list[str]:
-        lines = render_safety_lines(self.runtime.safety)
-        if impersonating:
-            # Full impersonation is incompatible with the AI-disclosure line:
-            # it flips the model back into assistant voice and encourages
-            # maid-style address terms.
-            lines = [
-                line for line in lines if "Disclose that you are an AI" not in line
-            ]
-        return lines
+    def _safety_lines_for(self) -> list[str]:
+        return render_safety_lines(self.runtime.safety)
 
     def _with_relevant_examples(
         self,
@@ -2542,7 +2533,7 @@ class InboundRouter:
                     )
 
             proactive_turn = not addressed_turn
-            safety_rules = self._safety_lines_for(impersonating=impersonating)
+            safety_rules = self._safety_lines_for()
             reply_style_lines = build_human_chat_style_lines(
                 proactive_turn=proactive_turn,
                 komachi_style=not impersonating,

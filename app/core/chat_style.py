@@ -274,6 +274,11 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
     true``. The model joins burst messages with the configured separator; this
     function splits them back into individual QQ messages. Personas without
     burst configuration always reply with a single message.
+
+    ``auto_split_long_segments`` (default true) keeps the historical safety net
+    that breaks one oversized segment at sentence boundaries. Deployments that
+    want the model to own the message shape can disable it: the reply is then
+    sent exactly as written, with no post-processing.
     """
 
     normalized = str(text or "").strip()
@@ -284,7 +289,8 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
     parts = [part.strip() for part in normalized.split(separator)]
     parts = [part for part in parts if part]
     max_chars = max(8, int(burst.get("max_chars") or 24))
-    if len(parts) == 1 and len(parts[0]) > max_chars:
+    auto_split = bool(burst.get("auto_split_long_segments", True))
+    if auto_split and len(parts) == 1 and len(parts[0]) > max_chars:
         parts = _split_long_segment(parts[0], max_chars)
     if len(parts) < 2:
         return [normalized]

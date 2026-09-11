@@ -190,3 +190,19 @@ def test_split_burst_reply_auto_splits_long_sentences() -> None:
         "前半像日常番哦。",
         "后半直接精神污染了。",
     ]
+
+
+def test_split_burst_reply_can_leave_the_reply_exactly_as_written() -> None:
+    """The persona can opt out of the forced long-segment split."""
+
+    burst = {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "max_chars": 8,
+        "auto_split_long_segments": False,
+    }
+    text = "这是一句明显超过上限但必须原样发出的完整回复，不许被切开。"
+
+    assert split_burst_reply(text, burst) == [text]
+    assert split_burst_reply("来了|人呢", burst) == ["来了", "人呢"]

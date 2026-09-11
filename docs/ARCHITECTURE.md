@@ -375,7 +375,7 @@ docs/                工程说明和历史设计资料
 
 - `configs/groups.yaml`：群是否接收、归档、发言、主动回复和生图；
 - `configs/persona.yaml`：小町人格、表达方式和特殊熟人规则；
-- `configs/safety.yaml`：AI 身份披露、prompt 防泄漏和内容安全；
+- `configs/safety.yaml`：prompt 防泄漏和内容安全；
 - `infra/wsl/.env.example`：无秘密的环境变量目录。
 
 ### 9.2 不可提交状态
