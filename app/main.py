@@ -18,6 +18,7 @@ from app.adapters.onebot_models import (
 )
 from app.adapters.sender import Sender
 from app.config import AppSettings, load_runtime_config
+from app.core.chat_style import build_reply_split_config
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationService
 from app.core.hybrid_memory_retriever import HybridMemoryRetriever
@@ -1565,6 +1566,9 @@ async def run() -> None:
             private_chat_qqs=settings.private_chat_whitelist,
             data_dir=settings.data_dir,
             web_search_client=web_search_client,
+            image_reference_search_client=image_reference_search_client,
+            image_reference_planner_client=image_reference_planner_client,
+            reply_split_config=build_reply_split_config(settings),
             image_model=settings.group_image_model,
             image_size="auto",
             image_quality="high",

@@ -148,6 +148,8 @@ async def test_private_main_composes_chat_only_private_service(monkeypatch, tmp_
     settings = _settings(tmp_path)
     captured: dict[str, object] = {}
     search_client = object()
+    reference_search_client = object()
+    reference_planner_client = object()
     image_client = object()
     reminder_events: list[str] = []
     FakeGateway.instances.clear()
@@ -197,6 +199,16 @@ async def test_private_main_composes_chat_only_private_service(monkeypatch, tmp_
     monkeypatch.setattr(private_main, "build_web_search_client", lambda _settings: search_client)
     monkeypatch.setattr(
         private_main,
+        "build_image_reference_search_client",
+        lambda _settings: reference_search_client,
+    )
+    monkeypatch.setattr(
+        private_main,
+        "build_group_image_reference_planner_client",
+        lambda **_kwargs: reference_planner_client,
+    )
+    monkeypatch.setattr(
+        private_main,
         "build_group_image_llm_client",
         lambda **_kwargs: image_client,
     )
@@ -208,6 +220,10 @@ async def test_private_main_composes_chat_only_private_service(monkeypatch, tmp_
     await private_main.run()
 
     assert captured["web_search_client"] is search_client
+    # Private drawings search reference images with the group image-service
+    # clients: the reference search client plus the low-effort query planner.
+    assert captured["image_reference_search_client"] is reference_search_client
+    assert captured["image_reference_planner_client"] is reference_planner_client
     # Private drawings must use the pinned image transport, not the chat model
     # that serves text replies (the split container previously fell back to it
     # and every private draw answered with the failure notice).
@@ -216,6 +232,11 @@ async def test_private_main_composes_chat_only_private_service(monkeypatch, tmp_
     assert captured["image_model"] == "gpt-image-2"
     assert captured["image_size"] == "auto"
     assert captured["image_max_attempts"] == 1
+    # The burst delivery shape follows the same GROUP_REPLY_SPLIT_* settings the
+    # group chat uses.
+    assert captured["reply_split_config"]["enabled"] is True
+    assert captured["reply_split_config"]["separator"] == "|"
+    assert captured["reply_split_config"]["max_messages"] == 3
     assert captured["reminder_scheduler"]["reminders"] == ["reminder"]
     assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
     assert captured["llm_kwargs"]["responses_only"] is True

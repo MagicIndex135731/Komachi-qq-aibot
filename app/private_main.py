@@ -7,10 +7,17 @@ from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_private_message_event, resolve_message_type
 from app.adapters.sender import Sender
 from app.config import AppSettings, load_runtime_config
+from app.core.chat_style import build_reply_split_config
 from app.core.context_builder import ContextBuilder
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
-from app.main import build_group_image_llm_client, build_llm_client, build_web_search_client
+from app.main import (
+    build_group_image_llm_client,
+    build_group_image_reference_planner_client,
+    build_image_reference_search_client,
+    build_llm_client,
+    build_web_search_client,
+)
 from app.private_chat.service import PrivateChatService
 from app.private_reminders import PrivateReminderScheduler, load_private_reminders
 from app.runtime_heartbeat import RuntimeHeartbeat
@@ -47,6 +54,14 @@ async def run() -> None:
         llm_client=llm_client,
     )
     web_search_client = build_web_search_client(settings)
+    # Private drawings refine reference-image queries with the same planner and
+    # external image search the group image service uses; the chat search client
+    # above is only for the text-side grounding path.
+    image_reference_search_client = build_image_reference_search_client(settings)
+    image_reference_planner_client = build_group_image_reference_planner_client(
+        settings=settings,
+        llm_client=llm_client,
+    )
     private_chat_service = PrivateChatService(
         engine=engine,
         sender=sender,
@@ -67,6 +82,9 @@ async def run() -> None:
         image_max_attempts=1,
         image_timeout_seconds=settings.group_image_timeout_seconds,
         web_search_client=web_search_client,
+        image_reference_search_client=image_reference_search_client,
+        image_reference_planner_client=image_reference_planner_client,
+        reply_split_config=build_reply_split_config(settings),
         assistant_name=str(runtime.persona.get("name", "小町")),
         persona=runtime.persona,
         safety=runtime.safety,

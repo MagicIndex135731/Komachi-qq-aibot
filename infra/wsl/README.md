@@ -70,6 +70,11 @@ WebSocket 客户端，但群聊进程只处理群消息，所以私聊必须有�
 - `xiaomachi-private` 运行 `python -m app.private_main`，只处理
   `message_type=private`（人格对话、私聊生图、提醒），不运行群聊的
   embedding 预热、记忆回填和启动窗口重放；
+- 私聊回复与主群共用同一套工作方式（记忆系统与人格模仿除外）：
+  `app/core/chat_style.py` 的真人化风格行（`chat_context="private"` 只改开场白）、
+  `GROUP_REPLY_SPLIT_*` 的拆条、未被明确要求时剥离链接、引用消息原文与代词
+  指代提示；私聊生图同样走 `build_image_reference_search_client` +
+  `build_group_image_reference_planner_client` 的参考图链路；
 - 两个容器共享 `NAPCAT_WS_URL` 和 `xiaomachi-bot-data` 卷；SQLite 以 WAL +
   `busy_timeout=30000` 串行写入，私聊与群聊可以同时落库；
 - 私聊容器不需要 GPU（`docker-compose.gpu.yml` 只给 `xiaomachi` 加设备），

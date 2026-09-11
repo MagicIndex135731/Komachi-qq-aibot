@@ -22,10 +22,22 @@ PROACTIVE_FORMAL_LEADIN_PATTERN = re.compile(
 
 
 def build_human_chat_style_lines(
-    *, proactive_turn: bool = False, komachi_style: bool = True
+    *,
+    proactive_turn: bool = False,
+    komachi_style: bool = True,
+    chat_context: str = "group",
 ) -> list[str]:
+    """Style lines for every human-like chat surface.
+
+    ``chat_context`` only changes the opening line so a direct message does not
+    claim to be "in a group"; the default keeps the group output
+    byte-identical.
+    """
+
     lines = [
-        "Talk like a real person chatting in a group.",
+        "Talk like a real person chatting on QQ."
+        if str(chat_context).strip().lower() == "private"
+        else "Talk like a real person chatting in a group.",
     ]
     if komachi_style:
         lines.extend(
@@ -300,6 +312,47 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
         overflow = parts[max_messages - 1 :]
         parts = parts[: max_messages - 1] + [separator.join(overflow)]
     return [part for part in parts if part]
+
+
+def build_reply_split_config(settings=None) -> dict:
+    """Delivery shape for a chat reply, taken from settings not the persona.
+
+    Shared by the group router and the private chat service so both surfaces
+    split a long answer into the same short QQ message burst. The persona only
+    describes style and personality; how a long answer is broken into QQ
+    messages is a system-level policy. Missing settings fall back to burst on,
+    three messages of 64 characters, and no configured delay.
+    """
+
+    def _value(name: str, default):
+        return getattr(settings, name, default)
+
+    min_delay = max(0.0, float(_value("group_reply_split_min_delay_seconds", 0.0)))
+    max_delay = max(min_delay, float(_value("group_reply_split_max_delay_seconds", min_delay)))
+    return {
+        "enabled": bool(_value("group_reply_split_enabled", True)),
+        "separator": "|",
+        "max_messages": max(1, min(6, int(_value("group_reply_split_max_messages", 3)))),
+        "max_chars": max(8, int(_value("group_reply_split_max_chars", 64))),
+        "auto_split_long_segments": True,
+        "min_delay_seconds": min_delay,
+        "max_delay_seconds": max_delay,
+    }
+
+
+def burst_delays(burst: dict | None, *, segment_count: int) -> tuple[float, float]:
+    """Delay window between burst segments, shared by every chat surface.
+
+    Group and private delivery must space a multi-message answer the same way;
+    an unset or zero delay still falls back to the 0.8-2.5s window the group
+    path has always used, so a burst never fires back-to-back by accident.
+    """
+
+    if not isinstance(burst, dict) or segment_count <= 1:
+        return 0.0, 0.0
+    delay_min = max(0.0, float(burst.get("min_delay_seconds") or 0.8))
+    delay_max = max(delay_min, float(burst.get("max_delay_seconds") or 2.5))
+    return delay_min, delay_max
 
 
 def normalize_chat_reply_burst_aware(text: str, burst: dict | None) -> str:

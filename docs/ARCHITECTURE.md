@@ -386,6 +386,12 @@ docs/                工程说明和历史设计资料
 聊天通道：2026-09-11 起已移除全部 Codex/项目控制能力（`app.dev_control`、
 `app.admin`、开发任务 worker 与 `管理员模式`），私聊不再读写仓库、执行命令或
 重启运行时。私聊的轮次仍保存在 `dev_sessions` / `dev_tasks` 表中（不改 schema）。
+私聊的回复工作方式与主群一致（记忆系统与人格模仿除外）：共用
+`app/core/chat_style.py` 的真人化风格行（`chat_context="private"` 只改开场白）、
+`GROUP_REPLY_SPLIT_*` 的短句连发、URL 策略（未被明确要求则剥离链接）、引用消息
+原文与代词指代提示、强制联网时的搜索优先级指令；私聊生图同样使用
+`build_image_reference_search_client` + `build_group_image_reference_planner_client`
+的参考图链路。
 
 ## 9. 配置与数据边界
 

@@ -30,7 +30,9 @@ from app.core.bbot_listener_cache import (
     upsert_listener_cache_entries,
 )
 from app.core.chat_style import (
+    burst_delays,
     build_human_chat_style_lines,
+    build_reply_split_config,
     format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
@@ -85,6 +87,11 @@ from app.core.memory_query_resolver import (
     is_requester_identity_query,
 )
 from app.core.persona_engine import render_persona, render_safety_lines
+from app.core.quoted_message import (
+    flatten_raw_message_text,
+    quoted_message_line_for_prompt,
+    quoted_pronoun_referent_note,
+)
 from app.core.persona_switch import (
     DEFAULT_PERSONA_KEY,
     PersonaManager,
@@ -222,12 +229,6 @@ REQUESTER_IDENTITY_INSTRUCTION = (
     "incomplete. Never copy a nearby assistant "
     "reply about another member, and never infer age, nationality, occupation, location, "
     "or another attribute that the requester did not directly establish."
-)
-
-
-_QUOTED_PRONOUN_PATTERN = re.compile(r"他|她|那位|这位|这个人|那家伙")
-_QUOTED_REFERENT_ASK_PATTERN = re.compile(
-    r"谁|什么|什么意思|在说谁|说的是谁|指谁|是谁|说什么|在说什么|指的谁"
 )
 
 
@@ -812,18 +813,7 @@ class InboundRouter:
         broken into QQ messages is a system-level policy.
         """
 
-        settings = self.runtime.settings
-        min_delay = max(0.0, float(getattr(settings, "group_reply_split_min_delay_seconds", 0.0)))
-        max_delay = max(min_delay, float(getattr(settings, "group_reply_split_max_delay_seconds", min_delay)))
-        return {
-            "enabled": bool(getattr(settings, "group_reply_split_enabled", True)),
-            "separator": "|",
-            "max_messages": max(1, min(6, int(getattr(settings, "group_reply_split_max_messages", 3)))),
-            "max_chars": max(8, int(getattr(settings, "group_reply_split_max_chars", 64))),
-            "auto_split_long_segments": True,
-            "min_delay_seconds": min_delay,
-            "max_delay_seconds": max_delay,
-        }
+        return build_reply_split_config(self.runtime.settings)
 
     async def _send_chat_reply(self, event, reply_text: str) -> None:
         """Send an LLM chat reply, optionally as a short multi-message burst."""
@@ -835,11 +825,7 @@ class InboundRouter:
         segments = split_burst_reply(reply_text, burst)
         impersonating = self._impersonating(event.group_id)
         base_id = self._outbound_platform_msg_id(event.platform_msg_id)
-        delay_min = 0.0
-        delay_max = 0.0
-        if isinstance(burst, dict) and len(segments) > 1:
-            delay_min = max(0.0, float(burst.get("min_delay_seconds") or 0.8))
-            delay_max = max(delay_min, float(burst.get("max_delay_seconds") or 2.5))
+        delay_min, delay_max = burst_delays(burst, segment_count=len(segments))
         for index, segment in enumerate(segments):
             if impersonating:
                 segment = scrub_banned_address_terms(
@@ -1159,31 +1145,10 @@ class InboundRouter:
         )
 
     def _flatten_raw_message_text(self, raw_payload: dict | None) -> str:
-        if not isinstance(raw_payload, dict):
-            return ""
-        message = raw_payload.get("message", raw_payload.get("raw_message", ""))
-        if isinstance(message, str):
-            return message.strip()
-        parts: list[str] = []
-        for item in message:
-            if not isinstance(item, dict) or item.get("type") != "text":
-                continue
-            text = str(item.get("data", {}).get("text", ""))
-            if text:
-                parts.append(text)
-        return "".join(parts).strip()
+        return flatten_raw_message_text(raw_payload)
 
     def _quoted_message_line_for_prompt(self, *, quoted_raw_payload: dict | None) -> str | None:
-        quoted_text = self._flatten_raw_message_text(quoted_raw_payload)
-        if not quoted_text:
-            return None
-        sender = quoted_raw_payload.get("sender", {}) if isinstance(quoted_raw_payload, dict) else {}
-        label = self._format_member_label(
-            nickname=str(sender.get("nickname", "")),
-            group_card=str(sender.get("card", "")),
-            fallback=str(quoted_raw_payload.get("user_id", "quoted-user")) if isinstance(quoted_raw_payload, dict) else "quoted-user",
-        )
-        return f"{label}: {quoted_text}"
+        return quoted_message_line_for_prompt(quoted_raw_payload=quoted_raw_payload)
 
     def _quoted_pronoun_referent_note(
         self,
@@ -1191,20 +1156,9 @@ class InboundRouter:
         query_text: str,
         quoted_raw_payload: dict | None,
     ) -> str | None:
-        if not isinstance(quoted_raw_payload, dict):
-            return None
-        if not self._flatten_raw_message_text(quoted_raw_payload):
-            return None
-        if not _QUOTED_PRONOUN_PATTERN.search(query_text):
-            return None
-        if not _QUOTED_REFERENT_ASK_PATTERN.search(query_text):
-            return None
-        return (
-            "Note: “他/她” in this question refers to the sender of the quoted "
-            "message above. Use the recent chat to determine who or what that "
-            "sender is talking about and quote the original lines. If the "
-            "quoted text explicitly names another person, follow the quoted "
-            "text; if no clear referent exists, say the evidence is insufficient."
+        return quoted_pronoun_referent_note(
+            query_text=query_text,
+            quoted_raw_payload=quoted_raw_payload,
         )
 
     def _is_reply_to_bot(self, *, event, messages: MessageRepository, quoted_raw_payload: dict | None) -> bool:

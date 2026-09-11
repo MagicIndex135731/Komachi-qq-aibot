@@ -111,6 +111,28 @@ class FakeSearchClient:
         ]
 
 
+class FakeImageReferenceSearchClient:
+    """Reference-image search client: only the private drawing path uses it."""
+
+    def __init__(self, results: list[ImageAttachment] | None = None) -> None:
+        self.results = list(results or [])
+        self.image_queries: list[tuple[str, int]] = []
+
+    def image_search(self, query: str, max_results: int = 3):
+        self.image_queries.append((query, max_results))
+        return list(self.results)
+
+
+class FakeReferencePlanner:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.prompts: list[list[str]] = []
+
+    def generate_text(self, prompt_lines, **_kwargs):
+        self.prompts.append(list(prompt_lines))
+        return self.response
+
+
 class FakeImageGenerationLlm:
     def __init__(self) -> None:
         self.generate_calls: list[dict] = []
@@ -239,7 +261,14 @@ async def test_owner_daily_chat_replies_inline_with_daily_prompt(sqlite_engine, 
     assert "Current private daily session summary:" in prompt
     assert "Recent private daily turns:" in prompt
     assert "比企谷小町" in prompt
-    assert "Do not default to Markdown" in prompt
+    # The private prompt runs the shared group work-style lines; only the
+    # opening line names a direct chat instead of a group.
+    assert "Talk like a real person chatting on QQ." in prompt
+    assert "Do not use Markdown, headings, bullet lists, numbered lists" in prompt
+    assert "Do not include URLs, website addresses, Markdown links" in prompt
+    # Memory retrieval and persona imitation stay out of the private prompt.
+    assert "相关话题下他的原话示例" not in prompt
+    assert "群历史" not in prompt
     # The Codex project channel is gone from the daily prompt.
     assert "local Xiaomachi repository" not in prompt
     assert "Relevant repository snippets:" not in prompt
@@ -1093,3 +1122,268 @@ async def test_chinese_session_commands_reset_and_report_daily_session(sqlite_en
     )
     assert len(sender.private_sent) == 4
     assert sender.private_sent[2].text == sender.private_sent[3].text
+
+
+def _burst_config(**overrides) -> dict:
+    config = {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "max_chars": 64,
+        "auto_split_long_segments": True,
+        # Keep the delivery test fast; the zero-delay fallback is covered by
+        # ``test_burst_delays_*`` in tests/core/test_chat_style.py.
+        "min_delay_seconds": 0.01,
+        "max_delay_seconds": 0.01,
+    }
+    config.update(overrides)
+    return config
+
+
+@pytest.mark.asyncio
+async def test_private_chat_delivers_a_burst_reply_as_separate_messages(sqlite_engine, tmp_path) -> None:
+    sender = FakeSender()
+    llm_client = FakeLlmClient(reply_text="来了|几点|上号")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+        bot_qq=200000003,
+        reply_split_config=_burst_config(),
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(message_id="p-chat-burst", user_id=10001, text="打游戏吗")
+    )
+
+    assert handled is True
+    assert [outbound.text for outbound in sender.private_sent] == ["来了", "几点", "上号"]
+    with session_scope(sqlite_engine) as session:
+        completed = DevTaskRepository(session).list_tasks_by_status("completed")
+        dev_session = DevSessionRepository(session).get_latest_owner_session(
+            owner_qq=10001,
+            session_mode=private_chat_module.SESSION_MODE_DAILY,
+        )
+        recent = DevTaskRepository(session).list_recent_tasks_for_session(
+            session_id=dev_session.id,
+            limit=1,
+        )
+    # The stored turn keeps the whole answer; delivery splits it.
+    assert completed[0].result_text == "来了|几点|上号"
+    task_id = recent[0].id
+    with session_scope(sqlite_engine) as session:
+        messages = MessageRepository(session)
+        stored = [
+            messages.get_by_platform_msg_id(
+                f"private-outbound-private_chat:{task_id}:completed{suffix}"
+            )
+            for suffix in ("", "-b1", "-b2")
+        ]
+    assert all(message is not None for message in stored)
+    assert [message.raw_json["delivery_state"] for message in stored] == [
+        "sent",
+        "sent",
+        "sent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_private_chat_strips_links_unless_the_user_asks_for_them(sqlite_engine, tmp_path) -> None:
+    sender = FakeSender()
+    llm_client = FakeLlmClient(reply_text="看这里 https://example.test/a 就明白了")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    await service.handle_private_message(
+        make_private_event(message_id="p-chat-url-1", user_id=10001, text="这个是怎么做的")
+    )
+
+    assert "https://example.test/a" not in sender.private_sent[-1].text
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Do not include URLs, website addresses, Markdown links" in prompt
+
+    requested_sender = FakeSender()
+    requested_llm = FakeLlmClient(reply_text="看这里 https://example.test/a")
+    requested_service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=requested_sender,
+        llm_client=requested_llm,
+        owner_qq=10001,
+    )
+
+    await requested_service.handle_private_message(
+        make_private_event(message_id="p-chat-url-2", user_id=10001, text="把链接发我")
+    )
+
+    assert requested_sender.private_sent[-1].text == "看这里 https://example.test/a"
+    requested_prompt = "\n".join(requested_llm.prompts[0])
+    assert "The user explicitly requested links." in requested_prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_puts_the_quoted_message_text_in_the_prompt(sqlite_engine, tmp_path) -> None:
+    sender = GatewayBackedSender(
+        gateway=FakeGateway(
+            get_msg_responses={
+                "q-quoted-text": {
+                    "message": [{"type": "text", "data": {"text": "形式主义大国"}}],
+                    "sender": {"nickname": "群友", "card": "阿渣"},
+                    "user_id": 20002,
+                }
+            }
+        )
+    )
+    llm_client = FakeLlmClient(reply_text="他是在说你刚才那句。")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+        bot_qq=200000003,
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-quoted-text",
+            user_id=10001,
+            text="他在说谁",
+            reply_to_msg_id="q-quoted-text",
+        )
+    )
+
+    assert handled is True
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Quoted message: 阿渣（QQ昵称：群友）: 形式主义大国" in prompt
+    assert "sender of the quoted message" in prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_marks_a_searched_turn_as_search_priority(sqlite_engine, tmp_path) -> None:
+    sender = FakeSender()
+    llm_client = FakeLlmClient(reply_text="我查了一下最近的新闻。")
+    search_client = FakeSearchClient()
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+        web_search_client=search_client,
+    )
+
+    await service.handle_private_message(
+        make_private_event(message_id="p-chat-search", user_id=10001, text="上网搜一下最近的新闻")
+    )
+
+    assert search_client.queries
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search priority:" in prompt
+    assert "Treat chat memory as background only." in prompt
+
+
+def test_private_drawings_use_the_reference_search_and_planner_clients(sqlite_engine, tmp_path) -> None:
+    chat_search = FakeSearchClient()
+    reference_search = FakeImageReferenceSearchClient()
+    planner = FakeReferencePlanner('{"should_search": false}')
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=FakeSender(),
+        llm_client=FakeLlmClient(),
+        owner_qq=10001,
+        web_search_client=chat_search,
+        image_reference_search_client=reference_search,
+        image_reference_planner_client=planner,
+    )
+
+    # The chat path keeps the chat search client; drawings use the reference one.
+    assert service.web_search_client is chat_search
+    assert service.private_image_service.web_search_client is reference_search
+    assert service.private_image_service.image_reference_planner_client is planner
+
+
+def test_private_drawings_fall_back_to_the_chat_search_client(sqlite_engine, tmp_path) -> None:
+    chat_search = FakeSearchClient()
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=FakeSender(),
+        llm_client=FakeLlmClient(),
+        owner_qq=10001,
+        web_search_client=chat_search,
+    )
+
+    assert service.private_image_service.web_search_client is chat_search
+    assert service.private_image_service.image_reference_planner_client is None
+
+
+@pytest.mark.asyncio
+async def test_private_reference_drawing_searches_images_with_the_planner(sqlite_engine, tmp_path) -> None:
+    sender = FakeSender()
+    image_llm = FakeImageGenerationLlm()
+    reference_search = FakeImageReferenceSearchClient(
+        results=[
+            ImageAttachment(
+                url="https://img.example.test/azha-reference.png",
+                file_id="azha-reference.png",
+            )
+        ]
+    )
+    planner = FakeReferencePlanner(
+        '{"should_search": true, "references": ['
+        '{"subject": "阿渣", "queries": ["阿渣 人设图"]}]}'
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=FakeLlmClient(reply_text="should not be used"),
+        image_llm_client=image_llm,
+        owner_qq=10001,
+        image_reference_search_client=reference_search,
+        image_reference_planner_client=planner,
+    )
+
+    with session_scope(sqlite_engine) as session:
+        sessions = DevSessionRepository(session)
+        tasks = DevTaskRepository(session)
+        dev_session = sessions.get_or_create_owner_session(
+            owner_qq=10001,
+            session_mode=private_chat_module.SESSION_MODE_DAILY,
+        )
+        task = tasks.add_task(
+            session_id=dev_session.id,
+            requested_by_qq=10001,
+            raw_request_text="参考阿渣的人设图生成一张",
+            intent_type="private_chat",
+        )
+        dev_task_id = task.id
+
+    result = await service.private_image_service.enqueue(
+        PrivateImageGenerationRequest(
+            user_id=10001,
+            trigger_message_id="p-reference-image",
+            prompt="参考阿渣的人设图生成一张",
+            web_search_query="阿渣",
+            dev_task_id=dev_task_id,
+        )
+    )
+
+    await service.private_image_service.wait_for_idle()
+
+    assert result.accepted is True
+    assert len(planner.prompts) == 1
+    assert reference_search.image_queries == [("阿渣 人设图", 2)]
+    assert [image.url for image in image_llm.edit_calls[0]["images"]] == [
+        "https://img.example.test/azha-reference.png"
+    ]
+    assert sender.private_image_sent and sender.private_image_sent[0]["user_id"] == 10001

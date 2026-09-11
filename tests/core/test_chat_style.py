@@ -1,5 +1,9 @@
+from types import SimpleNamespace
+
 from app.core.chat_style import (
+    burst_delays,
     build_human_chat_style_lines,
+    build_reply_split_config,
     format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
@@ -18,6 +22,45 @@ def test_build_human_chat_style_lines_blocks_markdownish_formatting() -> None:
     assert any("Do not use Markdown" in line for line in lines)
     assert any("real person" in line for line in lines)
     assert any("not a dislike" in line for line in lines)
+
+
+def test_build_human_chat_style_lines_private_context_only_changes_the_opening_line() -> None:
+    group_lines = build_human_chat_style_lines()
+    private_lines = build_human_chat_style_lines(chat_context="private")
+
+    assert group_lines[0] == "Talk like a real person chatting in a group."
+    assert private_lines[0] == "Talk like a real person chatting on QQ."
+    # Everything after the opening line is the shared work-style, unchanged.
+    assert private_lines[1:] == group_lines[1:]
+
+
+def test_build_reply_split_config_uses_group_settings_and_safe_defaults() -> None:
+    defaults = build_reply_split_config()
+    assert defaults == {
+        "enabled": True,
+        "separator": "|",
+        "max_messages": 3,
+        "max_chars": 64,
+        "auto_split_long_segments": True,
+        "min_delay_seconds": 0.0,
+        "max_delay_seconds": 0.0,
+    }
+
+    settings = SimpleNamespace(
+        group_reply_split_enabled=False,
+        group_reply_split_max_messages=2,
+        group_reply_split_max_chars=24,
+        group_reply_split_min_delay_seconds=1.5,
+        group_reply_split_max_delay_seconds=0.5,
+    )
+    configured = build_reply_split_config(settings)
+
+    assert configured["enabled"] is False
+    assert configured["max_messages"] == 2
+    assert configured["max_chars"] == 24
+    # The maximum delay is never allowed to fall below the minimum.
+    assert configured["min_delay_seconds"] == 1.5
+    assert configured["max_delay_seconds"] == 1.5
 
 
 def test_format_example_pairs_includes_context_after() -> None:
@@ -229,3 +272,25 @@ def test_split_burst_reply_keeps_an_unpunctuated_clause_whole() -> None:
     text = "小町就是要把这句话一口气说完中间一个标点都不带的完整长句所以不会被切开"
 
     assert split_burst_reply(text, burst) == [text]
+
+
+def test_burst_delays_share_the_group_window_across_surfaces() -> None:
+    """Group and private delivery must space bursts identically."""
+
+    assert burst_delays({"min_delay_seconds": 0.0, "max_delay_seconds": 0.0}, segment_count=3) == (
+        0.8,
+        2.5,
+    )
+    assert burst_delays({"min_delay_seconds": 0.4, "max_delay_seconds": 0.9}, segment_count=2) == (
+        0.4,
+        0.9,
+    )
+    # A single segment never waits, and a low max is clamped up to the min.
+    assert burst_delays({"min_delay_seconds": 0.4, "max_delay_seconds": 0.9}, segment_count=1) == (
+        0.0,
+        0.0,
+    )
+    assert burst_delays({"min_delay_seconds": 1.5, "max_delay_seconds": 0.2}, segment_count=2) == (
+        1.5,
+        1.5,
+    )

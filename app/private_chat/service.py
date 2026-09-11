@@ -20,11 +20,18 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 from pathlib import Path
+import random
 import re
 
 from app.adapters.onebot_models import PrivateMessageEvent
 from app.adapters.sender import OutboundPrivateMessage, QQMessageDeliveryUncertainError
-from app.core.chat_style import normalize_chat_reply
+from app.core.chat_style import (
+    burst_delays,
+    build_human_chat_style_lines,
+    build_reply_split_config,
+    normalize_chat_reply,
+    split_burst_reply,
+)
 from app.core.group_image_generation import (
     ImageJobResult,
     PrivateImageGenerationRequest,
@@ -32,6 +39,10 @@ from app.core.group_image_generation import (
 )
 from app.core.image_turn_resolver import resolve_private_images_for_turn
 from app.core.persona_engine import render_persona, render_safety_lines
+from app.core.quoted_message import (
+    quoted_message_line_for_prompt,
+    quoted_pronoun_referent_note,
+)
 from app.core.router import (
     AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
     AUTO_WEB_REFERENCE_QUERY_PATTERN,
@@ -47,6 +58,7 @@ from app.core.search_policy import (
     build_current_datetime_facts,
     build_forced_search_query,
     build_search_decision_prompt,
+    build_search_priority_instructions,
     is_explicit_search_request,
     is_general_search_decision_candidate,
     is_search_verification_query,
@@ -58,6 +70,11 @@ from app.core.search_policy import (
     parse_search_decision,
 )
 from app.core.time_utils import ASIA_SHANGHAI
+from app.core.url_policy import (
+    explicitly_requests_urls,
+    filter_reply_urls,
+    url_reply_policy_instruction,
+)
 from app.core.web_grounding import build_grounding_notes
 from app.storage.db import session_scope
 from app.storage.models import DevSession
@@ -123,6 +140,7 @@ class PrivateWebContext:
     web_results: list[str]
     web_pages: list[str]
     grounding_notes: list[str]
+    search_priority: bool = False
 
 
 class PrivateChatService:
@@ -141,6 +159,9 @@ class PrivateChatService:
         data_dir: Path,
         private_image_followup_window_seconds: float = 1.2,
         web_search_client=None,
+        image_reference_search_client=None,
+        image_reference_planner_client=None,
+        reply_split_config: dict | None = None,
         image_model: str = "gpt-image-2",
         image_size: str | None = "auto",
         image_quality: str | None = "high",
@@ -168,11 +189,26 @@ class PrivateChatService:
             float(private_image_followup_window_seconds),
         )
         self.web_search_client = web_search_client
+        # A private drawing must search reference images with the same client and
+        # planner the group image service uses; the chat search client stays for
+        # the text-side grounding path.
+        self.image_reference_search_client = (
+            image_reference_search_client
+            if image_reference_search_client is not None
+            else web_search_client
+        )
+        self.image_reference_planner_client = image_reference_planner_client
+        self.reply_split_config = dict(
+            reply_split_config
+            if reply_split_config is not None
+            else build_reply_split_config()
+        )
         self.private_image_service = PrivateImageGenerationService(
             engine=engine,
             llm_client=self.image_llm_client,
             sender=sender,
-            web_search_client=web_search_client,
+            web_search_client=self.image_reference_search_client,
+            image_reference_planner_client=self.image_reference_planner_client,
             output_dir=self.data_dir / "generated_private_images",
             model=image_model,
             size=image_size,
@@ -309,6 +345,34 @@ class PrivateChatService:
             logger.exception("private_reply_send_failed context=%s user_id=%s", context, user_id)
             failure_reason = str(exc).strip() or exc.__class__.__name__
             return False, failure_reason
+
+    async def _send_private_chat_reply(
+        self,
+        *,
+        user_id: int,
+        text: str,
+        context: str,
+    ) -> None:
+        """Send one chat reply, split into a short burst when configured.
+
+        The private surface uses the same delivery shape as the group chat: one
+        answer may arrive as up to ``max_messages`` short QQ messages with the
+        configured delay between them. Each segment reserves its own outbound
+        key, so reply de-duplication still covers the whole burst.
+        """
+
+        burst = self.reply_split_config
+        segments = split_burst_reply(text, burst)
+        # Same window as the group delivery path, from the shared helper.
+        delay_min, delay_max = burst_delays(burst, segment_count=len(segments))
+        for index, segment in enumerate(segments):
+            await self._deliver_private_text(
+                user_id=user_id,
+                text=segment,
+                context=context if index == 0 else f"{context}-b{index}",
+            )
+            if index < len(segments) - 1 and delay_max > 0:
+                await asyncio.sleep(random.uniform(delay_min, delay_max))
 
     async def _fetch_private_quoted_message_payload(self, *, reply_to_msg_id: str | None) -> dict | None:
         if not reply_to_msg_id:
@@ -613,6 +677,7 @@ class PrivateChatService:
             task_id = task.id
 
         try:
+            quoted_raw_payload: dict | None = None
             override_images = self._consume_private_image_turn_override(user_id=event.user_id)
             if override_images:
                 target_images = override_images
@@ -665,6 +730,7 @@ class PrivateChatService:
                     request_time=event.timestamp,
                     private_scope=private_scope,
                     image_count=len(target_images or []),
+                    quoted_raw_payload=quoted_raw_payload,
                 )
                 reply_text = self._normalize_private_reply(
                     self.llm_client.generate_text(
@@ -675,6 +741,10 @@ class PrivateChatService:
                 )
                 if not reply_text:
                     raise ValueError("empty private chat reply")
+                reply_text = filter_reply_urls(
+                    reply_text,
+                    allow_urls=explicitly_requests_urls(request_text),
+                )
 
             if private_image_request is None:
                 with session_scope(self.engine) as session:
@@ -697,15 +767,18 @@ class PrivateChatService:
                         sessions=DevSessionRepository(session),
                     )
 
-            await self._send_private_text(
-                user_id=event.user_id,
-                text=reply_text,
-                context=(
-                    f"private_chat:{task_id}:accepted"
-                    if private_image_request is not None
-                    else f"private_chat:{task_id}:completed"
-                ),
-            )
+            if private_image_request is not None:
+                await self._send_private_text(
+                    user_id=event.user_id,
+                    text=reply_text,
+                    context=f"private_chat:{task_id}:accepted",
+                )
+            else:
+                await self._send_private_chat_reply(
+                    user_id=event.user_id,
+                    text=reply_text,
+                    context=f"private_chat:{task_id}:completed",
+                )
         except Exception as exc:
             logger.exception("private_chat_failed user_id=%s scope=%s", event.user_id, private_scope)
             failure_reason = str(exc)
@@ -746,10 +819,13 @@ class PrivateChatService:
         del private_scope
         return [
             f"Reply style: Stay in {str(self.persona.get('name', self.assistant_name) or self.assistant_name)}'s daily-chat persona.",
-            "Reply style: Keep the tone natural, lively, and human, not stiff customer-service wording.",
-            "Reply style: Do not default to Markdown, headings, bullet lists, or multi-paragraph formatting in private chat replies.",
-            "Reply style: Prefer one compact message in one or two short paragraphs. Keep the information, but avoid splitting it into many blocks.",
-            "Reply style: For casual back-and-forth, stay natural and do not over-structure tiny replies.",
+            # Same human/Komachi work-style the group chat runs on; only the
+            # opening line names a direct chat instead of a group.
+            *build_human_chat_style_lines(
+                proactive_turn=False,
+                komachi_style=True,
+                chat_context="private",
+            ),
             "Reply style: If evidence is missing or conflicting, say so plainly instead of smoothing it over.",
         ]
 
@@ -771,6 +847,8 @@ class PrivateChatService:
 
     def _private_web_context_lines(self, web_context: PrivateWebContext) -> list[str]:
         lines: list[str] = []
+        if web_context.search_priority:
+            lines.extend(build_search_priority_instructions())
         if web_context.runtime_facts:
             lines.append(
                 "Treat runtime facts as authoritative for the current year, date, weekday, and clock time."
@@ -1060,6 +1138,9 @@ class PrivateChatService:
             web_results=web_results,
             web_pages=web_pages,
             grounding_notes=grounding_notes,
+            # A turn that goes out with fresh search evidence carries the same
+            # search-priority instructions the group chat adds.
+            search_priority=True,
         )
 
     def _build_private_chat_prompt(
@@ -1071,6 +1152,7 @@ class PrivateChatService:
         request_time,
         private_scope: str,
         image_count: int = 0,
+        quoted_raw_payload: dict | None = None,
     ) -> list[str]:
         session_summary = self._session_summary(session_id=session_id)
         recent_turns = self._recent_turn_lines(session_id=session_id, exclude_task_id=task_id)
@@ -1089,10 +1171,23 @@ class PrivateChatService:
         current_message_label = (
             "Current user message:" if private_scope == PRIVATE_SCOPE_ALLOWLIST_DAILY else "Current owner message:"
         )
+        target_text = request_text
+        quoted_message_line = quoted_message_line_for_prompt(
+            quoted_raw_payload=quoted_raw_payload
+        )
+        if quoted_message_line is not None:
+            target_text = f"{target_text}\nQuoted message: {quoted_message_line}"
+            pronoun_referent_note = quoted_pronoun_referent_note(
+                query_text=request_text,
+                quoted_raw_payload=quoted_raw_payload,
+            )
+            if pronoun_referent_note is not None:
+                target_text = f"{target_text}\n{pronoun_referent_note}"
         return [
             f"System persona: {self._private_daily_persona_text()}",
             self._private_daily_safety_line(extra_rule=daily_safety_extra),
             *self._private_reply_style_lines(private_scope=private_scope),
+            url_reply_policy_instruction(request_text),
             "Current private daily session summary:",
             session_summary or "(none)",
             "Recent private daily turns:",
@@ -1103,7 +1198,7 @@ class PrivateChatService:
                 recent_turns=recent_turns,
                 image_count=image_count,
             ),
-            f"{current_message_label} {request_text}",
+            f"{current_message_label} {target_text}",
         ]
 
     def _normalize_private_reply(self, text: str) -> str:
