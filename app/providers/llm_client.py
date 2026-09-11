@@ -63,6 +63,7 @@ class ResponsesStreamResult:
     response_id: str | None
     usage: LlmUsage | None
     function_calls: tuple[LlmFunctionCall, ...] = ()
+    reasoning_items: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(slots=True)
@@ -686,8 +687,12 @@ class LlmClient:
         for output_item in payload.get("output", []):
             if not isinstance(output_item, dict):
                 continue
+            if output_item.get("type") == "reasoning":
+                continue
             for content_item in output_item.get("content", []):
                 if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") in {"reasoning_text", "summary_text"}:
                     continue
                 text = content_item.get("text")
                 if isinstance(text, str):
@@ -838,6 +843,72 @@ class LlmClient:
             return text
         return f"{text[:limit]}..."
 
+    def _log_responses_rejection(self, *, exc: httpx.HTTPStatusError, model: str) -> None:
+        """Log one bounded summary for a non-retryable Responses rejection.
+
+        Thinking-mode providers answer a malformed continuation with a
+        descriptive 400 (for example a missing replayed reasoning item) that is
+        otherwise only diagnosable through replay probes.  The body is
+        truncated and whitespace-collapsed, and never retried, so a rejected
+        request produces exactly one log line per attempt.
+        """
+        response = exc.response
+        status_code = response.status_code if response is not None else 0
+        content_type = response.headers.get("content-type", "") if response is not None else ""
+        body_text = response.text if response is not None else ""
+        error_type = ""
+        error_code = ""
+        message = ""
+        try:
+            payload = json.loads(body_text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                error_type = str(error.get("type") or "")
+                error_code = str(error.get("code") or "")
+                message = str(error.get("message") or "")
+            elif isinstance(error, str):
+                message = error
+        summary = " ".join(self._truncate_log_value(message or body_text, limit=300).split())
+        logger.warning(
+            "responses_request_rejected status=%s model=%s content_type=%s error_type=%s error_code=%s body_prefix=%r",
+            status_code,
+            model,
+            content_type,
+            error_type,
+            error_code,
+            summary,
+        )
+
+    @staticmethod
+    def _reasoning_item_key(item: dict[str, Any]) -> str:
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            return item_id
+        return json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+    def _append_reasoning_item(
+        self,
+        collected: list[dict[str, Any]],
+        seen_keys: set[str],
+        item: Any,
+    ) -> None:
+        """Keep provider reasoning items verbatim so they can be replayed.
+
+        A thinking-mode continuation must carry the previous round's reasoning
+        items back; rewriting or dropping them (id, summary parts,
+        ``encrypted_content``) makes the upstream reject the follow-up.
+        """
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            return
+        key = self._reasoning_item_key(item)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        collected.append(item)
+
     def _extract_responses_result_from_sse(
         self,
         response_text: str,
@@ -850,6 +921,8 @@ class LlmClient:
         usage_payload: dict[str, Any] | None = None
         function_calls: list[LlmFunctionCall] = []
         seen_call_ids: set[str] = set()
+        reasoning_items: list[dict[str, Any]] = []
+        seen_reasoning_keys: set[str] = set()
 
         def append_function_call(item: dict[str, Any]) -> None:
             if not isinstance(item, dict) or item.get("type") != "function_call":
@@ -911,9 +984,19 @@ class LlmClient:
                 if isinstance(usage, dict):
                     usage_payload = usage
                 for output_item in response.get("output", []):
+                    self._append_reasoning_item(
+                        reasoning_items,
+                        seen_reasoning_keys,
+                        output_item,
+                    )
                     if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                         append_function_call(output_item)
             if payload_type == "response.output_item.done" and isinstance(payload.get("item"), dict):
+                self._append_reasoning_item(
+                    reasoning_items,
+                    seen_reasoning_keys,
+                    payload.get("item"),
+                )
                 append_function_call(payload.get("item"))
             if payload_type == "response.function_call_arguments.done":
                 append_function_call(
@@ -932,6 +1015,7 @@ class LlmClient:
             response_id=response_id,
             usage=usage,
             function_calls=tuple(function_calls),
+            reasoning_items=tuple(reasoning_items),
         )
 
     def _extract_responses_image_artifacts(self, payload: Any) -> list[ImageArtifact]:
@@ -1321,6 +1405,7 @@ class LlmClient:
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
                 if not self._is_retryable_responses_status_code(status_code):
+                    self._log_responses_rejection(exc=exc, model=model)
                     raise
                 last_error = exc
                 instructions_chars, input_chars = self._responses_payload_text_sizes(responses_payload)
@@ -1380,7 +1465,21 @@ class LlmClient:
                 continue
             usage = self._extract_responses_usage(response_data, model=model)
             response_id = response_data.get("id") if isinstance(response_data, dict) else None
-            return ResponsesStreamResult(text=text, response_id=response_id, usage=usage)
+            reasoning_items: list[dict[str, Any]] = []
+            seen_reasoning_keys: set[str] = set()
+            if isinstance(response_data, dict):
+                for output_item in response_data.get("output") or ():
+                    self._append_reasoning_item(
+                        reasoning_items,
+                        seen_reasoning_keys,
+                        output_item,
+                    )
+            return ResponsesStreamResult(
+                text=text,
+                response_id=response_id,
+                usage=usage,
+                reasoning_items=tuple(reasoning_items),
+            )
 
         if last_error is None:
             raise ValueError("responses request failed without a captured exception")
@@ -1790,10 +1889,12 @@ class LlmClient:
     ) -> str:
         """Run a bounded Responses function-calling loop and return final text.
 
-        Each round appends the assistant ``function_call`` items and their
-        ``function_call_output`` results to the input history. Tool failures,
-        malformed arguments, and round exhaustion degrade to the last model
-        text instead of blocking the reply path.
+        Each round appends the assistant ``reasoning`` items, ``function_call``
+        items and their ``function_call_output`` results to the input history;
+        thinking-mode providers refuse a continuation that drops the reasoning
+        items that produced a call. Tool failures, malformed arguments,
+        provider HTTP errors, and round exhaustion degrade to plain text
+        generation instead of blocking the reply path.
         """
         if not self._responses_enabled():
             return self.generate_text(
@@ -1808,6 +1909,15 @@ class LlmClient:
         output_tokens = (
             self.max_output_tokens if max_output_tokens is None else max(1, int(max_output_tokens))
         )
+
+        def generate_without_tools() -> str:
+            return self.generate_text(
+                prompt_lines,
+                conversation_key=conversation_key,
+                force_web_search=force_web_search,
+                allow_web_search=allow_web_search,
+                temperature=temperature,
+            )
 
         def request_with_tools(*, model: str) -> ResponsesStreamResult:
             return self._request_responses_stream_result(
@@ -1828,6 +1938,23 @@ class LlmClient:
             )
 
         extra_input_items: list[dict[str, Any]] = []
+
+        def append_round_result(result: ResponsesStreamResult) -> None:
+            """Replay this round's output in front of the next request.
+
+            The reasoning items that produced this round's function calls must
+            be sent back verbatim *before* those calls, with the call block kept
+            contiguous ahead of its outputs, otherwise thinking-mode providers
+            reject the continuation.
+            """
+            extra_input_items.extend(result.reasoning_items)
+            extra_input_items.extend(
+                self._function_call_input_items(
+                    result.function_calls,
+                    tool_executor,
+                )
+            )
+
         request_model = self._web_search_chat_model(
             default_model=self.responses_model,
             force_web_search=force_web_search,
@@ -1836,6 +1963,14 @@ class LlmClient:
         for round_index in range(effective_rounds + 1):
             try:
                 responses_result = request_with_tools(model=request_model)
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                logger.warning(
+                    "responses_tools_http_error_fallback_to_plain status=%s model=%s",
+                    status_code,
+                    request_model,
+                )
+                return generate_without_tools()
             except ValueError as exc:
                 fallback_model = self._distinct_responses_fallback_model(
                     primary_model=request_model
@@ -1849,6 +1984,18 @@ class LlmClient:
                     )
                     try:
                         responses_result = request_with_tools(model=fallback_model)
+                    except httpx.HTTPStatusError as status_exc:
+                        status_code = (
+                            status_exc.response.status_code
+                            if status_exc.response is not None
+                            else 0
+                        )
+                        logger.warning(
+                            "responses_tools_http_error_fallback_to_plain status=%s model=%s",
+                            status_code,
+                            fallback_model,
+                        )
+                        return generate_without_tools()
                     except ValueError:
                         if self.responses_only:
                             raise
@@ -1860,12 +2007,7 @@ class LlmClient:
                         self._record_usage(responses_result.usage)
                         if not responses_result.function_calls and responses_result.text is not None:
                             return responses_result.text
-                        extra_input_items.extend(
-                            self._function_call_input_items(
-                                responses_result.function_calls,
-                                tool_executor,
-                            )
-                        )
+                        append_round_result(responses_result)
                         continue
                 if self.responses_only:
                     raise
@@ -1873,12 +2015,7 @@ class LlmClient:
                     "responses_tools_fallback_to_compat reason=%s",
                     type(exc.__cause__ or exc).__name__,
                 )
-                return self.generate_text(
-                    prompt_lines,
-                    conversation_key=conversation_key,
-                    force_web_search=force_web_search,
-                    allow_web_search=allow_web_search,
-                )
+                return generate_without_tools()
             else:
                 self._remember_response_id(
                     conversation_key=conversation_key,
@@ -1896,12 +2033,7 @@ class LlmClient:
                     return responses_result.text
                 raise ValueError("model response did not include output text after tool rounds")
 
-            extra_input_items.extend(
-                self._function_call_input_items(
-                    responses_result.function_calls,
-                    tool_executor,
-                )
-            )
+            append_round_result(responses_result)
 
         raise ValueError("model response did not finish after tool rounds")
 
@@ -1910,9 +2042,18 @@ class LlmClient:
         function_calls: tuple[LlmFunctionCall, ...],
         tool_executor: Callable[[str, dict[str, Any]], str],
     ) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
+        """Build the follow-up items for one assistant tool round.
+
+        The assistant block stays contiguous: thinking-mode providers pair the
+        replayed ``reasoning`` items with the ``function_call`` items that
+        immediately follow them, and interleaving each call with its own output
+        breaks that pairing (DeepSeek answers HTTP 400 "the ``reasoning_text``
+        in the thinking mode must be passed back to the API").
+        """
+        call_items: list[dict[str, Any]] = []
+        output_items: list[dict[str, Any]] = []
         for call in function_calls:
-            items.append(
+            call_items.append(
                 {
                     "type": "function_call",
                     "call_id": call.call_id,
@@ -1920,14 +2061,14 @@ class LlmClient:
                     "arguments": call.arguments,
                 }
             )
-            items.append(
+            output_items.append(
                 {
                     "type": "function_call_output",
                     "call_id": call.call_id,
                     "output": self._execute_tool_call(call, tool_executor),
                 }
             )
-        return items
+        return [*call_items, *output_items]
 
     def _execute_tool_call(
         self,

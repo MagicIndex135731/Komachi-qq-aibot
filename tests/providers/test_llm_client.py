@@ -72,16 +72,21 @@ def _responses_tool_stream_body(
     response_id: str,
     text: str | None,
     function_calls: list[dict],
+    reasoning_items: list[dict] | None = None,
 ) -> str:
     completed_response = {
         "id": response_id,
         "object": "response",
         "status": "completed",
-        "output": function_calls,
+        "output": [*(reasoning_items or []), *function_calls],
     }
     body = (
         f'data: {json.dumps({"type": "response.created", "response": {"id": response_id}})}\n\n'
     )
+    for reasoning_item in reasoning_items or []:
+        body += (
+            f'data: {json.dumps({"type": "response.output_item.done", "item": reasoning_item})}\n\n'
+        )
     if text:
         body += (
             f'data: {json.dumps({"type": "response.output_text.delta", "delta": text})}\n\n'
@@ -291,6 +296,406 @@ def test_generate_text_with_tools_degrades_to_plain_when_responses_disabled() ->
     )
     assert text == "plain fallback"
     assert captured["payload"]["model"] == "gpt-5.4"
+
+
+REASONING_ITEM = {
+    "id": "rs_1",
+    "type": "reasoning",
+    "summary": [],
+    "content": [{"type": "reasoning_text", "text": "先查记忆再回答。"}],
+}
+
+
+def test_responses_sse_collects_reasoning_items_for_replay() -> None:
+    body = _responses_tool_stream_body(
+        response_id="r1",
+        text=None,
+        function_calls=[
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "memory_search",
+                "arguments": '{"query":"冰美式"}',
+            }
+        ],
+        reasoning_items=[REASONING_ITEM],
+    )
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+    )
+
+    result = client._extract_responses_result_from_sse(body, model="deepseek-v4-pro")
+
+    # The same item arrives as an ``output_item.done`` event and again inside
+    # the terminal ``response.completed`` payload; replay keeps one copy.
+    assert result.reasoning_items == (REASONING_ITEM,)
+    assert result.function_calls == (
+        LlmFunctionCall(
+            name="memory_search",
+            arguments='{"query":"冰美式"}',
+            call_id="call_1",
+        ),
+    )
+
+
+def test_responses_non_stream_json_collects_reasoning_items() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "r_json",
+                "output": [
+                    REASONING_ITEM,
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "答案"}],
+                    },
+                ],
+            },
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = client._request_responses_stream_result(
+        responses_payload={"model": "deepseek-v4-pro", "input": []},
+        model="deepseek-v4-pro",
+    )
+
+    assert result.text == "答案"
+    assert result.reasoning_items == (REASONING_ITEM,)
+
+
+def test_generate_text_with_tools_replays_reasoning_items_before_function_items() -> None:
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        if len(payloads) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                text=_responses_tool_stream_body(
+                    response_id="r1",
+                    text=None,
+                    function_calls=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "memory_search",
+                            "arguments": '{"query":"冰美式"}',
+                        }
+                    ],
+                    reasoning_items=[REASONING_ITEM],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="r2", text="最终回答"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    text = client.generate_text_with_tools(
+        ["Target message: 阿渣喜欢喝什么？"],
+        tools=MEMORY_TOOLS,
+        tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+    )
+
+    assert text == "最终回答"
+    second_input = payloads[1]["input"]
+    assert second_input[1] == REASONING_ITEM
+    assert [item.get("type") for item in second_input[2:]] == [
+        "function_call",
+        "function_call_output",
+    ]
+
+
+def test_generate_text_with_tools_keeps_parallel_call_block_contiguous() -> None:
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        if len(payloads) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                text=_responses_tool_stream_body(
+                    response_id="r1",
+                    text=None,
+                    function_calls=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "memory_search",
+                            "arguments": '{"query":"冰美式"}',
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_2",
+                            "name": "memory_search",
+                            "arguments": '{"query":"作息"}',
+                        },
+                    ],
+                    reasoning_items=[REASONING_ITEM],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="r2", text="并行回答"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    def executor(_name, arguments):
+        return f"hit for {arguments['query']}"
+
+    text = client.generate_text_with_tools(
+        ["Target message: 阿渣最近怎么样？"],
+        tools=MEMORY_TOOLS,
+        tool_executor=executor,
+    )
+
+    assert text == "并行回答"
+    second_input = payloads[1]["input"]
+    # Parallel calls share one assistant turn: reasoning + both calls first,
+    # then the matching outputs. Interleaving them trips the thinking-mode
+    # "reasoning_text must be passed back" rejection on DeepSeek.
+    assert [item.get("type") for item in second_input[1:]] == [
+        "reasoning",
+        "function_call",
+        "function_call",
+        "function_call_output",
+        "function_call_output",
+    ]
+    assert [item["call_id"] for item in second_input[2:4]] == ["call_1", "call_2"]
+    assert second_input[4]["output"] == "hit for 冰美式"
+    assert second_input[5]["output"] == "hit for 作息"
+
+
+def test_generate_text_with_tools_degrades_to_plain_when_tool_round_is_rejected(caplog) -> None:
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        if len(payloads) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                text=_responses_tool_stream_body(
+                    response_id="r1",
+                    text=None,
+                    function_calls=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "memory_search",
+                            "arguments": '{"query":"冰美式"}',
+                        }
+                    ],
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        if len(payloads) == 2:
+            return httpx.Response(
+                400,
+                request=request,
+                json={
+                    "error": {
+                        "message": "The `reasoning_text` in the thinking mode must be passed back to the API.",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="r3", text="降级后的回答"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
+        text = client.generate_text_with_tools(
+            ["Target message: 阿渣喜欢喝什么？"],
+            tools=MEMORY_TOOLS,
+            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+            max_tool_rounds=2,
+        )
+
+    assert text == "降级后的回答"
+    assert len(payloads) == 3
+    assert "tools" not in payloads[2]
+    assert not any(
+        item.get("type") in {"function_call", "function_call_output"}
+        for item in payloads[2]["input"]
+    )
+    assert any(
+        "responses_tools_http_error_fallback_to_plain" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_generate_text_with_tools_degrades_when_fallback_model_round_is_rejected(
+    caplog,
+) -> None:
+    payloads: list[dict] = []
+    empty_stream_body = (
+        f'data: {json.dumps({"type": "response.created", "response": {"id": "r_empty"}})}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content.decode("utf-8")))
+        if len(payloads) <= 3:
+            # The primary model answers 200 three times without text or tool
+            # calls, which exhausts the bounded responses attempt budget and
+            # raises ``ValueError`` into the tool loop.
+            return httpx.Response(
+                200,
+                request=request,
+                text=empty_stream_body,
+                headers={"content-type": "text/event-stream"},
+            )
+        if len(payloads) == 4:
+            return httpx.Response(
+                400,
+                request=request,
+                json={
+                    "error": {
+                        "message": "The `reasoning_text` in the thinking mode must be passed back to the API.",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            text=_responses_stream_body(response_id="r_final", text="降级后的回答"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        fallback_model="deepseek-v4-flash",
+        responses_model="deepseek-v4-pro",
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
+        text = client.generate_text_with_tools(
+            ["Target message: 阿渣喜欢喝什么？"],
+            tools=MEMORY_TOOLS,
+            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+        )
+
+    assert text == "降级后的回答"
+    assert [payload["model"] for payload in payloads] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-pro",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
+    assert "tools" not in payloads[-1]
+    assert any(
+        "responses_tools_http_error_fallback_to_plain" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_responses_non_retryable_4xx_logs_one_bounded_rejection(caplog) -> None:
+    attempts = 0
+    long_message = (
+        "The `reasoning_text` in the thinking mode must be passed back to the API. "
+        + "detail " * 80
+        + "TAIL_MARKER"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            400,
+            request=request,
+            json={
+                "error": {
+                    "message": long_message,
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error",
+                }
+            },
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        responses_only=True,
+        reasoning_effort="max",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.generate_text(["Target message: 私密问题原文"])
+
+    assert attempts == 1
+    rejections = [
+        record.getMessage()
+        for record in caplog.records
+        if "responses_request_rejected" in record.getMessage()
+    ]
+    assert len(rejections) == 1
+    assert "status=400" in rejections[0]
+    assert "reasoning_text" in rejections[0]
+    assert "TAIL_MARKER" not in rejections[0]
+    assert "私密问题原文" not in rejections[0]
 
 
 def test_llm_client_posts_to_chat_completions_endpoint_with_bearer_auth() -> None:
