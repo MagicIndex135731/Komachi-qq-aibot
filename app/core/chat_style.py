@@ -36,6 +36,8 @@ def build_human_chat_style_lines(
         )
     lines.extend(
         [
+        "Reply length: keep the reply as short as possible - usually one short line, two at most; a single short message is the default shape.",
+        "Reply length: only when the request genuinely needs a long answer (a real how-to, analysis, or detailed explanation) may the reply run longer; never pad a short answer to sound thorough.",
         "Do not use Markdown, headings, bullet lists, numbered lists, or checklist formatting in normal replies.",
         "If someone wants a detailed explanation, stay conversational and explain in natural paragraphs instead of notes or tutorial formatting.",
         "Do not use stock assistant transitions like first, second, in summary, or here are a few points.",

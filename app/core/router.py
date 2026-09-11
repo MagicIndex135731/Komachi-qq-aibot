@@ -810,15 +810,33 @@ class InboundRouter:
             event, reply_text, platform_msg_id=platform_msg_id
         )
 
+    def _reply_split_config(self) -> dict:
+        """Delivery shape for a chat reply, taken from settings not the persona.
+
+        The persona only describes style and personality; how a long answer is
+        broken into QQ messages is a system-level policy.
+        """
+
+        settings = self.runtime.settings
+        min_delay = max(0.0, float(getattr(settings, "group_reply_split_min_delay_seconds", 0.0)))
+        max_delay = max(min_delay, float(getattr(settings, "group_reply_split_max_delay_seconds", min_delay)))
+        return {
+            "enabled": bool(getattr(settings, "group_reply_split_enabled", True)),
+            "separator": "|",
+            "max_messages": max(1, min(6, int(getattr(settings, "group_reply_split_max_messages", 3)))),
+            "max_chars": max(8, int(getattr(settings, "group_reply_split_max_chars", 64))),
+            "auto_split_long_segments": True,
+            "min_delay_seconds": min_delay,
+            "max_delay_seconds": max_delay,
+        }
+
     async def _send_chat_reply(self, event, reply_text: str) -> None:
         """Send an LLM chat reply, optionally as a short multi-message burst."""
 
         active_persona = self._active_persona(event.group_id)
-        burst = (
-            active_persona.get("burst")
-            if isinstance(active_persona, dict)
-            else None
-        )
+        # Delivery shape comes from settings, not from the persona: the persona
+        # file only describes style and personality.
+        burst = self._reply_split_config()
         segments = split_burst_reply(reply_text, burst)
         impersonating = self._impersonating(event.group_id)
         base_id = self._outbound_platform_msg_id(event.platform_msg_id)
@@ -3114,13 +3132,10 @@ class InboundRouter:
             raw_reply = _scrub_impersonation_reply(raw_reply)
         if prepared_reply.proactive_turn:
             return normalize_brief_group_interjection_reply(raw_reply)
-        active_persona = self._active_persona(event.group_id)
-        burst = (
-            active_persona.get("burst")
-            if isinstance(active_persona, dict)
-            else None
-        )
-        return normalize_chat_reply_burst_aware(raw_reply, burst)
+        # Normal replies are normalized as plain text: the model's own line
+        # breaks must not silently turn into extra QQ messages.  Only an
+        # over-long answer is split later, by the delivery policy.
+        return normalize_chat_reply(raw_reply)
 
     def _enforce_envelope_reply(
         self,

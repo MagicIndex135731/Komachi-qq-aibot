@@ -124,19 +124,6 @@ def render_persona(persona: dict) -> str:
     if example_lines:
         examples = " ".join(f"「{line}」" for line in example_lines[:16])
         details.append(f"Example replies: {examples}.")
-    if isinstance(burst, dict) and burst.get("enabled"):
-        separator = str(burst.get("separator") or "|")
-        max_messages = max(1, min(6, int(burst.get("max_messages") or 3)))
-        max_chars = max(8, int(burst.get("max_chars") or 24))
-        details.append(
-            f"Reply burst: send your reply as 1-{max_messages} short QQ messages "
-            f"joined by '{separator}'. Most replies are a single message; use two "
-            f"or three only when the reply really has that many separate beats, "
-            f"and never pad the count to the maximum. Each part is one complete "
-            f"short line a person types in one breath, usually under about "
-            f"{max_chars} characters. The text is sent exactly as written, so "
-            f"size it to the shape you picked instead of expecting a trim."
-        )
     if isinstance(external_relations, list):
         for item in external_relations:
             if not isinstance(item, dict):
@@ -172,7 +159,6 @@ def render_persona(persona: dict) -> str:
                 secondary_details.append(" | ".join(parts))
         if secondary_details:
             details.append(f"Secondary personas: {' || '.join(secondary_details)}.")
-    details.append("Keep replies concise unless asked to expand.")
     return " ".join(details)
 
 

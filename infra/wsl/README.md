@@ -179,6 +179,18 @@ SnowLuma 本体（含 hook 自动挂载）都会自动起来，**但 QQ 不会�
 5. 上线后**不会补答离线期间积压的消息**：`GROUP_MESSAGE_MAX_AGE_SECONDS=300`
    之外的旧消息只归档、不回复（日志 `group_message_stale_archived`）。
 
+#### 回复长度与拆分的边界（2026-09-11 调整）
+
+`configs/persona.yaml` 只描述**风格和人格**，不再出现任何"几条消息 / 多少字 /
+用不用 Markdown"的格式约束；拆条与长度策略全部在系统层：
+
+- 默认尽量短：`app/core/chat_style.py` 的 `Reply length` 两条规则要求"一条短消息
+  为默认形态，只有问题确实需要长回答（教程 / 分析 / 详细说明）才展开"；
+- 拆条由 `.env` 的 `GROUP_REPLY_SPLIT_*` 控制：`GROUP_REPLY_SPLIT_MAX_CHARS=64`
+  之内的回答**原样单条发出**；超过时才在句号/逗号处切成最多
+  `GROUP_REPLY_SPLIT_MAX_MESSAGES=3` 条（只拆不丢字，不切句中）；
+- 回复里的换行会被合并成同一句，不再因为换行变成多条消息。
+
 回滚：`QQ_PLATFORM=llbot` + `systemctl restart xiaomachi-stack.service`。
 
 LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的

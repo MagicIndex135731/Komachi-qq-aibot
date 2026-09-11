@@ -22,7 +22,7 @@ def test_render_persona_matches_expected_template() -> None:
 
     assert text == (
         "You are Mira. Identity: AI assistant. Core traits: calm, curious. "
-        "Speaking tone: natural. Keep replies concise unless asked to expand."
+        "Speaking tone: natural."
     )
 
 
@@ -38,7 +38,7 @@ def test_render_persona_accepts_scalar_traits_and_missing_style() -> None:
 
     assert text == (
         "You are Mira. Identity: AI assistant. Core traits: calm. "
-        "Speaking tone: natural. Keep replies concise unless asked to expand."
+        "Speaking tone: natural."
     )
 
 
@@ -67,39 +67,22 @@ def test_render_persona_includes_speaking_style_details() -> None:
     assert "Opening style: 常用“感觉”起句." in text
 
 
-def test_render_persona_includes_burst_instruction_with_caps() -> None:
+def test_render_persona_never_mentions_reply_formatting() -> None:
+    """The persona describes style and personality, never the reply shape."""
+
     persona = {
         "name": "Mira",
         "identity": "AI assistant",
         "core_traits": ["calm"],
         "speaking_style": {"tone": "natural"},
-        "burst": {
-            "enabled": True,
-            "separator": "|",
-            "max_messages": 3,
-            "max_chars": 24,
-        },
+        "burst": {"enabled": True, "separator": "|", "max_messages": 3},
     }
 
     text = render_persona(persona)
 
-    assert "Reply burst" in text
-    assert "1-3 short QQ messages joined by '|'" in text
-    assert "Most replies are a single message" in text
-    assert "never pad the count to the maximum" in text
-    assert "sent exactly as written" in text
-
-
-def test_render_persona_skips_disabled_burst_instruction() -> None:
-    persona = {
-        "name": "Mira",
-        "identity": "AI assistant",
-        "core_traits": ["calm"],
-        "speaking_style": {"tone": "natural"},
-        "burst": {"enabled": False, "separator": "|", "max_messages": 3},
-    }
-
-    assert "Reply burst" not in render_persona(persona)
+    assert "Reply burst" not in text
+    assert "Keep replies concise" not in text
+    assert "message" not in text.lower()
 
 
 def test_render_persona_includes_secondary_persona_rules() -> None:

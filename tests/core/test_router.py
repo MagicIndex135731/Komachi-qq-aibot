@@ -746,13 +746,11 @@ async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> N
         sender=sender,
         llm_client=llm,
     )
-    router.runtime.persona["burst"] = {
-        "enabled": True,
-        "separator": "|",
-        "max_messages": 3,
-        "min_delay_seconds": 0,
-        "max_delay_seconds": 0,
-    }
+    router.runtime.settings.group_reply_split_enabled = True
+    router.runtime.settings.group_reply_split_max_messages = 3
+    router.runtime.settings.group_reply_split_max_chars = 64
+    router.runtime.settings.group_reply_split_min_delay_seconds = 0
+    router.runtime.settings.group_reply_split_max_delay_seconds = 0
 
     await router.handle_group_message(
         make_event(group_id=10001, mentioned_bot=True)
@@ -762,7 +760,9 @@ async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> N
 
 
 @pytest.mark.asyncio
-async def test_router_sends_newline_burst_as_separate_messages(sqlite_engine) -> None:
+async def test_router_collapses_model_line_breaks_into_one_message(sqlite_engine) -> None:
+    """Only over-long answers are split; the model's line breaks collapse."""
+
     sender = FakeSender()
     llm = LongReplyLlm("来了\n人呢")
     router = InboundRouter.build_for_test(
@@ -770,20 +770,17 @@ async def test_router_sends_newline_burst_as_separate_messages(sqlite_engine) ->
         sender=sender,
         llm_client=llm,
     )
-    router.runtime.persona["burst"] = {
-        "enabled": True,
-        "separator": "|",
-        "max_messages": 3,
-        "max_chars": 18,
-        "min_delay_seconds": 0,
-        "max_delay_seconds": 0,
-    }
+    router.runtime.settings.group_reply_split_enabled = True
+    router.runtime.settings.group_reply_split_max_messages = 3
+    router.runtime.settings.group_reply_split_max_chars = 18
+    router.runtime.settings.group_reply_split_min_delay_seconds = 0
+    router.runtime.settings.group_reply_split_max_delay_seconds = 0
 
     await router.handle_group_message(
         make_event(group_id=10001, mentioned_bot=True)
     )
 
-    assert [outbound.text for outbound in sender.sent] == ["来了", "人呢"]
+    assert [outbound.text for outbound in sender.sent] == ["来了 人呢"]
 
 
 @pytest.mark.asyncio

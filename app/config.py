@@ -82,6 +82,34 @@ class AppSettings(BaseSettings):
         ge=0,
         alias="GROUP_MESSAGE_MAX_AGE_SECONDS",
     )
+    # Reply delivery shape.  These live outside the persona so the persona file
+    # only describes style and personality: normal replies stay short, and only
+    # an over-long answer is split into several QQ messages.
+    group_reply_split_enabled: bool = Field(
+        default=True,
+        alias="GROUP_REPLY_SPLIT_ENABLED",
+    )
+    group_reply_split_max_messages: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        alias="GROUP_REPLY_SPLIT_MAX_MESSAGES",
+    )
+    group_reply_split_max_chars: int = Field(
+        default=64,
+        ge=8,
+        alias="GROUP_REPLY_SPLIT_MAX_CHARS",
+    )
+    group_reply_split_min_delay_seconds: float = Field(
+        default=0.8,
+        ge=0.0,
+        alias="GROUP_REPLY_SPLIT_MIN_DELAY_SECONDS",
+    )
+    group_reply_split_max_delay_seconds: float = Field(
+        default=2.5,
+        ge=0.0,
+        alias="GROUP_REPLY_SPLIT_MAX_DELAY_SECONDS",
+    )
     memory_compaction_enabled: bool = Field(default=True, alias="MEMORY_COMPACTION_ENABLED")
     memory_compaction_batch_size: int = Field(default=50, alias="MEMORY_COMPACTION_BATCH_SIZE")
     memory_compaction_max_facts: int = Field(default=24, alias="MEMORY_COMPACTION_MAX_FACTS")
