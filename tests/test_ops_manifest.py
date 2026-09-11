@@ -14,6 +14,7 @@ def test_supported_wsl_operations_files_exist() -> None:
         "open-napcat-webui.bat",
         "open-llbot-webui.bat",
         "open-snowluma-webui.bat",
+        "open-snowluma-desktop.bat",
         "infra/wsl/docker-compose.yml",
         "infra/wsl/docker-compose.llbot.yml",
         "infra/wsl/docker-compose.snowluma.yml",

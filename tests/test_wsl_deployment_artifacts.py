@@ -40,6 +40,7 @@ def test_wsl_required_files_exist() -> None:
         "open-napcat-webui.bat",
         "open-llbot-webui.bat",
         "open-snowluma-webui.bat",
+        "open-snowluma-desktop.bat",
         "infra/wsl/docker-compose.llbot.yml",
         "infra/wsl/docker-compose.snowluma.yml",
         "infra/wsl/scripts/bootstrap_llbot_runtime.py",

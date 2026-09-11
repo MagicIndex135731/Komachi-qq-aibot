@@ -148,6 +148,24 @@ curl -sS -X POST -H "Authorization: Bearer <webui-token>" \
 
 清空后 `ws-default` 会显示 `1 个客户端`（即 xiaomachi bot 已连接）。
 
+#### SnowLuma 的冷启动限制（实测 2026-09-11）
+
+PC 开机（或 `wsl --shutdown`）后的自恢复链路里，WSL、Docker、两个容器、
+SnowLuma 本体（含 hook 自动挂载）都会自动起来，**但 QQ 不会自动登录**：
+
+- QQ 客户端默认停在"手机QQ扫码登录"页，需要人工扫码；
+- 即使登录时勾选了"自动登录"，也没有效果：容器停止时 QQ 客户端是
+  **崩溃退出**的（`/app/.config/QQ/crash_files/tomb_*.txt` 里 `signal: 5
+  (SIGTRAP)`），登录态来不及落盘，下次启动回到扫码页；
+- 上游 SnowLuma 没有免扫码的环境变量（只有 EULA/PRIVACY/DEV_MODE/
+  UPDATE_CHECK/WEBUI_BOOTSTRAP_PASSWORD/TRUST_PROXY），`qq --help` 也没有
+  自动登录开关；
+- LLBot 自带会话文件（`qq-session-*.json`），容器/守护进程重启后能自动重登；
+  NapCat 类似。若"开机零人工"是硬要求，这是选择平台时的关键差异。
+
+因此开机后需要：双击 `open-snowluma-desktop.bat`（noVNC 直达 QQ 桌面并自动
+填入 VNC 密码）→ 点"刷新" → 手机扫码。watchdog 在离线时会弹 Windows 通知提醒。
+
 回滚：`QQ_PLATFORM=llbot` + `systemctl restart xiaomachi-stack.service`。
 
 LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的
