@@ -576,6 +576,14 @@ class BbotListenerCacheEntry(Base):
 
 
 class DevSession(Base):
+    """Private-chat turn store.
+
+    The table predates the chat-only private service (2026-09-11): it used to
+    hold Codex project sessions, and now backs daily private conversations and
+    private drawings.  The schema is kept without migration so existing rows
+    stay readable; ``session_mode`` is ``daily`` for every new session.
+    """
+
     __tablename__ = "dev_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -588,6 +596,12 @@ class DevSession(Base):
 
 
 class DevTask(Base):
+    """One private-chat turn (or private image job) inside a dev session.
+
+    ``intent_type`` is ``private_chat`` for chat turns; the file/command and
+    restart columns are legacy and stay empty.
+    """
+
     __tablename__ = "dev_tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

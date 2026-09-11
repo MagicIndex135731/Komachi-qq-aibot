@@ -15,11 +15,9 @@ from zoneinfo import ZoneInfo
 
 from app.adapters.sender import (
     OutboundMessage,
-    OutboundPrivateMessage,
     QQMessageBlockedError,
     QQMessageDeliveryUncertainError,
 )
-from app.admin.commands import AdminCommandParser, CommandContext
 from app.config import AppSettings, RuntimeConfig
 from app.core.bbot_bridge import build_bbot_outbound_message, resolve_bbot_command
 from app.core.memory_compaction import (
@@ -350,10 +348,9 @@ class InboundRouter:
     llm_client: object
     reply_policy: ReplyPolicy
     context_builder: ContextBuilder
-    admin_parser: AdminCommandParser
     proactive_judge_client: object | None = None
     web_search_client: WebSearchClient | None = None
-    dev_control_service: object | None = None
+    private_chat_service: object | None = None
     group_image_service: object | None = None
     memory_compaction_service: object | None = None
     memory_orchestrator: MemoryOrchestrator | None = None
@@ -406,7 +403,7 @@ class InboundRouter:
         sender,
         llm_client,
         web_search_client=None,
-        dev_control_service=None,
+        private_chat_service=None,
         group_image_service=None,
         memory_compaction_service=None,
         memory_orchestrator=None,
@@ -420,7 +417,6 @@ class InboundRouter:
             llm_supports_vision_input=True,
             bot_qq=123456789,
             owner_qq=987654321,
-            admin_qqs="",
             search_provider="tavily",
             search_base_url="https://api.tavily.com/search",
             search_api_key="",
@@ -473,8 +469,7 @@ class InboundRouter:
             web_search_client=web_search_client,
             reply_policy=ReplyPolicy(),
             context_builder=ContextBuilder(),
-            admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
-            dev_control_service=dev_control_service,
+            private_chat_service=private_chat_service,
             group_image_service=group_image_service,
             memory_compaction_service=memory_compaction_service,
             memory_orchestrator=memory_orchestrator,
@@ -3415,75 +3410,18 @@ class InboundRouter:
             return None
         return payload
 
-    async def _send_private_text(self, *, user_id: int, text: str) -> None:
-        await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
-
-    def _configured_group_ids(self) -> list[int]:
-        return [int(group_id) for group_id in self.runtime.group_policy.get("groups", {})]
-
-    def _runtime_group_speak_value(self, group_id: int) -> bool:
-        defaults = self.runtime.group_policy.get("default_group_behavior", {})
-        configured = self.runtime.group_policy.get("groups", {}).get(str(group_id), {})
-        return bool(configured.get("speak", defaults.get("speak", False)))
-
-    def _execute_private_admin_command(self, *, sender_qq: int, raw_text: str) -> str | None:
-        command = self.admin_parser.parse(
-            raw_text,
-            CommandContext(sender_qq=sender_qq, is_private_chat=True, group_id=None),
-        )
-        if command is None:
-            return None
-
-        with session_scope(self.engine) as session:
-            groups = GroupRepository(session)
-            if command.name == "group_allow":
-                group_id = int(command.arguments["group_id"])
-                groups.set_enabled(group_id, True)
-                groups.set_speak_enabled(group_id, True)
-                return f"已允许群 {group_id} 发言。"
-            if command.name == "group_deny":
-                group_id = int(command.arguments["group_id"])
-                groups.set_enabled(group_id, True)
-                groups.set_speak_enabled(group_id, False)
-                return f"已禁止群 {group_id} 发言。"
-            if command.name == "status":
-                configured_count = len(self._configured_group_ids())
-                return (
-                    f"当前模型是 {self.runtime.settings.llm_model}，"
-                    f"Bot QQ 是 {self.runtime.settings.bot_qq}，"
-                    f"配置里的群数量是 {configured_count}。"
-                )
-            if command.name == "off":
-                for group_id in self._configured_group_ids():
-                    groups.set_enabled(group_id, False)
-                    groups.set_speak_enabled(group_id, False)
-                return "我先把配置里的群都静音了。"
-            if command.name == "on":
-                for group_id in self._configured_group_ids():
-                    groups.set_enabled(group_id, True)
-                    groups.set_speak_enabled(group_id, self._runtime_group_speak_value(group_id))
-                return "我把配置里的群发言状态恢复了。"
-        return None
-
     async def handle_private_message(self, event) -> None:
+        """Persist one direct message and hand it to the private chat service.
+
+        Group commands and project/admin control are intentionally gone: the
+        private surface is chat-only (see research/39-private-chat-only-scope).
+        """
+
         persisted = self._persist_private_inbound_message(event)
         if not persisted:
             return
 
-        reply_text = self._execute_private_admin_command(sender_qq=event.user_id, raw_text=event.plain_text)
-        if reply_text is not None:
-            await self._send_private_text(user_id=event.user_id, text=reply_text)
-            return
-
-        if self.dev_control_service is not None:
-            handled = await self.dev_control_service.handle_private_message(event)
+        if self.private_chat_service is not None:
+            handled = await self.private_chat_service.handle_private_message(event)
             if handled:
                 return
-
-    async def handle_private_command(self, *, sender_qq: int, raw_text: str) -> None:
-        event = type(
-            "PrivateCommandEvent",
-            (),
-            {"user_id": sender_qq, "plain_text": raw_text},
-        )()
-        await self.handle_private_message(event)

@@ -11,7 +11,7 @@ if (-not $SourceRoot) {
 }
 
 $SourceRoot = [System.IO.Path]::GetFullPath($SourceRoot)
-$StateDir = Join-Path $SourceRoot "data\dev_control"
+$StateDir = Join-Path $SourceRoot "data\public_release_sync"
 $PidFile = Join-Path $StateDir "public_release_sync.pid"
 $StdOutLog = Join-Path $StateDir "public_release_sync.out.log"
 $StdErrLog = Join-Path $StateDir "public_release_sync.err.log"

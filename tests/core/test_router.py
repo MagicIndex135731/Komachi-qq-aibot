@@ -3620,28 +3620,6 @@ async def test_router_persists_inbound_message_before_reply_policy(sqlite_engine
 
 
 @pytest.mark.asyncio
-async def test_router_applies_private_group_allow_command(sqlite_engine) -> None:
-    sender = FakeSender()
-    llm = FakeLlm()
-    router = InboundRouter.build_for_test(
-        sqlite_engine=sqlite_engine,
-        sender=sender,
-        llm_client=llm,
-    )
-
-    await router.handle_private_command(sender_qq=987654321, raw_text="/bot group allow 30003")
-    await router.handle_group_message(make_event(group_id=30003, mentioned_bot=True, message_id="m-allow"))
-
-    with session_scope(sqlite_engine) as session:
-        group = GroupRepository(session).get_group(30003)
-
-    assert group is not None
-    assert group.speak_enabled is True
-    assert [outbound.text for outbound in sender.sent] == ["I am here."]
-    assert len(llm.calls) == 1
-
-
-@pytest.mark.asyncio
 async def test_router_stays_silent_in_non_allowlisted_group(sqlite_engine) -> None:
     sender = FakeSender()
     llm = FakeLlm()

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
-from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
@@ -18,7 +17,6 @@ from app.adapters.onebot_models import (
     resolve_message_type,
 )
 from app.adapters.sender import Sender
-from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationService
@@ -69,8 +67,8 @@ from app.core.message_archive import sync_group_message_archives_from_db
 from app.core.persona_switch import PersonaManager, PersonaSwitchService
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
-from app.dev_control.service import DevControlService
 from app.providers.llm_client import LlmClient
+from app.private_chat.service import PrivateChatService
 from app.providers.semantic_embeddings import EmbeddingProvider, build_embedding_provider
 from app.providers.web_search import WebSearchClient
 from app.runtime_heartbeat import RuntimeHeartbeat
@@ -1506,7 +1504,7 @@ async def run() -> None:
     group_image_service = None
     memory_compaction_service = None
     memory_runtime = None
-    dev_control_service = None
+    private_chat_service = None
     try:
         await heartbeat.start()
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
@@ -1557,7 +1555,7 @@ async def run() -> None:
             await group_image_service.start()
         if memory_compaction_service is not None:
             await memory_compaction_service.start()
-        dev_control_service = DevControlService(
+        private_chat_service = PrivateChatService(
             engine=engine,
             sender=sender,
             llm_client=llm_client,
@@ -1565,8 +1563,6 @@ async def run() -> None:
             owner_qq=settings.owner_qq,
             bot_qq=settings.bot_qq,
             private_chat_qqs=settings.private_chat_whitelist,
-            admin_qqs=settings.admin_whitelist,
-            repo_root=Path(__file__).resolve().parent.parent,
             data_dir=settings.data_dir,
             web_search_client=web_search_client,
             image_model=settings.group_image_model,
@@ -1579,11 +1575,11 @@ async def run() -> None:
             image_queue_capacity=settings.group_image_queue_capacity,
             image_max_attempts=1,
             image_timeout_seconds=settings.group_image_timeout_seconds,
-            assistant_name=str(runtime.persona.get("name", "Codex")),
+            assistant_name=str(runtime.persona.get("name", "小町")),
             persona=runtime.persona,
             safety=runtime.safety,
         )
-        await dev_control_service.start()
+        await private_chat_service.start()
         persona_manager = PersonaManager(
             engine=engine,
             personas=getattr(runtime, "personas", {}) or {},
@@ -1603,9 +1599,8 @@ async def run() -> None:
             proactive_judge_client=proactive_judge_client,
             reply_policy=ReplyPolicy(),
             context_builder=ContextBuilder(),
-            admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
             web_search_client=web_search_client,
-            dev_control_service=dev_control_service,
+            private_chat_service=private_chat_service,
             group_image_service=group_image_service,
             memory_compaction_service=memory_compaction_service,
             memory_orchestrator=memory_runtime.memory_orchestrator,
@@ -1678,8 +1673,8 @@ async def run() -> None:
             await group_image_service.stop()
         if memory_compaction_service is not None:
             await memory_compaction_service.stop()
-        if dev_control_service is not None:
-            await dev_control_service.stop()
+        if private_chat_service is not None:
+            await private_chat_service.stop()
         await heartbeat.stop()
 
 

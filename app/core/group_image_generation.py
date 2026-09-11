@@ -696,15 +696,3 @@ class PrivateImageGenerationService(GroupImageGenerationService):
             dev_task_id=int(payload["dev_task_id"]) if payload.get("dev_task_id") else None,
         )
 
-    def pending_dev_task_ids(self) -> set[int]:
-        if self.engine is None:
-            return set()
-        with session_scope(self.engine) as session:
-            jobs = JobRepository(session).list_jobs(job_type=self.job_type, statuses=["queued", "running"])
-        task_ids: set[int] = set()
-        for job in jobs:
-            payload = job.payload_json if isinstance(job.payload_json, dict) else {}
-            task_id = payload.get("dev_task_id")
-            if isinstance(task_id, int) and task_id > 0:
-                task_ids.add(task_id)
-        return task_ids

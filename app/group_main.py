@@ -12,7 +12,6 @@ from sqlalchemy import bindparam, text
 from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_group_message_event, resolve_message_type
 from app.adapters.sender import Sender
-from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
@@ -480,9 +479,8 @@ async def run() -> None:
             proactive_judge_client=proactive_judge_client,
             reply_policy=ReplyPolicy(),
             context_builder=ContextBuilder(),
-            admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
             web_search_client=web_search_client,
-            dev_control_service=None,
+            private_chat_service=None,
             group_image_service=group_image_service,
             memory_compaction_service=memory_compaction_service,
             memory_orchestrator=memory_runtime.memory_orchestrator,

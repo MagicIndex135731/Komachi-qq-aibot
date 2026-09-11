@@ -44,7 +44,6 @@ def _settings_for_search(*, provider: str, search_api_key: str) -> AppSettings:
         group_image_timeout_seconds=900.0,
         bot_qq=123456789,
         owner_qq=987654321,
-        admin_qqs="",
         search_provider=provider,
         search_base_url="https://api.tavily.com/search",
         search_api_key=search_api_key,
@@ -391,9 +390,9 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
         def __init__(self, **kwargs) -> None:
             router_arguments.update(kwargs)
 
-    class FakeDevControlService:
+    class FakePrivateChatService:
         def __init__(self, **kwargs) -> None:
-            router_arguments["dev_control_service_init"] = kwargs
+            router_arguments["private_chat_service_init"] = kwargs
 
         async def start(self) -> None:
             return None
@@ -432,8 +431,7 @@ async def test_run_wires_web_search_client_into_router(monkeypatch) -> None:
     )
     monkeypatch.setattr(app_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(app_main, "ContextBuilder", lambda: object())
-    monkeypatch.setattr(app_main, "AdminCommandParser", lambda **_kwargs: object())
-    monkeypatch.setattr(app_main, "DevControlService", FakeDevControlService)
+    monkeypatch.setattr(app_main, "PrivateChatService", FakePrivateChatService)
     monkeypatch.setattr(
         app_main,
         "build_memory_runtime",

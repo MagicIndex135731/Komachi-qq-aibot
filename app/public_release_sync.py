@@ -248,7 +248,7 @@ class PublicReleaseSync:
                 return True
             if parts[1] in {
                 "history",
-                "dev_control",
+                "public_release_sync",
                 "image_cache",
                 "generated_images",
                 "generated_private_images",

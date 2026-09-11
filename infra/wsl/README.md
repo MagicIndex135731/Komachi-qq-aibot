@@ -68,7 +68,7 @@ WebSocket 客户端，但群聊进程只处理群消息，所以私聊必须有�
 
 - `xiaomachi-bot` 运行 `python -m app.group_main`，只处理 `message_type=group`；
 - `xiaomachi-private` 运行 `python -m app.private_main`，只处理
-  `message_type=private`（管理员命令、私聊开发对话、提醒），不运行群聊的
+  `message_type=private`（人格对话、私聊生图、提醒），不运行群聊的
   embedding 预热、记忆回填和启动窗口重放；
 - 两个容器共享 `NAPCAT_WS_URL` 和 `xiaomachi-bot-data` 卷；SQLite 以 WAL +
   `busy_timeout=30000` 串行写入，私聊与群聊可以同时落库；
@@ -77,7 +77,7 @@ WebSocket 客户端，但群聊进程只处理群消息，所以私聊必须有�
 - 未知的 `message_type` 不会被静默丢弃：两个进程都会记录
   `inbound_message_unhandled`（含原始值与 payload 字段名），已知但不属于本进程
   的类型（群聊进程收到私聊）也会留下 `inbound_message_ignored`。
-- `.env` 只在容器创建时读取：改动 `LLM_*`、`PRIVATE_CHAT_QQS`、`ADMIN_QQS` 或
+- `.env` 只在容器创建时读取：改动 `LLM_*`、`PRIVATE_CHAT_QQS` 或
   代理变量后，需要同时重建 `xiaomachi` 与 `xiaomachi-private`（`--no-deps`，
   不得重启 QQ 平台容器）。
 

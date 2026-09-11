@@ -25,7 +25,6 @@ import yaml
 
 from app.adapters.onebot_models import parse_group_message_event
 from app.adapters.sender import Sender
-from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
 from app.core.chat_style import split_burst_reply
 from app.core.context_builder import ContextBuilder
@@ -364,13 +363,12 @@ def main() -> int:
         proactive_judge_client=None,
         reply_policy=ReplyPolicy(),
         web_search_client=None,
-        dev_control_service=None,
+        private_chat_service=None,
         group_image_service=None,
         memory_compaction_service=None,
         memory_orchestrator=memory_runtime.memory_orchestrator,
         persona_manager=manager,
         context_builder=ContextBuilder(),
-        admin_parser=AdminCommandParser(admin_whitelist=settings.admin_whitelist),
         persona_switch_service=PersonaSwitchService(
             manager=manager,
             sender=FakeSender(),

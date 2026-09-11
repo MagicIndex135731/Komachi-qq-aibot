@@ -25,7 +25,7 @@ class FakeLlm:
         return "unused"
 
 
-class FakeDevControlService:
+class FakePrivateChatService:
     def __init__(self) -> None:
         self.events = []
 
@@ -57,32 +57,32 @@ def make_private_event(
 
 
 @pytest.mark.asyncio
-async def test_router_forwards_owner_private_message_to_dev_service(sqlite_engine) -> None:
+async def test_router_forwards_owner_private_message_to_chat_service(sqlite_engine) -> None:
     sender = FakeSender()
-    dev_service = FakeDevControlService()
+    chat_service = FakePrivateChatService()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=FakeLlm(),
-        dev_control_service=dev_service,
+        private_chat_service=chat_service,
     )
     router.runtime.settings.owner_qq = 10001
 
     await router.handle_private_message(make_private_event(user_id=10001, text="check logs"))
 
-    assert [event.plain_text for event in dev_service.events] == ["check logs"]
+    assert [event.plain_text for event in chat_service.events] == ["check logs"]
     assert sender.private_sent == []
 
 
 @pytest.mark.asyncio
 async def test_router_ignores_duplicate_owner_private_message_delivery(sqlite_engine) -> None:
     sender = FakeSender()
-    dev_service = FakeDevControlService()
+    chat_service = FakePrivateChatService()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=FakeLlm(),
-        dev_control_service=dev_service,
+        private_chat_service=chat_service,
     )
     router.runtime.settings.owner_qq = 10001
     event = make_private_event(user_id=10001, text="check logs")
@@ -90,19 +90,19 @@ async def test_router_ignores_duplicate_owner_private_message_delivery(sqlite_en
     await router.handle_private_message(event)
     await router.handle_private_message(event)
 
-    assert [payload.platform_msg_id for payload in dev_service.events] == ["p-1"]
+    assert [payload.platform_msg_id for payload in chat_service.events] == ["p-1"]
     assert sender.private_sent == []
 
 
 @pytest.mark.asyncio
 async def test_router_private_message_dedup_does_not_conflict_with_group_message_ids(sqlite_engine) -> None:
     sender = FakeSender()
-    dev_service = FakeDevControlService()
+    chat_service = FakePrivateChatService()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=FakeLlm(),
-        dev_control_service=dev_service,
+        private_chat_service=chat_service,
     )
     router.runtime.settings.owner_qq = 10001
 
@@ -123,19 +123,20 @@ async def test_router_private_message_dedup_does_not_conflict_with_group_message
 
     await router.handle_private_message(make_private_event(user_id=10001, text="check logs"))
 
-    assert [event.plain_text for event in dev_service.events] == ["check logs"]
+    assert [event.plain_text for event in chat_service.events] == ["check logs"]
     assert sender.private_sent == []
 
 
 @pytest.mark.asyncio
-async def test_router_handles_private_group_allow_command_without_dev_service(sqlite_engine) -> None:
+async def test_router_ignores_private_admin_commands(sqlite_engine) -> None:
+    # The private surface is chat-only: ``/bot ...`` admin commands are gone.
     sender = FakeSender()
-    dev_service = FakeDevControlService()
+    chat_service = FakePrivateChatService()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=FakeLlm(),
-        dev_control_service=dev_service,
+        private_chat_service=chat_service,
     )
     router.runtime.settings.owner_qq = 10001
 
@@ -144,21 +145,20 @@ async def test_router_handles_private_group_allow_command_without_dev_service(sq
     with session_scope(sqlite_engine) as session:
         group = GroupRepository(session).get_group(10086)
 
-    assert group is not None
-    assert group.speak_enabled is True
-    assert [outbound.text for outbound in sender.private_sent] == ["已允许群 10086 发言。"]
-    assert dev_service.events == []
+    assert group is None
+    assert sender.private_sent == []
+    assert [event.plain_text for event in chat_service.events] == ["/bot group allow 10086"]
 
 
 @pytest.mark.asyncio
 async def test_router_persists_private_images_and_forwards_cached_event(sqlite_engine, tmp_path, monkeypatch) -> None:
     sender = FakeSender()
-    dev_service = FakeDevControlService()
+    chat_service = FakePrivateChatService()
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=FakeLlm(),
-        dev_control_service=dev_service,
+        private_chat_service=chat_service,
     )
     router.runtime.settings.owner_qq = 10001
 
@@ -190,9 +190,9 @@ async def test_router_persists_private_images_and_forwards_cached_event(sqlite_e
 
     await router.handle_private_message(event)
 
-    assert len(dev_service.events) == 1
-    assert len(dev_service.events[0].images) == 1
-    assert dev_service.events[0].images[0].local_path == str(tmp_path / "private-cat.png")
+    assert len(chat_service.events) == 1
+    assert len(chat_service.events[0].images) == 1
+    assert chat_service.events[0].images[0].local_path == str(tmp_path / "private-cat.png")
 
     with session_scope(sqlite_engine) as session:
         stored = MessageRepository(session).get_by_platform_msg_id("private-inbound-10001-p-1")

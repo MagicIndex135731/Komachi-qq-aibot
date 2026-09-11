@@ -17,7 +17,7 @@
 - 独立商用图片 API 的文生图、参考图生图和队列控制；
 - SQLite 持久化、群历史归档、用量记录和 QQ 发送状态跟踪；
 - Memory V3 的原始消息投影、本地向量化、混合检索、证据约束和受控发布；
-- 私聊管理、开发任务和提醒功能对应的独立进程入口。
+- 私聊人格对话、私聊生图和提醒功能对应的独立进程入口。
 
 ## 2. 总体架构
 
@@ -156,7 +156,7 @@ LLBot 与 NapCat 的登录态互相独立，不能同时用同一个 QQ 号运�
 
 - `xiaomachi-llbot` 运行固定版本的 LLBot 镜像；
 - `xiaomachi-bot` 运行 `python -m app.group_main`；
-- `xiaomachi-private` 运行 `python -m app.private_main`（私聊命令、开发任务与提醒），
+- `xiaomachi-private` 运行 `python -m app.private_main`（私聊人格对话、私聊生图与提醒），
   与群聊容器复用同一个镜像和数据卷，但不运行群聊的记忆/embedding 启动流程；
 - bot 数据卷以读写方式挂载到 `/workspace/data`；
 - LLBot 只能只读访问 bot 数据卷，同时拥有独立的登录态数据卷；
@@ -363,15 +363,13 @@ V3 的 raw generation 发现复用 V2 编排基础设施，因此正常运行必
 ```text
 app/
   adapters/          OneBot payload、WebSocket 和 QQ 发送
-  admin/             私聊管理命令
   core/              路由、策略、上下文、记忆和业务工作流
-  dev_control/       私聊开发任务与仓库控制
   jobs/              一次性/计划任务入口
+  private_chat/      私聊聊天服务（人格对话、生图、回复去重与滚动摘要）
   providers/         LLM、搜索、embedding 等外部适配
   storage/           SQLAlchemy models、schema 和 repositories
   group_main.py      生产群聊进程（xiaomachi-bot）
   private_main.py    生产私聊进程入口（xiaomachi-private）
-  dev_worker_main.py 开发任务 worker 入口
   main.py            共享 factory 和 legacy 组合入口
 configs/             群白名单、人格、安全和提醒 YAML
 infra/wsl/           Compose、Dockerfile、systemd、watchdog 和运维脚本
@@ -384,9 +382,10 @@ docs/                工程说明和历史设计资料
 当前 Docker 生产栈启动 `xiaomachi-bot`（`python -m app.group_main`）和
 `xiaomachi-private`（`python -m app.private_main`）两个容器：OneBot 会把每个事件
 广播给所有已连接客户端，群聊进程只处理 `message_type=group`，私聊进程只处理
-`message_type=private`（管理员命令、开发任务、提醒），两者共享数据卷。
-`dev_worker_main` 仍是独立的可选进程入口，只有单独部署时才运行；镜像内没有打包
-`codex` 可执行文件，因此生产私聊不启用本地开发 worker。
+`message_type=private`（人格对话、私聊生图、提醒），两者共享数据卷。私聊是纯
+聊天通道：2026-09-11 起已移除全部 Codex/项目控制能力（`app.dev_control`、
+`app.admin`、开发任务 worker 与 `管理员模式`），私聊不再读写仓库、执行命令或
+重启运行时。私聊的轮次仍保存在 `dev_sessions` / `dev_tasks` 表中（不改 schema）。
 
 ## 9. 配置与数据边界
 

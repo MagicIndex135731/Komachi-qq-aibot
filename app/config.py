@@ -63,7 +63,6 @@ class AppSettings(BaseSettings):
     group_image_timeout_seconds: float = Field(default=900.0, alias="GROUP_IMAGE_TIMEOUT_SECONDS")
     bot_qq: int = Field(alias="BOT_QQ")
     owner_qq: int = Field(alias="OWNER_QQ")
-    admin_qqs: str = Field(default="", alias="ADMIN_QQS")
     private_chat_qqs: str = Field(default="", alias="PRIVATE_CHAT_QQS")
     search_provider: str = Field(default="tavily", alias="SEARCH_PROVIDER")
     search_base_url: str = Field(default="https://api.tavily.com/search", alias="SEARCH_BASE_URL")
@@ -430,13 +429,6 @@ class AppSettings(BaseSettings):
     @property
     def log_dir(self) -> Path:
         return self.data_dir / "logs"
-
-    @property
-    def admin_whitelist(self) -> set[int]:
-        values = {self.owner_qq}
-        if self.admin_qqs:
-            values.update(int(item.strip()) for item in self.admin_qqs.split(",") if item.strip())
-        return values
 
     @property
     def private_chat_whitelist(self) -> set[int]:

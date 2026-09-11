@@ -6,14 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.dev_worker_main as dev_worker_main
 import app.group_main as group_main
 import app.main as app_main
 import app.private_main as private_main
 from app.adapters.onebot_models import resolve_message_type
 from app.config import AppSettings
 from app.core.router import InboundRouter
-from app.dev_control.service import DevControlService
+from app.private_chat.service import PrivateChatService
 from app.providers.semantic_embeddings import DisabledEmbeddingProvider
 
 
@@ -30,7 +29,6 @@ def _settings(tmp_path: Path) -> AppSettings:
         group_image_size="auto",
         bot_qq=123456789,
         owner_qq=987654321,
-        admin_qqs="",
         search_provider="tavily",
         search_base_url="https://api.tavily.com/search",
         search_api_key="search-key",
@@ -69,7 +67,7 @@ class FakeGateway:
 
 
 @pytest.mark.asyncio
-async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_path) -> None:
+async def test_group_main_builds_router_without_private_chat_service(monkeypatch, tmp_path) -> None:
     settings = _settings(tmp_path)
     captured: dict[str, object] = {}
     built_memory_orchestrator = object()
@@ -106,7 +104,6 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
     monkeypatch.setattr(app_main, "LlmClient", fake_llm_client)
     monkeypatch.setattr(group_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(group_main, "ContextBuilder", lambda: object())
-    monkeypatch.setattr(group_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(group_main, "build_web_search_client", lambda _settings: object())
     monkeypatch.setattr(group_main, "build_group_image_llm_client", lambda **_kwargs: object())
     monkeypatch.setattr(
@@ -138,7 +135,7 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
 
     await group_main.run()
 
-    assert captured["dev_control_service"] is None
+    assert captured["private_chat_service"] is None
     assert captured["memory_orchestrator"] is built_memory_orchestrator
     assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
     assert captured["llm_kwargs"]["responses_only"] is True
@@ -147,7 +144,7 @@ async def test_group_main_builds_router_without_dev_control(monkeypatch, tmp_pat
     assert FakeGateway.instances[0].reconnect_forever is True
 
 
-async def test_private_main_disables_local_worker(monkeypatch, tmp_path) -> None:
+async def test_private_main_composes_chat_only_private_service(monkeypatch, tmp_path) -> None:
     settings = _settings(tmp_path)
     captured: dict[str, object] = {}
     search_client = object()
@@ -197,7 +194,6 @@ async def test_private_main_disables_local_worker(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(app_main, "LlmClient", fake_llm_client)
     monkeypatch.setattr(private_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(private_main, "ContextBuilder", lambda: object())
-    monkeypatch.setattr(private_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(private_main, "build_web_search_client", lambda _settings: search_client)
     monkeypatch.setattr(
         private_main,
@@ -206,12 +202,11 @@ async def test_private_main_disables_local_worker(monkeypatch, tmp_path) -> None
     )
     monkeypatch.setattr(private_main, "load_private_reminders", lambda *, config_dir: ["reminder"])
     monkeypatch.setattr(private_main, "PrivateReminderScheduler", FakeReminderScheduler)
-    monkeypatch.setattr(private_main, "DevControlService", FakeService)
+    monkeypatch.setattr(private_main, "PrivateChatService", FakeService)
     monkeypatch.setattr(private_main, "InboundRouter", lambda **_kwargs: object())
 
     await private_main.run()
 
-    assert captured["enable_local_worker"] is False
     assert captured["web_search_client"] is search_client
     # Private drawings must use the pinned image transport, not the chat model
     # that serves text replies (the split container previously fell back to it
@@ -286,7 +281,6 @@ async def test_private_main_waits_for_gateway_before_starting_services(monkeypat
     monkeypatch.setattr(app_main, "LlmClient", lambda **_kwargs: object())
     monkeypatch.setattr(private_main, "ReplyPolicy", lambda: object())
     monkeypatch.setattr(private_main, "ContextBuilder", lambda: object())
-    monkeypatch.setattr(private_main, "AdminCommandParser", lambda **_kwargs: object())
     monkeypatch.setattr(private_main, "build_web_search_client", lambda _settings: search_client)
     monkeypatch.setattr(
         private_main,
@@ -295,7 +289,7 @@ async def test_private_main_waits_for_gateway_before_starting_services(monkeypat
     )
     monkeypatch.setattr(private_main, "load_private_reminders", lambda *, config_dir: ["reminder"])
     monkeypatch.setattr(private_main, "PrivateReminderScheduler", FakeReminderScheduler)
-    monkeypatch.setattr(private_main, "DevControlService", FakeService)
+    monkeypatch.setattr(private_main, "PrivateChatService", FakeService)
     monkeypatch.setattr(private_main, "InboundRouter", lambda **_kwargs: object())
 
     await private_main.run()
@@ -307,49 +301,6 @@ async def test_private_main_waits_for_gateway_before_starting_services(monkeypat
         "reminder-start",
     ]
     assert events[-2:] == ["reminder-stop", "service-stop"]
-
-
-@pytest.mark.asyncio
-async def test_dev_worker_main_enables_local_worker(monkeypatch, tmp_path) -> None:
-    settings = _settings(tmp_path)
-    captured: dict[str, object] = {}
-
-    def fake_llm_client(**kwargs):
-        captured["llm_kwargs"] = kwargs
-        return object()
-
-    class FakeService:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-        async def start(self) -> None:
-            return None
-
-        async def stop(self) -> None:
-            return None
-
-    monkeypatch.setattr(dev_worker_main, "AppSettings", lambda: settings)
-    monkeypatch.setattr(dev_worker_main, "build_engine", lambda _path: object())
-    monkeypatch.setattr(dev_worker_main, "create_all", lambda _engine: None)
-    monkeypatch.setattr(dev_worker_main, "NapCatGateway", FakeGateway)
-    monkeypatch.setattr(dev_worker_main, "Sender", lambda _gateway: object())
-    monkeypatch.setattr(app_main, "LlmClient", fake_llm_client)
-    monkeypatch.setattr(
-        dev_worker_main,
-        "load_runtime_config",
-        lambda _settings: SimpleNamespace(
-            persona={"name": "比企谷小町"},
-            safety={"deny_prompt_leak": True},
-        ),
-    )
-    monkeypatch.setattr(dev_worker_main, "DevControlService", FakeService)
-
-    await dev_worker_main.run()
-
-    assert captured["llm_kwargs"]["responses_model"] == "gpt-5.4"
-    assert captured["llm_kwargs"]["responses_only"] is True
-    assert captured["enable_local_worker"] is True
-    assert captured["assistant_name"] == "比企谷小町"
 
 
 # Placeholder QQ IDs only: real account numbers never enter tracked files.
@@ -413,17 +364,14 @@ async def _drive_private_process_with_payload(
 
     sender = RecordingPrivateSender()
     llm_client = RecordingPrivateLlmClient(reply_text="我在的，怎么啦")
-    dev_control_service = DevControlService(
+    private_chat_service = PrivateChatService(
         engine=sqlite_engine,
         sender=sender,
         llm_client=llm_client,
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=private_chat_qqs,
-        admin_qqs=set(),
-        repo_root=settings.data_dir.parent / "repo",
         data_dir=settings.data_dir,
-        enable_local_worker=False,
         assistant_name="小町",
         persona={"name": "小町"},
         safety={},
@@ -432,7 +380,7 @@ async def _drive_private_process_with_payload(
         sqlite_engine=sqlite_engine,
         sender=sender,
         llm_client=llm_client,
-        dev_control_service=dev_control_service,
+        private_chat_service=private_chat_service,
     )
 
     class SnowLumaGateway:
@@ -490,7 +438,7 @@ async def _drive_private_process_with_payload(
     )
     monkeypatch.setattr(private_main, "load_private_reminders", lambda *, config_dir: [])
     monkeypatch.setattr(private_main, "PrivateReminderScheduler", FakeReminderScheduler)
-    monkeypatch.setattr(private_main, "DevControlService", lambda **_kwargs: dev_control_service)
+    monkeypatch.setattr(private_main, "PrivateChatService", lambda **_kwargs: private_chat_service)
     monkeypatch.setattr(private_main, "InboundRouter", lambda **_kwargs: router)
 
     await private_main.run()
@@ -501,7 +449,6 @@ def _private_settings(tmp_path) -> AppSettings:
     settings = _settings(tmp_path)
     settings.bot_qq = PRIVATE_BOT_QQ
     settings.owner_qq = PRIVATE_OWNER_QQ
-    settings.admin_qqs = ""
     settings.private_chat_qqs = ""
     return settings
 
