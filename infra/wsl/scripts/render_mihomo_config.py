@@ -21,6 +21,10 @@ DIRECT_RULES = (
     "DOMAIN-SUFFIX,qpic.cn,DIRECT",
     "DOMAIN-SUFFIX,gtimg.cn,DIRECT",
     "DOMAIN-SUFFIX,tenpay.com,DIRECT",
+    # DeepSeek's official API is reachable from mainland China and carries the
+    # bot's chat/search traffic; routing it through the Hong Kong node only adds
+    # latency and puts model calls on a residential-ish egress.
+    "DOMAIN-SUFFIX,deepseek.com,DIRECT",
     "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",

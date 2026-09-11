@@ -78,6 +78,11 @@ powershell -ExecutionPolicy Bypass -File `
 当前机场配置。Mihomo 仅监听 WSL 回环地址，不启用 TUN，也不接管 Windows 系统
 代理。运行配置使用：
 
+`deepseek.com` 也在托管 `DIRECT` 规则内：小町的对话与联网检索都打官方
+DeepSeek 接口，该域名在国内可直连，绕香港只会增加延迟并改变出口 IP，因此不
+交给机场的兜底规则；只有生图供应商仍走 `XIAOMACHI-NOVA-HK`。这条规则在每次
+重新渲染时会被先剥离再重新插入，不会重复堆叠。
+
 ```dotenv
 XIAOMACHI_HTTP_PROXY=http://127.0.0.1:7897
 XIAOMACHI_HTTPS_PROXY=http://127.0.0.1:7897

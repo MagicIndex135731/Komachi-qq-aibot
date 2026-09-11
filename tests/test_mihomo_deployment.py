@@ -42,8 +42,26 @@ def test_rendered_profile_routes_nova_to_hong_kong_and_qq_direct() -> None:
     assert group["proxies"] == ["🇭🇰 香港Y01"]
     assert rendered["rules"][0] == f"DOMAIN,{MODULE.NOVA_HOST},{MODULE.NOVA_GROUP}"
     assert rendered["rules"].count("DOMAIN-SUFFIX,qq.com,DIRECT") == 1
+    assert rendered["rules"].count("DOMAIN-SUFFIX,deepseek.com,DIRECT") == 1
+    assert rendered["rules"].index("DOMAIN-SUFFIX,deepseek.com,DIRECT") < rendered[
+        "rules"
+    ].index("MATCH,选择节点")
     assert "DOMAIN-SUFFIX,qq.com,选择节点" not in rendered["rules"]
     assert rendered["rules"][-1] == "MATCH,选择节点"
+
+
+def test_deepseek_direct_rule_survives_rerender_without_duplication() -> None:
+    source = source_config()
+    source["rules"] = [
+        *MODULE.DIRECT_RULES,
+        "DOMAIN-SUFFIX,qq.com,选择节点",
+        "MATCH,选择节点",
+    ]
+
+    rendered = MODULE.render_config(source)
+
+    assert rendered["rules"].count("DOMAIN-SUFFIX,deepseek.com,DIRECT") == 1
+    assert rendered["rules"].count("DOMAIN-SUFFIX,qq.com,DIRECT") == 1
 
 
 def test_rendered_profile_fails_closed_without_hong_kong_nodes() -> None:
