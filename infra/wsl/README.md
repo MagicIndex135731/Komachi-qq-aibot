@@ -132,6 +132,22 @@ SnowLuma 镜像来自上游维护的 `SnowLuma.Docker.Framework`（Docker Hub
 重启 stack 会让 SnowLuma 重新生成一次性初始密码，因此首次登录期间先不要让它
 反复重启（watchdog 在这段时间保持停止）。
 
+首次登录后 SnowLuma 会为该账号自动生成 OneBot v11 默认配置（HTTP 3000 /
+WS 3001，绑定 127.0.0.1），并填入随机 `accessToken`。本栈的 bot 走
+`NAPCAT_WS_URL=ws://127.0.0.1:3001` 且**不带令牌**（与 NapCat 路径一致，
+`app/adapters/napcat_ws.py` 只在传入令牌时才发 `Authorization` 头），因此要把
+两个 `accessToken` 清空：WebUI→连接配置里删掉，或
+
+```bash
+# WebUI 登录后会返回 Bearer token，用它调用配置接口（保存即热重载，无需重启）
+curl -sS -X POST -H "Authorization: Bearer <webui-token>" \
+  -H 'Content-Type: application/json' \
+  --data-binary @onebot_config.json \
+  http://127.0.0.1:5099/api/config/<uin>
+```
+
+清空后 `ws-default` 会显示 `1 个客户端`（即 xiaomachi bot 已连接）。
+
 回滚：`QQ_PLATFORM=llbot` + `systemctl restart xiaomachi-stack.service`。
 
 LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的
