@@ -8,6 +8,7 @@ commands and outbound reply de-duplication.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -81,6 +82,35 @@ class FakeLlmClient:
         self.images_calls.append(None if images is None else list(images))
         self.conversation_keys.append(conversation_key)
         return self.reply_text
+
+
+class BuiltinSearchLlmClient(FakeLlmClient):
+    """Chat client that can carry the provider's built-in ``web_search`` tool."""
+
+    def __init__(self, reply_text: str = "builtin reply", *, web_search_model: str = "") -> None:
+        super().__init__(reply_text=reply_text)
+        self.supports_selective_web_search = True
+        self.supports_forced_web_search = True
+        self.builtin_web_search = True
+        self.web_search_model = web_search_model
+        self.generate_kwargs: list[dict] = []
+
+    def generate_text(
+        self,
+        prompt_lines,
+        *,
+        images=None,
+        conversation_key=None,
+        temperature=None,
+        **kwargs,
+    ):
+        self.generate_kwargs.append(dict(kwargs))
+        return super().generate_text(
+            prompt_lines,
+            images=images,
+            conversation_key=conversation_key,
+            temperature=temperature,
+        )
 
 
 class FakeSearchClient:
@@ -1288,6 +1318,259 @@ async def test_private_chat_marks_a_searched_turn_as_search_priority(sqlite_engi
     prompt = "\n".join(llm_client.prompts[0])
     assert "Web search priority:" in prompt
     assert "Treat chat memory as background only." in prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_forces_builtin_web_search_for_explicit_request(
+    sqlite_engine, tmp_path, caplog
+) -> None:
+    """Production has no external client, so the provider tool carries search."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(
+        reply_text="我查了下现在的天气。",
+        web_search_model="search-model",
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.private_chat.service"):
+        await service.handle_private_message(
+            make_private_event(
+                message_id="p-chat-builtin-forced",
+                user_id=10001,
+                text="帮我查一下现在北京天气",
+            )
+        )
+
+    assert service.web_search_client is None
+    assert llm_client.generate_kwargs == [
+        {"allow_web_search": True, "force_web_search": True}
+    ]
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search priority:" in prompt
+    # The turn carries no external evidence: the model has to search itself.
+    assert "Web search results:" not in prompt
+    assert any(
+        record.message.startswith("private_web_search_builtin")
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_chat_allows_builtin_web_search_for_time_sensitive_turn(
+    sqlite_engine, tmp_path
+) -> None:
+    """A dedicated search model scopes built-in search to fresh-info turns."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(
+        reply_text="我看看最近这条新闻。",
+        web_search_model="search-model",
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-builtin-optional",
+            user_id=10001,
+            text="最近有什么新闻吗",
+        )
+    )
+
+    assert llm_client.generate_kwargs == [{"allow_web_search": True}]
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search priority:" in prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_keeps_plain_turns_out_of_builtin_web_search(
+    sqlite_engine, tmp_path
+) -> None:
+    """A turn that needs no fresh facts must not attach the tool."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(
+        reply_text="我在的。",
+        web_search_model="search-model",
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    await service.handle_private_message(
+        make_private_event(message_id="p-chat-builtin-plain", user_id=10001, text="在吗")
+    )
+
+    assert llm_client.generate_kwargs == [{"allow_web_search": False}]
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search priority:" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_excludes_search_verification_turns_from_builtin_search(
+    sqlite_engine, tmp_path
+) -> None:
+    """Asking whether the bot searched must not trigger a fresh search."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(
+        reply_text="我刚刚没联网查。",
+        web_search_model="search-model",
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-builtin-verification",
+            user_id=10001,
+            text="你刚刚上网查了吗",
+        )
+    )
+
+    assert llm_client.generate_kwargs == [{"allow_web_search": False}]
+    assert "Web search priority:" not in "\n".join(llm_client.prompts[0])
+
+
+@pytest.mark.asyncio
+async def test_private_chat_keeps_builtin_search_open_without_a_search_model(
+    sqlite_engine, tmp_path
+) -> None:
+    """Without ``LLM_WEB_SEARCH_MODEL`` any turn may search, like the group."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(reply_text="阿渣喜欢看动画。")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-builtin-unscoped",
+            user_id=10001,
+            text="阿渣喜欢什么动画",
+        )
+    )
+
+    assert llm_client.generate_kwargs == [{"allow_web_search": True}]
+    assert "Web search priority:" in "\n".join(llm_client.prompts[0])
+
+
+@pytest.mark.asyncio
+async def test_private_chat_keeps_external_search_turns_off_the_builtin_tool(
+    sqlite_engine, tmp_path
+) -> None:
+    """With an external client the request stays on the old grounding path."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(reply_text="我查了一下最近的新闻。")
+    search_client = FakeSearchClient()
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+        web_search_client=search_client,
+    )
+
+    await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-external-search",
+            user_id=10001,
+            text="上网搜一下最近的新闻",
+        )
+    )
+
+    assert search_client.queries
+    assert llm_client.generate_kwargs == [{"allow_web_search": False}]
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search results:" in prompt
+    assert "Web search priority:" in prompt
+
+
+@pytest.mark.asyncio
+async def test_private_chat_forces_builtin_search_for_a_weather_followup(
+    sqlite_engine, tmp_path
+) -> None:
+    """The private-only weather follow-up trigger also drives the provider tool."""
+
+    sender = FakeSender()
+    llm_client = BuiltinSearchLlmClient(
+        reply_text="我按西安长安区重新查了一次天气。",
+        web_search_model="search-model",
+    )
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    with session_scope(sqlite_engine) as session:
+        sessions = DevSessionRepository(session)
+        tasks = DevTaskRepository(session)
+        dev_session = sessions.get_or_create_owner_session(owner_qq=10001, session_mode="daily")
+        first_task = tasks.add_task(
+            session_id=dev_session.id,
+            requested_by_qq=10001,
+            raw_request_text="帮我上网搜一下今天西安西电南校区附近天气",
+            intent_type="private_chat",
+        )
+        tasks.mark_completed(
+            task_id=first_task.id,
+            summary="weather lookup",
+            result_text="我查了，但搜出来的地名不太对。",
+            files_read=[],
+            files_changed=[],
+            commands_run=["llm_client.generate_text"],
+            restart_required=False,
+            restart_result="not-needed",
+            checkpoint_dir="",
+        )
+
+    handled = await service.handle_private_message(
+        make_private_event(
+            message_id="p-chat-builtin-weather-followup",
+            user_id=10001,
+            text="那就西安长安区",
+        )
+    )
+
+    assert handled is True
+    assert llm_client.generate_kwargs == [
+        {"allow_web_search": True, "force_web_search": True}
+    ]
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Web search priority:" in prompt
+    # No external evidence and no decision call: the provider has to search.
+    assert "Web search results:" not in prompt
 
 
 def test_private_drawings_use_the_reference_search_and_planner_clients(sqlite_engine, tmp_path) -> None:

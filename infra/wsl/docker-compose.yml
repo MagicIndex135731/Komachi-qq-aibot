@@ -60,7 +60,7 @@ services:
     command: ["python", "-m", "app.group_main"]
 
   xiaomachi-private:
-    # Private chat (admin commands, dev-control tasks, reminders). NapCat
+    # Private chat (persona conversation, drawings, reminders). NapCat
     # broadcasts every OneBot event to every connected client, so this process
     # shares the OneBot WebSocket with the group bot and ignores group payloads.
     # It reuses the image built by the xiaomachi service and the same data

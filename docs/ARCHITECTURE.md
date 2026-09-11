@@ -389,7 +389,11 @@ docs/                工程说明和历史设计资料
 私聊的回复工作方式与主群一致（记忆系统与人格模仿除外）：共用
 `app/core/chat_style.py` 的真人化风格行（`chat_context="private"` 只改开场白）、
 `GROUP_REPLY_SPLIT_*` 的短句连发、URL 策略（未被明确要求则剥离链接）、引用消息
-原文与代词指代提示、强制联网时的搜索优先级指令；私聊生图同样使用
+原文与代词指代提示；联网搜索与主群同一判定：外部搜索客户端存在时走
+`WebSearchClient` 取证，没有外部客户端时由私聊进程把
+`allow_web_search` / `force_web_search` 传给 `generate_text`，让供应商内置的
+`web_search` 工具接管（显式联网请求强制搜索，配置 `LLM_WEB_SEARCH_MODEL` 时只有
+时间敏感或明确联网的轮次触发，搜索轮次带搜索优先级指令）；私聊生图同样使用
 `build_image_reference_search_client` + `build_group_image_reference_planner_client`
 的参考图链路。
 

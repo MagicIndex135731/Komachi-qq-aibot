@@ -141,6 +141,11 @@ class PrivateWebContext:
     web_pages: list[str]
     grounding_notes: list[str]
     search_priority: bool = False
+    # Built-in provider search (``LLM_BUILTIN_WEB_SEARCH`` on the responses
+    # endpoint): the turn rides the provider's own ``web_search`` tool instead
+    # of an external search client, so the flags travel to ``generate_text``.
+    force_web_search: bool = False
+    allow_web_search: bool = False
 
 
 class PrivateChatService:
@@ -723,7 +728,7 @@ class PrivateChatService:
                 else:
                     reply_text = "现在排队的图太多了，你等一下再发"
             if reply_text is None:
-                prompt_lines = self._build_private_chat_prompt(
+                prompt_lines, web_context = self._build_private_chat_prompt(
                     session_id=session_id,
                     task_id=task_id,
                     request_text=request_text,
@@ -737,6 +742,7 @@ class PrivateChatService:
                         prompt_lines,
                         images=target_images,
                         conversation_key=conversation_key,
+                        **self._private_generation_search_kwargs(web_context),
                     )
                 )
                 if not reply_text:
@@ -1010,14 +1016,10 @@ class PrivateChatService:
         if needs_current_datetime_context(request_text):
             runtime_facts = build_current_datetime_facts(search_reference_time)
 
-        if self.web_search_client is None or runtime_facts or is_search_verification_query(request_text):
-            return PrivateWebContext(
-                runtime_facts=runtime_facts,
-                web_results=web_results,
-                web_pages=web_pages,
-                grounding_notes=grounding_notes,
-            )
-
+        # The search predicates drive both transports: the external client
+        # below, and the provider's own ``web_search`` tool when this
+        # deployment has no external client.  The built-in eligibility rules
+        # mirror the group router.
         explicit_search_request = is_explicit_search_request(request_text)
         reference_search_request = needs_reference_search(request_text)
         external_lookup_search_request = needs_external_lookup_search(request_text)
@@ -1035,6 +1037,50 @@ class PrivateChatService:
             or external_lookup_search_request
             or contextual_followup_search is not None
         )
+        # Ask the provider client instead of duplicating settings: only the
+        # client that serves this turn can say whether the built-in tool is
+        # configured, and a dedicated search model scopes it to turns that
+        # actually need fresh information (same rule as the group router).
+        builtin_search_configured = bool(
+            getattr(self.llm_client, "builtin_web_search", False)
+        )
+        scoped_builtin_search = bool(
+            str(getattr(self.llm_client, "web_search_model", "") or "").strip()
+        )
+        builtin_web_search_eligible = (
+            self.web_search_client is None
+            and builtin_search_configured
+            and not is_search_verification_query(request_text)
+            and (not scoped_builtin_search or time_sensitive or forced_search_request)
+        )
+        force_builtin_web_search = (
+            forced_search_request
+            and self.web_search_client is None
+            and builtin_search_configured
+        )
+        builtin_web_search_active = (
+            builtin_web_search_eligible or force_builtin_web_search
+        )
+
+        if self.web_search_client is None or runtime_facts or is_search_verification_query(request_text):
+            if builtin_web_search_active:
+                logger.info(
+                    "private_web_search_builtin owner_qq=%s force=%s eligible=%s scoped=%s",
+                    self.owner_qq,
+                    force_builtin_web_search,
+                    builtin_web_search_eligible,
+                    scoped_builtin_search,
+                )
+            return PrivateWebContext(
+                runtime_facts=runtime_facts,
+                web_results=web_results,
+                web_pages=web_pages,
+                grounding_notes=grounding_notes,
+                search_priority=builtin_web_search_active,
+                force_web_search=force_builtin_web_search,
+                allow_web_search=builtin_web_search_eligible,
+            )
+
         optional_search_eligible = (time_sensitive or general_search_candidate) and not forced_search_request
         if not forced_search_request and not optional_search_eligible:
             return PrivateWebContext(
@@ -1153,7 +1199,7 @@ class PrivateChatService:
         private_scope: str,
         image_count: int = 0,
         quoted_raw_payload: dict | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], PrivateWebContext]:
         session_summary = self._session_summary(session_id=session_id)
         recent_turns = self._recent_turn_lines(session_id=session_id, exclude_task_id=task_id)
         history_block = "\n".join(recent_turns) if recent_turns else "(none)"
@@ -1199,7 +1245,24 @@ class PrivateChatService:
                 image_count=image_count,
             ),
             f"{current_message_label} {target_text}",
-        ]
+        ], web_context
+
+    def _private_generation_search_kwargs(self, web_context: PrivateWebContext) -> dict:
+        """Provider kwargs that let this turn ride the built-in web search.
+
+        Mirrors the group router's capability guards: the selective flag only
+        travels to clients that declare it, and only a forced search asks the
+        provider to attach the tool unconditionally.  Callers without built-in
+        search receive a byte-identical request to before.
+        """
+        kwargs: dict = {}
+        if bool(getattr(self.llm_client, "supports_selective_web_search", False)):
+            kwargs["allow_web_search"] = web_context.allow_web_search
+        if web_context.force_web_search and bool(
+            getattr(self.llm_client, "supports_forced_web_search", False)
+        ):
+            kwargs["force_web_search"] = True
+        return kwargs
 
     def _normalize_private_reply(self, text: str) -> str:
         raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
