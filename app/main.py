@@ -55,6 +55,7 @@ from app.core.memory_context_packer import (
 from app.core.memory_evidence_expander import MemoryEvidenceExpander
 from app.core.memory_orchestrator import MemoryOrchestrator, ShadowJobRequest
 from app.core.memory_query_resolver import MemoryQueryResolver
+from app.core.message_freshness import is_stale_message, message_age_seconds
 from app.core.member_identity import GroupMemberIdentity, group_member_identities_from_messages
 from app.core.memory_retrieval_channels import build_memory_retrieval_channels
 from app.core.memory_v2_context import MemoryV2ContextProvider
@@ -1629,6 +1630,21 @@ async def run() -> None:
                 bot_qq=settings.bot_qq,
                 bot_name=str(runtime.persona.get("name", settings.bot_qq)),
             )
+            if is_stale_message(
+                event,
+                max_age_seconds=settings.group_message_max_age_seconds,
+            ):
+                # Offline messages queue up while the bot is down and are handed
+                # over in one burst once the session returns.  Keep them for
+                # context/memory, but never answer a message from hours ago.
+                logging.info(
+                    "group_message_stale_archived group_id=%s msg_id=%s age_seconds=%.0f",
+                    event.group_id,
+                    event.platform_msg_id,
+                    message_age_seconds(event),
+                )
+                await asyncio.to_thread(router.ingest_historical_group_message, event)
+                return
             await router.handle_group_message(event)
 
         async def backfill_group_history_on_connect() -> None:

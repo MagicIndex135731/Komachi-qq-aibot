@@ -74,6 +74,14 @@ class AppSettings(BaseSettings):
     context_recent_limit: int = Field(default=60, alias="CONTEXT_RECENT_LIMIT")
     context_summary_limit: int = Field(default=3, alias="CONTEXT_SUMMARY_LIMIT")
     context_history_limit: int = Field(default=8, alias="CONTEXT_HISTORY_LIMIT")
+    # Live group messages older than this are archived (context/memory) but not
+    # answered: QQ bridges replay everything that queued up while the session
+    # was offline.  0 disables the gate.
+    group_message_max_age_seconds: int = Field(
+        default=300,
+        ge=0,
+        alias="GROUP_MESSAGE_MAX_AGE_SECONDS",
+    )
     memory_compaction_enabled: bool = Field(default=True, alias="MEMORY_COMPACTION_ENABLED")
     memory_compaction_batch_size: int = Field(default=50, alias="MEMORY_COMPACTION_BATCH_SIZE")
     memory_compaction_max_facts: int = Field(default=24, alias="MEMORY_COMPACTION_MAX_FACTS")
