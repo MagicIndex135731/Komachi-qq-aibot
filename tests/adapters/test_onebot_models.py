@@ -1,4 +1,51 @@
-from app.adapters.onebot_models import parse_group_message_event, parse_private_message_event
+from app.adapters.onebot_models import (
+    parse_group_message_event,
+    parse_private_message_event,
+    resolve_message_type,
+)
+
+
+def test_resolve_message_type_accepts_snowluma_private_and_group() -> None:
+    # SnowLuma emits ``private`` with ``sub_type: "friend"``, so ``friend`` is
+    # normalized only as a tolerance for bridges that copied it there.
+    assert resolve_message_type({"message_type": "private", "sub_type": "friend"}) == "private"
+    assert resolve_message_type({"message_type": "friend"}) == "private"
+    assert resolve_message_type({"message_type": " PRIVATE "}) == "private"
+    assert resolve_message_type({"message_type": "group", "sub_type": "normal"}) == "group"
+
+
+def test_resolve_message_type_reports_unknown_instead_of_the_raw_value() -> None:
+    assert resolve_message_type({}) == "unknown"
+    assert resolve_message_type({"message_type": None}) == "unknown"
+    assert resolve_message_type({"message_type": "guild"}) == "unknown"
+
+
+def test_parse_private_message_event_handles_snowluma_friend_payload() -> None:
+    # Shape verified against the deployed SnowLuma bridge on 2026-09-11:
+    # array ``message``, ``sub_type`` = friend and a negative ``message_id``.
+    payload = {
+        "time": 1789137600,
+        "self_id": 900000103,
+        "post_type": "message",
+        "message_type": "private",
+        "sub_type": "friend",
+        "message_id": -1747119563,
+        "user_id": 900000101,
+        "message": [{"type": "text", "data": {"text": "我喜欢你"}}],
+        "raw_message": "我喜欢你",
+        "font": 0,
+        "sender": {"user_id": 900000101, "nickname": "owner", "card": ""},
+        "anonymous": None,
+    }
+
+    event = parse_private_message_event(payload)
+
+    assert event.platform_msg_id == "-1747119563"
+    assert event.user_id == 900000101
+    assert event.nickname == "owner"
+    assert event.plain_text == "我喜欢你"
+    assert event.msg_type == "text"
+    assert event.timestamp.isoformat() == "2026-09-11T14:40:00+00:00"
 
 
 def test_parse_group_message_event_extracts_plain_text_and_mentions() -> None:

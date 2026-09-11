@@ -63,7 +63,7 @@ restore_on_failure() {
   fi
 }
 trap restore_on_failure EXIT
-for container_name in xiaomachi-bot xiaomachi-llbot xiaomachi-napcat; do
+for container_name in xiaomachi-bot xiaomachi-private xiaomachi-llbot xiaomachi-napcat; do
   if [[ "$(docker inspect -f '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" == true ]]; then
     docker stop --time 30 "${container_name}" >/dev/null
     stopped_containers+=("${container_name}")

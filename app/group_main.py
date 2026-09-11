@@ -10,7 +10,7 @@ from pathlib import Path
 from sqlalchemy import bindparam, text
 
 from app.adapters.napcat_ws import NapCatGateway
-from app.adapters.onebot_models import parse_group_message_event
+from app.adapters.onebot_models import parse_group_message_event, resolve_message_type
 from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
@@ -495,7 +495,23 @@ async def run() -> None:
                 return
             if payload.get("post_type") != "message":
                 return
-            if payload.get("message_type") != "group":
+            message_type = resolve_message_type(payload)
+            if message_type != "group":
+                # Direct chats belong to the xiaomachi-private process, and an
+                # unknown value means the bridge speaks a dialect this process
+                # cannot parse. Never drop either case without a trace.
+                if message_type == "unknown":
+                    logging.warning(
+                        "inbound_message_unhandled process=group message_type=%r keys=%s",
+                        payload.get("message_type"),
+                        sorted(payload.keys()),
+                    )
+                else:
+                    logging.info(
+                        "inbound_message_ignored process=group message_type=%s msg_id=%s",
+                        message_type,
+                        payload.get("message_id"),
+                    )
                 return
 
             group_id = int(payload["group_id"])

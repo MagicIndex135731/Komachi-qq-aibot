@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from app.adapters.napcat_ws import NapCatGateway
+from app.adapters.onebot_models import resolve_message_type
 from app.adapters.sender import Sender
 from app.config import AppSettings, load_runtime_config
 from app.dev_control.service import DevControlService
@@ -45,7 +46,7 @@ async def run() -> None:
     )
 
     async def ignore_payload(payload: dict) -> None:
-        if payload.get("post_type") == "message" and payload.get("message_type") == "group":
+        if payload.get("post_type") == "message" and resolve_message_type(payload) == "group":
             if int(payload.get("group_id", 0) or 0) == 10001:
                 logging.info(
                     "worker_process_observed_group_payload group_id=%s msg_id=%s user_id=%s",

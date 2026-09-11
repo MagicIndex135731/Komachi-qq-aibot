@@ -10,8 +10,9 @@ start-xiaomachi-wsl.bat
   -> infra/wsl/scripts/start.sh
   -> 启动当前 QQ 平台容器
   -> 条件打开当前 QQ 平台 WebUI
-  -> 无依赖启动小町（OneBot 未就绪时自动重连）
-  -> OneBot 与小町心跳检查
+  -> 无依赖启动小町群聊容器（OneBot 未就绪时自动重连）
+  -> 无依赖启动小町私聊容器（xiaomachi-private）
+  -> OneBot、群聊心跳与私聊进程检查
 ```
 
 停止和状态入口使用同一个固定脚本，分别调用 `stop.sh` 和 `status.sh`。
@@ -59,6 +60,39 @@ bash infra/wsl/scripts/stop.sh
 `start.sh` 先启动 QQ 平台并尝试打开 WebUI，再启动小町，避免 Compose 的健康依赖阻塞登录页面。LLBot WebUI 为 `http://127.0.0.1:3080/`，OneBot 为 `ws://127.0.0.1:3002`；NapCat 回退平台仍使用 `6099` 与 `3001`。浏览器启动失败不会阻断容器。
 
 文本模型使用 Responses 端点时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true` 启用主模型内置联网检索。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存到 `runtime/logs/responses-tool-events.jsonl`，不进入 Git。
+
+### 私聊容器（xiaomachi-private）
+
+群聊和私聊是同一镜像里的两个容器：OneBot 把每个事件广播给所有已连接的
+WebSocket 客户端，但群聊进程只处理群消息，所以私聊必须有独立进程接管。
+
+- `xiaomachi-bot` 运行 `python -m app.group_main`，只处理 `message_type=group`；
+- `xiaomachi-private` 运行 `python -m app.private_main`，只处理
+  `message_type=private`（管理员命令、私聊开发对话、提醒），不运行群聊的
+  embedding 预热、记忆回填和启动窗口重放；
+- 两个容器共享 `NAPCAT_WS_URL` 和 `xiaomachi-bot-data` 卷；SQLite 以 WAL +
+  `busy_timeout=30000` 串行写入，私聊与群聊可以同时落库；
+- 私聊容器不需要 GPU（`docker-compose.gpu.yml` 只给 `xiaomachi` 加设备），
+  私聊生图走商用图片 API；
+- 未知的 `message_type` 不会被静默丢弃：两个进程都会记录
+  `inbound_message_unhandled`（含原始值与 payload 字段名），已知但不属于本进程
+  的类型（群聊进程收到私聊）也会留下 `inbound_message_ignored`。
+- `.env` 只在容器创建时读取：改动 `LLM_*`、`PRIVATE_CHAT_QQS`、`ADMIN_QQS` 或
+  代理变量后，需要同时重建 `xiaomachi` 与 `xiaomachi-private`（`--no-deps`，
+  不得重启 QQ 平台容器）。
+
+验证：
+
+```bash
+docker compose -f infra/wsl/docker-compose.snowluma.yml ps
+docker exec xiaomachi-private cat /workspace/data/logs/private.heartbeat.json
+docker logs --tail 50 xiaomachi-private
+```
+
+`status.sh` 在群聊就绪后还会检查 `xiaomachi-private` 容器和
+`private.heartbeat.json` 的新鲜度；私聊进程不存活时 status 直接失败，避免出现
+“群聊正常、私聊已经死掉”的假健康。发布时 `install_linux_runtime.sh` 只重建
+`xiaomachi` 与 `xiaomachi-private`（`--no-deps`），不会重启 QQ 平台容器。
 
 ### WSL 内置 Mihomo 上游代理
 
@@ -252,14 +286,15 @@ Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V
 兼容开关，不是 V3 回滚开关。发布前使用 SQLite backup API 创建并验证
 `integrity_check=ok` 的备份，再按下方 V3 流程完成准备、评测、激活。
 
-部署只构建和重建 `xiaomachi` service（容器名 `xiaomachi-bot`）：
+部署只构建 `xiaomachi` 镜像（容器名 `xiaomachi-bot`），再重建两个应用容器
+`xiaomachi` 与 `xiaomachi-private`（私聊进程）：
 
 ```bash
 docker compose -f docker-compose.llbot.yml build xiaomachi
 # 无 NVIDIA 机器（ENABLE_GPU=0，默认）：
-docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi
+docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi xiaomachi-private
 # 有 NVIDIA 机器（ENABLE_GPU=1）：
-docker compose -f docker-compose.llbot.yml -f docker-compose.gpu.yml up -d --no-deps --force-recreate xiaomachi
+docker compose -f docker-compose.llbot.yml -f docker-compose.gpu.yml up -d --no-deps --force-recreate xiaomachi xiaomachi-private
 ```
 
 操作前后记录 `xiaomachi-llbot` 的 container ID 与 `StartedAt`；

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import sys
 import tomllib
@@ -178,7 +179,13 @@ def test_linux_runtime_upgrade_recreates_only_bot_and_preserves_llbot() -> None:
     )
 
     assert "recreate_bot_only()" in script
-    assert 'up -d --no-deps --force-recreate --no-build xiaomachi' in script
+    # Both application services are recreated, and the private-chat service is
+    # only added when the target release actually defines it (an older release
+    # must still be able to recreate the group bot during a rollback).
+    assert "app_services=(xiaomachi)" in script
+    assert 'app_services+=(xiaomachi-private)' in script
+    assert 'xiaomachi-private:[[:space:]]*$' in script
+    assert 'up -d --no-deps --force-recreate --no-build "${app_services[@]}"' in script
     assert 'recreate_bot_only "${INSTALL_ROOT}/current"' in script
     upgrade_section = script.split('if [[ -n "${previous_release}" ]]; then', 1)[1]
     upgrade_section = upgrade_section.split('else\n  systemctl start xiaomachi-stack.service', 1)[0]
@@ -298,6 +305,20 @@ def test_wsl_start_opens_selected_platform_login_before_status_probe() -> None:
     assert "isLogin" in launcher
 
 
+def test_wsl_start_brings_up_private_chat_after_the_group_bot() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
+
+    bot_up = script.index(
+        'docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi'
+    )
+    private_up = script.index(
+        'docker compose -f "${compose_file}" up -d --no-deps xiaomachi-private'
+    )
+    status_probe = script.index('bash "${SCRIPT_DIR}/status.sh"', private_up)
+
+    assert bot_up < private_up < status_probe
+
+
 def test_wsl_env_example_has_no_real_secrets() -> None:
     env_example = (REPO_ROOT / "infra/wsl/.env.example").read_text(encoding="utf-8")
     bot_account = "398" + "301" + "0865"
@@ -367,7 +388,13 @@ def test_memory_orchestration_env_and_wsl_runbook_define_a_safe_bot_only_rollout
         assert "nvidia.com/gpu=all" in documentation
         assert "docker-compose.gpu.yml" in documentation
         assert "ENABLE_GPU" in documentation
-        assert "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate xiaomachi" in documentation
+        # The documented rollout must name both application services; a
+        # substring match on ``xiaomachi`` alone would pass even when the
+        # private-chat container silently keeps the previous release.
+        assert (
+            "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate "
+            "xiaomachi xiaomachi-private" in documentation
+        )
         assert "xiaomachi-llbot" in documentation
     assert "/workspace/data/models" in wsl_readme
     assert "must not restart xiaomachi-llbot" in wsl_readme
@@ -490,6 +517,36 @@ def test_xiaomachi_compose_keeps_gpu_device_in_optional_override() -> None:
     assert "name" not in gpu
 
 
+def test_every_platform_compose_file_runs_the_private_chat_container() -> None:
+    platform_services = {
+        "docker-compose.yml": "napcat",
+        "docker-compose.llbot.yml": "llbot",
+        "docker-compose.snowluma.yml": "snowluma",
+    }
+    for name, platform_service in platform_services.items():
+        compose = yaml.safe_load((REPO_ROOT / "infra/wsl" / name).read_text(encoding="utf-8"))
+        services = compose["services"]
+        private = services["xiaomachi-private"]
+
+        assert private["image"] == "xiaomachi-bot:local"
+        assert private["container_name"] == "xiaomachi-private"
+        assert private["restart"] == "unless-stopped"
+        assert private["network_mode"] == "host"
+        assert private["working_dir"] == "/workspace"
+        assert private["env_file"] == ["./.env"]
+        assert private["command"] == ["python", "-m", "app.private_main"]
+        assert "xiaomachi_data:/workspace/data" in private["volumes"]
+        assert private["depends_on"][platform_service]["condition"] == "service_started"
+        # The private process shares the group bot's OneBot WebSocket and needs
+        # no CUDA device (it never runs the memory/embedding startup work).
+        assert any(
+            str(entry).startswith("NAPCAT_WS_URL=ws://127.0.0.1:")
+            for entry in private["environment"]
+        )
+        assert "devices" not in private
+        assert services["xiaomachi"]["command"] == ["python", "-m", "app.group_main"]
+
+
 def test_status_script_uses_on_demand_probes_before_logs() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
     assert 'Waiting for ${service_name} container' in script
@@ -557,6 +614,61 @@ def test_status_script_waits_for_gateway_ready_marker() -> None:
     assert "if after_start < -5" in script
     assert 'state not in ("connected", "ready")' in script
     assert "Xiaomachi bot is up and accepting messages." in script
+
+
+def test_status_script_reports_the_private_chat_process() -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    private_block = script.split("Private chat process:", 1)[1]
+
+    assert 'private_container_name="xiaomachi-private"' in script
+    assert "private.heartbeat.json" in private_block
+    assert "heartbeat_age_seconds" in private_block
+    assert 'd.get("state") != "alive" or age > 20' in private_block
+    assert "from datetime import datetime, timezone" in private_block
+    assert "is not serving private chat." in private_block
+    assert 'logs --tail=80 xiaomachi-private' in private_block
+    # The group-bot readiness semantics and the final success line must not move
+    # behind the private probe.
+    private_probe = script.index("Private chat process:")
+    group_success = script.index("Xiaomachi bot is up and accepting messages.")
+    assert private_probe < group_success
+
+
+def test_status_private_heartbeat_probe_rejects_missing_and_stopped(capsys) -> None:
+    script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
+    marker = 'if python3 - "${private_heartbeat_payload}" <<\'PY\'\n'
+    probe = script.split(marker, 1)[1].split("\nPY", 1)[0]
+    fresh = datetime.now(UTC).isoformat()
+    original_argv = sys.argv
+    try:
+        sys.argv = [
+            "status-private-probe",
+            json.dumps({"state": "alive", "pid": 123, "updated_at": fresh}),
+        ]
+        exec(compile(probe, "status-private-probe", "exec"), {})
+        assert "heartbeat_age_seconds=" in capsys.readouterr().out
+
+        for status in ("stopped", "starting"):
+            sys.argv = [
+                "status-private-probe",
+                json.dumps({"state": status, "pid": 123, "updated_at": fresh}),
+            ]
+            try:
+                exec(compile(probe, "status-private-probe", "exec"), {})
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError(f"{status} private heartbeat was accepted")
+
+        sys.argv = ["status-private-probe", ""]
+        try:
+            exec(compile(probe, "status-private-probe", "exec"), {})
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("missing private heartbeat was accepted")
+    finally:
+        sys.argv = original_argv
 
 
 def test_status_script_waits_for_current_process_embedding_prewarm() -> None:

@@ -12,7 +12,11 @@ from typing import Any, Callable
 from sqlalchemy import func, select
 
 from app.adapters.napcat_ws import NapCatGateway
-from app.adapters.onebot_models import parse_group_message_event, parse_private_message_event
+from app.adapters.onebot_models import (
+    parse_group_message_event,
+    parse_private_message_event,
+    resolve_message_type,
+)
 from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
@@ -1565,7 +1569,7 @@ async def run() -> None:
             repo_root=Path(__file__).resolve().parent.parent,
             data_dir=settings.data_dir,
             web_search_client=web_search_client,
-            image_model=settings.llm_model,
+            image_model=settings.group_image_model,
             image_size="auto",
             image_quality="high",
             image_background=None,
@@ -1613,13 +1617,25 @@ async def run() -> None:
             if payload.get("post_type") != "message":
                 return
 
-            message_type = payload.get("message_type")
+            message_type = resolve_message_type(payload)
             if message_type == "private":
                 event = parse_private_message_event(payload)
+                logging.info(
+                    "private_message_received user_id=%s msg_type=%s",
+                    event.user_id,
+                    event.msg_type,
+                )
                 await router.handle_private_message(event)
                 return
 
             if message_type != "group":
+                # Never drop an inbound message silently: an unexpected
+                # message_type means the bridge speaks a different dialect.
+                logging.warning(
+                    "inbound_message_unhandled process=main message_type=%r keys=%s",
+                    payload.get("message_type"),
+                    sorted(payload.keys()),
+                )
                 return
             group_id = int(payload["group_id"])
             if not should_ingest_group_message(group_id=group_id, group_policy=runtime.group_policy):

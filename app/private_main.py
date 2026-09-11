@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from app.adapters.napcat_ws import NapCatGateway
-from app.adapters.onebot_models import parse_private_message_event
+from app.adapters.onebot_models import parse_private_message_event, resolve_message_type
 from app.adapters.sender import Sender
 from app.admin.commands import AdminCommandParser
 from app.config import AppSettings, load_runtime_config
@@ -13,7 +13,7 @@ from app.core.context_builder import ContextBuilder
 from app.core.reply_policy import ReplyPolicy
 from app.core.router import InboundRouter
 from app.dev_control.service import DevControlService
-from app.main import build_llm_client, build_web_search_client
+from app.main import build_group_image_llm_client, build_llm_client, build_web_search_client
 from app.private_reminders import PrivateReminderScheduler, load_private_reminders
 from app.runtime_heartbeat import RuntimeHeartbeat
 from app.storage.db import build_engine, create_all
@@ -39,17 +39,38 @@ async def run() -> None:
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "private.heartbeat.json")
     sender = Sender(gateway)
     llm_client = build_llm_client(settings=settings, engine=engine)
+    # Private drawings must not ride the chat transport: ``GROUP_IMAGE_CHAT_*``
+    # pins the provider that actually serves the image model, and the legacy
+    # combined entry handed this client to DevControlService.  Without it the
+    # private process would ask the chat model (for example DeepSeek) for an
+    # image and always answer with the failure notice.
+    group_image_llm_client = build_group_image_llm_client(
+        settings=settings,
+        engine=engine,
+        llm_client=llm_client,
+    )
     web_search_client = build_web_search_client(settings)
     dev_control_service = DevControlService(
         engine=engine,
         sender=sender,
         llm_client=llm_client,
+        image_llm_client=group_image_llm_client,
         owner_qq=settings.owner_qq,
         bot_qq=settings.bot_qq,
         private_chat_qqs=settings.private_chat_whitelist,
         admin_qqs=settings.admin_whitelist,
         repo_root=Path(__file__).resolve().parent.parent,
         data_dir=settings.data_dir,
+        image_model=settings.group_image_model,
+        image_size="auto",
+        image_quality="high",
+        image_background=None,
+        image_output_format="png",
+        image_output_compression=None,
+        image_moderation=None,
+        image_queue_capacity=settings.group_image_queue_capacity,
+        image_max_attempts=1,
+        image_timeout_seconds=settings.group_image_timeout_seconds,
         enable_local_worker=False,
         web_search_client=web_search_client,
         assistant_name=str(runtime.persona.get("name", "Codex")),
@@ -77,14 +98,34 @@ async def run() -> None:
     async def handle_payload(payload: dict) -> None:
         if payload.get("post_type") != "message":
             return
-        if payload.get("message_type") == "group" and int(payload.get("group_id", 0) or 0) == 10001:
-            logging.info(
-                "private_process_observed_group_payload group_id=%s msg_id=%s user_id=%s",
-                payload.get("group_id"),
-                payload.get("message_id"),
-                payload.get("user_id"),
+        message_type = resolve_message_type(payload)
+        if message_type == "group":
+            # The OneBot server broadcasts every event to every connected
+            # client, so group traffic normally shows up here as well. Only the
+            # explicit diagnostic for group 10001 is recorded; everything else
+            # stays at DEBUG to keep the private log quiet.
+            if int(payload.get("group_id", 0) or 0) == 10001:
+                logging.info(
+                    "private_process_observed_group_payload group_id=%s msg_id=%s user_id=%s",
+                    payload.get("group_id"),
+                    payload.get("message_id"),
+                    payload.get("user_id"),
+                )
+            else:
+                logging.debug(
+                    "inbound_message_ignored process=private message_type=group group_id=%s msg_id=%s",
+                    payload.get("group_id"),
+                    payload.get("message_id"),
+                )
+            return
+        if message_type != "private":
+            # Never drop an inbound message silently: an unexpected
+            # message_type means the bridge speaks a different dialect.
+            logging.warning(
+                "inbound_message_unhandled process=private message_type=%r keys=%s",
+                payload.get("message_type"),
+                sorted(payload.keys()),
             )
-        if payload.get("message_type") != "private":
             return
 
         event = parse_private_message_event(payload)

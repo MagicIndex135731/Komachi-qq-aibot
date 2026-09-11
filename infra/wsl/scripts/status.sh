@@ -330,5 +330,37 @@ if [[ "${ready_ok}" != true ]]; then
   exit 1
 fi
 
+echo "Private chat process:"
+private_container_name="xiaomachi-private"
+private_ok=false
+for attempt in $(seq 1 12); do
+  private_status="$(docker inspect --format '{{.State.Status}}' "${private_container_name}" 2>/dev/null || true)"
+  if [[ "${private_status}" == "running" ]]; then
+    private_heartbeat_payload="$(docker exec "${private_container_name}" cat /workspace/data/logs/private.heartbeat.json 2>/dev/null || true)"
+    if python3 - "${private_heartbeat_payload}" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+if not sys.argv[1]: raise SystemExit(1)
+d = json.loads(sys.argv[1])
+t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
+if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+age = (datetime.now(timezone.utc) - t.astimezone(timezone.utc)).total_seconds()
+print(f"state={d.get('state')} pid={d.get('pid')} heartbeat_age_seconds={age:.1f}")
+if d.get("state") != "alive" or age > 20: raise SystemExit(1)
+PY
+    then
+      private_ok=true
+      break
+    fi
+  fi
+  echo "  waiting for private chat process (${attempt}/12)"
+  sleep 5
+done
+if [[ "${private_ok}" != true ]]; then
+  echo "${private_container_name} is not serving private chat."
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi-private
+  exit 1
+fi
+
 echo "Xiaomachi bot is up and accepting messages."
 exit 0

@@ -57,6 +57,35 @@ services:
         condition: service_started
     command: ["python", "-m", "app.group_main"]
 
+  xiaomachi-private:
+    # Private chat (admin commands, dev-control tasks, reminders). LLBot
+    # broadcasts every OneBot event to every connected client, so this process
+    # shares the OneBot WebSocket with the group bot and ignores group payloads.
+    # It reuses the image built by the xiaomachi service and the same data
+    # volume; it never runs the memory/embedding startup work.
+    image: xiaomachi-bot:local
+    container_name: xiaomachi-private
+    restart: "unless-stopped"
+    network_mode: host
+    working_dir: /workspace
+    env_file:
+      - ./.env
+    environment:
+      - NAPCAT_WS_URL=ws://127.0.0.1:${LLBOT_WS_PORT:-3002}
+      - PYTHONUNBUFFERED=1
+      - TZ=${TZ:-Asia/Shanghai}
+      # Keep the QQ/OneBot gateway direct. These runtime proxy settings apply
+      # only to Xiaomachi's outbound providers (for example the LLM API).
+      - HTTP_PROXY=${XIAOMACHI_HTTP_PROXY:-${DOCKER_HTTP_PROXY:-}}
+      - HTTPS_PROXY=${XIAOMACHI_HTTPS_PROXY:-${DOCKER_HTTPS_PROXY:-}}
+      - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,llbot,xiaomachi,host.docker.internal}}
+    volumes:
+      - xiaomachi_data:/workspace/data
+    depends_on:
+      llbot:
+        condition: service_started
+    command: ["python", "-m", "app.private_main"]
+
 volumes:
   llbot_data:
     external: true

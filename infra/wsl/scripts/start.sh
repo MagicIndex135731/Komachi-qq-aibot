@@ -147,6 +147,12 @@ fi
 docker compose -f "${compose_file}" up -d "${service_name}"
 open_login_page
 docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
+# Private chat runs in its own container: the group process drops every
+# non-group payload, and the private process (admin commands, dev control,
+# reminders) must stay free of the group/memory startup work.  The OneBot
+# server broadcasts every event to every connected client, so both processes
+# share the same WebSocket.
+docker compose -f "${compose_file}" up -d --no-deps xiaomachi-private
 if bash "${SCRIPT_DIR}/status.sh"; then
   :
 else

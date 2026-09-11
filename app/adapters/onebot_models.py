@@ -88,6 +88,27 @@ def parse_group_message_event(payload: dict[str, Any], *, bot_qq: int, bot_name:
     )
 
 
+def resolve_message_type(payload: dict[str, Any]) -> str:
+    """Normalize an inbound OneBot ``message_type``.
+
+    SnowLuma (``xiaomachi-snowluma``) emits ``private`` for direct chats with
+    ``sub_type: "friend"`` and ``group`` with ``sub_type: "normal"``; the
+    ``message`` field is always the OneBot array format. ``friend`` is a
+    ``sub_type`` value rather than a ``message_type``, but older bridges copied
+    it into ``message_type``, so it is still tolerated here.
+
+    Returns ``"private"``, ``"group"`` or ``"unknown"`` so callers can log the
+    raw value instead of dropping a payload in silence.
+    """
+
+    value = str(payload.get("message_type") or "").strip().lower()
+    if value in {"private", "friend"}:
+        return "private"
+    if value == "group":
+        return "group"
+    return "unknown"
+
+
 def parse_private_message_event(payload: dict[str, Any]) -> PrivateMessageEvent:
     message = payload.get("message", payload.get("raw_message", ""))
     plain_text = _flatten_message(message)

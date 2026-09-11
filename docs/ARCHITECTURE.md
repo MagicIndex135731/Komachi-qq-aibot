@@ -27,20 +27,29 @@ flowchart LR
     Server <--> Gateway["LLBot / NapCat"]
     Gateway <--> OB["OneBot 11 WebSocket"]
     OB <--> Group["app.group_main"]
-    Group --> Router["InboundRouter"]
+    OB <--> Private["app.private_main"]
+    Group --> Router["InboundRouter(group)"]
+    Private --> PrivateRouter["InboundRouter(private)"]
     Router <--> DB[("SQLite bot.db")]
+    PrivateRouter <--> DB
     Router --> Memory["Memory V3"]
     Memory <--> DB
     Memory --> Embed["本地 BGE / sqlite-vec"]
     Router --> LLM["商用 LLM API"]
+    PrivateRouter --> LLM
     Router --> Search["内置搜索或 Tavily / DDGS"]
     Router --> Image["商用图片 API"]
+    PrivateRouter --> Image
     LLM --> Router
+    LLM --> PrivateRouter
     Search --> Router
     Image --> Router
+    Image --> PrivateRouter
     Router --> OB
+    PrivateRouter --> OB
     Watchdog["systemd + watchdog"] --> Gateway
     Watchdog --> Group
+    Watchdog --> Private
 ```
 
 核心边界如下：
@@ -147,11 +156,15 @@ LLBot 与 NapCat 的登录态互相独立，不能同时用同一个 QQ 号运�
 
 - `xiaomachi-llbot` 运行固定版本的 LLBot 镜像；
 - `xiaomachi-bot` 运行 `python -m app.group_main`；
+- `xiaomachi-private` 运行 `python -m app.private_main`（私聊命令、开发任务与提醒），
+  与群聊容器复用同一个镜像和数据卷，但不运行群聊的记忆/embedding 启动流程；
 - bot 数据卷以读写方式挂载到 `/workspace/data`；
 - LLBot 只能只读访问 bot 数据卷，同时拥有独立的登录态数据卷；
 - GPU 只分配给 `xiaomachi-bot`，LLBot 不需要 CUDA。
 
-发布必须使用 bot-only 命令：只构建并重建 `xiaomachi`，不得重启或重建 LLBot。这样不会破坏 QQ 登录态。
+发布必须使用 bot-only 命令：构建 `xiaomachi` 镜像后只重建 `xiaomachi` 与
+`xiaomachi-private`，不得重启或重建 QQ 平台容器（LLBot / NapCat / SnowLuma）。
+这样不会破坏 QQ 登录态。
 
 ### 4.3 健康检查
 
@@ -162,6 +175,7 @@ LLBot 与 NapCat 的登录态互相独立，不能同时用同一个 QQ 号运�
 3. OneBot `get_status` 与 `get_login_info`；
 4. `xiaomachi-bot` 容器；
 5. `/workspace/data/logs/group.heartbeat.json` 的新鲜度。
+6. `xiaomachi-private` 容器与 `/workspace/data/logs/private.heartbeat.json` 的新鲜度。
 
 watchdog 还会周期性调用 `get_status` 和 `get_group_list(no_cache=true)`。连续异常时只重启当前 QQ 平台一次；仍需登录则通知 Windows 用户处理，而不是删除登录数据。
 
@@ -355,8 +369,8 @@ app/
   jobs/              一次性/计划任务入口
   providers/         LLM、搜索、embedding 等外部适配
   storage/           SQLAlchemy models、schema 和 repositories
-  group_main.py      当前生产群聊进程
-  private_main.py    私聊管理与提醒进程入口
+  group_main.py      生产群聊进程（xiaomachi-bot）
+  private_main.py    生产私聊进程入口（xiaomachi-private）
   dev_worker_main.py 开发任务 worker 入口
   main.py            共享 factory 和 legacy 组合入口
 configs/             群白名单、人格、安全和提醒 YAML
@@ -367,7 +381,12 @@ docs/                工程说明和历史设计资料
 .trellis/spec/       可执行开发契约；不是生产数据
 ```
 
-当前 Docker 生产栈只启动 `app.group_main`。`private_main` 和 `dev_worker_main` 是独立进程入口，只有单独部署时才运行；它们不会因群聊容器启动而自动出现。
+当前 Docker 生产栈启动 `xiaomachi-bot`（`python -m app.group_main`）和
+`xiaomachi-private`（`python -m app.private_main`）两个容器：OneBot 会把每个事件
+广播给所有已连接客户端，群聊进程只处理 `message_type=group`，私聊进程只处理
+`message_type=private`（管理员命令、开发任务、提醒），两者共享数据卷。
+`dev_worker_main` 仍是独立的可选进程入口，只有单独部署时才运行；镜像内没有打包
+`codex` 可执行文件，因此生产私聊不启用本地开发 worker。
 
 ## 9. 配置与数据边界
 

@@ -47,7 +47,7 @@ fi
 
 mapfile -t previously_running < <(
   docker ps --format '{{.Names}}' \
-    | grep -E '^(xiaomachi-bot|xiaomachi-llbot|xiaomachi-napcat)$' || true
+    | grep -E '^(xiaomachi-bot|xiaomachi-private|xiaomachi-llbot|xiaomachi-napcat)$' || true
 )
 install_succeeded=false
 activation_started=false
@@ -70,12 +70,21 @@ platform_compose_name() {
 recreate_bot_only() {
   local target_release="${1:?release path required}"
   local compose_dir="${target_release}/infra/wsl"
-  local -a compose_args=(-f "${compose_dir}/$(platform_compose_name "${compose_dir}")")
+  local compose_file="${compose_dir}/$(platform_compose_name "${compose_dir}")"
+  local -a compose_args=(-f "${compose_file}")
+
+  # Both application services are recreated together.  The private-chat
+  # container is optional: an older release does not define it, and a rollback
+  # must still recreate the group bot on its own.
+  local -a app_services=(xiaomachi)
+  if grep -Eq '^[[:space:]]+xiaomachi-private:[[:space:]]*$' "${compose_file}"; then
+    app_services+=(xiaomachi-private)
+  fi
 
   if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "${compose_dir}/.env"; then
     compose_args+=(-f "${compose_dir}/docker-compose.gpu.yml")
   fi
-  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --no-build xiaomachi
+  docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --no-build "${app_services[@]}"
 }
 
 restore_previous_runtime() {
