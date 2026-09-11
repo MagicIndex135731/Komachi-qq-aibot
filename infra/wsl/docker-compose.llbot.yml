@@ -2,7 +2,13 @@ name: xiaomachi-linux-stack
 
 services:
   llbot:
-    image: linyuchen/llbot:8.1.10@sha256:067159e742b529dedba5f0b2987290fb34b4627a1f605b83119e36ef76a81467
+    # Source build of LLOneBot main @ b18cbb38 (2026-09-07). The latest release
+    # (8.1.10) predates the PR #856 session-expiry fix, and that fix is the
+    # whole runtime delta between v8.1.10 and main. Rebuild it with the upstream
+    # docker/Dockerfile.local (see infra/wsl/README.md); roll back by restoring
+    # the pinned official digest below.
+    #   linyuchen/llbot:8.1.10@sha256:067159e742b529dedba5f0b2987290fb34b4627a1f605b83119e36ef76a81467
+    image: xiaomachi-llbot:main-b18cbb38
     container_name: xiaomachi-llbot
     restart: "unless-stopped"
     network_mode: host

@@ -87,6 +87,91 @@ def test_llbot_gets_one_bounded_additional_restart_before_notification() -> None
     assert state.alerted is True
 
 
+def test_llbot_login_pending_skips_restarts_and_notifies_once() -> None:
+    watchdog = load_watchdog()
+    state = watchdog.WatchdogState(offline_checks=3)
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=30.0,
+        human_login_required=True,
+        max_recovery_restarts=watchdog.LLBOT_MAX_RECOVERY_RESTARTS,
+        llbot_guid_resync_required=True,
+    )
+
+    assert action == watchdog.ACTION_NOTIFY
+    assert state.alerted is True
+    assert state.restart_attempts == 0
+    assert state.restart_used is False
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=900.0,
+        human_login_required=True,
+        max_recovery_restarts=watchdog.LLBOT_MAX_RECOVERY_RESTARTS,
+    )
+
+    assert action == watchdog.ACTION_NONE
+    assert state.restart_attempts == 0
+
+
+def test_recovery_restart_backoff_grows_and_caps() -> None:
+    watchdog = load_watchdog()
+
+    assert watchdog.recovery_grace_for_attempt(1) == watchdog.RECOVERY_GRACE_SECONDS
+    assert watchdog.recovery_grace_for_attempt(2) == watchdog.RECOVERY_GRACE_SECONDS * 2
+    assert watchdog.recovery_grace_for_attempt(3) == watchdog.RECOVERY_GRACE_SECONDS * 4
+    assert watchdog.recovery_grace_for_attempt(12) == watchdog.RECOVERY_BACKOFF_CAP_SECONDS
+
+    state = watchdog.WatchdogState(
+        offline_checks=3,
+        restart_used=True,
+        restart_attempts=2,
+        restart_requested_at=100.0,
+    )
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=100.0 + watchdog.RECOVERY_GRACE_SECONDS,
+        max_recovery_restarts=3,
+    )
+    assert action == watchdog.ACTION_NONE
+
+    state, action = watchdog.evaluate_state(
+        state,
+        online=False,
+        now=100.0 + watchdog.RECOVERY_GRACE_SECONDS * 2,
+        max_recovery_restarts=3,
+    )
+    assert action == watchdog.ACTION_RESTART
+    assert state.restart_attempts == 3
+
+
+def test_llbot_login_pending_detection_only_uses_the_recent_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+    calls: list[dict[str, Any]] = []
+
+    def fake_logs(container_name: str = "xiaomachi-llbot", **kwargs: Any) -> str:
+        calls.append(kwargs)
+        return "2026-09-11 [I] qq-protocol 二维码文件已保存: /app/llbot/data/temp/login-qrcode.png"
+
+    monkeypatch.setattr(watchdog, "_llbot_recent_logs", fake_logs)
+    assert watchdog.llbot_login_pending() is True
+    assert calls == [{"since_seconds": watchdog.LLBOT_LOGIN_PENDING_WINDOW_SECONDS}]
+
+    monkeypatch.setattr(
+        watchdog,
+        "_llbot_recent_logs",
+        lambda *_, **__: "2026-09-11 [I] onebot11-adapter ws connect /",
+    )
+    assert watchdog.llbot_login_pending() is False
+
+
 def test_online_probe_resets_incident_state() -> None:
     watchdog = load_watchdog()
     incident = watchdog.WatchdogState(
@@ -1140,7 +1225,7 @@ def test_llbot_runtime_uses_current_patch_and_survives_process_exit() -> None:
     start_script = (REPO_ROOT / "infra/wsl/scripts/start.sh").read_text(encoding="utf-8")
     status_script = (REPO_ROOT / "infra/wsl/scripts/status.sh").read_text(encoding="utf-8")
 
-    assert "linyuchen/llbot:8.1.10@sha256:" in compose
+    assert "xiaomachi-llbot:main-b18cbb38" in compose
     assert "AUTO_LOGIN_QQ=${BOT_QQ:-}" in compose
     assert 'restart: "unless-stopped"' in compose
     assert "replay protection unavailable" in start_script

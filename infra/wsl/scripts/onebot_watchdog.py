@@ -25,6 +25,12 @@ ACTION_NOTIFY = "notify"
 OFFLINE_THRESHOLD = 3
 RECOVERY_GRACE_SECONDS = 120
 LLBOT_MAX_RECOVERY_RESTARTS = 2
+# Later recovery restarts wait longer, so a kick that can only be repaired by
+# a human QR scan cannot turn into a burst of re-login attempts.
+RECOVERY_BACKOFF_CAP_SECONDS = 900
+# A QR login that is still waiting for a human.  Only the recent window counts;
+# an old QR line from an earlier incident must not block recovery restarts.
+LLBOT_LOGIN_PENDING_WINDOW_SECONDS = 900
 LLBOT_FORENSICS_FILENAME = "llbot-kick-forensics.jsonl"
 LLBOT_FORENSICS_MAX_BYTES = 262_144
 LLBOT_FORENSICS_KEEP_LINES = 200
@@ -130,6 +136,7 @@ class WatchdogState:
     restart_requested_at: float = 0.0
     llbot_guid_resync_restart_used: bool = False
     llbot_kick_signature: str = ""
+    llbot_login_pending: bool = False
     alerted: bool = False
     webui_alerted: bool = False
     isLogin: bool | None = None
@@ -180,12 +187,27 @@ def exclusive_lock(path: Path):
         handle.close()
 
 
+def recovery_grace_for_attempt(
+    attempts: int, *, base_seconds: int = RECOVERY_GRACE_SECONDS
+) -> int:
+    """Return the wait before the next recovery restart.
+
+    Attempts escalate 120s -> 240s -> 480s ... and stop growing at
+    ``RECOVERY_BACKOFF_CAP_SECONDS``.  The first recovery restart keeps the
+    original grace so a plain transport outage still recovers as before.
+    """
+
+    exponent = max(0, int(attempts) - 1)
+    return min(max(1, int(base_seconds)) * (2**exponent), RECOVERY_BACKOFF_CAP_SECONDS)
+
+
 def evaluate_state(
     state: WatchdogState,
     *,
     online: bool | None,
     active_session_ok: bool | None = True,
     webui_login_error: bool = False,
+    human_login_required: bool = False,
     now: float,
     offline_threshold: int = OFFLINE_THRESHOLD,
     recovery_grace_seconds: int = RECOVERY_GRACE_SECONDS,
@@ -207,6 +229,13 @@ def evaluate_state(
         next_state = state
 
     restart_attempts = max(int(next_state.restart_attempts), int(next_state.restart_used))
+    if unhealthy and human_login_required:
+        # The QQ session is gone and only a QR scan can restore it.  Another
+        # restart would just repeat a failing login against QQ (the re-login
+        # burst we want to avoid), so alert the user once and stop restarting.
+        if next_state.alerted:
+            return next_state, ACTION_NONE
+        return replace(next_state, alerted=True), ACTION_NOTIFY
     if (
         unhealthy
         and llbot_guid_resync_required
@@ -229,7 +258,10 @@ def evaluate_state(
         and restart_attempts < max(1, int(max_recovery_restarts))
         and (
             restart_attempts == 0
-            or now - next_state.restart_requested_at >= recovery_grace_seconds
+            or now - next_state.restart_requested_at
+            >= recovery_grace_for_attempt(
+                restart_attempts, base_seconds=recovery_grace_seconds
+            )
         )
     ):
         return (
@@ -271,6 +303,7 @@ def load_state(path: Path) -> WatchdogState:
                 if isinstance(payload.get("llbot_kick_signature"), str)
                 else ""
             ),
+            llbot_login_pending=bool(payload.get("llbot_login_pending", False)),
             alerted=bool(payload.get("alerted", False)),
             webui_alerted=bool(payload.get("webui_alerted", False)),
             isLogin=payload.get("isLogin") if isinstance(payload.get("isLogin"), bool) else None,
@@ -432,10 +465,19 @@ def restart_napcat(compose_file: Path) -> tuple[bool, str]:
 
 
 def _llbot_recent_logs(
-    container_name: str = "xiaomachi-llbot", *, timestamps: bool = False
+    container_name: str = "xiaomachi-llbot",
+    *,
+    timestamps: bool = False,
+    since_seconds: int | None = None,
 ) -> str:
     """Read the small diagnostic tail without persisting raw gateway logs."""
-    command = ["docker", "logs", "--tail", "200"]
+    command = ["docker", "logs"]
+    if since_seconds is None:
+        command += ["--tail", "200"]
+    else:
+        # A bounded window keeps stale rows from an earlier incident out of the
+        # decision, which matters for the QR-login detector below.
+        command += ["--since", f"{max(1, int(since_seconds))}s"]
     if timestamps:
         # ``docker logs`` prints the application line on its own, so the log
         # driver timestamp is the only stable per-incident identity a repeated
@@ -467,6 +509,21 @@ def llbot_signing_backend_unavailable(container_name: str = "xiaomachi-llbot") -
 def llbot_guid_resync_required(container_name: str = "xiaomachi-llbot") -> bool:
     """Detect a 1001-kick GUID change that an old native signer cannot absorb."""
     return "setmachineguid" in _llbot_recent_logs(container_name).lower()
+
+
+def llbot_login_pending(container_name: str = "xiaomachi-llbot") -> bool:
+    """Detect a QR login that is waiting for a human scan.
+
+    A QQ 1001 kick invalidates the saved session, so LLBot falls back to the
+    QR login flow.  Restarting the container cannot finish that flow; every
+    restart just repeats a failing login attempt against QQ.  Only the recent
+    window counts, so an old QR line cannot block recovery restarts forever.
+    """
+    output = _llbot_recent_logs(
+        container_name,
+        since_seconds=LLBOT_LOGIN_PENDING_WINDOW_SECONDS,
+    )
+    return "login-qrcode.png" in output or "二维码文件已保存" in output
 
 
 def llbot_kick_signature(container_name: str = "xiaomachi-llbot") -> str:
@@ -805,6 +862,12 @@ async def run_check(
         and not llbot_signing_error
         and llbot_guid_resync_required()
     )
+    llbot_scan_pending = (
+        platform == "llbot"
+        and online is not True
+        and not llbot_signing_error
+        and llbot_login_pending()
+    )
     webui_login_error = is_explicit_webui_login_error(webui_status) or llbot_signing_error
     # Restarting LLBot cannot repair an unavailable external signing service.
     # Treat it as an explicit login error so the user is notified immediately,
@@ -819,12 +882,14 @@ async def run_check(
         now=time.time(),
         max_recovery_restarts=(LLBOT_MAX_RECOVERY_RESTARTS if platform == "llbot" else 1),
         llbot_guid_resync_required=llbot_guid_resync_needed,
+        human_login_required=llbot_scan_pending,
     )
     next_state = replace(
         next_state,
         isLogin=webui_status["isLogin"],
         isOffline=webui_status["isOffline"],
         llbot_kick_signature=kick_signature or next_state.llbot_kick_signature,
+        llbot_login_pending=llbot_scan_pending,
         webui_login_error=webui_login_error,
         webui_login_error_kind=(
             "llbot_signing_backend_unavailable"
@@ -836,6 +901,12 @@ async def run_check(
 
     probe_event = "probe_online" if online is True else "probe_offline" if online is False else "probe_unknown"
     append_log(log_file, probe_event, probe_detail)
+    if llbot_scan_pending and not state.llbot_login_pending:
+        append_log(
+            log_file,
+            "llbot_login_required",
+            "qr_scan_pending_restart_skipped",
+        )
 
     if action == ACTION_RESTART:
         ok, detail = (
@@ -864,6 +935,8 @@ async def run_check(
     elif action == ACTION_NOTIFY:
         if llbot_signing_error:
             reason = "llbot_signing_backend_unavailable"
+        elif llbot_scan_pending:
+            reason = "llbot_login_required"
         elif webui_login_error and not state.webui_alerted and next_state.webui_alerted:
             reason = "webui_login_error"
         else:

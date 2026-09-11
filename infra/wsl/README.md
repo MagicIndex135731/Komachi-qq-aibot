@@ -100,6 +100,39 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 切片补发或发送额外失败提示，以避免同一回复重复出现。该记录保留在近期上下文中以维持
 对话连续性，但不参与自动摘要和长期记忆压缩；同一入站消息重放时也不会再次生成回复。
 
+### QQ 1001 掉线与签名组件
+
+LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的
+`@lucky-lillia/sign-proxy-loader`（20260813 构建）**没有导出 `setMachineGuid`**。QQ
+1001 掉线后 LLBot 会重新生成 `machine_guid.bin`，但签名层无法切换设备指纹，日志会打印
+`sign-proxy 未导出 setMachineGuid (老版 .node), GUID 切换不会生效`。该 sign-proxy 由上游
+私有仓库构建、未发布到 npm，仓库内无法自行升级；等上游新版 release 后换回官方 digest。
+
+由于 8.1.10 早于会话过期修复（PR #856），生产当前运行的是**上游 main 的源码构建**：
+
+```bash
+# 在 WSL 内（需要走代理，否则 GitHub 直连很慢）
+curl -sL -x http://127.0.0.1:7897 -o /root/llbot-main.tar.gz \
+  https://codeload.github.com/LLOneBot/LuckyLilliaBot/tar.gz/refs/heads/main
+mkdir -p /root/llbot-main && tar -xzf /root/llbot-main.tar.gz -C /root/llbot-main --strip-components=1
+mkdir -p /root/llbot-main/.yarn   # 该目录被 gitignore，构建需要它存在
+cd /root/llbot-main
+docker build -f docker/Dockerfile.local --network=host \
+  --build-arg BUILD_PROXY=http://127.0.0.1:7897 -t xiaomachi-llbot:main-<commit> .
+```
+
+v8.1.10 → main 的运行时代码差异只有会话鉴权/登录恢复这一组修复（`direct.ts`、
+`direct-lib/client.ts`、`direct-lib/login.ts`、`base.ts`、`emailNotification.ts`、
+`milky/adapter.ts`），没有其它功能改动。镜像只存在于本地 Docker daemon，不要清理；
+上游 8.1.11+ 发布后把 `docker-compose.llbot.yml` 里的镜像换回官方 digest 即可回滚。
+
+1001 掉线在历史日志中多次标注为“异地登录顶号”（同一 QQ 号在别处登录）。恢复顺序是：
+先退出其它登录端，再打开 LLBot WebUI（`open-llbot-webui.bat`）扫码。
+
+watchdog 侧的策略：检测到“等扫码”状态（最近 15 分钟内出现 `login-qrcode.png`）时**不再重启
+容器**——重启无法完成扫码，只会重复一次失败登录；此时只通知一次。其余 recovery 重启按
+120s → 240s → 480s 退避，上限 15 分钟，避免短时间内反复重登触发 QQ 风控。
+
 ## 运行态保护
 
 不要删除：
