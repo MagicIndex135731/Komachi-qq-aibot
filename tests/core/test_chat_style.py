@@ -206,3 +206,26 @@ def test_split_burst_reply_can_leave_the_reply_exactly_as_written() -> None:
 
     assert split_burst_reply(text, burst) == [text]
     assert split_burst_reply("来了|人呢", burst) == ["来了", "人呢"]
+
+
+def test_split_burst_reply_packs_a_long_run_on_reply_at_clause_boundaries() -> None:
+    burst = {"enabled": True, "separator": "|", "max_messages": 3, "max_chars": 24}
+    text = (
+        "哼，看在你诚心诚意求教的份上，小町就大发慈悲告诉你一次，"
+        "不过下次再问这种蠢问题，小町分数可要扣到底了，笨蛋。"
+    )
+
+    parts = split_burst_reply(text, burst)
+
+    assert 2 <= len(parts) <= 3
+    assert "".join(parts) == text
+    assert all(len(part) <= 40 for part in parts)
+
+
+def test_split_burst_reply_keeps_an_unpunctuated_clause_whole() -> None:
+    """No punctuation means no natural cut point, so the line stays intact."""
+
+    burst = {"enabled": True, "separator": "|", "max_messages": 3, "max_chars": 24}
+    text = "小町就是要把这句话一口气说完中间一个标点都不带的完整长句所以不会被切开"
+
+    assert split_burst_reply(text, burst) == [text]

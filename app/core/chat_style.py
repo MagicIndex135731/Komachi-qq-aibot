@@ -315,16 +315,54 @@ def normalize_chat_reply_burst_aware(text: str, burst: dict | None) -> str:
 
 
 def _split_long_segment(text: str, limit: int) -> list[str]:
-    chunks: list[str] = []
+    """Break one oversized message at natural boundaries without losing text.
+
+    Sentence endings are the preferred cut points.  A sentence that is still
+    far over the budget is packed at clause boundaries (，、；:：) so a long
+    run-on reply reaches QQ as several short messages instead of one wall of
+    text.  Characters are never dropped, and a clause without any punctuation
+    is kept whole rather than cut mid-sentence.
+    """
+
+    normalized = str(text or "").strip()
+    if not normalized:
+        return []
+
+    sentences: list[str] = []
     current = ""
-    for char in str(text):
+    for char in normalized:
         current += char
         if len(current) >= limit and char in SENTENCE_ENDINGS:
-            chunks.append(current)
+            sentences.append(current)
             current = ""
     if current.strip():
-        chunks.append(current)
-    cleaned = [chunk.strip() for chunk in chunks if chunk.strip()]
+        sentences.append(current)
+
+    chunks: list[str] = []
+    for sentence in sentences:
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        if len(stripped) <= limit:
+            chunks.append(stripped)
+            continue
+        chunks.extend(_pack_at_clause_boundaries(stripped, limit))
+    return chunks or [normalized]
+
+
+def _pack_at_clause_boundaries(text: str, limit: int) -> list[str]:
+    """Greedily pack one over-long sentence at clause boundaries."""
+
+    pieces: list[str] = []
+    current = ""
+    for char in text:
+        current += char
+        if char in CLAUSE_ENDINGS and len(current) >= limit:
+            pieces.append(current.strip())
+            current = ""
+    if current.strip():
+        pieces.append(current.strip())
+    cleaned = [piece for piece in pieces if piece]
     return cleaned or [str(text).strip()]
 
 
