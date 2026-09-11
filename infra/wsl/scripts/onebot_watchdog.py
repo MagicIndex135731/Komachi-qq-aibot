@@ -31,6 +31,7 @@ RECOVERY_BACKOFF_CAP_SECONDS = 900
 # A QR login that is still waiting for a human.  Only the recent window counts;
 # an old QR line from an earlier incident must not block recovery restarts.
 LLBOT_LOGIN_PENDING_WINDOW_SECONDS = 900
+SNOWLUMA_WEBUI_URL = "http://127.0.0.1:5099"
 LLBOT_FORENSICS_FILENAME = "llbot-kick-forensics.jsonl"
 LLBOT_FORENSICS_MAX_BYTES = 262_144
 LLBOT_FORENSICS_KEEP_LINES = 200
@@ -526,6 +527,22 @@ def llbot_login_pending(container_name: str = "xiaomachi-llbot") -> bool:
     return "login-qrcode.png" in output or "二维码文件已保存" in output
 
 
+def snowluma_login_required(webui_url: str = SNOWLUMA_WEBUI_URL) -> bool:
+    """Detect a SnowLuma stack that is up but has no QQ session.
+
+    SnowLuma only opens its OneBot port once the QQ client is logged in.  When
+    the WebUI answers while OneBot stays silent, the container itself is
+    healthy and the stack is waiting for a human QR scan - restarting it would
+    only throw away the pending QR code, so the watchdog notifies instead.
+    """
+
+    try:
+        with _open_without_redirects(Request(webui_url, method="GET"), timeout=5) as response:
+            return 200 <= int(getattr(response, "status", 0)) < 300
+    except Exception:
+        return False
+
+
 def llbot_kick_signature(container_name: str = "xiaomachi-llbot") -> str:
     """Fingerprint the newest QQ 1001 kick line without persisting it.
 
@@ -868,6 +885,11 @@ async def run_check(
         and not llbot_signing_error
         and llbot_login_pending()
     )
+    snowluma_scan_pending = (
+        platform == "snowluma"
+        and online is not True
+        and snowluma_login_required()
+    )
     webui_login_error = is_explicit_webui_login_error(webui_status) or llbot_signing_error
     # Restarting LLBot cannot repair an unavailable external signing service.
     # Treat it as an explicit login error so the user is notified immediately,
@@ -882,7 +904,7 @@ async def run_check(
         now=time.time(),
         max_recovery_restarts=(LLBOT_MAX_RECOVERY_RESTARTS if platform == "llbot" else 1),
         llbot_guid_resync_required=llbot_guid_resync_needed,
-        human_login_required=llbot_scan_pending,
+        human_login_required=llbot_scan_pending or snowluma_scan_pending,
     )
     next_state = replace(
         next_state,
@@ -935,6 +957,8 @@ async def run_check(
     elif action == ACTION_NOTIFY:
         if llbot_signing_error:
             reason = "llbot_signing_backend_unavailable"
+        elif snowluma_scan_pending:
+            reason = "snowluma_login_required"
         elif llbot_scan_pending:
             reason = "llbot_login_required"
         elif webui_login_error and not state.webui_alerted and next_state.webui_alerted:

@@ -166,6 +166,19 @@ SnowLuma 本体（含 hook 自动挂载）都会自动起来，**但 QQ 不会�
 因此开机后需要：双击 `open-snowluma-desktop.bat`（noVNC 直达 QQ 桌面并自动
 填入 VNC 密码）→ 点"刷新" → 手机扫码。watchdog 在离线时会弹 Windows 通知提醒。
 
+#### 开机流程（当前约定：每次开机人工扫一次码）
+
+1. Windows 登录 → 计划任务 `Xiaomachi WSL Runtime` 自动拉起 WSL 与整套 stack
+   （mihomo、SnowLuma、bot 容器都在其中）；
+2. SnowLuma 会自己起来、自动挂 hook，但 QQ 客户端停在扫码页；
+3. watchdog 探测到"WebUI 正常但 OneBot 未监听"时**不会重启容器**（重启只会换掉
+   二维码），而是弹一次 Windows 通知：`SnowLuma is running but the QQ account is
+   not logged in. Double-click open-snowluma-desktop.bat ...`；
+4. 双击 `open-snowluma-desktop.bat` → 点"刷新" → 手机扫码；OneBot 起来后 bot
+   自动连上（`ws-default` 显示 1 个客户端），无需其它操作；
+5. 上线后**不会补答离线期间积压的消息**：`GROUP_MESSAGE_MAX_AGE_SECONDS=300`
+   之外的旧消息只归档、不回复（日志 `group_message_stale_archived`）。
+
 回滚：`QQ_PLATFORM=llbot` + `systemctl restart xiaomachi-stack.service`。
 
 LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的

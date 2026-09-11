@@ -87,6 +87,77 @@ def test_llbot_gets_one_bounded_additional_restart_before_notification() -> None
     assert state.alerted is True
 
 
+def test_snowluma_login_required_uses_the_webui_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = load_watchdog()
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return False
+
+    monkeypatch.setattr(watchdog, "_open_without_redirects", lambda *a, **k: FakeResponse())
+    assert watchdog.snowluma_login_required() is True
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(watchdog, "_open_without_redirects", refuse)
+    assert watchdog.snowluma_login_required() is False
+
+
+def test_snowluma_waiting_for_scan_never_restarts_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logged-out SnowLuma stack needs a human scan, not a container restart."""
+
+    watchdog = load_watchdog()
+    restarts: list[str] = []
+    reasons: list[str] = []
+
+    async def probe_onebot(_: str) -> tuple[bool | None, bool | None, str]:
+        return False, False, "ConnectionRefusedError"
+
+    monkeypatch.setattr(watchdog, "probe_onebot", probe_onebot)
+    monkeypatch.setattr(watchdog, "snowluma_login_required", lambda *_: True)
+    monkeypatch.setattr(
+        watchdog,
+        "restart_service",
+        lambda _compose, service: (restarts.append(service), "started")[0],
+    )
+    def notify(_path: Path, reason: str) -> tuple[bool, str]:
+        reasons.append(reason)
+        return True, "started"
+
+    monkeypatch.setattr(watchdog, "notify_windows", notify)
+    monkeypatch.setattr(watchdog.time, "time", lambda: 100.0)
+
+    kwargs = {
+        "ws_url": "ws://fake",
+        "state_file": tmp_path / "state.json",
+        "log_file": tmp_path / "watchdog.log",
+        "compose_file": tmp_path / "docker-compose.snowluma.yml",
+        "notifier": tmp_path / "notify.ps1",
+        "service_name": "snowluma",
+        "platform": "snowluma",
+    }
+    watchdog.run_once(**kwargs)
+
+    state = watchdog.load_state(kwargs["state_file"])
+    assert restarts == []
+    assert reasons == ["snowluma_login_required"]
+    assert state.alerted is True
+
+    # The alert stays single-shot while the scan is still pending.
+    watchdog.run_once(**kwargs)
+    assert reasons == ["snowluma_login_required"]
+
+
 def test_llbot_login_pending_skips_restarts_and_notifies_once() -> None:
     watchdog = load_watchdog()
     state = watchdog.WatchdogState(offline_checks=3)
