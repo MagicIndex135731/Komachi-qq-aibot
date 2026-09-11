@@ -186,11 +186,17 @@ def test_start_script_selects_llbot_compose_and_preserves_napcat_default() -> No
 
     assert "QQ_PLATFORM" in script
     assert 'platform="${platform:-napcat}"' in script
-    assert '"${platform}" != "napcat" && "${platform}" != "llbot"' in script
+    assert "napcat|llbot|snowluma" in script
+    assert "QQ_PLATFORM must be napcat, llbot or snowluma." in script
     assert 'compose_file="docker-compose.llbot.yml"' in script
-    assert 'other_compose_file="docker-compose.yml"' in script
+    assert 'other_compose_files="docker-compose.yml docker-compose.snowluma.yml"' in script
     assert 'compose_file="docker-compose.yml"' in script
-    assert 'other_compose_file="docker-compose.llbot.yml"' in script
+    assert 'other_compose_files="docker-compose.llbot.yml docker-compose.snowluma.yml"' in script
+    assert 'compose_file="docker-compose.snowluma.yml"' in script
+    assert 'other_compose_files="docker-compose.yml docker-compose.llbot.yml"' in script
+    assert 'service_name="snowluma"' in script
+    assert 'launcher="open_snowluma_webui.ps1"' in script
+    assert "webui_port=5099" in script
     assert 'launcher="open_llbot_webui.ps1"' in script
     assert 'launcher="open_napcat_webui.ps1"' in script
     assert 'service_name="llbot"' in script
@@ -219,6 +225,7 @@ def test_stop_status_keepalive_and_watchdog_are_platform_aware() -> None:
 
     assert 'docker compose -f docker-compose.yml down --remove-orphans' in stop_script
     assert 'docker compose -f docker-compose.llbot.yml down --remove-orphans' in stop_script
+    assert 'docker compose -f docker-compose.snowluma.yml down --remove-orphans' in stop_script
     assert 'onebot-watchdog-*.json' in stop_script
 
     assert "QQ_PLATFORM" in status_script
@@ -227,6 +234,10 @@ def test_stop_status_keepalive_and_watchdog_are_platform_aware() -> None:
     assert 'container_name="xiaomachi-llbot"' in status_script
     assert 'compose_file="docker-compose.yml"' in status_script
     assert 'service_name="napcat"' in status_script
+    assert 'compose_file="docker-compose.snowluma.yml"' in status_script
+    assert 'service_name="snowluma"' in status_script
+    assert 'container_name="xiaomachi-snowluma"' in status_script
+    assert "SnowLuma WebUI probe:" in status_script
 
     assert 'platform="${3:-napcat}"' in keepalive_script
     assert 'compose_file="${wsl_dir}/docker-compose.llbot.yml"' in keepalive_script
@@ -234,11 +245,14 @@ def test_stop_status_keepalive_and_watchdog_are_platform_aware() -> None:
     assert 'onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"' in keepalive_script
     assert 'compose_file="${wsl_dir}/docker-compose.yml"' in keepalive_script
     assert 'service_name="napcat"' in keepalive_script
+    assert 'compose_file="${wsl_dir}/docker-compose.snowluma.yml"' in keepalive_script
+    assert 'service_name="snowluma"' in keepalive_script
     assert 'onebot-watchdog-${platform}.json' in keepalive_script
     assert "--daemon" in keepalive_script
     assert "--once" not in keepalive_script
 
-    assert 'choices=("napcat", "llbot")' in watchdog
+    assert '"snowluma"' in watchdog
+    assert '"napcat", "llbot", "snowluma"' in watchdog
     assert 'service_name: str = "napcat"' in watchdog
     assert 'platform: str = "napcat"' in watchdog
     assert "restart_service(compose_file, service_name)" in watchdog

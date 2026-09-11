@@ -107,6 +107,33 @@ LLBot 返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发
 
 ### QQ 1001 掉线与签名组件
 
+主用 QQ 桥接现在是 **SnowLuma**（`QQ_PLATFORM=snowluma`）：它是同类的
+"挂官方 QQ 客户端 → 转 OneBot v11"运行时，但 2026-09 的掉线潮里它的 issue 区
+没有出现 LLBot/NapCat 那样的高频被踢反馈，因此作为 A/B 的候选先上线观察。
+
+| 平台 | `QQ_PLATFORM` | 容器 | WebUI | OneBot v11 |
+|---|---|---|---|---|
+| SnowLuma | `snowluma` | `xiaomachi-snowluma` | 5099（noVNC 6081，VNC 5900） | 3001/3000 |
+| LLBot | `llbot` | `xiaomachi-llbot` | 3080 | `LLBOT_WS_PORT`（默认 3002） |
+| NapCat | `napcat` | `xiaomachi-napcat` | 6099 | 3001 |
+
+切换流程（登录态各自独立，互不影响）：
+
+```bash
+# infra/wsl/.env 里改 QQ_PLATFORM=<napcat|llbot|snowluma>，然后
+systemctl restart xiaomachi-stack.service   # stop.sh 会停掉另外两个 stack
+# 首次登录：open-snowluma-webui.bat（密码自动复制到剪贴板，初始账号 admin）
+```
+
+SnowLuma 镜像来自上游维护的 `SnowLuma.Docker.Framework`（Docker Hub
+`motricseven7/snowluma`，compose 里按 digest 固定 v1.14.15）。首次登录需要
+在 WebUI 里改密码并接入 QQ；`SNOWLUMA_ACCEPT_EULA=1` 与
+`SNOWLUMA_ACCEPT_PRIVACY=1` 表示运营者已阅读并接受发行包内的协议。
+重启 stack 会让 SnowLuma 重新生成一次性初始密码，因此首次登录期间先不要让它
+反复重启（watchdog 在这段时间保持停止）。
+
+回滚：`QQ_PLATFORM=llbot` + `systemctl restart xiaomachi-stack.service`。
+
 LLBot 8.1.10 是当前上游最新 release（GitHub release 与 Docker Hub `latest` 一致），其内置的
 `@lucky-lillia/sign-proxy-loader`（20260813 构建）**没有导出 `setMachineGuid`**。QQ
 1001 掉线后 LLBot 会重新生成 `machine_guid.bin`，但签名层无法切换设备指纹，日志会打印

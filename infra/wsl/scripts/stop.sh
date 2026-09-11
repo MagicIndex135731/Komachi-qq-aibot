@@ -8,6 +8,7 @@ cd "${WSL_DIR}"
 compose_exit=0
 docker compose -f docker-compose.yml down --remove-orphans || compose_exit=$?
 docker compose -f docker-compose.llbot.yml down --remove-orphans || compose_exit=$?
+docker compose -f docker-compose.snowluma.yml down --remove-orphans || compose_exit=$?
 
 runtime_dir="${WSL_DIR}/runtime"
 flag_file="${runtime_dir}/keepalive.enabled"

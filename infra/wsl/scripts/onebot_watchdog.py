@@ -1031,7 +1031,11 @@ def main() -> int:
     parser.add_argument("--log-file", type=Path, default=wsl_dir / "runtime/logs/onebot-watchdog.log")
     parser.add_argument("--compose-file", type=Path, default=wsl_dir / "docker-compose.yml")
     parser.add_argument("--service-name", default="napcat")
-    parser.add_argument("--platform", choices=("napcat", "llbot"), default="napcat")
+    parser.add_argument(
+        "--platform",
+        choices=("napcat", "llbot", "snowluma"),
+        default="napcat",
+    )
     parser.add_argument("--notifier", type=Path, default=script_dir / "notify_windows.ps1")
     parser.add_argument("--webui-config", type=Path, default=wsl_dir / "runtime/napcat/config/webui.json")
     parser.add_argument("--webui-url", default="http://127.0.0.1:6099")

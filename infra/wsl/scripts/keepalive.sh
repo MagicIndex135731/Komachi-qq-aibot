@@ -8,17 +8,25 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 wsl_dir="$(cd "${script_dir}/.." && pwd)"
 watchdog_python="${XIAOMACHI_WATCHDOG_PYTHON:-/opt/xiaomachi/current/.venv-wsl/bin/python}"
 
-if [[ "${platform}" == "llbot" ]]; then
-  compose_file="${wsl_dir}/docker-compose.llbot.yml"
-  service_name="llbot"
-  llbot_ws_port="$(sed -n 's/^[[:space:]]*LLBOT_WS_PORT[[:space:]]*=[[:space:]]*//p' "${wsl_dir}/.env" | tail -n 1 | tr -d '\r')"
-  llbot_ws_port="${llbot_ws_port:-3002}"
-  onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"
-else
-  compose_file="${wsl_dir}/docker-compose.yml"
-  service_name="napcat"
-  onebot_ws_url="ws://127.0.0.1:3001"
-fi
+case "${platform}" in
+  llbot)
+    compose_file="${wsl_dir}/docker-compose.llbot.yml"
+    service_name="llbot"
+    llbot_ws_port="$(sed -n 's/^[[:space:]]*LLBOT_WS_PORT[[:space:]]*=[[:space:]]*//p' "${wsl_dir}/.env" | tail -n 1 | tr -d '\r')"
+    llbot_ws_port="${llbot_ws_port:-3002}"
+    onebot_ws_url="ws://127.0.0.1:${llbot_ws_port}"
+    ;;
+  snowluma)
+    compose_file="${wsl_dir}/docker-compose.snowluma.yml"
+    service_name="snowluma"
+    onebot_ws_url="ws://127.0.0.1:3001"
+    ;;
+  *)
+    compose_file="${wsl_dir}/docker-compose.yml"
+    service_name="napcat"
+    onebot_ws_url="ws://127.0.0.1:3001"
+    ;;
+esac
 
 mkdir -p "$(dirname "${pid_file}")"
 echo "$$" >"${pid_file}"

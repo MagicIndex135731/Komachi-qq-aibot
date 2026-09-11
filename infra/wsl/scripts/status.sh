@@ -39,15 +39,23 @@ memory_embedding_provider="${memory_embedding_provider:-local}"
 memory_embedding_device="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_DEVICE[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 memory_embedding_device="$(strip_optional_env_quotes "${memory_embedding_device}")"
 memory_embedding_device="${memory_embedding_device:-cpu}"
-if [[ "${platform}" == "llbot" ]]; then
-  compose_file="docker-compose.llbot.yml"
-  service_name="llbot"
-  container_name="xiaomachi-llbot"
-else
-  compose_file="docker-compose.yml"
-  service_name="napcat"
-  container_name="xiaomachi-napcat"
-fi
+case "${platform}" in
+  llbot)
+    compose_file="docker-compose.llbot.yml"
+    service_name="llbot"
+    container_name="xiaomachi-llbot"
+    ;;
+  snowluma)
+    compose_file="docker-compose.snowluma.yml"
+    service_name="snowluma"
+    container_name="xiaomachi-snowluma"
+    ;;
+  *)
+    compose_file="docker-compose.yml"
+    service_name="napcat"
+    container_name="xiaomachi-napcat"
+    ;;
+esac
 
 llbot_ws_port="$(sed -n 's/^[[:space:]]*LLBOT_WS_PORT[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
 llbot_ws_port="${llbot_ws_port:-3002}"
@@ -206,6 +214,25 @@ if [[ "${platform}" == "llbot" ]]; then
   fi
 fi
 
+if [[ "${platform}" == "snowluma" ]]; then
+  echo "SnowLuma WebUI probe:"
+  webui_ok=false
+  for attempt in $(seq 1 12); do
+    if curl -fsS --max-time 8 http://127.0.0.1:5099/ >/dev/null; then
+      echo "webui=http://127.0.0.1:5099/ ok"
+      webui_ok=true
+      break
+    fi
+    echo "  waiting for SnowLuma WebUI (${attempt}/12)"
+    sleep 5
+  done
+  if [[ "${webui_ok}" != true ]]; then
+    echo "SnowLuma WebUI did not become ready. Check the ${service_name} logs."
+    docker compose -f "${compose_file}" logs --tail=80 "${service_name}"
+    exit 1
+  fi
+fi
+
 echo "OneBot probe (${platform}):"
 probe_output="$(mktemp)"
 trap 'rm -f "${probe_output}"' EXIT
@@ -226,6 +253,10 @@ if [[ "${probe_ok}" != true ]]; then
       && ! docker logs --tail 200 "${container_name}" 2>&1 \
         | grep -Fq -e "replay protection unavailable" -e "sign 未初始化"; then
     echo "LLBot QQ is offline; leaving the stack running so the watchdog can recover after the network returns."
+    exit 75
+  fi
+  if [[ "${platform}" == "snowluma" ]]; then
+    echo "SnowLuma QQ is not logged in yet; open the WebUI on 5099 to finish the QR login."
     exit 75
   fi
   echo "OneBot did not become ready. Check the ${service_name} logs and WebUI."

@@ -54,10 +54,23 @@ activation_started=false
 legacy_names=()
 legacy_original_names=()
 
+# The bot service is defined in every platform compose file; pick the one the
+# release's QQ_PLATFORM selects so a hotfix recreate keeps the active QQ bridge.
+platform_compose_name() {
+  local compose_dir="${1:?compose dir required}"
+  local platform
+  platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' "${compose_dir}/.env" 2>/dev/null | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  case "${platform}" in
+    napcat) printf '%s' "docker-compose.yml" ;;
+    snowluma) printf '%s' "docker-compose.snowluma.yml" ;;
+    *) printf '%s' "docker-compose.llbot.yml" ;;
+  esac
+}
+
 recreate_bot_only() {
   local target_release="${1:?release path required}"
   local compose_dir="${target_release}/infra/wsl"
-  local -a compose_args=(-f "${compose_dir}/docker-compose.llbot.yml")
+  local -a compose_args=(-f "${compose_dir}/$(platform_compose_name "${compose_dir}")")
 
   if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "${compose_dir}/.env"; then
     compose_args+=(-f "${compose_dir}/docker-compose.gpu.yml")
@@ -204,7 +217,7 @@ fi
 # Build and validate the immutable application image before stopping an
 # already-running release.  This keeps upgrade downtime short and prevents a
 # broken build from replacing the current symlink.
-docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi
+docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi
 
 activation_started=true
 systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true

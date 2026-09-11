@@ -1,0 +1,89 @@
+name: xiaomachi-linux-snowluma-stack
+
+services:
+  snowluma:
+    # SnowLuma ships no official image; this is the upstream-maintained runtime
+    # image (SnowLuma.Docker.Framework) pinned to the amd64 digest of v1.14.15.
+    image: motricseven7/snowluma:v1.14.15@sha256:8b934a2882bdb63f00ec67b97731fe8a8e840409b6ae98ca688618742bd0ef0d
+    container_name: xiaomachi-snowluma
+    restart: "unless-stopped"
+    # Every container in this stack runs on the host network: the Docker daemon
+    # has bridge networking disabled, so published ports cannot work. SnowLuma
+    # therefore binds 5099 (WebUI), 6081 (noVNC), 5900 (VNC), 3000/3001 (OneBot)
+    # directly on the host, exactly like the other QQ platforms.
+    network_mode: host
+    shm_size: 1gb
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - VNC_PASSWD=${VNC_PASSWD:-vncpasswd}
+      - SNOWLUMA_WEBUI_HOST=${SNOWLUMA_WEBUI_HOST:-0.0.0.0}
+      - SNOWLUMA_WEBUI_PORT=${SNOWLUMA_WEBUI_PORT:-5099}
+      - SNOWLUMA_LOG_LEVEL=${SNOWLUMA_LOG_LEVEL:-info}
+      - SNOWLUMA_SCREEN=${SNOWLUMA_SCREEN:-1920x1080x24}
+      - SNOWLUMA_HOOK_AUTOLOAD=${SNOWLUMA_HOOK_AUTOLOAD:-1}
+      - SNOWLUMA_QQ_FLAGS=--disable-gpu --disable-software-rasterizer --disable-gpu-compositing
+      # Unattended deployment: the operator accepted the bundled EULA/privacy
+      # terms by running the stack (see infra/wsl/README.md).
+      - SNOWLUMA_ACCEPT_EULA=${SNOWLUMA_ACCEPT_EULA:-1}
+      - SNOWLUMA_ACCEPT_PRIVACY=${SNOWLUMA_ACCEPT_PRIVACY:-1}
+    volumes:
+      # WebUI account, OneBot config and the QQ session live in these volumes.
+      - snowluma_data:/app/data
+      - snowluma_client_config:/app/.config
+      - snowluma_client_data:/app/.local/share
+
+  xiaomachi:
+    image: xiaomachi-bot:local
+    build:
+      context: ../..
+      dockerfile: infra/wsl/Dockerfile.xiaomachi
+      network: host
+      args:
+        PIP_DEFAULT_TIMEOUT: ${PIP_DEFAULT_TIMEOUT:-120}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+        NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,snowluma,xiaomachi,host.docker.internal}
+    container_name: xiaomachi-bot
+    restart: "unless-stopped"
+    network_mode: host
+    working_dir: /workspace
+    env_file:
+      - ./.env
+    environment:
+      # SnowLuma exposes OneBot v11 on 3001 by default; the bot keeps using the
+      # NAPCAT_WS_URL variable name for every non-LLBot platform.
+      - NAPCAT_WS_URL=ws://127.0.0.1:3001
+      - PYTHONUNBUFFERED=1
+      - TZ=${TZ:-Asia/Shanghai}
+      # Keep the QQ/OneBot gateway direct. These runtime proxy settings apply
+      # only to Xiaomachi's outbound providers (for example the LLM API).
+      - HTTP_PROXY=${XIAOMACHI_HTTP_PROXY:-${DOCKER_HTTP_PROXY:-}}
+      - HTTPS_PROXY=${XIAOMACHI_HTTPS_PROXY:-${DOCKER_HTTPS_PROXY:-}}
+      - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,snowluma,xiaomachi,host.docker.internal}}
+    volumes:
+      - xiaomachi_data:/workspace/data
+    depends_on:
+      snowluma:
+        condition: service_started
+    command: ["python", "-m", "app.group_main"]
+
+volumes:
+  snowluma_data:
+    name: xiaomachi-snowluma-data
+  snowluma_client_config:
+    name: xiaomachi-snowluma-client-config
+  snowluma_client_data:
+    name: xiaomachi-snowluma-client-data
+  xiaomachi_data:
+    external: true
+    name: xiaomachi-bot-data

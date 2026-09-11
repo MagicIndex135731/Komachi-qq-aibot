@@ -39,10 +39,13 @@ def test_wsl_required_files_exist() -> None:
         "status-xiaomachi-wsl.bat",
         "open-napcat-webui.bat",
         "open-llbot-webui.bat",
+        "open-snowluma-webui.bat",
         "infra/wsl/docker-compose.llbot.yml",
+        "infra/wsl/docker-compose.snowluma.yml",
         "infra/wsl/scripts/bootstrap_llbot_runtime.py",
         "infra/wsl/scripts/migrate_xiaomachi_data_volume.sh",
         "infra/wsl/scripts/open_llbot_webui.ps1",
+        "infra/wsl/scripts/open_snowluma_webui.ps1",
     ]
     missing = [path for path in required if not (REPO_ROOT / path).exists()]
     assert missing == []
@@ -124,7 +127,10 @@ def test_linux_runtime_installer_copies_allowlist_to_ext4_release_tree() -> None
     assert 'install -m 0600 "${SOURCE_ROOT}/infra/wsl/.env" "${shared_dir}/.env.next"' in script
     assert 'docker rename "${original_name}" "${legacy_name}"' in script
     assert 'docker rename "${legacy_names[$index]}" "${legacy_original_names[$index]}"' in script
-    assert 'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi' in script
+    assert (
+        'docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi'
+        in script
+    )
 
 
 def test_linux_runtime_installer_preserves_local_group_policy_before_image_build() -> None:
@@ -141,9 +147,13 @@ def test_linux_runtime_installer_preserves_local_group_policy_before_image_build
     persist_policy = script.index('shared_groups_config="${shared_config_dir}/groups.local.yaml"')
     release_policy = script.index('"${release_dir}/configs/groups.local.yaml"')
     image_build = script.index(
-        'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi'
+        'docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi'
     )
     assert persist_policy < release_policy < image_build
+    # The bot image build and every hotfix recreate follow the active platform.
+    assert "platform_compose_name()" in script
+    assert 'snowluma) printf \'%s\' "docker-compose.snowluma.yml" ;;' in script
+    assert 'napcat) printf \'%s\' "docker-compose.yml" ;;' in script
 
 
 def test_linux_runtime_installer_does_not_restart_production_on_preflight_failure() -> None:
@@ -154,7 +164,7 @@ def test_linux_runtime_installer_does_not_restart_production_on_preflight_failur
     assert "activation_started=false" in script
     assert 'if [[ "${activation_started}" != true ]]; then' in script
     image_build = script.index(
-        'docker compose -f "${release_dir}/infra/wsl/docker-compose.llbot.yml" build xiaomachi'
+        'docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi'
     )
     activation = script.index("activation_started=true")
     stop_runtime = script.index("systemctl stop xiaomachi-watchdog.service", activation)
@@ -294,7 +304,9 @@ def test_wsl_env_example_has_no_real_secrets() -> None:
     forbidden = ["sk-", "Bearer ", "OPENAI_API_KEY=", bot_account, personal_account]
     assert not any(token in env_example for token in forbidden)
     assert "NAPCAT_WS_URL=ws://napcat:3001" in env_example
-    assert "QQ_PLATFORM=llbot" in env_example
+    assert "QQ_PLATFORM=snowluma" in env_example
+    assert "VNC_PASSWD=" in env_example
+    assert "SNOWLUMA_WEBUI_PORT=5099" in env_example
     assert "LLBOT_WS_PORT=3002" in env_example
     assert "NAPCAT_QUICK_PASSWORD=" in env_example
     assert "NAPCAT_QUICK_PASSWORD_MD5=" in env_example
@@ -493,9 +505,11 @@ def test_llbot_offline_status_keeps_recovery_owned_by_the_watchdog() -> None:
     assert '[[ "${platform}" == "llbot" ]]' in script
     assert "leaving the stack running so the watchdog can recover" in script
     assert "exit 75" in script
-    assert '"${platform}" == "llbot" && "${status_exit}" == 75' in start_script
+    assert 'if [[ "${status_exit}" == 75 ]]' in start_script
     assert "watchdog will retry" in start_script
     assert "not accepting messages yet" in start_script
+    assert "SnowLuma QQ is not logged in yet" in script
+    assert "exit 75" in script
     assert 'if "%STATUS_EXIT_CODE%"=="75" goto :recovering' in start_bat
     assert "stack and watchdog are still running" in start_bat
     assert "OneBot probe (${platform})" in script

@@ -33,25 +33,40 @@ fi
 
 platform="$(sed -n 's/^[[:space:]]*QQ_PLATFORM[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 platform="${platform:-napcat}"
-if [[ "${platform}" != "napcat" && "${platform}" != "llbot" ]]; then
-  echo "QQ_PLATFORM must be napcat or llbot."
-  exit 1
-fi
+case "${platform}" in
+  napcat|llbot|snowluma) ;;
+  *)
+    echo "QQ_PLATFORM must be napcat, llbot or snowluma."
+    exit 1
+    ;;
+esac
 
-if [[ "${platform}" == "llbot" ]]; then
-  compose_file="docker-compose.llbot.yml"
-  other_compose_file="docker-compose.yml"
-  service_name="llbot"
-  webui_port=3080
-  launcher="open_llbot_webui.ps1"
-  python3 "${SCRIPT_DIR}/bootstrap_llbot_runtime.py" --wsl-dir "${WSL_DIR}"
-else
-  compose_file="docker-compose.yml"
-  other_compose_file="docker-compose.llbot.yml"
-  service_name="napcat"
-  webui_port=6099
-  launcher="open_napcat_webui.ps1"
-fi
+# Exactly one platform runs at a time: a QQ account cannot be logged in on two
+# bridges at once.  ``other_compose_files`` lists every stack to tear down first.
+case "${platform}" in
+  llbot)
+    compose_file="docker-compose.llbot.yml"
+    other_compose_files="docker-compose.yml docker-compose.snowluma.yml"
+    service_name="llbot"
+    webui_port=3080
+    launcher="open_llbot_webui.ps1"
+    python3 "${SCRIPT_DIR}/bootstrap_llbot_runtime.py" --wsl-dir "${WSL_DIR}"
+    ;;
+  snowluma)
+    compose_file="docker-compose.snowluma.yml"
+    other_compose_files="docker-compose.yml docker-compose.llbot.yml"
+    service_name="snowluma"
+    webui_port=5099
+    launcher="open_snowluma_webui.ps1"
+    ;;
+  *)
+    compose_file="docker-compose.yml"
+    other_compose_files="docker-compose.llbot.yml docker-compose.snowluma.yml"
+    service_name="napcat"
+    webui_port=6099
+    launcher="open_napcat_webui.ps1"
+    ;;
+esac
 
 gpu_flag=""
 if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' .env; then
@@ -106,7 +121,9 @@ open_login_page() {
 }
 
 enable_keepalive
-docker compose -f "${other_compose_file}" down --remove-orphans || true
+for other_compose_file in ${other_compose_files}; do
+  docker compose -f "${other_compose_file}" down --remove-orphans || true
+done
 # Persistent runtime state lives in Docker named volumes on the Linux ext4
 # filesystem.  The migration script is a no-op in an installed Linux release.
 docker volume inspect xiaomachi-bot-data >/dev/null 2>&1 || docker volume create xiaomachi-bot-data >/dev/null
@@ -134,15 +151,15 @@ if bash "${SCRIPT_DIR}/status.sh"; then
   :
 else
   status_exit=$?
-  if [[ "${platform}" == "llbot" && "${status_exit}" == 75 ]]; then
-    echo "LLBot is waiting for QQ network recovery; the stack remains running and the watchdog will retry."
+  if [[ "${status_exit}" == 75 ]]; then
+    echo "${service_name} is waiting for the QQ login/network; the stack remains running and the watchdog will retry."
     startup_waiting_for_qq=true
   else
     exit "${status_exit}"
   fi
 fi
 if [[ "${startup_waiting_for_qq}" == true ]]; then
-  echo "Xiaomachi startup is pending QQ recovery; it is not accepting messages yet."
+  echo "Xiaomachi startup is pending QQ login; it is not accepting messages yet."
 else
   echo "Xiaomachi startup complete: bot is up and accepting messages."
 fi
