@@ -3,6 +3,8 @@
 __pycache__/
 .pytest_cache/
 .pytest-*/
+# 所有测试临时目录统一收在 .test-tmp/ 下（scripts/clean_test_tmp.ps1 可清理）
+.test-tmp/
 *.pyc
 *.egg-info/
 data/bot.db
