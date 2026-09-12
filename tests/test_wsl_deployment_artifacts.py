@@ -36,6 +36,7 @@ def test_wsl_required_files_exist() -> None:
         "infra/wsl/systemd/xiaomachi-memory-audit.service",
         "infra/wsl/systemd/xiaomachi-memory-audit.timer",
         "start-xiaomachi-wsl.bat",
+        "rebuild-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
         "open-napcat-webui.bat",
@@ -100,11 +101,28 @@ def test_windows_bat_entries_prefer_fixed_linux_runtime() -> None:
     assert "run_systemd_with_output start xiaomachi-stack.service" in entry
     assert "journalctl --no-pager --follow --output=cat" in entry
     assert "run_systemd_with_output stop xiaomachi-stack.service" in entry
+
+
     assert "for base in /mnt/d /mnt/e /mnt/c" in entry
     assert "find \"${base}\"" in entry
     assert "pyproject.toml" in entry
     assert "install_linux_runtime.sh" in entry
     assert "start|stop|status|anchor|install" in entry
+
+
+def test_rebuild_bat_runs_the_installer_and_reports_readiness() -> None:
+    """The one-click rebuild entry must reinstall, not merely start."""
+
+    content = (REPO_ROOT / "rebuild-xiaomachi-wsl.bat").read_text(encoding="utf-8")
+
+    assert content.isascii()
+    assert (
+        'wsl.exe --user root --cd "%~dp0" --exec bash infra/wsl/scripts/xiaomachi-wsl-entry.sh install'
+        in content
+    )
+    assert 'wsl.exe --user root --exec "%ENTRY%" status' in content
+    assert 'if "%STATUS_EXIT_CODE%"=="75" goto :recovering' in content
+    assert "pause" in content.lower()
 
 
 def test_linux_runtime_installer_copies_allowlist_to_ext4_release_tree() -> None:

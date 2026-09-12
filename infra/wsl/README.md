@@ -17,6 +17,21 @@ start-xiaomachi-wsl.bat
 
 停止和状态入口使用同一个固定脚本，分别调用 `stop.sh` 和 `status.sh`。
 
+改完人格 / 配置 / 代码后要生效，用 **`rebuild-xiaomachi-wsl.bat`**：
+
+```text
+rebuild-xiaomachi-wsl.bat
+  -> infra/wsl/scripts/install_linux_runtime.sh
+  -> 把当前仓库装成新 release（含 configs/、app/）
+  -> 重建镜像并重建 xiaomachi-bot + xiaomachi-private
+  -> QQ 平台容器（SnowLuma / LLBot / NapCat）保持不动，登录态不受影响
+  -> 跑一遍 status.sh 确认 readiness
+```
+
+`start-xiaomachi-wsl.bat` 只在**首次安装**时会走 install；装好之后它只负责启动与
+状态检查，不会重建镜像，所以改完文件必须用 `rebuild-xiaomachi-wsl.bat`（或同样的
+install 命令）才会生效。
+
 Windows 可能在最后一个交互式 `wsl.exe` 退出后回收 WSL VM。生产机应安装登录级
 任务计划，让独立进程持有运行锚点并在登录后恢复 systemd 服务：
 
