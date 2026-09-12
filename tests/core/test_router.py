@@ -3279,6 +3279,7 @@ async def test_router_hides_reserved_outbound_from_recent_messages_and_cooldown(
     assert len(llm.calls) == 2
     assert "I am here." not in "\n".join(llm.calls[1])
     assert llm.calls[1][3].startswith("Reply style: ")
+    assert "cannot browse or search the web" in llm.calls[1][3]
     assert (
         llm.calls[1][4]
         == "Recent messages:\n"

@@ -329,6 +329,9 @@ async def test_owner_daily_chat_replies_inline_with_daily_prompt(sqlite_engine, 
     assert "Talk like a real person chatting on QQ." in prompt
     assert "Do not use Markdown, headings, bullet lists, numbered lists" in prompt
     assert "Do not include URLs, website addresses, Markdown links" in prompt
+    # The no-web-access claim is banned on every turn, not only on searched
+    # turns: the search-priority block below is conditional, this line is not.
+    assert "never tell the user you cannot browse or search the web" in prompt
     # The default persona keeps the mesugaki voice; ``chat_voice: clingy``
     # swaps only the edge lines (see the clingy test below).
     assert "mesugaki" in prompt

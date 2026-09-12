@@ -34,6 +34,25 @@ def test_build_human_chat_style_lines_private_context_only_changes_the_opening_l
     assert private_lines[1:] == group_lines[1:]
 
 
+def test_build_human_chat_style_lines_never_claims_no_web_access() -> None:
+    """A plain turn without tools must not tell the user the bot cannot search."""
+
+    expected = (
+        "You do have live web search in this chat when a turn needs it: never tell the user "
+        "you cannot browse or search the web; when a turn has no fresh results, say the "
+        "information may be out of date instead of claiming you have no web access."
+    )
+
+    group_lines = build_human_chat_style_lines()
+    private_lines = build_human_chat_style_lines(chat_context="private")
+
+    assert expected in group_lines
+    assert expected in private_lines
+    # The capability line sits in the shared block, so neither the voice nor the
+    # proactive path may drop it.
+    assert expected in build_human_chat_style_lines(proactive_turn=True, voice="clingy")
+
+
 def test_build_reply_split_config_uses_group_settings_and_safe_defaults() -> None:
     defaults = build_reply_split_config()
     assert defaults == {
