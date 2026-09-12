@@ -113,6 +113,39 @@ class BuiltinSearchLlmClient(FakeLlmClient):
         )
 
 
+class TurnLabeledLlmClient(FakeLlmClient):
+    """Replies ``reply-<n>`` to the owner message ``owner-message-<n>``.
+
+    The private context window is asserted on message identity, so the fake
+    echoes the turn number back instead of returning one fixed reply.
+    """
+
+    def generate_text(
+        self,
+        prompt_lines,
+        *,
+        images=None,
+        conversation_key=None,
+        temperature=None,
+    ):
+        current_message = next(
+            (
+                line.split("Current owner message: ", maxsplit=1)[1]
+                for line in reversed(list(prompt_lines))
+                if line.startswith("Current owner message: ")
+            ),
+            "",
+        )
+        if "owner-message-" in current_message:
+            self.reply_text = f"reply-{current_message.split('owner-message-', maxsplit=1)[1]}"
+        return super().generate_text(
+            prompt_lines,
+            images=images,
+            conversation_key=conversation_key,
+            temperature=temperature,
+        )
+
+
 class FakeSearchClient:
     def __init__(self) -> None:
         self.queries: list[tuple[str, int]] = []
@@ -319,6 +352,61 @@ async def test_owner_daily_chat_replies_inline_with_daily_prompt(sqlite_engine, 
             for row in connection.execute(text("select session_mode from dev_sessions order by id asc"))
         ]
     assert session_modes == ["daily"]
+
+
+@pytest.mark.asyncio
+async def test_private_context_window_keeps_the_last_twenty_messages(
+    sqlite_engine, tmp_path
+) -> None:
+    """The daily context window counts both sides: 20 messages = ten exchanges."""
+
+    sender = FakeSender()
+    llm_client = TurnLabeledLlmClient()
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    for index in range(1, 16):
+        handled = await service.handle_private_message(
+            make_private_event(
+                message_id=f"p-window-{index}",
+                user_id=10001,
+                text=f"owner-message-{index}",
+            )
+        )
+        assert handled is True
+
+    await service.handle_private_message(
+        make_private_event(
+            message_id="p-window-current",
+            user_id=10001,
+            text="owner-message-current",
+        )
+    )
+
+    prompt_lines = llm_client.prompts[-1]
+    summary_start = prompt_lines.index("Current private daily session summary:")
+    turns_start = prompt_lines.index("Recent private daily turns:")
+    summary_block = prompt_lines[summary_start + 1].splitlines()
+    history_block = prompt_lines[turns_start + 1].splitlines()
+
+    # Fifteen exchanges happened; the window keeps the newest 20 messages, so
+    # the oldest survivors are #6 and its reply.  The in-flight turn is not
+    # part of the window yet.
+    expected_window = [
+        line
+        for index in range(6, 16)
+        for line in (f"Owner: owner-message-{index}", f"Assistant: reply-{index}")
+    ]
+    assert len(expected_window) == private_chat_module.PRIVATE_CONTEXT_MESSAGE_LIMIT
+    assert history_block == expected_window
+    assert summary_block == expected_window
+    assert sum(line.startswith("Owner: ") for line in history_block) == 10
+    assert sum(line.startswith("Assistant: ") for line in history_block) == 10
 
 
 @pytest.mark.asyncio

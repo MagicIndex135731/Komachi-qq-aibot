@@ -130,8 +130,16 @@ SESSION_MODE_DAILY = "daily"
 PRIVATE_SCOPE_OWNER_DAILY = "owner_daily"
 PRIVATE_SCOPE_ALLOWLIST_DAILY = "allowlist_daily"
 
-SUMMARY_LINE_LIMIT = 14
-RECENT_TURN_LIMIT = 8
+# The private daily context is the last N *messages* of the session and counts
+# both sides: every owner message and every Komachi reply occupies one slot, so
+# 20 messages cover up to ten exchanges.  The rolling session summary and the
+# recent-turns block in the prompt share the same window.
+PRIVATE_CONTEXT_MESSAGE_LIMIT = 20
+SUMMARY_LINE_LIMIT = PRIVATE_CONTEXT_MESSAGE_LIMIT
+# Half the window: each history turn contributes up to two lines (owner +
+# assistant).  The call site fetches two turns beyond this so the recent-turns
+# block still fills the window once the in-flight turn is excluded.
+RECENT_TURN_LIMIT = PRIVATE_CONTEXT_MESSAGE_LIMIT // 2
 
 
 @dataclass(slots=True)
