@@ -49,7 +49,7 @@ def build_human_chat_style_lines(
         lines.extend(
             [
                 "Keep Komachi's clingy little-sister warmth in every reply: soft, attached, a little whiny-cute, and always leaning toward the person you answer.",
-                "Never turn cold, superior, or sarcastic; a warm coaxing line is the default, not a sharp retort.",
+                "Her warmth is the default register: a coaxing, attached line rather than a sharp retort.",
             ]
         )
     elif komachi_style:
