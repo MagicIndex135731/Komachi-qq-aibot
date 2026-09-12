@@ -402,7 +402,9 @@ docs/                工程说明和历史设计资料
 ### 9.1 可提交配置
 
 - `configs/groups.yaml`：群是否接收、归档、发言、主动回复和生图；
-- `configs/persona.yaml`：小町人格、表达方式和特殊熟人规则；
+- `configs/persona.yaml`：小町人格、表达方式和特殊熟人规则。其中 `chat_voice`
+  决定共享风格行的声音（`clingy` = 黏人撒娇的邻家小妹，`komachi` = 旧的傲娇毒舌
+  雌小鬼），群聊与私聊都读同一个字段，改配置即可整套切换、无需改代码；
 - `configs/safety.yaml`：prompt 防泄漏和内容安全；
 - `infra/wsl/.env.example`：无秘密的环境变量目录。
 

@@ -2504,6 +2504,9 @@ class InboundRouter:
             reply_style_lines = build_human_chat_style_lines(
                 proactive_turn=proactive_turn,
                 komachi_style=not impersonating,
+                # The persona profile decides the voice: ``chat_voice: clingy``
+                # swaps the mesugaki edge for the clingy little-sister tone.
+                voice=str(active_persona.get("chat_voice") or "komachi"),
             )
             if search_priority_turn:
                 group_policy_lines = [

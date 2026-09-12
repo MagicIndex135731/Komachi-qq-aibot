@@ -296,6 +296,9 @@ async def test_owner_daily_chat_replies_inline_with_daily_prompt(sqlite_engine, 
     assert "Talk like a real person chatting on QQ." in prompt
     assert "Do not use Markdown, headings, bullet lists, numbered lists" in prompt
     assert "Do not include URLs, website addresses, Markdown links" in prompt
+    # The default persona keeps the mesugaki voice; ``chat_voice: clingy``
+    # swaps only the edge lines (see the clingy test below).
+    assert "mesugaki" in prompt
     # Memory retrieval and persona imitation stay out of the private prompt.
     assert "相关话题下他的原话示例" not in prompt
     assert "群历史" not in prompt
@@ -316,6 +319,35 @@ async def test_owner_daily_chat_replies_inline_with_daily_prompt(sqlite_engine, 
             for row in connection.execute(text("select session_mode from dev_sessions order by id asc"))
         ]
     assert session_modes == ["daily"]
+
+
+@pytest.mark.asyncio
+async def test_private_prompt_uses_the_persona_chat_voice(sqlite_engine, tmp_path) -> None:
+    """``chat_voice: clingy`` swaps the mesugaki edge for the clingy voice."""
+
+    sender = FakeSender()
+    llm_client = FakeLlmClient(reply_text="在的在的，小町一直在等你说话呀。")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+        assistant_name="比企谷小町",
+        persona={
+            "name": "比企谷小町",
+            "identity": "A fixed AI persona modeled after Hikigaya Komachi.",
+            "chat_voice": "clingy",
+        },
+    )
+
+    await service.handle_private_message(
+        make_private_event(message_id="p-chat-clingy", user_id=10001, text="在吗")
+    )
+
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "clingy little-sister warmth" in prompt
+    assert "mesugaki" not in prompt
 
 
 @pytest.mark.asyncio

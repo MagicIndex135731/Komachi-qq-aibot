@@ -294,3 +294,30 @@ def test_burst_delays_share_the_group_window_across_surfaces() -> None:
         1.5,
         1.5,
     )
+
+
+def test_clingy_voice_swaps_the_mesugaki_edge_for_little_sister_warmth() -> None:
+    lines = build_human_chat_style_lines(voice="clingy")
+    joined = "\n".join(lines)
+
+    assert "clingy little-sister warmth" in joined
+    assert "mesugaki" not in joined
+    assert "sharp roast" not in joined
+
+
+def test_clingy_proactive_lines_never_land_a_jab() -> None:
+    joined = "\n".join(build_human_chat_style_lines(proactive_turn=True, voice="clingy"))
+
+    assert "quietly leaning in" in joined
+    assert "sharp roast" not in joined
+    assert "land the jab" not in joined
+    assert "teasing put-downs like" not in joined
+
+
+def test_clingy_voice_is_ignored_without_the_komachi_style() -> None:
+    """Impersonation turns pass ``komachi_style=False`` and keep their own text."""
+
+    assert build_human_chat_style_lines(
+        voice="clingy",
+        komachi_style=False,
+    ) == build_human_chat_style_lines(komachi_style=False)

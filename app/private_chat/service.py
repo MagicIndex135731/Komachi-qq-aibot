@@ -831,6 +831,7 @@ class PrivateChatService:
                 proactive_turn=False,
                 komachi_style=True,
                 chat_context="private",
+                voice=str(self.persona.get("chat_voice") or "komachi"),
             ),
             "Reply style: If evidence is missing or conflicting, say so plainly instead of smoothing it over.",
         ]
