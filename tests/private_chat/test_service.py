@@ -510,6 +510,31 @@ async def test_daily_datetime_question_marks_runtime_facts_as_authoritative(sqli
 
 
 @pytest.mark.asyncio
+async def test_daily_plain_question_still_receives_runtime_facts(sqlite_engine, tmp_path) -> None:
+    """Every private turn carries the clock, not only date questions."""
+
+    sender = FakeSender()
+    llm_client = FakeLlmClient(reply_text="我在的。")
+    service = build_service(
+        sqlite_engine,
+        tmp_path,
+        sender=sender,
+        llm_client=llm_client,
+        owner_qq=10001,
+    )
+
+    handled = await service.handle_private_message(
+        make_private_event(message_id="p-chat-runtime-plain", user_id=10001, text="在吗")
+    )
+
+    assert handled is True
+    prompt = "\n".join(llm_client.prompts[0])
+    assert "Runtime facts:" in prompt
+    assert "Current local date:" in prompt
+    assert "Treat runtime facts as authoritative for the current year, date, weekday, and clock time." in prompt
+
+
+@pytest.mark.asyncio
 async def test_daily_chat_passes_current_images_to_llm(sqlite_engine, tmp_path) -> None:
     sender = FakeSender()
     llm_client = FakeLlmClient(reply_text="我看到这张图了。")

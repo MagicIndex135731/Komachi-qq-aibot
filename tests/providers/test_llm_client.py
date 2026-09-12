@@ -2698,6 +2698,51 @@ def test_llm_client_records_web_search_tool_events_from_sse() -> None:
     assert events[-1]["event"] == "response.web_search_call.completed"
 
 
+def test_llm_client_records_web_search_queries_and_structured_error(caplog) -> None:
+    """DeepSeek nests the issued queries under ``item.action.queries``."""
+
+    events: list[dict] = []
+    search_item = {
+        "id": "ws_deepseek_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"queries": ["上海 2026年9月12日 新闻", "上海 今日新闻"]},
+    }
+    body = (
+        f'data: {json.dumps({"type": "response.output_item.done", "item": search_item})}\n\n'
+        f'data: {json.dumps({"type": "response.web_search_call.failed", "item_id": "ws_deepseek_1", "error": {"code": "rate_limited", "message": "query budget exhausted"}})}\n\n'
+        f'data: {json.dumps({"type": "response.output_text.delta", "delta": "grounded"})}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = LlmClient(
+        base_url="https://api.deepseek.test/v1",
+        api_key="test-key",
+        model="deepseek-v4-pro",
+        responses_model="deepseek-v4-pro",
+        tool_event_recorder=events.append,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.providers.llm_client"):
+        assert client.generate_text(["Target message: Alice: 搜索今天的新闻"]) == "grounded"
+
+    assert events[0]["queries"] == '["上海 2026年9月12日 新闻", "上海 今日新闻"]'
+    assert events[-1]["event"] == "response.web_search_call.failed"
+    assert events[-1]["error"] == "code=rate_limited message=query budget exhausted"
+    assert any(
+        "queries=" in record.message and "上海 2026年9月12日 新闻" in record.message
+        for record in caplog.records
+    )
+
+
 def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoint() -> None:
     captured_payloads: list[dict] = []
     responses = iter(

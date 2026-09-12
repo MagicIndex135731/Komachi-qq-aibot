@@ -401,7 +401,9 @@ docs/                工程说明和历史设计资料
 `WebSearchClient` 取证，没有外部客户端时由私聊进程把
 `allow_web_search` / `force_web_search` 传给 `generate_text`，让供应商内置的
 `web_search` 工具接管（显式联网请求强制搜索，配置 `LLM_WEB_SEARCH_MODEL` 时只有
-时间敏感或明确联网的轮次触发，搜索轮次带搜索优先级指令）；私聊生图同样使用
+时间敏感或明确联网的轮次触发，搜索轮次带搜索优先级指令：查询词必须用 Runtime
+facts 里的当前日期/年份，且禁止回答「不能联网」；私聊每轮都注入 Runtime facts，
+不再只在日期类提问时注入）；私聊生图同样使用
 `build_image_reference_search_client` + `build_group_image_reference_planner_client`
 的参考图链路。
 

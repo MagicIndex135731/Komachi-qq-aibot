@@ -326,8 +326,22 @@ def test_memory_budget_for_search_never_exceeds_available_input() -> None:
 def test_search_priority_instructions_prefer_fresh_results_and_say_miss() -> None:
     instructions = build_search_priority_instructions()
 
-    assert len(instructions) == 2
+    assert len(instructions) == 4
     assert "prefer its fresh results over chat memory" in instructions[0]
     assert "Treat chat memory as background only" in instructions[0]
     assert "say the search did not hit" in instructions[1]
     assert "Never present old chat memory as current fact" in instructions[1]
+
+
+def test_search_priority_instructions_pin_the_current_year_and_ban_cannot_search_claims() -> None:
+    instructions = build_search_priority_instructions()
+
+    assert any(
+        "Runtime facts" in line and "never write a stale year" in line
+        for line in instructions
+    )
+    assert any(
+        "never claim you cannot browse or search the web" in line
+        and "what the search did find" in line
+        for line in instructions
+    )

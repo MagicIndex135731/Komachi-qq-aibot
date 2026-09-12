@@ -1022,8 +1022,11 @@ class PrivateChatService:
         grounding_notes: list[str] = []
 
         search_reference_time = self._normalize_private_timestamp(request_time).astimezone()
-        if needs_current_datetime_context(request_text):
-            runtime_facts = build_current_datetime_facts(search_reference_time)
+        # Every private turn carries the current clock, exactly like the group
+        # router: without it the model invents stale years for its own search
+        # queries and cannot ground "today"/"this year" style answers.
+        runtime_facts = build_current_datetime_facts(search_reference_time)
+        current_datetime_context_required = needs_current_datetime_context(request_text)
 
         # The search predicates drive both transports: the external client
         # below, and the provider's own ``web_search`` tool when this
@@ -1071,7 +1074,11 @@ class PrivateChatService:
             builtin_web_search_eligible or force_builtin_web_search
         )
 
-        if self.web_search_client is None or runtime_facts or is_search_verification_query(request_text):
+        if (
+            self.web_search_client is None
+            or current_datetime_context_required
+            or is_search_verification_query(request_text)
+        ):
             if builtin_web_search_active:
                 logger.info(
                     "private_web_search_builtin owner_qq=%s force=%s eligible=%s scoped=%s",

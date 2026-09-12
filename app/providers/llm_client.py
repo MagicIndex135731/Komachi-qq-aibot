@@ -793,6 +793,7 @@ class LlmClient:
         item_id = payload.get("item_id")
         status = payload.get("status")
         query = payload.get("query")
+        queries = payload.get("queries")
         title = payload.get("title")
         url = payload.get("url")
         error = payload.get("error")
@@ -800,21 +801,29 @@ class LlmClient:
             item_id = item_id or item.get("id")
             status = status or item.get("status")
             query = query or item.get("query")
+            if not queries:
+                # DeepSeek/OpenAI style web_search_call carries the issued
+                # queries under item.action.queries.
+                action = item.get("action")
+                if isinstance(action, dict):
+                    queries = action.get("queries")
             title = title or item.get("title")
             url = url or item.get("url")
             error = error or item.get("error")
 
+        error_text = self._format_tool_event_error(error)
         logger.info(
-            "responses_tool_event response_id=%s event=%s item_id=%s item_type=%s status=%s query=%r title=%r url=%r error=%r",
+            "responses_tool_event response_id=%s event=%s item_id=%s item_type=%s status=%s query=%r queries=%r title=%r url=%r error=%r",
             response_id or "",
             payload_type,
             item_id or "",
             item_type or "",
             status or "",
             self._truncate_log_value(query),
+            self._truncate_log_value(queries),
             self._truncate_log_value(title),
             self._truncate_log_value(url),
-            self._truncate_log_value(error),
+            self._truncate_log_value(error_text),
         )
         if self.tool_event_recorder is not None and (
             "web_search_call" in payload_type or item_type == "web_search_call"
@@ -827,13 +836,32 @@ class LlmClient:
                         "item_id": str(item_id or ""),
                         "status": str(status or ""),
                         "query": self._truncate_log_value(query),
+                        "queries": self._truncate_log_value(queries),
                         "title": self._truncate_log_value(title),
                         "url": self._truncate_log_value(url),
-                        "error": self._truncate_log_value(error),
+                        "error": self._truncate_log_value(error_text),
                     }
                 )
             except Exception:
                 logger.exception("responses_tool_event_record_failed")
+
+    @staticmethod
+    def _format_tool_event_error(value: Any) -> Any:
+        """Flatten a structured tool error into one readable ``key=value`` line.
+
+        Providers report tool failures as nested objects such as
+        ``{"code": "rate_limited", "message": "..."}``; flattening them keeps
+        the container log scannable. Plain strings, ``None``, and any other
+        shape pass through unchanged.
+        """
+        if not isinstance(value, dict):
+            return value
+        parts = [
+            f"{key}={value[key]}"
+            for key in ("code", "type", "message")
+            if value.get(key) not in (None, "")
+        ]
+        return " ".join(parts) if parts else value
 
     def _truncate_log_value(self, value: Any, *, limit: int = 240) -> str:
         if value is None:

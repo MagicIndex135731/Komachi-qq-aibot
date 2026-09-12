@@ -301,6 +301,11 @@ SEARCH_PRIORITY_INSTRUCTIONS = (
     "If web search does not return the requested current information, say the search did not "
     "hit and ask for a typhoon name, keyword, or screenshot. Never present old chat memory as "
     "current fact.",
+    "Web search priority: compose the query with the current date and year given in Runtime "
+    "facts; never write a stale year carried over from training data or older turns.",
+    "Web search priority: this turn has live web access, so never claim you cannot browse or "
+    "search the web. If the results do not cover the question, state what the search did find "
+    "and what it did not.",
 )
 
 
