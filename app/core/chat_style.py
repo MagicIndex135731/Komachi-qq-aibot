@@ -16,6 +16,11 @@ CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 CLAUSE_PATTERN = re.compile(r"[^。！？!?~，、；;:：]+(?:[。！？!?~，、；;:：]|$)")
 SENTENCE_ENDINGS = "。！？!?~."
 CLAUSE_ENDINGS = "，、；;:："
+# Punctuation that already closes a burst segment, so merging the overflow
+# pieces back together needs no extra comma between them.
+BURST_SEGMENT_ENDINGS = (
+    tuple(SENTENCE_ENDINGS) + tuple(CLAUSE_ENDINGS) + ("…", "～", "」", "』", "）", ")", "”", "’")
+)
 PROACTIVE_FORMAL_LEADIN_PATTERN = re.compile(
     r"^(?:总的来说|总体来说|简单来说|从这个角度看|从这个角度来说|某种程度上|归根结底|本质上|由此可见|可以看出|这意味着|这说明)(?:[，,:：]\s*)?"
 )
@@ -318,6 +323,12 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
     function splits them back into individual QQ messages. Personas without
     burst configuration always reply with a single message.
 
+    The separator is wire format between the prompt and this splitter, never
+    message text: it must not reach QQ. Overflow past ``max_messages`` is merged
+    into the final message with punctuation instead of the separator, and a
+    separator the model left dangling (``来了|``) is stripped from the single
+    message that is delivered.
+
     ``auto_split_long_segments`` (default true) keeps the historical safety net
     that breaks one oversized segment at sentence boundaries. Deployments that
     want the model to own the message shape can disable it: the reply is then
@@ -336,11 +347,34 @@ def split_burst_reply(text: str, burst: dict | None) -> list[str]:
     if auto_split and len(parts) == 1 and len(parts[0]) > max_chars:
         parts = _split_long_segment(parts[0], max_chars)
     if len(parts) < 2:
+        if separator and separator in normalized:
+            dangling = normalized.replace(separator, "").strip()
+            return [dangling] if dangling else []
         return [normalized]
     if len(parts) > max_messages:
         overflow = parts[max_messages - 1 :]
-        parts = parts[: max_messages - 1] + [separator.join(overflow)]
+        parts = parts[: max_messages - 1] + [_merge_burst_overflow(overflow)]
     return [part for part in parts if part]
+
+
+def _merge_burst_overflow(parts: list[str]) -> str:
+    """Merge burst segments past the message cap into the final message.
+
+    Joining with punctuation keeps the merged text readable without leaking the
+    separator into a delivered QQ message: ``一|二|三|四`` under a three-message
+    cap ends with ``三，四``, and a segment already closed by a sentence ending
+    (``三。``) is joined without an extra comma.
+    """
+
+    merged = ""
+    for part in parts:
+        piece = part.strip()
+        if not piece:
+            continue
+        if merged and merged[-1] not in BURST_SEGMENT_ENDINGS:
+            merged += "，"
+        merged += piece
+    return merged
 
 
 def build_reply_split_config(settings=None) -> dict:

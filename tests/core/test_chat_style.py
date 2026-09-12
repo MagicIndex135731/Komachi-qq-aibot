@@ -174,8 +174,40 @@ def test_split_burst_reply_disabled_without_burst_config() -> None:
 def test_split_burst_reply_splits_and_caps_segments() -> None:
     burst = {"enabled": True, "separator": "|", "max_messages": 3}
     assert split_burst_reply("来了|人呢", burst) == ["来了", "人呢"]
-    assert split_burst_reply("一|二|三|四", burst) == ["一", "二", "三|四"]
+    assert split_burst_reply("一|二|三|四", burst) == ["一", "二", "三，四"]
     assert split_burst_reply("一条消息", burst) == ["一条消息"]
+
+
+def test_split_burst_reply_merges_overflow_without_leaking_the_separator() -> None:
+    """More segments than the cap must never put the separator on the wire."""
+
+    burst = {"enabled": True, "separator": "|", "max_messages": 3, "max_chars": 64}
+    text = (
+        "诶…主人问今晚的呀，小町刚搜了下～这是 LPL 季后赛，iG 打 AL"
+        "|Rookie 那种气势，小町悄悄押 iG 赢"
+        "|谁赢都不意外啦。"
+        "|主人更看好哪边呀？🍙"
+    )
+
+    parts = split_burst_reply(text, burst)
+
+    assert parts == [
+        "诶…主人问今晚的呀，小町刚搜了下～这是 LPL 季后赛，iG 打 AL",
+        "Rookie 那种气势，小町悄悄押 iG 赢",
+        "谁赢都不意外啦。主人更看好哪边呀？🍙",
+    ]
+    assert all("|" not in part for part in parts)
+
+
+def test_split_burst_reply_strips_a_dangling_separator() -> None:
+    """A separator with nothing on one side is an artifact, not message text."""
+
+    burst = {"enabled": True, "separator": "|", "max_messages": 3}
+
+    assert split_burst_reply("来了|", burst) == ["来了"]
+    assert split_burst_reply("|来了", burst) == ["来了"]
+    assert split_burst_reply("|", burst) == []
+    assert split_burst_reply("来了", burst) == ["来了"]
 
 
 def test_scrub_banned_address_terms_replaces_honorifics() -> None:

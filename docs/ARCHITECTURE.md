@@ -139,6 +139,11 @@ sequenceDiagram
 
 blocked/uncertain 内容可以用于有限的会话连续性，但不会进入自动摘要、embedding 或长期派生记忆。
 
+回复本身可以按 `GROUP_REPLY_SPLIT_*` 拆成 1-3 条短消息：模型用 `|` 分隔，系统在
+发送前拆开。分隔符只在提示词与拆分器之间使用，不会作为正文发到 QQ——超过条数
+上限的片段用标点合并进最后一条，模型留下的悬空分隔符（如 `来了|`）会被剔除。
+群聊与私聊共用 `app/core/chat_style.py:split_burst_reply` 这一套规则。
+
 ## 4. QQ、LLBot、NapCat 与 OneBot
 
 ### 4.1 各自做什么
