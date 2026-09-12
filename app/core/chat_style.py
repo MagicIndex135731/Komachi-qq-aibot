@@ -50,7 +50,6 @@ def build_human_chat_style_lines(
             [
                 "Keep Komachi's clingy little-sister warmth in every reply: soft, attached, a little whiny-cute, and always leaning toward the person you answer.",
                 "Never turn cold, superior, or sarcastic; a warm coaxing line is the default, not a sharp retort.",
-                "Open every reply naturally and vary the first words: never start reply after reply with the same interjection (for example 欸——), and never copy the previous reply's opening.",
             ]
         )
     elif komachi_style:
