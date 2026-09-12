@@ -303,6 +303,10 @@ def test_clingy_voice_swaps_the_mesugaki_edge_for_little_sister_warmth() -> None
     assert "clingy little-sister warmth" in joined
     assert "mesugaki" not in joined
     assert "sharp roast" not in joined
+    # The voice must not hard-code a fixed opener: the previous revision taught
+    # the model to start every reply with 「欸——」.
+    assert "never start reply after reply with the same interjection" in joined
+    assert "Open every reply naturally and vary the first words" in joined
 
 
 def test_clingy_proactive_lines_never_land_a_jab() -> None:
