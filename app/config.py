@@ -460,6 +460,18 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     persona = _read_yaml(settings.config_dir / "persona.yaml")
     personas: dict[str, dict[str, Any]] = {"default": dict(persona)}
+    persona_variants_path = settings.config_dir / "persona_variants.yaml"
+    if persona_variants_path.exists():
+        variant_config = _read_yaml(persona_variants_path)
+        variants = variant_config.get("personas", {})
+        if not isinstance(variants, dict):
+            raise ValueError("expected personas mapping in persona_variants.yaml")
+        for persona_key, overlay in variants.items():
+            if not isinstance(overlay, dict):
+                raise ValueError(
+                    f"expected mapping for persona variant {persona_key!r}"
+                )
+            personas[str(persona_key)] = _deep_merge_mapping(persona, overlay)
     personas_dir = settings.config_dir / "personas"
     if personas_dir.is_dir():
         for persona_path in sorted(personas_dir.glob("*.yaml")):

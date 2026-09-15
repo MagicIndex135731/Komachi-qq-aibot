@@ -863,9 +863,8 @@ class InboundRouter:
         return self.persona_manager.active_persona(group_id)
 
     def _impersonating(self, group_id: int) -> bool:
-        return (
-            self.persona_manager is not None
-            and self.persona_manager.active_key(group_id) != DEFAULT_PERSONA_KEY
+        return self.persona_manager is not None and self.persona_manager.is_impersonating(
+            group_id
         )
 
     def _persona_text_for(self, active_persona: dict, group_id: int) -> str:

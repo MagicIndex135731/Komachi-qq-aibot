@@ -19,8 +19,18 @@ def _personas() -> dict[str, dict]:
         "default": {
             "name": "测试小町",
             "identity": "AI assistant",
+            "aliases": ["粘人小町"],
             "core_traits": ["calm"],
             "speaking_style": {"tone": "natural"},
+        },
+        "mouthy_komachi": {
+            "name": "测试小町",
+            "identity": "AI assistant",
+            "aliases": ["嘴臭小町"],
+            "komachi_variant": True,
+            "switch_label": "嘴臭小町",
+            "core_traits": ["sharp"],
+            "speaking_style": {"tone": "sharp"},
         },
         "test_self": {
             "name": "测试君",
@@ -40,6 +50,8 @@ def test_parse_switch_command_accepts_half_and_full_width_colon() -> None:
     assert parse_switch_command("  切换人格为 :  测试君  ", personas) == "test_self"
     assert parse_switch_command("切换人格为:测试小町", personas) == "default"
     assert parse_switch_command("切换人格为:小町", personas) == "default"
+    assert parse_switch_command("切换人格为:粘人小町", personas) == "default"
+    assert parse_switch_command("切换人格为:嘴臭小町", personas) == "mouthy_komachi"
 
 
 def test_parse_switch_command_ignores_non_commands_and_unknown_targets() -> None:
@@ -120,6 +132,20 @@ def test_persona_manager_bot_label_marked_when_impersonating(sqlite_engine) -> N
     assert manager.bot_transcript_label(10001) == "测试君（小町扮演）"
 
 
+def test_komachi_variant_is_not_treated_as_member_impersonation(sqlite_engine) -> None:
+    personas = _personas()
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    manager.set_persona_key(10001, "mouthy_komachi")
+
+    assert manager.is_impersonating(10001) is False
+    assert manager.bot_transcript_label(10001) == "测试小町"
+
+
 class FakeSender:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -184,6 +210,24 @@ def test_switch_service_confirms_noop_when_already_active(sqlite_engine) -> None
     assert sender.calls == []
 
 
+def test_switch_service_uses_komachi_variant_label(sqlite_engine) -> None:
+    personas = _personas()
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaSwitchService(manager=manager, sender=FakeSender(), bot_qq=987654321)
+
+    confirmation = asyncio.run(
+        service.switch(group_id=10001, target_key="mouthy_komachi")
+    )
+
+    assert manager.active_key(10001) == "mouthy_komachi"
+    assert confirmation == "已切换为嘴臭小町人格。"
+
+
 def test_router_impersonation_guardrail_and_memory_filter(sqlite_engine) -> None:
     from app.core.router import InboundRouter
 
@@ -200,6 +244,27 @@ def test_router_impersonation_guardrail_and_memory_filter(sqlite_engine) -> None
     text = router._persona_text_for(router._active_persona(10001), 10001)
     assert "完整扮演群成员 测试君" in text
     assert "不是任何其他身份" in text
+
+
+def test_router_keeps_komachi_variant_on_komachi_path(sqlite_engine) -> None:
+    from app.core.router import InboundRouter
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=object(),
+        llm_client=object(),
+    )
+    router.persona_manager.personas["mouthy_komachi"] = {
+        "name": "测试小町",
+        "identity": "AI assistant",
+        "komachi_variant": True,
+    }
+    router.persona_manager.set_persona_key(10001, "mouthy_komachi")
+
+    assert router._impersonating(10001) is False
+    assert "完整扮演群成员" not in router._persona_text_for(
+        router._active_persona(10001), 10001
+    )
 
 
 def test_router_sanitizes_impersonation_context_lines(sqlite_engine) -> None:

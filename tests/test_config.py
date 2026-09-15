@@ -9,6 +9,14 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
     (config_dir / "persona.yaml").write_text("name: 小柚\nidentity: AI assistant\n", encoding="utf-8")
+    (config_dir / "persona_variants.yaml").write_text(
+        "personas:\n"
+        "  mouthy_komachi:\n"
+        "    aliases: [嘴臭小町]\n"
+        "    komachi_variant: true\n"
+        "    chat_voice: komachi\n",
+        encoding="utf-8",
+    )
     (config_dir / "groups.yaml").write_text(
         "default_group_behavior:\n  speak: false\n  archive: true\ngroups: {}\n",
         encoding="utf-8",
@@ -29,6 +37,9 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
     runtime = load_runtime_config(settings)
 
     assert runtime.persona["name"] == "小柚"
+    assert runtime.personas["mouthy_komachi"]["name"] == "小柚"
+    assert runtime.personas["mouthy_komachi"]["aliases"] == ["嘴臭小町"]
+    assert runtime.personas["mouthy_komachi"]["chat_voice"] == "komachi"
     assert runtime.group_policy["default_group_behavior"]["speak"] is False
     assert runtime.safety["deny_prompt_leak"] is True
 

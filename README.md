@@ -123,6 +123,8 @@ LLBot 默认 WebUI 地址为 <http://127.0.0.1:3080/>。也可以双击 `open-ll
 
 一个群只有同时设置 `enabled: true` 和 `speak: true` 才允许小町发言。`memory_enabled: true` 会为该群启用完整记忆；关闭时只使用近期上下文，不生成或检索长期记忆。
 
+群主可 @ 小町发送 `切换人格为:粘人小町` 或 `切换人格为:嘴臭小町`，在当前进程中按群切换小町说话风格；重启后会回到粘人小町。全角冒号也可用。
+
 群策略的字段示例见 [`configs/groups.yaml`](configs/groups.yaml)，运行时的数据边界见[架构文档：配置与数据边界](docs/ARCHITECTURE.md#9-配置与数据边界)。
 
 ### 记忆系统

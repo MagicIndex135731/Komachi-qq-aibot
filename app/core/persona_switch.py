@@ -462,6 +462,13 @@ class PersonaManager:
         key = self.active_key(group_id)
         return self.personas.get(key) or self.default_persona
 
+    def is_impersonating(self, group_id: int) -> bool:
+        """Whether the current group persona represents another member."""
+
+        if self.active_key(group_id) == DEFAULT_PERSONA_KEY:
+            return False
+        return not bool(self.active_persona(group_id).get("komachi_variant"))
+
     def _member_alias_map(
         self,
         *,
@@ -603,7 +610,7 @@ class PersonaManager:
         """Internal label for bot lines; distinct from the impersonated member."""
 
         name = self.active_name(group_id)
-        if self.active_key(group_id) == DEFAULT_PERSONA_KEY:
+        if not self.is_impersonating(group_id):
             return name
         short_name = self.default_short_name()
         if not short_name:
@@ -656,7 +663,9 @@ class PersonaSwitchService:
 
         group_id = int(group_id)
         target_persona = self.manager.personas.get(target_key) or self.manager.default_persona
-        target_name = str(target_persona.get("name", "") or "").strip() or target_key
+        target_name = str(
+            target_persona.get("switch_label") or target_persona.get("name", "") or target_key
+        ).strip()
         current_key = self.manager.active_key(group_id)
         if current_key == target_key:
             return f"当前已经是{target_name}人格，无需切换。"
