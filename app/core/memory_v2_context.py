@@ -43,6 +43,7 @@ class QueryResolver(Protocol):
         group_id: int | None = None,
         requester_id: int | None = None,
         impersonated_subject_id: int | None = None,
+        addressed_bot_user_id: int | None = None,
     ) -> ResolvedMemoryQuery: ...
 
 
@@ -71,6 +72,7 @@ class MemoryV2Request:
     available_input: int
     now: datetime | None = None
     impersonated_subject_id: int | None = None
+    bot_user_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,10 +154,20 @@ class MemoryV2ContextProvider:
             "group_id": request.group_id,
             "requester_id": getattr(request, "current_user_id", None),
             "impersonated_subject_id": request.impersonated_subject_id,
+            "addressed_bot_user_id": request.bot_user_id,
+            "excluded_member_ids": frozenset(
+                {
+                    *self._excluded_member_ids,
+                    *(
+                        (int(request.bot_user_id),)
+                        if request.bot_user_id is not None
+                        else ()
+                    ),
+                }
+            ),
         }
         if self._member_loader is not None:
             resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
-            resolve_kwargs["excluded_member_ids"] = self._excluded_member_ids
         resolve_started = perf_counter()
         resolved = self._resolver.resolve(request.query, **resolve_kwargs)
         resolve_ms = (perf_counter() - resolve_started) * 1000

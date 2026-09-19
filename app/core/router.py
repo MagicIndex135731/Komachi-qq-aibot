@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, time, timedelta
 import json
@@ -195,7 +195,11 @@ _PACKED_LINE_SPEAKER_PATTERN = re.compile(
 )
 
 
-def _scrub_impersonation_reply(text: str) -> str:
+def _scrub_impersonation_reply(
+    text: str,
+    *,
+    speaker_labels: Iterable[str] = (),
+) -> str:
     """Deterministic backstop for impersonation replies.
 
     Removes maid-style address terms (主人/您/大人...) that leak from model
@@ -204,6 +208,21 @@ def _scrub_impersonation_reply(text: str) -> str:
     """
 
     cleaned = scrub_banned_address_terms(str(text or ""), BANNED_ADDRESS_TERMS)
+    for label in sorted(
+        {str(value).strip() for value in speaker_labels if str(value).strip()},
+        key=len,
+        reverse=True,
+    ):
+        without_prefix = re.sub(
+            rf"^\s*@?{re.escape(label)}\s*[:：]\s*",
+            "",
+            cleaned,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if without_prefix != cleaned:
+            cleaned = without_prefix
+            break
     return cleaned.strip()
 
 
@@ -2232,6 +2251,11 @@ class InboundRouter:
                 use_full_history=use_full_history,
                 recent_limit=recent_context_limit,
                 impersonated_subject_id=impersonated_subject_id,
+                bot_user_id=(
+                    int(self.runtime.settings.bot_qq)
+                    if event.mentioned_bot
+                    else None
+                ),
             )
             if memory_enabled:
                 memory_result = self.memory_orchestrator.build_context(memory_request)
@@ -3085,7 +3109,10 @@ class InboundRouter:
                 **generation_kwargs,
             )
         if self._impersonating(event.group_id):
-            raw_reply = _scrub_impersonation_reply(raw_reply)
+            raw_reply = _scrub_impersonation_reply(
+                raw_reply,
+                speaker_labels=self._build_bot_names(""),
+            )
         if prepared_reply.proactive_turn:
             return normalize_brief_group_interjection_reply(raw_reply)
         # Normal replies are normalized as plain text: the model's own line

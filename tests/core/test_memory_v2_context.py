@@ -18,7 +18,12 @@ from app.core.memory_context_packer import (
     PackedMemoryContext,
 )
 from app.core.memory_orchestrator import MemoryContextResult
-from app.core.memory_query_resolver import ResolvedMemoryQuery, TimeRange
+from app.core.memory_query_resolver import (
+    MemoryQueryResolver,
+    ResolvedMemoryQuery,
+    TimeRange,
+)
+from app.core.member_identity import GroupMemberIdentity
 from app.core.memory_evidence_expander import MemoryEvidenceExpander
 from app.core.memory_v2_context import MemoryV2ContextProvider, MemoryV2Request
 
@@ -34,9 +39,13 @@ class Resolver:
     preferred_fact_kinds: tuple[str, ...] = ()
     original_query: str | None = None
     received_impersonated_subject_id: int | None = None
+    received_excluded_member_ids: frozenset[int] = frozenset()
 
     def resolve(self, query, **kwargs):
         self.received_impersonated_subject_id = kwargs.get("impersonated_subject_id")
+        self.received_excluded_member_ids = kwargs.get(
+            "excluded_member_ids", frozenset()
+        )
         return ResolvedMemoryQuery(
             original_query=self.original_query or query,
             retrieval_query=query,
@@ -74,6 +83,75 @@ def test_provider_forwards_typed_impersonated_subject_to_resolver() -> None:
     )
 
     assert resolver.received_impersonated_subject_id == 222
+
+
+def test_provider_merges_request_bot_id_into_subject_exclusions() -> None:
+    resolver = Resolver(needs_history=False)
+    provider = MemoryV2ContextProvider(
+        resolver=resolver,
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        excluded_member_ids={333},
+    )
+
+    provider(
+        MemoryV2Request(
+            group_id=100,
+            query="@比企谷小町 你最近在看什么动画",
+            recent_messages=(),
+            quoted_message=None,
+            target_message_id=None,
+            available_input=1000,
+            impersonated_subject_id=222,
+            bot_user_id=123456789,
+        )
+    )
+
+    assert resolver.received_excluded_member_ids == frozenset({333, 123456789})
+
+
+def test_provider_binds_impersonated_subject_for_bot_address_alias() -> None:
+    provider = MemoryV2ContextProvider(
+        resolver=MemoryQueryResolver(),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        member_loader=lambda _group_id: (
+            GroupMemberIdentity(
+                user_id=123456789,
+                nickname="比企谷小町",
+                group_card="小町",
+                in_scope=False,
+            ),
+            GroupMemberIdentity(
+                user_id=222,
+                nickname="阿渣",
+                group_card="足泽满灰交",
+                in_scope=True,
+            ),
+        ),
+    )
+
+    trace = provider.evaluate(
+        MemoryV2Request(
+            group_id=100,
+            query="@比企谷小町 你最近在看什么动画",
+            recent_messages=(),
+            quoted_message=None,
+            target_message_id="production-shaped-query",
+            available_input=1000,
+            impersonated_subject_id=222,
+            bot_user_id=123456789,
+        )
+    )
+
+    assert trace.resolved_query.subject_ids == ("222",)
+    assert trace.resolved_query.subject_binding == "impersonated"
+    assert trace.resolved_query.answer_mode == "current_fact"
+    assert trace.result.resolved_subject_binding == "impersonated"
 
 
 class Retriever:

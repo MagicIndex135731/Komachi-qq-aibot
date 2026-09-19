@@ -512,6 +512,7 @@ class MemoryQueryResolver:
         requester_id: int | str | None = None,
         requester_uin: int | str | None = None,
         impersonated_subject_id: int | str | None = None,
+        addressed_bot_user_id: int | str | None = None,
     ) -> ResolvedMemoryQuery:
         """Return a typed retrieval query without reading persistence.
 
@@ -526,6 +527,15 @@ class MemoryQueryResolver:
         normalized_impersonated_id = self._normalize_requester_id(
             impersonated_subject_id,
             None,
+        )
+        normalized_bot_id = self._normalize_requester_id(
+            addressed_bot_user_id,
+            None,
+        )
+        subject_query = self._strip_addressed_bot_mentions(
+            original,
+            group_members=group_members,
+            bot_user_id=normalized_bot_id,
         )
         current_time = self._as_shanghai_time(now or datetime.now(ASIA_SHANGHAI))
         recent = tuple(recent_messages[-self._recent_limit :])
@@ -603,7 +613,7 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
-            ), aliases=("我的", "我"))
+            ), aliases=("我的", "我"), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
                 and self._should_attempt_semantic_resolution(original)
@@ -620,7 +630,7 @@ class MemoryQueryResolver:
             return plan
 
         direct_reference = self._classify_direct_member_reference(
-            original,
+            subject_query,
             group_members,
             exclude_user_ids=excluded_member_ids,
             has_time_range=time_range is not None,
@@ -655,7 +665,7 @@ class MemoryQueryResolver:
                 ),
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
-            ), aliases=(direct_member.matched_alias,))
+            ), aliases=(direct_member.matched_alias,), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
                 and self._should_attempt_semantic_resolution(
@@ -719,8 +729,8 @@ class MemoryQueryResolver:
             )
 
         if normalized_requester_id is not None and (
-            self._is_first_person_subject(original)
-            or self._is_requester_mention_query(original)
+            self._is_first_person_subject(subject_query)
+            or self._is_requester_mention_query(subject_query)
         ):
             requester_subject = (normalized_requester_id,)
             plan = self._with_topic_query(ResolvedMemoryQuery(
@@ -740,7 +750,7 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
-            ), aliases=("我的", "我"))
+            ), aliases=("我的", "我"), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
                 and self._should_attempt_semantic_resolution(original)
@@ -772,7 +782,7 @@ class MemoryQueryResolver:
                 return self._with_topic_query(
                     ResolvedMemoryQuery(
                         original_query=original,
-                        retrieval_query=original,
+                        retrieval_query=subject_query,
                         entities=(
                             str(
                                 impersonated_member.group_card
@@ -793,6 +803,7 @@ class MemoryQueryResolver:
                         coverage_mode=coverage_mode,
                     ),
                     aliases=("你", "您"),
+                    topic_source=subject_query,
                 )
 
         if answer_mode == "mention":
@@ -835,7 +846,11 @@ class MemoryQueryResolver:
                 coverage_mode=coverage_mode,
             )
             if quoted_message is None and speaker_ids:
-                return self._with_topic_query(plan, aliases=entities)
+                return self._with_topic_query(
+                    plan,
+                    aliases=entities,
+                    topic_source=subject_query,
+                )
             return plan
 
         if (
@@ -908,6 +923,40 @@ class MemoryQueryResolver:
         if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(original):
             return self._with_explicit_group_history_topic(plan)
         return plan
+
+    @staticmethod
+    def _strip_addressed_bot_mentions(
+        query: str,
+        *,
+        group_members: Sequence[GroupMemberIdentity],
+        bot_user_id: str | None,
+    ) -> str:
+        """Remove only explicit @ tokens that address the bot account.
+
+        OneBot renders an ``at`` segment into ``@<display name>`` inside
+        ``plain_text``.  That token is delivery metadata, not a person named by
+        the user's question.  Human member mentions are deliberately left
+        untouched so they retain explicit-subject precedence.
+        """
+
+        if bot_user_id is None:
+            return str(query or "").strip()
+        aliases = {
+            str(alias).strip()
+            for member in group_members
+            if str(member.user_id) == str(bot_user_id)
+            for alias in (member.group_card, member.nickname, str(member.user_id))
+            if str(alias or "").strip()
+        }
+        cleaned = str(query or "")
+        for alias in sorted(aliases, key=len, reverse=True):
+            cleaned = re.sub(
+                rf"(?<!\S)@\s*{re.escape(alias)}(?=\s|$)",
+                " ",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        return " ".join(cleaned.split())
 
     @staticmethod
     def _classify_direct_member_reference(
@@ -1855,15 +1904,25 @@ class MemoryQueryResolver:
         plan: ResolvedMemoryQuery,
         *,
         aliases: Sequence[str],
+        topic_source: str | None = None,
     ) -> ResolvedMemoryQuery:
-        topic = plan.original_query
+        topic = (
+            str(topic_source)
+            if topic_source is not None
+            else plan.original_query
+        )
         removed: list[str] = []
         for alias in sorted(
             {value.strip() for value in aliases if value and value.strip()},
             key=len,
             reverse=True,
         ):
-            updated, count = re.subn(re.escape(alias), " ", topic, flags=re.IGNORECASE)
+            updated, count = re.subn(
+                rf"(?:@\s*)?{re.escape(alias)}",
+                " ",
+                topic,
+                flags=re.IGNORECASE,
+            )
             if count:
                 topic = updated
                 removed.append(alias)
@@ -1897,7 +1956,7 @@ class MemoryQueryResolver:
                     break
         return replace(
             plan,
-            retrieval_query=topic_query or plan.original_query,
+            retrieval_query=topic_query or plan.retrieval_query,
             topic_query=topic_query,
             topic_terms=tuple(dict.fromkeys(topic_terms)),
             topic_extraction="deterministic" if topic_query is not None else "none",

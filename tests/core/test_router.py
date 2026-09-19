@@ -19,6 +19,7 @@ from app.core.router import (
     MEMORY_ATTRIBUTE_MATCHING_INSTRUCTION,
     InboundRouter,
     PreparedGroupReply,
+    _scrub_impersonation_reply,
 )
 from app.core.reply_policy import ReplyDecision
 from app.core.search_policy import AddressDecision
@@ -404,6 +405,96 @@ async def test_router_passes_impersonated_subject_without_mutating_query(
     assert len(memory.requests) == 1
     assert memory.requests[0].query == "你最近在学什么"
     assert memory.requests[0].impersonated_subject_id == 30001
+    assert memory.requests[0].bot_user_id == router.runtime.settings.bot_qq
+
+
+@pytest.mark.asyncio
+async def test_router_carries_bot_id_for_raw_onebot_mention_in_impersonation(
+    sqlite_engine,
+) -> None:
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_orchestrator=memory,
+    )
+    router.runtime.persona["name"] = "比企谷小町"
+    router.persona_manager.personas["member_persona"] = {
+        "name": "阿渣",
+        "identity": "group member",
+        "source_user_id": 30001,
+    }
+    router.persona_manager.set_persona_key(10001, "member_persona")
+    event = make_event(
+        group_id=10001,
+        user_id=20001,
+        mentioned_bot=True,
+        message_id="raw-onebot-bot-mention",
+        plain_text="@比企谷小町 你最近在看什么动画",
+    )
+    event.raw_payload["message"][1]["data"]["text"] = "你最近在看什么动画"
+
+    await router.handle_group_message(event)
+
+    assert event.raw_payload["message"][0] == {
+        "type": "at",
+        "data": {"qq": str(router.runtime.settings.bot_qq)},
+    }
+    assert len(memory.requests) == 1
+    assert memory.requests[0].query == "@比企谷小町 你最近在看什么动画"
+    assert memory.requests[0].impersonated_subject_id == 30001
+    assert memory.requests[0].bot_user_id == router.runtime.settings.bot_qq
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_mark_plain_human_mention_as_bot_address(
+    sqlite_engine,
+) -> None:
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_orchestrator=memory,
+    )
+    router.persona_manager.personas["member_persona"] = {
+        "name": "阿渣",
+        "identity": "group member",
+        "source_user_id": 30001,
+    }
+    router.persona_manager.set_persona_key(10001, "member_persona")
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            user_id=20001,
+            mentioned_bot=False,
+            message_id="plain-human-mention",
+            plain_text="@比企谷小町 最近在看什么动画",
+        )
+    )
+
+    assert len(memory.requests) == 1
+    assert memory.requests[0].bot_user_id is None
+
+
+@pytest.mark.parametrize(
+    ("raw_reply", "expected"),
+    (
+        ("比企谷小町：不知道", "不知道"),
+        ("@小町: 不知道", "不知道"),
+        ("结论：不知道", "结论：不知道"),
+    ),
+)
+def test_impersonation_reply_strips_only_default_bot_speaker_prefix(
+    raw_reply: str,
+    expected: str,
+) -> None:
+    assert _scrub_impersonation_reply(
+        raw_reply,
+        speaker_labels=("比企谷小町", "小町"),
+    ) == expected
 
 
 class RelativeYearSearchLlm:

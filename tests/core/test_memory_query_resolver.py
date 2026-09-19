@@ -52,6 +52,93 @@ def test_typed_impersonated_subject_binds_without_rewriting_query() -> None:
     assert result.answer_mode == "current_fact"
 
 
+def test_bot_address_alias_does_not_override_typed_impersonated_subject() -> None:
+    members = (
+        GroupMemberIdentity(
+            user_id=123456789,
+            nickname="比企谷小町",
+            group_card="小町",
+            in_scope=False,
+        ),
+        GroupMemberIdentity(
+            user_id=222,
+            nickname="阿渣",
+            group_card="足泽满灰交",
+            in_scope=True,
+        ),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "@比企谷小町 你最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={123456789},
+        requester_id=111,
+        impersonated_subject_id=222,
+        addressed_bot_user_id=123456789,
+    )
+
+    assert result.original_query == "@比企谷小町 你最近在看什么动画"
+    assert result.retrieval_query == "动画"
+    assert "比企谷小町" not in result.retrieval_query
+    assert result.subject_ids == ("222",)
+    assert result.subject_binding == "impersonated"
+    assert result.answer_mode == "current_fact"
+
+
+def test_real_human_alias_still_precedes_typed_impersonated_subject() -> None:
+    members = (
+        GroupMemberIdentity(user_id=123456789, nickname="比企谷小町", in_scope=True),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", in_scope=True),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "@逆蝶蝶 最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={123456789},
+        requester_id=111,
+        impersonated_subject_id=222,
+        addressed_bot_user_id=123456789,
+    )
+
+    assert result.subject_ids == ("333",)
+    assert result.subject_binding == "explicit"
+
+
+def test_bot_address_is_removed_before_human_subject_topic_extraction() -> None:
+    members = (
+        GroupMemberIdentity(
+            user_id=123456789,
+            nickname="比企谷小町",
+            group_card="小町",
+            in_scope=False,
+        ),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", in_scope=True),
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "@比企谷小町 @逆蝶蝶 最近在看什么动画",
+        recent_messages=(),
+        now=NOW,
+        group_members=members,
+        excluded_member_ids={123456789},
+        requester_id=111,
+        impersonated_subject_id=222,
+        addressed_bot_user_id=123456789,
+    )
+
+    assert result.subject_ids == ("333",)
+    assert result.subject_binding == "explicit"
+    assert result.retrieval_query == "动画"
+    assert result.topic_query == "动画"
+    assert "比企谷小町" not in result.retrieval_query
+
+
 def test_impersonated_subject_must_be_an_in_scope_group_member() -> None:
     result = MemoryQueryResolver().resolve(
         "你最近在玩什么",
