@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 import json
+import math
 import re
 from typing import Any, Iterable, Mapping, Sequence
 import unicodedata
@@ -420,6 +421,17 @@ def _normalize_fact_candidate(candidate: Any) -> Any:
     if not isinstance(candidate, Mapping):
         return candidate
     normalized = dict(candidate)
+    subject_id = normalized.get("subject_id")
+    if isinstance(subject_id, bool):
+        normalized["subject_id"] = None
+    elif isinstance(subject_id, int):
+        normalized["subject_id"] = str(subject_id)
+    elif isinstance(subject_id, float):
+        normalized["subject_id"] = (
+            str(int(subject_id))
+            if math.isfinite(subject_id) and subject_id.is_integer()
+            else None
+        )
     valid_until = normalized.get("valid_until")
     if valid_until is not None and _parse_valid_until(valid_until) is None:
         normalized["valid_until"] = None

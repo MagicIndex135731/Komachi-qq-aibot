@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import yaml
 from sqlalchemy import text
@@ -27,6 +27,94 @@ from app.storage.repositories import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_LIVE_PROFILE_REQUIRED_TYPES: dict[str, type] = {
+    "name": str,
+    "identity": str,
+    "core_traits": list,
+    "speaking_style": dict,
+    "self_concept": str,
+    "speech_habits": list,
+    "style_avoid": list,
+    "relationships": list,
+    "address_rules": list,
+}
+_LIVE_PROFILE_OPTIONAL_TYPES: dict[str, type] = {
+    "aliases": list,
+    "burst": dict,
+    "example_bank": list,
+    "example_lines": list,
+    "external_relations": list,
+    "facts": list,
+    "group_card": str,
+    "live_refresh": bool,
+    "source_group_id": int,
+    "source_user_id": int,
+}
+_LIVE_PROFILE_FIELD_ALIASES = {
+    "speaking_habits": "speech_habits",
+}
+
+
+def _normalize_live_profile_contract(
+    profile: dict,
+    *,
+    fallback_profile: dict | None = None,
+) -> dict:
+    """Normalize known aliases and enforce the live-refresh output contract."""
+
+    normalized = dict(profile)
+    for alias, canonical in _LIVE_PROFILE_FIELD_ALIASES.items():
+        if alias not in normalized:
+            continue
+        alias_value = normalized.pop(alias)
+        if canonical in normalized and normalized[canonical] != alias_value:
+            raise ValueError(
+                f"persona live profile has conflicting fields: {canonical}, {alias}"
+            )
+        normalized.setdefault(canonical, alias_value)
+
+    allowed = {
+        *_LIVE_PROFILE_REQUIRED_TYPES,
+        *_LIVE_PROFILE_OPTIONAL_TYPES,
+    }
+    unknown = sorted(set(normalized) - allowed)
+    if unknown:
+        raise ValueError(
+            "persona live profile has unknown fields: " + ", ".join(unknown)
+        )
+
+    if fallback_profile is not None:
+        for key in _LIVE_PROFILE_REQUIRED_TYPES:
+            if key not in normalized and key in fallback_profile:
+                normalized[key] = fallback_profile[key]
+
+    missing = sorted(set(_LIVE_PROFILE_REQUIRED_TYPES) - set(normalized))
+    if missing:
+        raise ValueError(
+            "persona live profile is missing required fields: " + ", ".join(missing)
+        )
+
+    expected_types = {
+        **_LIVE_PROFILE_REQUIRED_TYPES,
+        **_LIVE_PROFILE_OPTIONAL_TYPES,
+    }
+    wrong_types = sorted(
+        key
+        for key, value in normalized.items()
+        if not isinstance(value, expected_types[key])
+        or (
+            expected_types[key] is int
+            and isinstance(value, bool)
+        )
+    )
+    if wrong_types:
+        raise ValueError(
+            "persona live profile has invalid field types: "
+            + ", ".join(wrong_types)
+        )
+    return normalized
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -239,7 +327,21 @@ class PersonaLiveSyncService:
                 return
             new_count = int(state.new_since_refresh or 0)
             last_refresh = state.last_refresh_at
-            if new_count < self.refresh_threshold:
+            if new_count <= 0:
+                return
+            threshold_due = new_count >= self.refresh_threshold
+            cooldown_due = False
+            if last_refresh is not None:
+                refresh_instant = last_refresh
+                if refresh_instant.tzinfo is None:
+                    refresh_instant = refresh_instant.replace(tzinfo=UTC)
+                else:
+                    refresh_instant = refresh_instant.astimezone(UTC)
+                cooldown_due = (
+                    datetime.now(UTC) - refresh_instant
+                    >= timedelta(seconds=self.refresh_cooldown_seconds)
+                )
+            if not threshold_due and not cooldown_due:
                 return
             if last_refresh is not None:
                 if last_refresh.tzinfo is not None:
@@ -332,7 +434,10 @@ class PersonaLiveSyncService:
             reasoning_effort="low",
         )
         generated = client.generate_text([prompt])
-        profile = parse_persona_yaml(generated)
+        profile = _normalize_live_profile_contract(
+            parse_persona_yaml(generated),
+            fallback_profile=current_profile,
+        )
         # Bind relationships by the current profile's member->id map so a
         # model that drops member_user_id cannot silently regress bindings.
         id_by_name: dict[str, int] = {}

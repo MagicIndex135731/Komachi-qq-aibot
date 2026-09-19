@@ -50,6 +50,10 @@ class AppSettings(BaseSettings):
     group_image_api_key: str = Field(default="", alias="GROUP_IMAGE_API_KEY")
     group_image_chat_base_url: str = Field(default="", alias="GROUP_IMAGE_CHAT_BASE_URL")
     group_image_chat_api_key: str = Field(default="", alias="GROUP_IMAGE_CHAT_API_KEY")
+    group_image_transport: Literal["responses", "images"] = Field(
+        default="responses",
+        alias="GROUP_IMAGE_TRANSPORT",
+    )
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
     group_image_generations_endpoint: str = Field(
         default="/images/generations",

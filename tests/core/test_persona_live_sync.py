@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
 
 from app.core.persona_live_sync import (
     PersonaLiveSyncService,
     _build_examples,
     _merge_profile,
+    _normalize_live_profile_contract,
 )
 from app.core.persona_switch import PersonaManager
 from app.storage.db import session_scope
@@ -254,11 +260,10 @@ def test_tick_only_refreshes_personas_with_live_refresh_flag(
     assert synced == ["live_self"]
 
 
-def test_refresh_triggers_on_threshold_only(
+def test_refresh_triggers_on_threshold_or_cooldown(
     sqlite_engine, monkeypatch
 ) -> None:
     from datetime import timedelta
-    from pathlib import Path
 
     settings = _fake_settings()
     personas = {
@@ -301,16 +306,74 @@ def test_refresh_triggers_on_threshold_only(
     service._maybe_refresh_profile("test_self", 222, 10001)
     assert calls == [1]
 
-    # Below threshold: no refresh, even if a day has passed.
+    # Below threshold: refresh once the 24-hour fallback is due.
     with session_scope(sqlite_engine) as session:
         repo = PersonaStyleSyncStateRepository(session)
         state = repo.get(group_id=10001, user_id=222)
-        state.last_refresh_at = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        state.last_refresh_at = datetime.now(UTC) - timedelta(hours=25)
         state.new_since_refresh = 50
         session.add(state)
         session.commit()
     service._maybe_refresh_profile("test_self", 222, 10001)
-    assert calls == [1]
+    assert calls == [1, 1]
+
+
+def test_refresh_cooldown_requires_new_messages_and_elapsed_day(
+    sqlite_engine, monkeypatch
+) -> None:
+    from datetime import timedelta
+
+    settings = _fake_settings()
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    service = PersonaLiveSyncService(
+        engine=sqlite_engine,
+        settings=settings,
+        personas=personas,
+        manager=manager,
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        service,
+        "_write_refreshed_profile",
+        lambda **_kwargs: calls.append(1) or Path("unused.live.yaml"),
+    )
+
+    with session_scope(sqlite_engine) as session:
+        repo = PersonaStyleSyncStateRepository(session)
+        repo.set_watermark(
+            group_id=10001, user_id=222, last_msg_id="9", new_count=50
+        )
+        state = repo.get(group_id=10001, user_id=222)
+        state.last_refresh_at = datetime.now(UTC) - timedelta(hours=23)
+        session.add(state)
+
+    service._maybe_refresh_profile("test_self", 222, 10001)
+    assert calls == []
+
+    with session_scope(sqlite_engine) as session:
+        state = PersonaStyleSyncStateRepository(session).get(
+            group_id=10001, user_id=222
+        )
+        state.last_refresh_at = datetime.now(UTC) - timedelta(hours=25)
+        state.new_since_refresh = 0
+        session.add(state)
+
+    service._maybe_refresh_profile("test_self", 222, 10001)
+    assert calls == []
 
 
 def test_load_runtime_config_merges_live_persona(tmp_path) -> None:
@@ -381,6 +444,153 @@ def test_merge_profile_unions_facts_and_external_relations() -> None:
 
     assert [item.get("fact") for item in merged["facts"]] == ["玩lolm", "看阿森纳"]
     assert [item.get("name") for item in merged["external_relations"]] == ["灰泽满"]
+
+
+def _valid_live_profile() -> dict:
+    return {
+        "name": "测试君",
+        "identity": "群成员",
+        "core_traits": ["直接"],
+        "speaking_style": {"tone": "casual"},
+        "self_concept": "普通群友",
+        "speech_habits": ["短句"],
+        "style_avoid": ["客服腔"],
+        "relationships": [],
+        "address_rules": [],
+        "facts": [],
+        "external_relations": [],
+    }
+
+
+def test_live_profile_contract_normalizes_speaking_habits_alias() -> None:
+    profile = _valid_live_profile()
+    profile["speaking_habits"] = profile.pop("speech_habits")
+
+    normalized = _normalize_live_profile_contract(profile)
+
+    assert normalized["speech_habits"] == ["短句"]
+    assert "speaking_habits" not in normalized
+
+
+def test_live_profile_contract_rejects_missing_required_field() -> None:
+    profile = _valid_live_profile()
+    del profile["address_rules"]
+
+    with pytest.raises(ValueError, match="missing required fields: address_rules"):
+        _normalize_live_profile_contract(profile)
+
+
+def test_live_profile_contract_inherits_missing_field_from_current_profile() -> None:
+    current = _valid_live_profile()
+    profile = _valid_live_profile()
+    del profile["address_rules"]
+
+    normalized = _normalize_live_profile_contract(
+        profile,
+        fallback_profile=current,
+    )
+
+    assert normalized["address_rules"] == current["address_rules"]
+
+
+def test_live_profile_contract_rejects_wrong_top_level_type() -> None:
+    profile = _valid_live_profile()
+    profile["speech_habits"] = "短句"
+
+    with pytest.raises(ValueError, match="invalid field types: speech_habits"):
+        _normalize_live_profile_contract(profile)
+
+
+def test_live_profile_contract_rejects_unknown_field() -> None:
+    profile = _valid_live_profile()
+    profile["speech_pattern"] = ["未知字段"]
+
+    with pytest.raises(ValueError, match="unknown fields: speech_pattern"):
+        _normalize_live_profile_contract(profile)
+
+
+def test_live_profile_contract_accepts_valid_profile() -> None:
+    profile = _valid_live_profile()
+
+    assert _normalize_live_profile_contract(profile) == profile
+
+
+def test_write_refreshed_profile_rejects_malformed_output_before_write(
+    tmp_path, monkeypatch
+) -> None:
+    from app.providers.llm_client import LlmClient
+
+    current = {**_valid_live_profile(), "source_user_id": 222}
+    del current["address_rules"]
+    personas = {"default": {"name": "测试小町"}, "test_self": current}
+    settings = _fake_settings()
+    settings.data_dir = tmp_path
+    service = PersonaLiveSyncService(
+        engine=None,
+        settings=settings,
+        personas=personas,
+        manager=SimpleNamespace(personas=personas),
+    )
+    service._window_transcript_block = lambda **kwargs: "测试君: 短句"
+    malformed = _valid_live_profile()
+    del malformed["address_rules"]
+    monkeypatch.setattr(
+        LlmClient,
+        "generate_text",
+        lambda self, prompt: yaml.safe_dump(malformed, allow_unicode=True),
+    )
+
+    with pytest.raises(ValueError, match="missing required fields: address_rules"):
+        service._write_refreshed_profile(
+            persona_key="test_self",
+            current_profile=current,
+            examples=[],
+            user_id=222,
+            group_id=10001,
+        )
+
+    assert not (tmp_path / "personas" / "test_self.live.yaml").exists()
+    assert personas["test_self"] is current
+
+
+def test_write_refreshed_profile_writes_valid_output_and_preserves_current_fields(
+    tmp_path, monkeypatch
+) -> None:
+    from app.providers.llm_client import LlmClient
+
+    current = {**_valid_live_profile(), "source_user_id": 222}
+    personas = {"default": {"name": "测试小町"}, "test_self": current}
+    settings = _fake_settings()
+    settings.data_dir = tmp_path
+    service = PersonaLiveSyncService(
+        engine=None,
+        settings=settings,
+        personas=personas,
+        manager=SimpleNamespace(personas=personas),
+    )
+    service._window_transcript_block = lambda **kwargs: "测试君: 确实"
+    refreshed = _valid_live_profile()
+    refreshed["speaking_habits"] = ["确实"]
+    del refreshed["speech_habits"]
+    monkeypatch.setattr(
+        LlmClient,
+        "generate_text",
+        lambda self, prompt: yaml.safe_dump(refreshed, allow_unicode=True),
+    )
+
+    live_path = service._write_refreshed_profile(
+        persona_key="test_self",
+        current_profile=current,
+        examples=[],
+        user_id=222,
+        group_id=10001,
+    )
+
+    written = yaml.safe_load(live_path.read_text(encoding="utf-8"))
+    assert written["speech_habits"] == ["确实"]
+    assert "speaking_habits" not in written
+    assert personas["test_self"]["source_user_id"] == 222
+    assert personas["test_self"]["speech_habits"] == ["短句", "确实"]
 
 
 def test_window_transcript_block_renders_flow_with_image_placeholder(sqlite_engine) -> None:

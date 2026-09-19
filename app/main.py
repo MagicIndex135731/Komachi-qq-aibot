@@ -382,7 +382,14 @@ def build_group_image_llm_client(*, settings: AppSettings, engine, llm_client):
     # for chat.  Reuse the chat transport/model so image requests carry the
     # proxy's supported ``image_generation`` tool format instead of going to a
     # separate, often unavailable ``/images/generations`` service.
-    if all(hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")):
+    # Some OpenAI-compatible providers expose image generation only through
+    # /images/generations and do not implement the Responses image tool.
+    # Keep Responses as the default, but allow production to select the
+    # explicit generations/edits transport without changing chat routing.
+    image_transport = getattr(settings, "group_image_transport", "responses")
+    if image_transport != "images" and all(
+        hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")
+    ):
         image_model = (settings.group_image_model or "gpt-image-2").strip() or "gpt-image-2"
         image_model = resolve_primary_chat_completions_model(
             model=image_model,

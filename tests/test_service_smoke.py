@@ -120,6 +120,26 @@ def test_build_group_image_llm_client_prefers_dedicated_image_chat_transport() -
     assert client.http_client is primary_client.http_client
 
 
+def test_build_group_image_llm_client_can_force_direct_images_transport() -> None:
+    settings = _settings_for_search(provider="tavily", search_api_key="search-key")
+    settings.group_image_transport = "images"
+    settings.group_image_base_url = "https://xfastapi.example.test/v1"
+    settings.group_image_api_key = "image-key"
+    primary_client = LlmClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        responses_model=settings.llm_model,
+    )
+
+    client = build_group_image_llm_client(settings=settings, engine=object(), llm_client=primary_client)
+
+    assert client.base_url == "https://xfastapi.example.test/v1"
+    assert client.api_key == "image-key"
+    assert client.responses_model == ""
+    assert client.image_responses_model == ""
+
+
 def test_build_group_image_reference_planner_uses_configured_chat_model() -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
     settings.llm_model = "deepseek-flash"

@@ -286,6 +286,7 @@ class MemberFactRefreshService:
             await asyncio.sleep(self.interval_seconds)
 
     def _tick(self) -> None:
+        self._refresh_bot_names()
         for group_id in self.group_ids:
             members = _active_members(
                 self.engine,
@@ -307,7 +308,14 @@ class MemberFactRefreshService:
                         MemberFactRefreshState,
                         (int(group_id), int(user_id)),
                     )
-                    new_count = 0
+                    watermark = int(state.last_msg_id or 0) if state else 0
+                    _, eligible_lines = self._pending_member_lines(
+                        session,
+                        group_id=group_id,
+                        user_id=user_id,
+                        watermark=watermark,
+                    )
+                    new_count = len(eligible_lines)
                     last_refresh = state.last_refresh_at if state else None
                     overdue = False
                     due_today = True
@@ -335,34 +343,23 @@ class MemberFactRefreshService:
                 (int(group_id), int(user_id)),
             )
             watermark = int(state.last_msg_id or 0) if state is not None else 0
-            all_new_lines = _new_member_lines(
+            all_new_lines, new_lines = self._pending_member_lines(
                 session,
                 group_id=group_id,
                 user_id=user_id,
                 watermark=watermark,
             )
-            new_lines = [
-                row
-                for row in all_new_lines
-                if not message_mentions_bot(
-                    getattr(row, "raw_json", None),
-                    bot_qqs=self.bot_qqs,
-                    bot_text_names=self.bot_text_names,
-                )
-            ]
             last_id = watermark
             if all_new_lines:
                 last_id = max(int(row.id) for row in all_new_lines)
-            session.merge(
-                MemberFactRefreshState(
-                    group_id=int(group_id),
-                    user_id=int(user_id),
-                    last_msg_id=str(last_id),
-                    last_refresh_at=datetime.now(UTC),
-                )
-            )
         if not new_lines:
+            self._commit_refresh_state(
+                group_id=group_id,
+                user_id=user_id,
+                last_id=last_id,
+            )
             return
+
         facts = extract_facts_from_lines(
             self.settings,
             [str(row.plain_text) for row in new_lines],
@@ -374,6 +371,51 @@ class MemberFactRefreshService:
             user_id=user_id,
             facts=facts,
         )
+        self._commit_refresh_state(
+            group_id=group_id,
+            user_id=user_id,
+            last_id=last_id,
+        )
+        logger.info(
+            "member_fact_refresh group_id=%s user_id=%s facts=%s imported=%s",
+            group_id,
+            user_id,
+            len(facts),
+            imported,
+        )
+
+    def _pending_member_lines(
+        self,
+        session,
+        *,
+        group_id: int,
+        user_id: int,
+        watermark: int,
+    ):
+        all_new_lines = _new_member_lines(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            watermark=watermark,
+        )
+        eligible_lines = [
+            row
+            for row in all_new_lines
+            if not message_mentions_bot(
+                getattr(row, "raw_json", None),
+                bot_qqs=self.bot_qqs,
+                bot_text_names=self.bot_text_names,
+            )
+        ]
+        return all_new_lines, eligible_lines
+
+    def _commit_refresh_state(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        last_id: int,
+    ) -> None:
         with session_scope(self.engine) as session:
             session.merge(
                 MemberFactRefreshState(
@@ -383,13 +425,6 @@ class MemberFactRefreshService:
                     last_refresh_at=datetime.now(UTC),
                 )
             )
-        logger.info(
-            "member_fact_refresh group_id=%s user_id=%s facts=%s imported=%s",
-            group_id,
-            user_id,
-            len(facts),
-            imported,
-        )
 
     def _refresh_bot_names(self) -> None:
         from sqlalchemy import bindparam, text

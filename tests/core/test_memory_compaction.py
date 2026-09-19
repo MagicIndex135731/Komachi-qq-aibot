@@ -273,6 +273,50 @@ def test_parser_normalizes_noncritical_model_format_variance() -> None:
     assert result.facts[0].valid_until is None
 
 
+@pytest.mark.parametrize("subject_id", (42, 42.0))
+def test_parser_normalizes_terra_style_numeric_subject_id(subject_id: object) -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户喜欢火锅。",
+            "facts": [
+                _fact(
+                    subject_id=subject_id,
+                    content="42 喜欢吃火锅。",
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        strict=True,
+    )
+
+    assert len(result.facts) == 1
+    assert result.facts[0].subject_id == "42"
+
+
+@pytest.mark.parametrize("subject_id", (True, 42.5, float("nan"), float("inf")))
+def test_parser_rejects_invalid_numeric_subject_id(subject_id: object) -> None:
+    result = parse_memory_compaction_response(
+        {
+            "summary": "用户喜欢火锅。",
+            "facts": [
+                _fact(
+                    subject_id=subject_id,
+                    content="42 喜欢吃火锅。",
+                )
+            ],
+        },
+        allowed_source_msg_ids={"m-1"},
+        allowed_subject_ids={"42"},
+        source_subject_ids={"m-1": "42"},
+        strict=True,
+    )
+
+    assert result.facts == ()
+    assert result.rejected_fact_count == 1
+
+
 def test_parser_rejects_single_author_personal_fact_mislabeled_as_group() -> None:
     result = parse_memory_compaction_response(
         {
