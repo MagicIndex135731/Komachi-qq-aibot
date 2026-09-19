@@ -15,6 +15,16 @@ _CURRENT_VIEWING_INTENT_PATTERN = re.compile(
     r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
 )
 _CURRENT_VIEWING_FEATURES = ("在看", "观看", "追看", "追番", "补番", "补剧")
+_CURRENT_ACTIVITY_INTENT_PATTERN = re.compile(
+    r"(?:最近|现在|目前|近期|当下).{0,12}?"
+    r"(?:在|正在)?(?:看|追|补|玩|做|学|忙|干)(?:着)?"
+    r"(?:什么|啥|哪个|哪些)|"
+    r"(?:正在|在)(?:玩|做|学|忙|干)(?:着)?(?:什么|啥)"
+)
+_CURRENT_STATE_INTENT_PATTERN = re.compile(
+    r"(?:(?:现在|目前|最近|近期|当下).{0,12}?)?"
+    r"(?:在哪|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+)
 
 # Storage kinds stay separate so each fact keeps one lifecycle and canonical
 # identity.  A portrait is a read-time view over these stable personal kinds.
@@ -32,17 +42,59 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("preference",), re.compile(r"喜欢|偏好|最爱|爱看|爱听|爱吃|爱喝|爱玩|主人|称呼")),
     (("running_joke",), re.compile(r"什么梗|有啥梗|有什么梗|梗")),
     (("relationship",), re.compile(r"什么关系|和谁|和什么人|关系")),
-    (("plan",), re.compile(r"打算|计划|准备做")),
+    (("plan",), re.compile(r"打算|计划|准备(?:做|去|学|看|玩)?|接下来|下一步")),
     (("decision",), re.compile(r"决定")),
     (("current", "event"), _CURRENT_VIEWING_INTENT_PATTERN),
-    (("current",), re.compile(r"最近在做什么|在做什么|在干嘛|干什么")),
+    (("current", "event"), _CURRENT_STATE_INTENT_PATTERN),
+    (("current",), _CURRENT_ACTIVITY_INTENT_PATTERN),
     (("event",), re.compile(r"最近发生|发生了什么|发生什么")),
     (PERSON_PORTRAIT_KINDS, _COMPOSITE_PORTRAIT_PATTERN),
     (("profile",), re.compile(r"哪里人|做什么的")),
 )
 
 
-_RECENCY_INTENT_PATTERN = re.compile(r"最近|现在|目前|近期|当下|刚刚|刚")
+def fact_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...]:
+    """Return the bounded storage-kind policy for member-fact injection.
+
+    This is intentionally shared with normal fact intent inference.  Callers
+    may rank within the returned kinds, but must not broaden it to every kind:
+    a one-off current activity is not a durable preference, and an expired
+    plan is never profile knowledge.
+    """
+
+    preferred = preferred_kinds_for_query(query=query, answer_mode=answer_mode)
+    preferred_set = frozenset(preferred)
+    if preferred == PERSON_PORTRAIT_KINDS:
+        return PERSON_PORTRAIT_KINDS
+    if preferred == ("preference", "taboo", "profile"):
+        # This is the resolver's generic current-fact fallback, not a proven
+        # preference intent. Keep legacy durable facts available.
+        return ("fact", "relationship", "profile", "preference", "taboo")
+    if preferred_set & {"current", "event"}:
+        allowed = ["current", "event"]
+        if "profile" in preferred_set:
+            allowed.append("profile")
+        return tuple(allowed)
+    if preferred_set & {"plan", "decision"}:
+        return ("plan", "decision")
+    if preferred_set & {"preference", "taboo"}:
+        return tuple(
+            kind for kind in ("preference", "taboo") if kind in preferred_set
+        )
+    if "relationship" in preferred_set:
+        return ("relationship", "profile", "fact")
+    if preferred_set & set(PERSON_PORTRAIT_KINDS):
+        return PERSON_PORTRAIT_KINDS
+    if "profile" in preferred_set:
+        return ("profile", "fact")
+    # Preserve the pre-existing durable-fact behavior for queries without a
+    # recognized dynamic intent.
+    return ("fact", "relationship")
+
+
+_RECENCY_INTENT_PATTERN = re.compile(
+    r"最近|现在|目前|近期|当下|刚刚|刚|接下来|之后|下一步|未来|打算|计划|准备"
+)
 _TEMPORAL_FACT_KINDS = (
     "current",
     "event",
@@ -181,10 +233,14 @@ def memory_query_features(
                 piece = text[index : index + size]
                 if _CJK.fullmatch(piece):
                     features.add(piece)
-    if _CURRENT_VIEWING_INTENT_PATTERN.search(
-        str(intent_query if intent_query is not None else query)
-    ):
+    intent_text = str(intent_query if intent_query is not None else query)
+    if _CURRENT_VIEWING_INTENT_PATTERN.search(intent_text):
         features.update(_CURRENT_VIEWING_FEATURES)
+    if re.search(r"动画|动漫|番剧", intent_text):
+        # Distillation categories use “动漫”, while people commonly ask
+        # “什么动画”.  Keep both terms so a title-only fact (for example an
+        # abbreviation such as RW0) can still match through its predicate.
+        features.update(("动画", "动漫", "番剧"))
     return tuple(sorted(features))
 
 

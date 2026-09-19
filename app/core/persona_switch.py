@@ -17,6 +17,15 @@ from datetime import UTC, datetime
 from sqlalchemy import text
 
 from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
+from app.core.memory_fact_ranking import (
+    fact_kinds_for_query,
+    matching_member_fact_ids,
+    memory_query_features,
+    preferred_kinds_for_query,
+    rank_member_facts,
+    select_temporal_current_facts,
+    temporal_recency_required,
+)
 from app.storage.models import (
     MemoryItem,
     MemoryItemSemanticVector,
@@ -26,6 +35,7 @@ from app.storage.models import (
 from app.storage.db import session_scope
 from app.storage.repositories import (
     GroupPersonaStateRepository,
+    MemoryRepository,
     PersonaStyleExampleRepository,
 )
 
@@ -379,25 +389,35 @@ class PersonaManager:
         context_lines: list[str],
         *,
         limit: int = 5,
+        now: datetime | None = None,
+        answer_mode: str = "current_fact",
     ) -> list[dict]:
-        """Pull topic-relevant facts about the active member from shared memory."""
+        """Pull valid, intent-compatible facts about the active member."""
 
         persona = self.active_persona(group_id)
         user_id = _as_positive_int(persona.get("source_user_id"))
         if user_id is None:
             return []
+        query_text = str(context_lines[0] if context_lines else "").split(":", 1)[-1].strip()
+        allowed_kinds = fact_kinds_for_query(
+            query=query_text,
+            answer_mode=answer_mode,
+        )
+        preferred_kinds = preferred_kinds_for_query(
+            query=query_text,
+            answer_mode=answer_mode,
+        )
         with session_scope(self.engine) as session:
-            rows = list(
-                session.query(MemoryItem)
-                .filter(
-                    MemoryItem.scope_type == "group",
-                    MemoryItem.scope_id == str(int(group_id)),
-                    MemoryItem.subject_id == str(user_id),
-                    MemoryItem.memory_kind.in_(("fact", "relationship")),
-                    MemoryItem.status == "active",
+            rows = [
+                row
+                for row in MemoryRepository(session).list_current_group_memories(
+                    scope_id=str(int(group_id)),
+                    subject_id=str(user_id),
+                    as_of=now,
+                    limit=500,
                 )
-                .all()
-            )
+                if str(row.memory_kind or "") in allowed_kinds
+            ]
             vectors: dict[int, list[float]] = {}
             if rows and self.embedding_provider is not None:
                 row_ids = [row.id for row in rows]
@@ -413,20 +433,41 @@ class PersonaManager:
                         vectors[int(vector_row.memory_id)] = [
                             float(value) for value in parsed
                         ]
+        query_features = memory_query_features(
+            query=query_text,
+            intent_query=query_text,
+        )
+        recency_required = temporal_recency_required(query=query_text)
+        ranked_rows = rank_member_facts(
+            rows,
+            query_features=query_features,
+            preferred_kinds=preferred_kinds,
+            recency_boost=recency_required,
+            limit=len(rows),
+        )
+        if recency_required:
+            ranked_rows = select_temporal_current_facts(
+                ranked_rows,
+                matching_fact_ids=matching_member_fact_ids(
+                    ranked_rows,
+                    query_features=query_features,
+                ),
+                topic_specific=True,
+            )
         bank = [
             {
                 "memory_id": int(row.id),
-                "category": str(row.predicate or "fact"),
+                "category": str(row.memory_kind or row.predicate or "fact"),
                 "fact": str(row.content or ""),
             }
-            for row in rows
+            for row in ranked_rows
             if str(row.content or "").strip()
         ]
         if self.embedding_provider is not None and vectors:
-            query_text = " ".join(
+            semantic_query_text = " ".join(
                 str(line).split(":", 1)[-1] for line in context_lines
             )
-            query_vector = self.embedding_provider.embed_query(query_text)
+            query_vector = self.embedding_provider.embed_query(semantic_query_text)
             if query_vector:
                 keyword_scores = retrieve_relevant_facts(
                     bank, context_lines, limit=len(bank)
@@ -453,7 +494,15 @@ class PersonaManager:
                     {"category": item["category"], "fact": item["fact"]}
                     for _, item in scored[: max(0, limit)]
                 ]
-        return retrieve_relevant_facts(bank, context_lines, limit=limit)
+        # ``rows`` have already been kind-filtered, relevance-ranked and (for
+        # temporal questions) reduced to the freshest topic candidate.  A
+        # second lexical-only pass is lossy for abbreviations and proper names:
+        # e.g. a current anime fact containing only ``RW0`` was selected above
+        # but then disappeared because it did not literally contain “动画”.
+        return [
+            {"category": item["category"], "fact": item["fact"]}
+            for item in bank[: max(0, limit)]
+        ]
 
     def active_key(self, group_id: int) -> str:
         return self._group_keys.get(int(group_id), DEFAULT_PERSONA_KEY)

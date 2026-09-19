@@ -37,6 +37,7 @@ from app.core.memory_background_service import (
 from app.core.memory_compaction_service import MemoryCompactionService
 from app.core.memory_fact_ranking import (
     PERSON_PORTRAIT_KINDS,
+    fact_kinds_for_query,
     filter_member_query_features,
     is_composite_portrait_query,
     matching_member_fact_ids,
@@ -973,6 +974,22 @@ def build_memory_runtime(
                 )
             )
             subject_ids = resolved_query.subject_ids
+            allowed_fact_kinds = (
+                frozenset(
+                    fact_kinds_for_query(
+                        query=str(resolved_query.original_query),
+                        answer_mode=resolved_query.answer_mode,
+                    )
+                )
+                if subject_ids and resolved_query.answer_mode == "current_fact"
+                else None
+            )
+            if allowed_fact_kinds is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if str(row.memory_kind or "") in allowed_fact_kinds
+                ]
             boosted_fact_ids: set[int] = set()
             preferred_fact_ids: set[int] = set()
             semantic_scores_by_id: dict[int, float] = {}
@@ -1025,6 +1042,12 @@ def build_memory_runtime(
                             settings.memory_member_fact_supplement_limit,
                         ),
                     )
+                    if allowed_fact_kinds is not None:
+                        candidates = [
+                            row
+                            for row in candidates
+                            if str(row.memory_kind or "") in allowed_fact_kinds
+                        ]
                     semantic_scores: dict[int, float] = {}
                     if (
                         settings.memory_fact_semantic_ranking_enabled

@@ -432,6 +432,94 @@ def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
     assert any(item["fact"] == "主玩英雄联盟手游" for item in picked)
 
 
+def test_persona_manager_selects_dynamic_fact_kinds_by_intent_and_validity(
+    sqlite_engine,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from app.storage.db import session_scope
+    from app.storage.repositories import MemoryRepository
+
+    personas = {
+        "default": {"name": "测试小町"},
+        "test_self": {
+            "name": "测试君",
+            "identity": "group member",
+            "source_user_id": 222,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+    manager.load_state()
+    manager.set_persona_key(10001, "test_self")
+    now = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        repo = MemoryRepository(session)
+        for kind, key, content, valid_until in (
+            ("current", "current-new", "最近在学日语", now + timedelta(days=2)),
+            ("current", "current-old", "之前在学法语", now - timedelta(days=1)),
+            ("plan", "plan", "接下来准备去登山", now + timedelta(days=3)),
+            ("preference", "preference", "喜欢爵士乐", None),
+            ("relationship", "relationship", "和甲是同学", None),
+        ):
+            repo.upsert_canonical_memory(
+                scope_type="group",
+                scope_id="10001",
+                subject_type="user",
+                subject_id="222",
+                memory_kind=kind,
+                canonical_key=key,
+                predicate=kind,
+                object_text="",
+                content=content,
+                importance=3,
+                confidence=0.9,
+                source_msg_ids=[key],
+                valid_from=now - timedelta(days=2),
+                valid_until=valid_until,
+            )
+        repo.upsert_canonical_memory(
+            scope_type="group",
+            scope_id="10001",
+            subject_type="user",
+            subject_id="222",
+            memory_kind="event",
+            canonical_key="anime-abbreviation",
+            predicate="动漫",
+            object_text="",
+            content="刚看完一集 RW0",
+            importance=3,
+            confidence=0.9,
+            source_msg_ids=["anime-abbreviation"],
+            valid_from=now - timedelta(hours=1),
+        )
+
+    current = manager.retrieve_facts(
+        10001, ["你最近在学什么"], now=now, limit=5
+    )
+    plans = manager.retrieve_facts(
+        10001, ["你接下来有什么计划"], now=now, limit=5
+    )
+    preferences = manager.retrieve_facts(
+        10001, ["你喜欢什么音乐"], now=now, limit=5
+    )
+    relationships = manager.retrieve_facts(
+        10001, ["你和甲是什么关系"], now=now, limit=5
+    )
+    current_anime = manager.retrieve_facts(
+        10001, ["你最近在看什么动画"], now=now, limit=5
+    )
+
+    assert [item["fact"] for item in current] == ["最近在学日语"]
+    assert [item["fact"] for item in plans] == ["接下来准备去登山"]
+    assert [item["fact"] for item in preferences] == ["喜欢爵士乐"]
+    assert [item["fact"] for item in relationships] == ["和甲是同学"]
+    assert [item["fact"] for item in current_anime] == ["刚看完一集 RW0"]
+
+
 def test_live_persona_refreshes_relationship_labels(sqlite_engine) -> None:
     from app.storage.db import session_scope
     from app.storage.repositories import UserRepository

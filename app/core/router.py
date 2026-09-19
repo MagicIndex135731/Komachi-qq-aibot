@@ -2211,14 +2211,18 @@ class InboundRouter:
                 memory_tool_executor is not None
                 and self._query_mentions_member(event.plain_text, users_by_id)
             )
-            memory_query = event.plain_text
+            impersonated_subject_id = None
             if impersonating and _should_bind_impersonated_self(event.plain_text):
-                # Bind self-referential pronouns to the impersonated member so
-                # the semantic retrieval loads their profile facts.
-                memory_query = f"{memory_query}（'你'指{persona_name}本人）"
+                raw_subject_id = active_persona.get("source_user_id")
+                if (
+                    not isinstance(raw_subject_id, bool)
+                    and str(raw_subject_id or "").strip().isdigit()
+                    and int(raw_subject_id) > 0
+                ):
+                    impersonated_subject_id = int(raw_subject_id)
             memory_request = GroupMemoryContextRequest(
                 group_id=event.group_id,
-                query=memory_query,
+                query=event.plain_text,
                 recent_messages=recent_memory_messages,
                 quoted_message=quoted_memory_message,
                 target_message_id=event.platform_msg_id,
@@ -2227,6 +2231,7 @@ class InboundRouter:
                 current_user_id=event.user_id,
                 use_full_history=use_full_history,
                 recent_limit=recent_context_limit,
+                impersonated_subject_id=impersonated_subject_id,
             )
             if memory_enabled:
                 memory_result = self.memory_orchestrator.build_context(memory_request)

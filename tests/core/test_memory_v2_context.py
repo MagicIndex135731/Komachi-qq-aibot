@@ -14,6 +14,7 @@ from app.core.hybrid_memory_retriever import (
 from app.core.memory_context_packer import (
     EvidenceMessage,
     EvidenceSegment,
+    MemoryContextPacker,
     PackedMemoryContext,
 )
 from app.core.memory_orchestrator import MemoryContextResult
@@ -32,8 +33,10 @@ class Resolver:
     subject_binding: str = "unbound"
     preferred_fact_kinds: tuple[str, ...] = ()
     original_query: str | None = None
+    received_impersonated_subject_id: int | None = None
 
     def resolve(self, query, **kwargs):
+        self.received_impersonated_subject_id = kwargs.get("impersonated_subject_id")
         return ResolvedMemoryQuery(
             original_query=self.original_query or query,
             retrieval_query=query,
@@ -46,6 +49,31 @@ class Resolver:
             subject_binding=self.subject_binding,
             preferred_fact_kinds=self.preferred_fact_kinds,
         )
+
+
+def test_provider_forwards_typed_impersonated_subject_to_resolver() -> None:
+    resolver = Resolver(needs_history=False)
+    provider = MemoryV2ContextProvider(
+        resolver=resolver,
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+
+    provider(
+        MemoryV2Request(
+            group_id=100,
+            query="你最近在做什么",
+            recent_messages=(),
+            quoted_message=None,
+            target_message_id=None,
+            available_input=1000,
+            impersonated_subject_id=222,
+        )
+    )
+
+    assert resolver.received_impersonated_subject_id == 222
 
 
 class Retriever:

@@ -60,7 +60,7 @@ AnswerMode = Literal[
     "general_history",
 ]
 CoverageMode = Literal["relevance", "chronological", "time_buckets"]
-SubjectBinding = Literal["explicit", "requester", "unbound"]
+SubjectBinding = Literal["explicit", "requester", "impersonated", "unbound"]
 TopicExtraction = Literal["none", "deterministic", "fallback"]
 
 
@@ -253,11 +253,33 @@ _CURRENT_VIEWING_QUERY_PATTERN = (
     r"(?:看|追|补)(?:着)?(?:什么|啥)|"
     r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
 )
+_CURRENT_ACTIVITY_QUERY_PATTERN = (
+    r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
+    r"(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:正在|在)(?:玩|做|学|忙|干)(?:着)?(?:什么|啥))"
+)
+_CURRENT_STATE_QUERY_PATTERN = (
+    r"(?:(?:现在|目前|最近|近期|当下).{0,12}?)?"
+    r"(?:在哪|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+)
+_FUTURE_FACT_QUERY_PATTERN = (
+    r"(?:接下来|之后|下一步|未来).{0,12}?(?:打算|准备|计划|决定).{0,12}?"
+    r"(?:什么|啥|怎么|哪些|吗|呢|有)|"
+    r"(?:有什么|有啥|有哪些)(?:打算|准备|计划|决定)|"
+    r"(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢)"
+)
 _CURRENT_FACT_PATTERN = re.compile(
     r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"讨厌什么|不喜欢什么|还记得|记得|"
-    r"画像|是什么样的人|哪里人|做什么的|介绍一下|主人|称呼我|叫我|"
+    r"画像|是什么样的人|哪里人|做什么的|介绍一下|什么关系|和谁|"
+    r"主人|称呼我|叫我|"
     + _CURRENT_VIEWING_QUERY_PATTERN
+    + "|"
+    + _CURRENT_ACTIVITY_QUERY_PATTERN
+    + "|"
+    + _CURRENT_STATE_QUERY_PATTERN
+    + "|"
+    + _FUTURE_FACT_QUERY_PATTERN
 )
 _TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
 _TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
@@ -282,7 +304,8 @@ _CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
     r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"讨厌什么|不喜欢什么|还记得|记得|给出|完整|个人|介绍一下|"
     r"(?:我|我的)?(?:最近|现在|目前|近期|当下)?(?:我|我的)?"
-    r"(?:正在|在)?(?:看|追|补)(?:着)?(?:什么|啥)"
+    r"(?:正在|在)?(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥)|"
+    r"(?:接下来|之后|下一步|未来)?(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢|有)"
 )
 _HISTORY_SCAFFOLD_PATTERN = re.compile(
     r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
@@ -331,7 +354,8 @@ _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
     r"(?:(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"讨厌什么|不喜欢什么|"
     r"(?:最近|现在|目前|近期|当下)?(?:正在|在)?"
-    r"(?:看|追|补)(?:着)?(?:什么|啥))"
+    r"(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥)|"
+    r"(?:接下来|之后|下一步|未来)?.{0,8}?(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢|有))"
 )
 _REMEMBER_PERSON_PATTERN = re.compile(
     r"^\s*(?:还)?记得\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:吗|么|的|曾经|以前|喜欢|讨厌|[？?]|$)"
@@ -487,6 +511,7 @@ class MemoryQueryResolver:
         group_id: int | None = None,
         requester_id: int | str | None = None,
         requester_uin: int | str | None = None,
+        impersonated_subject_id: int | str | None = None,
     ) -> ResolvedMemoryQuery:
         """Return a typed retrieval query without reading persistence.
 
@@ -498,6 +523,10 @@ class MemoryQueryResolver:
         original = query.strip()
         normalized_group_id = self._normalize_group_id(group_id)
         normalized_requester_id = self._normalize_requester_id(requester_id, requester_uin)
+        normalized_impersonated_id = self._normalize_requester_id(
+            impersonated_subject_id,
+            None,
+        )
         current_time = self._as_shanghai_time(now or datetime.now(ASIA_SHANGHAI))
         recent = tuple(recent_messages[-self._recent_limit :])
         time_range = self._parse_time_range(original, current_time)
@@ -726,6 +755,45 @@ class MemoryQueryResolver:
                         requester_id=normalized_requester_id,
                     )
             return plan
+
+        if normalized_impersonated_id is not None:
+            impersonated_member = next(
+                (
+                    member
+                    for member in group_members
+                    if member.in_scope
+                    and int(member.user_id) not in excluded_member_ids
+                    and str(member.user_id) == normalized_impersonated_id
+                ),
+                None,
+            )
+            if impersonated_member is not None:
+                impersonated_subject = (normalized_impersonated_id,)
+                return self._with_topic_query(
+                    ResolvedMemoryQuery(
+                        original_query=original,
+                        retrieval_query=original,
+                        entities=(
+                            str(
+                                impersonated_member.group_card
+                                or impersonated_member.nickname
+                                or normalized_impersonated_id
+                            ),
+                        ),
+                        speaker_ids=impersonated_subject,
+                        subject_ids=impersonated_subject,
+                        time_range=time_range,
+                        retrieval_mode="temporal" if time_range else "hybrid",
+                        needs_history=needs_history,
+                        needs_detail=needs_detail,
+                        group_id=normalized_group_id,
+                        requester_id=normalized_requester_id,
+                        subject_binding="impersonated",
+                        answer_mode=answer_mode,
+                        coverage_mode=coverage_mode,
+                    ),
+                    aliases=("你", "您"),
+                )
 
         if answer_mode == "mention":
             return ResolvedMemoryQuery(

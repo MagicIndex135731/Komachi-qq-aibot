@@ -349,9 +349,11 @@ class BuiltinSearchAwareLlm:
 class CapturingMemoryOrchestrator:
     def __init__(self) -> None:
         self.seen_available_inputs: list[int] = []
+        self.requests: list[object] = []
 
     def build_context(self, request):
         self.seen_available_inputs.append(request.available_input)
+        self.requests.append(request)
         return MemoryContextResult(
             group_id=request.group_id,
             packed_context=LegacyMemoryPromptContext(
@@ -369,6 +371,39 @@ class CapturingMemoryOrchestrator:
             estimated_tokens=0,
             mode="normal",
         )
+
+
+@pytest.mark.asyncio
+async def test_router_passes_impersonated_subject_without_mutating_query(
+    sqlite_engine,
+) -> None:
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_orchestrator=memory,
+    )
+    router.persona_manager.personas["member_persona"] = {
+        "name": "测试成员",
+        "identity": "group member",
+        "source_user_id": 30001,
+    }
+    router.persona_manager.set_persona_key(10001, "member_persona")
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            user_id=20001,
+            mentioned_bot=True,
+            message_id="typed-impersonation-subject",
+            plain_text="你最近在学什么",
+        )
+    )
+
+    assert len(memory.requests) == 1
+    assert memory.requests[0].query == "你最近在学什么"
+    assert memory.requests[0].impersonated_subject_id == 30001
 
 
 class RelativeYearSearchLlm:

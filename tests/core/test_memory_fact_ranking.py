@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app.core.memory_fact_ranking import (
     PERSON_PORTRAIT_KINDS,
+    fact_kinds_for_query,
     filter_member_query_features,
     is_composite_portrait_query,
     matching_member_fact_ids,
@@ -57,8 +58,9 @@ def test_preferred_kinds_for_query_intent_mapping() -> None:
         ("阿渣最近发生了什么？", ("event",)),
         (
             "阿渣目前在哪里工作？",
-            ("current", "event", "plan", "decision", "relationship", "profile"),
+            ("current", "event"),
         ),
+        ("阿渣在哪里工作？", ("current", "event")),
         ("介绍一下阿渣", PERSON_PORTRAIT_KINDS),
         ("阿渣是什么样的人？", PERSON_PORTRAIT_KINDS),
         ("阿渣的完整个人画像", PERSON_PORTRAIT_KINDS),
@@ -84,6 +86,25 @@ def test_preferred_kinds_for_query_current_fact_fallback() -> None:
         query="还记得阿渣吗？",
         answer_mode="general_history",
     ) == ()
+
+
+def test_fact_kinds_for_query_isolates_dynamic_intents() -> None:
+    assert fact_kinds_for_query(
+        query="阿渣最近在看什么动画",
+        answer_mode="current_fact",
+    ) == ("current", "event")
+    assert fact_kinds_for_query(
+        query="阿渣接下来有什么计划",
+        answer_mode="current_fact",
+    ) == ("plan", "decision")
+    assert fact_kinds_for_query(
+        query="阿渣喜欢什么动画",
+        answer_mode="current_fact",
+    ) == ("preference",)
+    assert fact_kinds_for_query(
+        query="介绍一下阿渣",
+        answer_mode="current_fact",
+    ) == PERSON_PORTRAIT_KINDS
 
 
 def test_composite_portrait_query_is_distinct_from_single_attribute_query() -> None:
@@ -252,6 +273,8 @@ def test_temporal_recency_required_detects_recent_intent() -> None:
         "阿渣近期决定了什么",
         "阿渣刚刚和谁建立了关系",
         "最近聊过什么",
+        "阿渣接下来有什么计划",
+        "阿渣打算做什么",
     )
     assert all(temporal_recency_required(query=query) for query in temporal_queries)
     assert not temporal_recency_required(query="阿渣喜欢什么动画")

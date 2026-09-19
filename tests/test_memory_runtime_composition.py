@@ -1519,10 +1519,9 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
     packed = trace.result.packed_context
     texts = [fact.text for fact in packed.facts]
     assert any("海贼王" in text for text in texts)
-    assert any("前后端" in text for text in texts)
-    assert texts.index(next(t for t in texts if "海贼王" in t)) < texts.index(
-        next(t for t in texts if "前后端" in t)
-    )
+    assert not any("前后端" in text for text in texts), [
+        (fact.memory_kind, fact.text) for fact in packed.facts
+    ]
     anime_fact = next(fact for fact in packed.facts if "海贼王" in fact.text)
     assert anime_fact.memory_kind == "preference"
     assert anime_fact.observed_at is not None
@@ -1750,7 +1749,7 @@ def test_preference_question_prefers_preference_kind_over_current(
     texts = [fact.text for fact in trace.result.packed_context.facts]
     assert any("喜欢看动画" in text for text in texts)
     assert any("海贼王" in text for text in texts)
-    assert any("前后端" in text for text in texts)
-    assert texts.index(next(t for t in texts if "海贼王" in t)) < texts.index(
-        next(t for t in texts if "前后端" in t)
-    )
+    assert not any("前后端" in text for text in texts), [
+        (fact.memory_kind, fact.text)
+        for fact in trace.result.packed_context.facts
+    ]

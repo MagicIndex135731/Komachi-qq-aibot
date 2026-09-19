@@ -29,9 +29,7 @@ class Recent:
     is_bot: bool = False
 
 
-def test_impersonation_hint_binds_subject_to_member() -> None:
-    from app.core.member_identity import GroupMemberIdentity
-
+def test_typed_impersonated_subject_binds_without_rewriting_query() -> None:
     members = [
         GroupMemberIdentity(
             user_id=222,
@@ -41,14 +39,95 @@ def test_impersonation_hint_binds_subject_to_member() -> None:
         )
     ]
     result = MemoryQueryResolver().resolve(
-        "你最近面了哪些企业（'你'指阿渣本人）",
+        "你最近在学什么",
         recent_messages=(),
         now=NOW,
         group_members=members,
+        impersonated_subject_id=222,
     )
 
-    assert result.subject_ids is not None
-    assert "222" in result.subject_ids
+    assert result.original_query == "你最近在学什么"
+    assert result.subject_ids == ("222",)
+    assert result.subject_binding == "impersonated"
+    assert result.answer_mode == "current_fact"
+
+
+def test_impersonated_subject_must_be_an_in_scope_group_member() -> None:
+    result = MemoryQueryResolver().resolve(
+        "你最近在玩什么",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(
+                user_id=222,
+                nickname="阿渣",
+                group_card="足泽满灰交",
+                in_scope=False,
+            ),
+        ),
+        impersonated_subject_id=222,
+    )
+
+    assert result.subject_ids != ("222",)
+    assert result.subject_binding != "impersonated"
+
+
+def test_requester_subject_precedes_impersonated_subject() -> None:
+    result = MemoryQueryResolver().resolve(
+        "我最近在玩什么",
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+    )
+
+    assert result.subject_ids == ("111",)
+    assert result.subject_binding == "requester"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_kinds"),
+    (
+        ("你最近在看什么", ("current", "event")),
+        ("你最近在玩什么", ("current",)),
+        ("你最近在学什么", ("current",)),
+        (
+            "你现在在哪里工作",
+            ("current", "event"),
+        ),
+        ("你接下来有什么计划", ("plan",)),
+        ("你打算做什么", ("plan",)),
+        ("你在哪里工作", ("current", "event")),
+        ("你喜欢什么", ("preference",)),
+        ("你和甲是什么关系", ("relationship",)),
+    ),
+)
+def test_impersonated_subject_generalized_current_fact_matrix(
+    query: str,
+    expected_kinds: tuple[str, ...],
+) -> None:
+    from app.core.memory_fact_ranking import preferred_kinds_for_query
+
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+    )
+
+    assert result.subject_ids == ("222",)
+    assert result.subject_binding == "impersonated"
+    assert result.answer_mode == "current_fact"
+    assert preferred_kinds_for_query(
+        query=query,
+        answer_mode=result.answer_mode,
+    ) == expected_kinds
 
 
 def test_third_person_query_binds_the_named_member_not_impersonated_one() -> None:
@@ -63,6 +142,7 @@ def test_third_person_query_binds_the_named_member_not_impersonated_one() -> Non
         recent_messages=(),
         now=NOW,
         group_members=members,
+        impersonated_subject_id=222,
     )
 
     assert result.subject_ids == ("333",)

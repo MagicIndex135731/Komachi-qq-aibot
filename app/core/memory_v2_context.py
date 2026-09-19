@@ -42,6 +42,7 @@ class QueryResolver(Protocol):
         excluded_member_ids: set[int] | frozenset[int] = frozenset(),
         group_id: int | None = None,
         requester_id: int | None = None,
+        impersonated_subject_id: int | None = None,
     ) -> ResolvedMemoryQuery: ...
 
 
@@ -69,6 +70,7 @@ class MemoryV2Request:
     target_message_id: str | None
     available_input: int
     now: datetime | None = None
+    impersonated_subject_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +151,7 @@ class MemoryV2ContextProvider:
             "now": request.now,
             "group_id": request.group_id,
             "requester_id": getattr(request, "current_user_id", None),
+            "impersonated_subject_id": request.impersonated_subject_id,
         }
         if self._member_loader is not None:
             resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
@@ -339,7 +342,7 @@ class MemoryV2ContextProvider:
             )
             logger.info(
                 "memory_query_metrics route=%s group_id=%s answer_mode=%s "
-                "coverage=%s has_subject=%s subject_ambiguous=%s has_time=%s "
+                "coverage=%s subject_binding=%s has_subject=%s subject_ambiguous=%s has_time=%s "
                 "topic_extraction=%s topic_terms=%s "
                 "adaptive_enabled=%s expansion_mode=%s expansion_reasons=%s "
                 "attempted_channels=%s failed_channels=%s channel_counts=%s "
@@ -355,6 +358,7 @@ class MemoryV2ContextProvider:
                 request.group_id,
                 resolved.answer_mode,
                 resolved.coverage_mode,
+                resolved.subject_binding,
                 resolved.subject_ids is not None,
                 resolved.subject_ids == (),
                 resolved.time_range is not None,
