@@ -567,10 +567,7 @@ def test_generate_text_with_tools_degrades_to_plain_when_tool_round_is_rejected(
     assert text == "降级后的回答"
     assert len(payloads) == 3
     assert "tools" not in payloads[2]
-    assert not any(
-        item.get("type") in {"function_call", "function_call_output"}
-        for item in payloads[2]["input"]
-    )
+    assert isinstance(payloads[2]["input"], str)
     assert any(
         "responses_tools_http_error_fallback_to_plain" in record.getMessage()
         for record in caplog.records
@@ -1808,17 +1805,7 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
             "Safety rules: Stay safe.\n\n"
             "Reply style: Talk like a real person in chat."
         ),
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "Recent messages:\nAlice: hi\nMira: hello\n\nTarget message: Alice: hi",
-                    }
-                ],
-            }
-        ],
+        "input": "Recent messages:\nAlice: hi\nMira: hello\n\nTarget message: Alice: hi",
     }
     assert len(recorded) == 1
     assert recorded[0].endpoint == "responses"
@@ -2779,23 +2766,13 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Target message: Alice: first"}],
-            }
-        ],
+        "input": "Target message: Alice: first",
     }
     assert captured_payloads[1] == {
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Target message: Alice: second"}],
-            }
-        ],
+        "input": "Target message: Alice: second",
     }
 
 

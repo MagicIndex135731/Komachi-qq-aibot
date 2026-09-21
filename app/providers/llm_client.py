@@ -219,49 +219,67 @@ class LlmClient:
         extra_input_items: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         preloaded_image_parts: list[dict[str, str]] | None = None,
+        force_structured_input: bool = False,
     ) -> dict[str, Any]:
         prompt_part: dict[str, Any] = {
             "type": "input_text",
             "text": "\n\n".join(input_lines),
         }
-        content: list[dict[str, Any]] = []
         image_parts = preloaded_image_parts if preloaded_image_parts is not None else self._load_input_images(images or [])
-        has_labeled_references = any(
-            str(image_part.get("reference_subject", "") or "").strip()
-            for image_part in image_parts
+        builtin_web_search_active = self._builtin_web_search_active(
+            model=model,
+            has_images=bool(images),
+            force_web_search=force_web_search,
+            allow_web_search=allow_web_search,
         )
-        if not has_labeled_references:
-            content.append(prompt_part)
-        for image_part in image_parts:
-            subject = str(image_part.get("reference_subject", "") or "").strip()
-            if subject:
-                content.append(
-                    {
-                        "type": "input_text",
-                        "text": f"这是“{subject}”的参考图。",
-                    }
-                )
-            data_url = f"data:{image_part['media_type']};base64,{image_part['data']}"
-            content.append(
-                {
-                    "type": "input_image",
-                    "image_url": data_url,
-                }
-            )
-        if has_labeled_references:
-            content.append(prompt_part)
-        user_item: dict[str, Any] = {
-            "role": "user",
-            "content": content,
-        }
-        input_items: list[dict[str, Any]] = [user_item]
-        if extra_input_items:
-            input_items.extend(extra_input_items)
+        requires_structured_input = bool(
+            force_structured_input
+            or images
+            or preloaded_image_parts
+            or previous_response_id
+            or extra_input_items
+            or tools is not None
+            or builtin_web_search_active
+        )
         payload: dict[str, Any] = {
             "model": model,
             "stream": True,
-            "input": input_items,
         }
+        if requires_structured_input:
+            content: list[dict[str, Any]] = []
+            has_labeled_references = any(
+                str(image_part.get("reference_subject", "") or "").strip()
+                for image_part in image_parts
+            )
+            if not has_labeled_references:
+                content.append(prompt_part)
+            for image_part in image_parts:
+                subject = str(image_part.get("reference_subject", "") or "").strip()
+                if subject:
+                    content.append(
+                        {
+                            "type": "input_text",
+                            "text": f"这是“{subject}”的参考图。",
+                        }
+                    )
+                data_url = f"data:{image_part['media_type']};base64,{image_part['data']}"
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": data_url,
+                    }
+                )
+            if has_labeled_references:
+                content.append(prompt_part)
+            input_items: list[dict[str, Any]] = [{"role": "user", "content": content}]
+            if extra_input_items:
+                input_items.extend(extra_input_items)
+            payload["input"] = input_items
+        else:
+            # Some OpenAI-compatible gateways route structured message arrays
+            # differently. Keep ordinary text turns in the canonical flat
+            # Responses shape; images, tools, and continuations stay structured.
+            payload["input"] = prompt_part["text"]
         if instructions:
             payload["instructions"] = "\n\n".join(instructions)
         if previous_response_id:
@@ -277,12 +295,7 @@ class LlmClient:
             payload["temperature"] = resolved_temperature
         if tools is not None:
             resolved_tools = list(tools)
-            if self._builtin_web_search_active(
-                model=model,
-                has_images=bool(images),
-                force_web_search=force_web_search,
-                allow_web_search=allow_web_search,
-            ):
+            if builtin_web_search_active:
                 resolved_tools.append(
                     {
                         "type": "web_search",
@@ -293,12 +306,7 @@ class LlmClient:
             payload["tool_choice"] = (
                 {"type": "web_search"} if force_web_search else "auto"
             )
-        elif self._builtin_web_search_active(
-            model=model,
-            has_images=bool(images),
-            force_web_search=force_web_search,
-            allow_web_search=allow_web_search,
-        ):
+        elif builtin_web_search_active:
             payload["tools"] = [
                 {
                     "type": "web_search",
@@ -332,6 +340,7 @@ class LlmClient:
             input_lines=[prompt],
             images=images,
             preloaded_image_parts=image_parts,
+            force_structured_input=True,
         )
         if images:
             for content in payload["input"][0]["content"]:
