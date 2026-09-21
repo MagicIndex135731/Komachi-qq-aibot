@@ -567,7 +567,7 @@ def test_generate_text_with_tools_degrades_to_plain_when_tool_round_is_rejected(
     assert text == "降级后的回答"
     assert len(payloads) == 3
     assert "tools" not in payloads[2]
-    assert isinstance(payloads[2]["input"], str)
+    assert payloads[2]["input"] == payloads[0]["input"]
     assert any(
         "responses_tools_http_error_fallback_to_plain" in record.getMessage()
         for record in caplog.records
@@ -1805,7 +1805,17 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
             "Safety rules: Stay safe.\n\n"
             "Reply style: Talk like a real person in chat."
         ),
-        "input": "Recent messages:\nAlice: hi\nMira: hello\n\nTarget message: Alice: hi",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Recent messages:\nAlice: hi\nMira: hello\n\nTarget message: Alice: hi",
+                    }
+                ],
+            }
+        ],
     }
     assert len(recorded) == 1
     assert recorded[0].endpoint == "responses"
@@ -1815,7 +1825,7 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert recorded[0].output_tokens == 45
 
 
-def test_responses_builtin_web_search_keeps_plain_text_input() -> None:
+def test_responses_builtin_web_search_uses_structured_input() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
@@ -1831,7 +1841,17 @@ def test_responses_builtin_web_search_keeps_plain_text_input() -> None:
         allow_web_search=True,
     )
 
-    assert payload["input"] == "Target message: Alice: what happened today?"
+    assert payload["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Target message: Alice: what happened today?",
+                }
+            ],
+        }
+    ]
     assert payload["tools"] == [{"type": "web_search", "search_context_size": "high"}]
 
 
@@ -2786,13 +2806,27 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "input": "Target message: Alice: first",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Target message: Alice: first"}
+                ],
+            }
+        ],
     }
     assert captured_payloads[1] == {
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "input": "Target message: Alice: second",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Target message: Alice: second"}
+                ],
+            }
+        ],
     }
 
 
