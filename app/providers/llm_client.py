@@ -239,7 +239,6 @@ class LlmClient:
             or previous_response_id
             or extra_input_items
             or tools is not None
-            or builtin_web_search_active
         )
         payload: dict[str, Any] = {
             "model": model,

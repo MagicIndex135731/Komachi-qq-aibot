@@ -1815,6 +1815,26 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
     assert recorded[0].output_tokens == 45
 
 
+def test_responses_builtin_web_search_keeps_plain_text_input() -> None:
+    client = LlmClient(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="gpt-5.6-terra",
+        responses_model="gpt-5.6-terra",
+        builtin_web_search=True,
+    )
+
+    payload = client._build_responses_payload(
+        model="gpt-5.6-terra",
+        instructions=[],
+        input_lines=["Target message: Alice: what happened today?"],
+        allow_web_search=True,
+    )
+
+    assert payload["input"] == "Target message: Alice: what happened today?"
+    assert payload["tools"] == [{"type": "web_search", "search_context_size": "high"}]
+
+
 def test_responses_model_fallback_uses_terra_on_responses_endpoint() -> None:
     captured_requests: list[httpx.Request] = []
 
