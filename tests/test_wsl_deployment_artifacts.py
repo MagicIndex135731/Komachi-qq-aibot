@@ -406,16 +406,13 @@ def test_memory_orchestration_env_and_wsl_runbook_define_a_safe_bot_only_rollout
         assert "nvidia.com/gpu=all" in documentation
         assert "docker-compose.gpu.yml" in documentation
         assert "ENABLE_GPU" in documentation
-        # The documented rollout must name both application services; a
-        # substring match on ``xiaomachi`` alone would pass even when the
-        # private-chat container silently keeps the previous release.
-        assert (
-            "docker compose -f docker-compose.llbot.yml up -d --no-deps --force-recreate "
-            "xiaomachi xiaomachi-private" in documentation
-        )
+        # The rollout must use the platform-aware installer and name both
+        # application services, without requiring the LLBot compose file.
+        assert "bash infra/wsl/scripts/install_linux_runtime.sh" in documentation
+        assert "`xiaomachi` 与 `xiaomachi-private`" in documentation
         assert "xiaomachi-llbot" in documentation
     assert "/workspace/data/models" in wsl_readme
-    assert "must not restart xiaomachi-llbot" in wsl_readme
+    assert "不重启当前 QQ 接入容器" in wsl_readme
     assert "[WSL/Docker 部署与运维](infra/wsl/README.md)" in root_readme
     assert "MEMORY_ORCHESTRATION_V2_ENABLED" not in root_readme
 

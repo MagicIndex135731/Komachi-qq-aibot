@@ -24,8 +24,8 @@ timeout /t 2 /nobreak >nul
 exit /b 0
 
 :recovering
-echo LLBot QQ is temporarily offline. The stack and watchdog are still running.
-echo After the network returns, LLBot will retry recovery automatically. Run status-xiaomachi-wsl.bat later to confirm it is online.
+echo The current QQ platform is temporarily offline. The stack and watchdog are still running.
+echo Complete login if needed, then run status-xiaomachi-wsl.bat to confirm QQ is online.
 pause
 exit /b 75
 

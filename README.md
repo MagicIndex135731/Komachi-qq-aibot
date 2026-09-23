@@ -2,7 +2,7 @@
 
 小町是一个面向 QQ 群聊的 AI 机器人。她能以稳定的人格参与群聊，理解文字与图片，按需联网检索，并通过分层记忆持续认识群成员和群内发生的事情。
 
-项目目前以 **Windows 11 + WSL2 + Docker + LLBot** 为主要运行环境，NapCat 可作为备用 QQ 接入方式。文本模型支持 OpenAI 兼容的 Responses 或 Chat Completions 接口；NVIDIA GPU 为可选项。
+项目目前以 **Windows 11 + WSL2 + Docker** 为主要运行环境，示例配置使用 SnowLuma 接入 QQ；LLBot 和 NapCat 是可切换的备选平台。文本模型支持 OpenAI 兼容的 Responses 或 Chat Completions 接口；NVIDIA GPU 为可选项。
 
 > 这是一个仍在持续开发的个人项目。部署前请确认你了解 QQ 机器人、模型 API 和本地数据保存带来的风险。
 
@@ -56,17 +56,19 @@ bash infra/wsl/scripts/bootstrap_wsl.sh
 ```dotenv
 BOT_QQ=机器人QQ号
 OWNER_QQ=管理员QQ号
-QQ_PLATFORM=llbot
+QQ_PLATFORM=snowluma
 
 LLM_BASE_URL=https://你的模型接口地址
 LLM_API_KEY=你的API密钥
-LLM_MODEL=你的模型名称
+LLM_MODEL=gpt-6-sol
 LLM_TEXT_ENDPOINT=responses
 ```
 
 不要把 `.env`、API 密钥、QQ 密码、WebUI Token 或验证码链接提交到 Git。
 
-然后从 `configs/groups.yaml` 复制一份本地群配置：
+模型名称只是示例，必须与你的接口实际提供的模型一致。新安装尚未准备 Memory V3 索引时，先在本地 `.env` 把 `MEMORY_RAW_V3_ENABLED` 设为 `false`；完成 [V3 准备、评测与激活](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 后再启用。`.env.example` 中的 `true` 是已完成激活的运行配置示例，不是跳过初始化的许可。
+
+然后在 Windows PowerShell 中从 `configs/groups.yaml` 复制一份本地群配置：
 
 ```powershell
 Copy-Item configs/groups.yaml configs/groups.local.yaml
@@ -84,7 +86,7 @@ start-xiaomachi-wsl.bat
 
 启动窗口会显示构建、QQ 平台、OneBot、小町容器、可选 CUDA 预热和网关就绪进度。窗口正常自动关闭时，小町已经可以接收消息；启动失败时窗口会保留错误信息。
 
-LLBot 默认 WebUI 地址为 <http://127.0.0.1:3080/>。也可以双击 `open-llbot-webui.bat` 打开页面并完成首次登录。
+使用示例中的 SnowLuma 时，双击 `open-snowluma-webui.bat` 打开管理页面，首次设置密码并配置 OneBot；需要 QQ 扫码时使用 `open-snowluma-desktop.bat`。首次登录与冷启动限制见 [SnowLuma 操作说明](infra/wsl/README.md#qq-平台选择与-snowluma)。若改用 LLBot 或 NapCat，应打开对应平台的 WebUI；它们的登录态互不共用。
 
 ### 5. 检查状态
 
@@ -92,8 +94,11 @@ LLBot 默认 WebUI 地址为 <http://127.0.0.1:3080/>。也可以双击 `open-ll
 
 - QQ 平台容器健康；
 - OneBot 已连接；
-- 小町心跳和消息网关已就绪；
-- 至少存在一个允许发言的本地群策略。
+- 群聊与私聊进程、心跳和消息网关已就绪；
+- 至少存在一个允许发言的本地群策略；
+- 向量预热、数据库、记忆/人格文件与后台任务状态正常。
+
+日常状态检查不调用模型。需要验证当前模型接口与人格更新字段、临时文件写入链路时，在 WSL 中运行 `bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh --deep`：它至多发起一次受输出预算限制的真实请求，不会修改生产人格文件；搜索和生图只检查配置，不执行付费生成。详见 [状态检查说明](infra/wsl/README.md#操作命令)。
 
 如果状态检查未通过，请先查看[常见问题](#常见问题)和 [WSL/Docker 验收说明](infra/wsl/README.md#验收)。
 
@@ -102,9 +107,11 @@ LLBot 默认 WebUI 地址为 <http://127.0.0.1:3080/>。也可以双击 `open-ll
 | 入口 | 用途 |
 | --- | --- |
 | `start-xiaomachi-wsl.bat` | 显示启动和预热进度，全部就绪后自动关闭窗口 |
+| `rebuild-xiaomachi-wsl.bat` | 将当前工作区代码、配置与人格发布为新的 Linux 运行版本；只重建应用容器 |
 | `stop-xiaomachi-wsl.bat` | 停止小町、QQ 接入和后台看护服务 |
-| `status-xiaomachi-wsl.bat` | 检查 systemd、容器、OneBot、心跳和群策略 |
-| `open-llbot-webui.bat` | 打开默认 LLBot 管理页面 |
+| `status-xiaomachi-wsl.bat` | 零模型 token 检查 systemd、QQ/OneBot、应用、数据库与后台任务 |
+| `open-snowluma-webui.bat` / `open-snowluma-desktop.bat` | 打开当前示例平台的管理页 / QQ 扫码桌面 |
+| `open-llbot-webui.bat` | 使用 LLBot 备选平台时打开管理页面 |
 | `open-napcat-webui.bat` | 使用 NapCat 备用接入时打开其管理页面 |
 
 后台运行由 WSL systemd 和 Windows 登录级计划任务共同维持，不需要保留一个空白 CMD 窗口。启动入口、服务关系和日志位置见 [WSL/Docker 启动链路](infra/wsl/README.md#启动链路)。
@@ -137,7 +144,7 @@ Memory V3 将原始消息、话题片段、结构化事实、人物画像和关�
 
 ### GPU 加速
 
-GPU 只用于小町本地向量模型，不分配给 LLBot。没有 NVIDIA GPU 时保持：
+GPU 只用于小町本地向量模型，不分配给 QQ 接入容器。没有 NVIDIA GPU 时保持：
 
 ```dotenv
 ENABLE_GPU=0
@@ -158,11 +165,9 @@ MEMORY_EMBEDDING_DEVICE=auto
 
 - `infra/wsl/.env`
 - `configs/groups.local.yaml`
-- `infra/wsl/runtime/llbot/data`
-- `infra/wsl/runtime/napcat/ntqq`
-- `infra/wsl/runtime/napcat/config`
-- `infra/wsl/runtime/logs`
-- 小町 SQLite 数据库与模型缓存卷
+- SnowLuma / LLBot / NapCat 的独立 Docker 登录态卷；
+- `xiaomachi-bot-data` 卷中的 SQLite 数据库、聊天归档、模型缓存与日志；
+- `/opt/xiaomachi/shared/` 中的本机配置、运行文件与备份。
 
 更新代码或重建镜像前应先备份数据库和登录态。更完整的数据边界、备份和发布要求见 [WSL/Docker 运行态保护](infra/wsl/README.md#运行态保护)和[工程架构](docs/ARCHITECTURE.md#9-配置与数据边界)。
 
@@ -176,9 +181,9 @@ MEMORY_EMBEDDING_DEVICE=auto
 
 检查该群是否已经写入 `configs/groups.local.yaml`，并确认同时启用了 `enabled` 和 `speak`。修改本地群策略后需要按部署文档重新安装或发布运行版本，不能只修改工作区文件。
 
-### LLBot 或 NapCat 要求重新登录
+### QQ 接入平台要求重新登录
 
-打开当前平台对应的 WebUI 完成登录，然后重新运行状态检查。不要删除平台数据目录，否则会丢失已保存的登录态。
+打开当前平台对应的 WebUI 或 SnowLuma QQ 桌面完成登录，然后重新运行状态检查。SnowLuma 冷启动可能需要重新扫码；不要删除平台数据卷，否则会丢失已保存的登录态。
 
 ### 模型请求失败或很慢
 
@@ -200,7 +205,7 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-提交修改前请至少运行受影响测试，并检查 Docker Compose 配置和文档链接。项目内部设计约束与各层职责以 `.trellis/spec/` 和 [工程架构文档](docs/ARCHITECTURE.md)为准。
+提交修改前请至少运行受影响测试，并检查 Docker Compose 配置和文档链接。公开的模块职责与运行边界见 [工程架构文档](docs/ARCHITECTURE.md)；本地开发工作流可能另有不随 GitHub 仓库分发的内部规范。
 
 ## License
 
