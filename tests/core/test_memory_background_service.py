@@ -2744,3 +2744,41 @@ def test_store_claim_retires_memory_disabled_group_jobs(sqlite_engine) -> None:
             )
         ).scalar_one()
         assert int(count) == 0
+
+
+def test_store_claim_rotates_job_types_so_episode_retries_are_not_starved(
+    sqlite_engine,
+) -> None:
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    store = SqlAlchemyMemoryBackgroundStore(
+        sqlite_engine,
+        raw_message_embedding_enabled=True,
+        raw_message_embedding_generation=7,
+    )
+    store.configure_generations(
+        segmentation_generation="segment-v1",
+        compaction_generation="compact-v2",
+    )
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session)
+        for message_id in range(3):
+            jobs.enqueue_coalescing_job(
+                job_type="raw_message_embed",
+                job_key=f"raw:{message_id}",
+                payload_json={"group_id": 100, "message_id": message_id},
+                run_at=now,
+                target_generation="vector:7",
+            )
+        jobs.enqueue_coalescing_job(
+            job_type="memory_episode_process",
+            job_key="episode:1",
+            payload_json={"group_id": 100, "episode_id": 1},
+            run_at=now,
+            target_generation="compact-v2",
+        )
+
+    first = store.claim_next_job(worker_id="w", now=now, lease_seconds=60)
+    second = store.claim_next_job(worker_id="w", now=now, lease_seconds=60)
+
+    assert first is not None and first.job_type == "memory_episode_process"
+    assert second is not None and second.job_type == "raw_message_embed"

@@ -629,6 +629,7 @@ class SqlAlchemyMemoryBackgroundStore:
         )
         self.segmentation_generation: str | None = None
         self.compaction_generation: str | None = None
+        self._next_claim_job_type_index = 0
 
     def _memory_group_enabled(self, group_id: int) -> bool:
         if self._memory_enabled_group_ids is None:
@@ -905,13 +906,16 @@ class SqlAlchemyMemoryBackgroundStore:
         )
         with session_scope(self.engine) as session:
             jobs = JobRepository(session)
-            for job_type in (
+            job_types = (
+                self.episode_job_type,
                 self.raw_message_projection_job_type,
                 self.raw_message_embed_job_type,
                 self.allocator_job_type,
-                self.episode_job_type,
                 self.shadow_job_type,
-            ):
+            )
+            for offset in range(len(job_types)):
+                job_type_index = (self._next_claim_job_type_index + offset) % len(job_types)
+                job_type = job_types[job_type_index]
                 target_generation = None
                 include_derived_generations = False
                 if job_type == self.raw_message_projection_job_type:
@@ -936,6 +940,7 @@ class SqlAlchemyMemoryBackgroundStore:
                     include_derived_generations=include_derived_generations,
                 )
                 if row is not None:
+                    self._next_claim_job_type_index = (job_type_index + 1) % len(job_types)
                     job = _background_job(row)
                     if not self._memory_group_enabled(job.group_id):
                         try:
