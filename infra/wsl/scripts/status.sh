@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--deep" ) ]]; then
+  echo "Usage: status.sh [--deep]" >&2
+  exit 2
+fi
+deep_probe=false
+[[ $# -eq 1 ]] && deep_probe=true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${WSL_DIR}/../.." && pwd)"
@@ -359,6 +366,16 @@ done
 if [[ "${private_ok}" != true ]]; then
   echo "${private_container_name} is not serving private chat."
   docker compose -f "${compose_file}" logs --tail=80 xiaomachi-private
+  exit 1
+fi
+
+echo "Component diagnostics:"
+component_args=()
+if [[ "${deep_probe}" == true ]]; then
+  component_args+=(--deep)
+fi
+if ! docker exec "${bot_container_name}" python -m scripts.status_components "${component_args[@]}"; then
+  echo "Xiaomachi component diagnostics failed."
   exit 1
 fi
 

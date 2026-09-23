@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import yaml
 from sqlalchemy import text
@@ -19,6 +20,7 @@ from app.core.message_mentions import (
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.style_distill import parse_persona_yaml
 from app.core.style_distill import merge_persona_lists
+from app.core.worker_status import write_worker_status
 from app.storage.db import session_scope
 from app.storage.repositories import (
     PersonaStyleExampleRepository,
@@ -27,6 +29,7 @@ from app.storage.repositories import (
 
 
 logger = logging.getLogger(__name__)
+PERSONA_REFRESH_REASONING_EFFORT = "medium"
 
 
 _LIVE_PROFILE_REQUIRED_TYPES: dict[str, type] = {
@@ -117,6 +120,20 @@ def _normalize_live_profile_contract(
     return normalized
 
 
+def write_live_profile(*, data_dir: Path, persona_key: str, profile: dict) -> Path:
+    """Validate and persist a live profile; also used by the status probe."""
+
+    normalized = _normalize_live_profile_contract(profile)
+    live_dir = data_dir / "personas"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    live_path = live_dir / f"{persona_key}.live.yaml"
+    live_path.write_text(
+        yaml.safe_dump(normalized, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return live_path
+
+
 def _parse_timestamp(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -180,12 +197,22 @@ class PersonaLiveSyncService:
 
     async def run(self) -> None:
         while True:
+            write_worker_status(
+                self.settings.log_dir, "persona_sync", "running", self.interval_seconds
+            )
             try:
                 await asyncio.to_thread(self._tick)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("persona_live_sync_tick_failed")
+                write_worker_status(
+                    self.settings.log_dir, "persona_sync", "error", self.interval_seconds
+                )
+            else:
+                write_worker_status(
+                    self.settings.log_dir, "persona_sync", "idle", self.interval_seconds
+                )
             await asyncio.sleep(self.interval_seconds)
 
     def _tick(self) -> None:
@@ -431,7 +458,7 @@ class PersonaLiveSyncService:
             responses_model=self.settings.llm_model,
             max_output_tokens=16000,
             timeout_seconds=180.0,
-            reasoning_effort="medium",
+            reasoning_effort=PERSONA_REFRESH_REASONING_EFFORT,
         )
         generated = client.generate_text([prompt])
         profile = _normalize_live_profile_contract(
@@ -451,12 +478,10 @@ class PersonaLiveSyncService:
         for rel in profile.get("relationships") or []:
             if isinstance(rel, dict) and not rel.get("member_user_id"):
                 rel["member_user_id"] = id_by_name.get(str(rel.get("member") or ""))
-        live_dir = self.settings.data_dir / "personas"
-        live_dir.mkdir(parents=True, exist_ok=True)
-        live_path = live_dir / f"{persona_key}.live.yaml"
-        live_path.write_text(
-            yaml.safe_dump(profile, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
+        live_path = write_live_profile(
+            data_dir=self.settings.data_dir,
+            persona_key=persona_key,
+            profile=profile,
         )
         merged = _merge_profile(current_profile, profile)
         self.personas[persona_key] = merged

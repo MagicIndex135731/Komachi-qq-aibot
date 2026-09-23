@@ -17,6 +17,7 @@ from app.core.message_mentions import (
     collect_bot_display_names,
     message_mentions_bot,
 )
+from app.core.worker_status import write_worker_status
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
 from app.storage.models import MemberFactRefreshState, MemoryItem
@@ -451,12 +452,22 @@ class MemberFactRefreshService:
 
     async def run(self) -> None:
         while True:
+            write_worker_status(
+                self.settings.log_dir, "member_facts", "running", self.interval_seconds
+            )
             try:
                 await asyncio.to_thread(self._tick)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("member_fact_refresh_tick_failed")
+                write_worker_status(
+                    self.settings.log_dir, "member_facts", "error", self.interval_seconds
+                )
+            else:
+                write_worker_status(
+                    self.settings.log_dir, "member_facts", "idle", self.interval_seconds
+                )
             await asyncio.sleep(self.interval_seconds)
 
     def replay_member_window(

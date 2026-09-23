@@ -69,8 +69,19 @@ bash infra/wsl/scripts/bootstrap_wsl.sh
 cd "/mnt/d/qq群ai小人"
 bash infra/wsl/scripts/start.sh
 bash infra/wsl/scripts/status.sh
+bash infra/wsl/scripts/status.sh --deep
 bash infra/wsl/scripts/stop.sh
 ```
+
+普通 `status.sh` 在容器、QQ/OneBot、群聊与私聊心跳、向量预热之外，还会只读检查
+SQLite 完整性、记忆/检索表、成员事实刷新状态、人格同步状态和现有人格文件契约，
+模型/生图/搜索配置，以及人格同步与成员事实后台任务的进度标记，不消耗模型 token。
+`--deep` 额外使用当前文本模型的 Responses 接口发起一次合成语料请求
+（与生产人格更新共用 `medium` 推理强度、最多 1200 输出 token、至多一次上游请求，
+不调用联网或生图），验证返回字段类型，
+并在临时目录用与真实人格更新相同的写入逻辑进行 YAML 落盘和读回；
+真实人格文件、消息及数据库均不会被探针修改。上游临时过载或格式不符时深度检测失败，
+可稍后重试；启动流程只运行零 token 的普通模式。
 
 `start.sh` 先启动 QQ 平台并尝试打开 WebUI，再启动小町，避免 Compose 的健康依赖阻塞登录页面。LLBot WebUI 为 `http://127.0.0.1:3080/`，OneBot 为 `ws://127.0.0.1:3002`；NapCat 回退平台仍使用 `6099` 与 `3001`。浏览器启动失败不会阻断容器。
 
