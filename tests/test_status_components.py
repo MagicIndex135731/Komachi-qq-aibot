@@ -61,7 +61,7 @@ def test_live_persona_probe_rejects_missing_model_fields(tmp_path, monkeypatch) 
     assert not status_components.check_live_persona(_settings(tmp_path))
 
 
-def test_storage_probe_rejects_invalid_persisted_persona(tmp_path) -> None:
+def test_storage_probe_rejects_invalid_persisted_persona(tmp_path, capsys) -> None:
     settings = _settings(tmp_path)
     with sqlite3.connect(settings.sqlite_path) as db:
         for table in (
@@ -74,7 +74,15 @@ def test_storage_probe_rejects_invalid_persisted_persona(tmp_path) -> None:
                     f"CREATE TABLE {table} (last_refresh_at TEXT, new_since_refresh INTEGER)"
                 )
             elif table == "jobs":
-                db.execute(f"CREATE TABLE {table} (job_type TEXT, status TEXT)")
+                db.execute(
+                    f"CREATE TABLE {table} (job_type TEXT, status TEXT, "
+                    "payload_json TEXT, target_generation TEXT, completed_at TEXT)"
+                )
+            elif table == "conversation_episodes":
+                db.execute(
+                    f"CREATE TABLE {table} (id INTEGER, group_id INTEGER, "
+                    "status TEXT, is_current INTEGER, compaction_version TEXT)"
+                )
             elif table == "retrieval_documents":
                 db.execute(
                     f"CREATE TABLE {table} (status TEXT, embedding_eligible INTEGER, embedding_status TEXT)"
@@ -82,10 +90,57 @@ def test_storage_probe_rejects_invalid_persisted_persona(tmp_path) -> None:
             else:
                 db.execute(f"CREATE TABLE {table} (id INTEGER)")
     assert status_components.check_storage(settings)
+    assert "OK    memory_episode_backlog: queued=0 running=0 failed=0 overdue=0" in capsys.readouterr().out
     persona_dir = tmp_path / "personas"
     persona_dir.mkdir()
     (persona_dir / "broken.live.yaml").write_text("name: broken\n", encoding="utf-8")
     assert not status_components.check_storage(settings)
+
+
+def test_memory_episode_backlog_status_is_read_only_and_nonfatal(
+    tmp_path, capsys,
+) -> None:
+    settings = _settings(tmp_path)
+    with sqlite3.connect(settings.sqlite_path) as db:
+        db.execute(
+            "CREATE TABLE conversation_episodes (id INTEGER, group_id INTEGER, "
+            "status TEXT, is_current INTEGER, compaction_version TEXT)"
+        )
+        db.execute(
+            "CREATE TABLE jobs (job_type TEXT, status TEXT, payload_json TEXT, "
+            "target_generation TEXT, completed_at TEXT)"
+        )
+        db.execute("CREATE TABLE groups (group_id INTEGER, enabled INTEGER)")
+        db.executemany("INSERT INTO groups VALUES (?,?)", [(1, 1), (2, 0)])
+        db.executemany(
+            "INSERT INTO conversation_episodes VALUES (?,?,?,?,?)",
+            [
+                (1, 1, "failed", 1, "compact-v2"),
+                (2, 1, "failed", 0, "compact-v2"),
+                (3, 2, "failed", 1, "compact-v2"),
+                (4, 1, "closed", 1, "compact-v2"),
+                (5, 1, "processing", 1, "compact-v2"),
+                (6, 1, "failed", 1, "compact-v1"),
+            ],
+        )
+        db.executemany(
+            "INSERT INTO jobs VALUES (?,?,?,?,?)",
+            [
+                ("memory_episode_process", "failed", '{"group_id":1,"episode_id":1}', "compact-v2", "2026-09-20 12:00:00"),
+                ("memory_episode_process", "failed", '{"group_id":1,"episode_id":2}', "compact-v2", "2026-09-20 12:00:00"),
+                ("memory_episode_process", "failed", '{"group_id":2,"episode_id":3}', "compact-v2", "2026-09-20 12:00:00"),
+                ("memory_episode_process", "queued", '{"group_id":1,"episode_id":4}', "compact-v2", None),
+                ("memory_episode_process", "running", '{"group_id":1,"episode_id":5}', "compact-v2", None),
+                ("memory_episode_process", "failed", '{"group_id":1,"episode_id":6}', "compact-v2", "2026-09-20 12:00:00"),
+            ],
+        )
+        db.execute("PRAGMA query_only=ON")
+        status_components._check_memory_episode_backlog(
+            db, tables={"jobs", "conversation_episodes", "groups"},
+            now=datetime(2026, 9, 23, tzinfo=UTC),
+        )
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 6
+    assert "WARN  memory_episode_backlog: queued=1 running=1 failed=1 overdue=1" in capsys.readouterr().out
 
 
 def test_shared_profile_writer_enforces_contract(tmp_path) -> None:

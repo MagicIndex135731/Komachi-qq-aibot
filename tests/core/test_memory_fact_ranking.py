@@ -11,11 +11,48 @@ from app.core.memory_fact_ranking import (
     matching_member_fact_ids,
     memory_query_features,
     preferred_kinds_for_query,
+    prefer_recent_viewing_event,
     rank_member_facts,
+    recent_viewing_event_fallback,
     select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
 )
+
+
+def test_recent_viewing_event_fallback_requires_explicit_recent_viewing() -> None:
+    now = datetime(2026, 9, 23, tzinfo=UTC)
+    watched = _fact(
+        1, "该成员看完了《示例动画》。", memory_kind="event",
+        last_seen_at=datetime(2026, 9, 20, tzinfo=UTC),
+    )
+    discussion = _fact(
+        2, "该成员讨论了《另一部动画》。", memory_kind="event",
+        last_seen_at=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    old = _fact(
+        3, "该成员看完了《旧作》。", memory_kind="event",
+        last_seen_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert recent_viewing_event_fallback(
+        [discussion, old, watched], query="最近在看什么动画", now=now,
+    ) is watched
+    assert recent_viewing_event_fallback(
+        [discussion, old], query="最近在看什么动画", now=now,
+    ) is None
+    assert recent_viewing_event_fallback(
+        [watched], query="喜欢什么动画", now=now,
+    ) is None
+    distractor = _fact(
+        4, "该成员在看另一部动画。", memory_kind="current",
+        last_seen_at=datetime(2026, 9, 18, tzinfo=UTC),
+    )
+    assert prefer_recent_viewing_event(watched, matched_current=[distractor])
+    newer_current = _fact(
+        5, "该成员在看《新作品》。", memory_kind="current",
+        last_seen_at=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    assert not prefer_recent_viewing_event(watched, matched_current=[newer_current])
 
 
 def _fact(

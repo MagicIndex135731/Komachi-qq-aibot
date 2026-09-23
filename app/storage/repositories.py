@@ -1426,6 +1426,19 @@ class MemoryRepository:
             )
         ).first()
         previous_content: str | None = str(memory.content) if memory is not None else None
+        source_at = (
+            _normalize_utc_sqlite_timestamp(valid_from)
+            if valid_from is not None else None
+        )
+        if (
+            memory_kind == "current"
+            and memory is not None
+            and source_at is not None
+            and memory.last_seen_at is not None
+            and _normalize_utc_sqlite_timestamp(memory.last_seen_at) > source_at
+        ):
+            # A delayed episode must not roll a newer current state backwards.
+            return memory
         if memory is None:
             legacy_memory = None
             if normalized_sources:
@@ -1538,6 +1551,13 @@ class MemoryRepository:
                 )
             )
             for older in previous:
+                if (
+                    memory_kind == "current"
+                    and source_at is not None
+                    and older.last_seen_at is not None
+                    and _normalize_utc_sqlite_timestamp(older.last_seen_at) > source_at
+                ):
+                    continue
                 self.mark_superseded(
                     memory_id=older.id,
                     superseded_by_id=memory.id,
@@ -5076,8 +5096,7 @@ class JobRepository:
                 "attempt_count = attempt_count + 1, "
                 "status = CASE WHEN attempt_count + 1 >= max_attempts "
                 "THEN 'failed' ELSE 'queued' END, "
-                "run_at = CASE WHEN attempt_count + 1 >= max_attempts "
-                "THEN run_at ELSE :retry_at END, "
+                "run_at = :retry_at, "
                 "last_error_code = :error_code, "
                 "completed_at = CASE WHEN attempt_count + 1 >= max_attempts "
                 "THEN :failed_at ELSE NULL END, "
@@ -5100,6 +5119,57 @@ class JobRepository:
             return None
         self.session.expire_all()
         return self.session.get(Job, int(failed_id))
+
+    def recover_failed_episode_jobs(
+        self,
+        *,
+        now: datetime,
+        compaction_generation: str,
+        enabled_group_ids: frozenset[int] | None,
+        limit: int,
+        attempts_per_cycle: int = 3,
+        dry_run: bool = False,
+    ) -> int:
+        """Rearm due failures without erasing cumulative attempts or error history."""
+        if enabled_group_ids is not None and not enabled_group_ids:
+            return 0
+        params: dict[str, Any] = {
+            "now": _normalize_utc_sqlite_timestamp(now),
+            "generation": compaction_generation,
+            "limit": max(1, int(limit)),
+            "attempts_per_cycle": max(1, int(attempts_per_cycle)),
+        }
+        group_filter = ""
+        if enabled_group_ids is not None:
+            group_filter = "AND e.group_id IN :group_ids "
+            params["group_ids"] = tuple(sorted(enabled_group_ids))
+        selector = (
+            "SELECT j.id FROM jobs j "
+            "JOIN conversation_episodes e ON e.id=CAST(json_extract(j.payload_json, '$.episode_id') AS INTEGER) "
+            "WHERE j.job_type='memory_episode_process' AND j.status='failed' "
+            "AND datetime(j.run_at) <= datetime(:now) "
+            "AND j.target_generation=:generation "
+            "AND e.group_id=CAST(json_extract(j.payload_json, '$.group_id') AS INTEGER) "
+            "AND e.compaction_version=j.target_generation "
+            "AND e.is_current=1 AND e.status='failed' "
+            f"{group_filter}"
+            "ORDER BY j.run_at, j.id LIMIT :limit"
+        )
+        if dry_run:
+            statement = text(selector)
+        else:
+            statement = text(
+                "UPDATE jobs SET status='queued', "
+                "max_attempts=attempt_count + :attempts_per_cycle, "
+                "completed_at=NULL, locked_by=NULL, locked_at=NULL, lease_until=NULL "
+                f"WHERE id IN ({selector}) "
+                "AND status='failed' RETURNING id"
+            )
+        if enabled_group_ids is not None:
+            statement = statement.bindparams(bindparam("group_ids", expanding=True))
+        count = len(self.session.execute(statement, params).scalars().all())
+        self.session.expire_all()
+        return count
 
     def update_coalescing_job_payload(
         self,

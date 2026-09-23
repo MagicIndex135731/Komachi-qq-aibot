@@ -43,7 +43,9 @@ from app.core.memory_fact_ranking import (
     matching_member_fact_ids,
     memory_query_features,
     preferred_kinds_for_query,
+    prefer_recent_viewing_event,
     rank_member_facts,
+    recent_viewing_event_fallback,
     select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
@@ -1097,6 +1099,23 @@ def build_memory_runtime(
                             ranked_rows,
                             query_features=temporal_match_features,
                         )
+                        viewing_event = recent_viewing_event_fallback(
+                            candidates,
+                            query=str(resolved_query.original_query),
+                            now=datetime.now().astimezone(),
+                        )
+                        matching_current = [
+                            row for row in ranked_rows
+                            if row.id in matching_ids and row.memory_kind == "current"
+                        ]
+                        if prefer_recent_viewing_event(
+                            viewing_event, matched_current=matching_current,
+                        ):
+                            ranked_rows = [
+                                viewing_event,
+                                *[row for row in ranked_rows if row.id != viewing_event.id],
+                            ]
+                            matching_ids = {int(viewing_event.id)}
                         ranked_rows = select_temporal_current_facts(
                             ranked_rows,
                             matching_fact_ids=matching_ids,

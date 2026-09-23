@@ -22,6 +22,7 @@ from app.core.memory_background_service import (
     SqlAlchemyMemoryBackgroundStore,
     _compatible_segmentation_generation,
     _episode_summary_bounds,
+    _episode_terminal_retry_seconds,
 )
 from app.storage.db import (
     activate_retrieval_vector_generation,
@@ -43,6 +44,13 @@ from app.storage.repositories import (
 
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+
+
+def test_terminal_episode_retry_backoff_is_capped_and_structural_errors_wait_longer() -> None:
+    assert _episode_terminal_retry_seconds(attempt_count=2, error_code="HTTPStatusError") == 900
+    assert _episode_terminal_retry_seconds(attempt_count=5, error_code="HTTPStatusError") == 1800
+    assert _episode_terminal_retry_seconds(attempt_count=2, error_code="ValueError") == 21600
+    assert _episode_terminal_retry_seconds(attempt_count=100, error_code="HTTPStatusError") == 86400
 
 
 def test_episode_summary_bounds_use_timestamps_not_episode_ordinals() -> None:
@@ -942,6 +950,28 @@ def test_current_facts_get_default_expiry() -> None:
     preference = next(fact for fact in result.facts if fact.kind == "preference")
     assert current.valid_until == "2026-08-10T00:00:00+00:00"
     assert preference.valid_until is None
+
+
+def test_replayed_current_fact_expires_relative_to_source_message() -> None:
+    service = MemoryBackgroundService(
+        store=FakeStore(), deriver=FakeDeriver(), worker_id="test-worker",
+        segmentation_generation="segment-v2", compaction_generation="compact-v2",
+        current_ttl_hours=24,
+    )
+    derivation = EpisodeDerivation(
+        summary="", facts=(DerivedFact(
+            content="watching a series", source_msg_ids=("older", "newer"),
+            kind="current", subject_id="10001",
+        ),), events=(), windows=(),
+    )
+    result = service._apply_current_default_expiry(
+        derivation, now=datetime(2026, 9, 23, tzinfo=UTC),
+        source_timestamps={
+            "older": datetime(2026, 9, 19, tzinfo=UTC),
+            "newer": datetime(2026, 9, 20, tzinfo=UTC),
+        },
+    )
+    assert result.facts[0].valid_until == "2026-09-21T00:00:00+00:00"
 
 
 def test_sqlalchemy_raw_message_projection_queues_id_only_jobs_and_fts_survives_embedding_failure(

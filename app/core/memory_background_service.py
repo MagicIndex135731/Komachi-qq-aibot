@@ -65,6 +65,13 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _episode_terminal_retry_seconds(*, attempt_count: int, error_code: str) -> int:
+    """Bound recovery after each exhausted three-attempt provider cycle."""
+    base = 21600 if error_code == "ValueError" else 900
+    cycles = min(7, max(0, int(attempt_count) // 3))
+    return min(86400, base * (2 ** cycles))
+
+
 def _episode_summary_bounds(
     messages: Sequence[BackgroundMessage],
 ) -> tuple[BackgroundMessage, BackgroundMessage]:
@@ -983,7 +990,14 @@ class SqlAlchemyMemoryBackgroundStore:
                 claimed_generation=job.claimed_generation,
                 error_code=error_code,
                 now=now,
-                retry_at=now + timedelta(seconds=max(1, retry_delay_seconds)),
+                retry_at=now + timedelta(seconds=(
+                    _episode_terminal_retry_seconds(
+                        attempt_count=job.attempt_count, error_code=error_code,
+                    )
+                    if job.job_type == self.episode_job_type
+                    and job.attempt_count + 1 >= job.max_attempts
+                    else max(1, retry_delay_seconds)
+                )),
             )
             if failed is None:
                 return False
@@ -1013,6 +1027,17 @@ class SqlAlchemyMemoryBackgroundStore:
                         document.updated_at = shanghai_naive(now)
                         session.add(document)
             return will_retry
+
+    def reconcile_failed_episodes(self, *, now: datetime, limit: int) -> int:
+        if self.compaction_generation is None:
+            return 0
+        with session_scope(self.engine) as session:
+            return JobRepository(session).recover_failed_episode_jobs(
+                now=now,
+                compaction_generation=self.compaction_generation,
+                enabled_group_ids=self._memory_enabled_group_ids,
+                limit=limit,
+            )
 
     def load_raw_message_embedding(
         self,
@@ -1706,6 +1731,7 @@ class MemoryBackgroundService:
         self._worker_task: asyncio.Task[None] | None = None
         self._startup_reconciliation_task: asyncio.Task[None] | None = None
         self._next_reconciliation_at: datetime | None = None
+        self._next_failure_reconciliation_at: datetime | None = None
 
     def _memory_group_enabled(self, group_id: int) -> bool:
         if self._memory_enabled_group_ids is None:
@@ -1798,11 +1824,20 @@ class MemoryBackgroundService:
         derivation: EpisodeDerivation,
         *,
         now: datetime,
+        source_timestamps: dict[str, datetime] | None = None,
     ) -> EpisodeDerivation:
         """Give current-state facts a bounded validity so stale states expire."""
-        until = (now + timedelta(hours=self.current_ttl_hours)).isoformat()
+        source_timestamps = source_timestamps or {}
+        def expiry(fact: DerivedFact) -> str:
+            source_times = [
+                _utc(source_timestamps[source_id])
+                for source_id in fact.source_msg_ids
+                if source_id in source_timestamps
+            ]
+            evidence_at = max(source_times) if source_times else now
+            return (evidence_at + timedelta(hours=self.current_ttl_hours)).isoformat()
         facts = tuple(
-            replace(fact, valid_until=fact.valid_until or until)
+            replace(fact, valid_until=fact.valid_until or expiry(fact))
             if fact.kind == "current" and not fact.valid_until
             else fact
             for fact in derivation.facts
@@ -1996,6 +2031,8 @@ class MemoryBackgroundService:
 
     def run_once(self, *, now: datetime | None = None) -> bool:
         resolved_now = _utc(now or datetime.now(UTC))
+        if self._reconcile_failed_episodes(resolved_now):
+            return True
         job = self.store.claim_next_job(
             worker_id=self.worker_id,
             now=resolved_now,
@@ -2052,6 +2089,26 @@ class MemoryBackgroundService:
                 job.claimed_generation,
             )
         return True
+
+    def _reconcile_failed_episodes(self, now: datetime, force: bool = False) -> int:
+        if (not force and self._next_failure_reconciliation_at is not None
+                and now < self._next_failure_reconciliation_at):
+            return 0
+        self._next_failure_reconciliation_at = now + timedelta(
+            seconds=self.reconciliation_interval_seconds
+        )
+        reconcile = getattr(self.store, "reconcile_failed_episodes", None)
+        if not callable(reconcile):
+            return 0
+        try:
+            repaired = int(reconcile(now=now, limit=min(5, self.reconciliation_batch_size)) or 0)
+        except Exception:
+            logger.exception("memory_failed_episode_reconciliation_failed")
+            return 0
+        if repaired:
+            self._wake_event.set()
+            logger.warning("memory_failed_episode_reconciled count=%s", repaired)
+        return repaired
 
     def _reconcile_raw_message_projections(
         self,
@@ -2421,6 +2478,10 @@ class MemoryBackgroundService:
             derivation = self._apply_current_default_expiry(
                 derivation,
                 now=now,
+                source_timestamps={
+                    message.platform_msg_id: message.timestamp
+                    for message in safe_messages
+                },
             )
             _validate_derivation_sources(
                 derivation,

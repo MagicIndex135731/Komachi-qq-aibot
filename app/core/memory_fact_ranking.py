@@ -187,6 +187,35 @@ def temporal_recency_required(*, query: str) -> bool:
     return bool(_RECENCY_INTENT_PATTERN.search(str(query or "")))
 
 
+def recent_viewing_event_fallback(
+    facts: Sequence[RankableMemoryFact], *, query: str, now: Any,
+    horizon_days: int = 14,
+) -> RankableMemoryFact | None:
+    """Use a recent explicit viewing event when a current-viewing query has no match."""
+    if not _CURRENT_VIEWING_INTENT_PATTERN.search(str(query or "")):
+        return None
+    now_seconds = float(stored_as_utc(now).timestamp())
+    candidates = [
+        fact for fact in facts
+        if str(getattr(fact, "memory_kind", "")) == "event"
+        and re.search(r"(?:看完|补完|追完|看了|补了|追了).{0,18}《[^》]+》", str(fact.content or ""))
+        and 0 <= now_seconds - _recency_value(fact) <= horizon_days * 86400
+    ]
+    return max(candidates, key=_recency_value) if candidates else None
+
+
+def prefer_recent_viewing_event(
+    event: RankableMemoryFact | None,
+    *,
+    matched_current: Sequence[RankableMemoryFact],
+) -> bool:
+    """A direct finished-viewing event can outrank older generic current text."""
+    if event is None:
+        return False
+    newest_current = max((_recency_value(fact) for fact in matched_current), default=0.0)
+    return _recency_value(event) > newest_current
+
+
 def _recency_value(fact: RankableMemoryFact) -> float:
     for attribute in ("last_seen_at", "valid_from"):
         value = getattr(fact, attribute, None)

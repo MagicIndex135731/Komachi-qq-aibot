@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -23,7 +24,7 @@ from app.core.persona_live_sync import (
     write_live_profile,
 )
 from app.core.style_distill import parse_persona_yaml
-from app.providers.llm_client import LlmClient
+from app.providers.llm_client import LlmClient, LlmUsage
 
 
 PROBE_OUTPUT_TOKEN_CAP = 1200
@@ -45,6 +46,44 @@ def _print(status: str, component: str, detail: str) -> None:
 def _table_count(connection: sqlite3.Connection, table: str) -> int:
     # Only call with literals below, never user-provided table names.
     return int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+
+
+def _check_memory_episode_backlog(
+    db: sqlite3.Connection, *, tables: set[str], now: datetime | None = None,
+) -> None:
+    """Show actionable current episode work without affecting health exit status."""
+    group_join = ""
+    group_filter = ""
+    if "groups" in tables:
+        group_join = "JOIN groups g ON g.group_id=e.group_id "
+        group_filter = "AND g.enabled=1 "
+    now_local = (now or datetime.now(UTC)).astimezone(
+        ZoneInfo("Asia/Shanghai")
+    ).replace(tzinfo=None)
+    queued, running, failed, overdue = db.execute(
+        "SELECT "
+        "COALESCE(SUM(j.status='queued'),0), "
+        "COALESCE(SUM(j.status='running'),0), "
+        "COALESCE(SUM(j.status='failed'),0), "
+        "COALESCE(SUM(j.status='failed' "
+        "AND j.completed_at < datetime(?, '-1 day')),0) "
+        "FROM jobs j JOIN conversation_episodes e "
+        "ON e.id=CAST(json_extract(j.payload_json,'$.episode_id') AS INTEGER) "
+        + group_join +
+        "WHERE j.job_type='memory_episode_process' "
+        "AND j.status IN ('queued','running','failed') "
+        "AND e.status IN ('closed','processing','failed') "
+        "AND e.is_current=1 AND e.compaction_version=j.target_generation "
+        "AND e.group_id=CAST(json_extract(j.payload_json,'$.group_id') AS INTEGER) "
+        + group_filter,
+        (now_local.isoformat(sep=" "),),
+    ).fetchone()
+    counts = (int(queued), int(running), int(failed), int(overdue))
+    _print(
+        "WARN" if any(counts) else "OK",
+        "memory_episode_backlog",
+        "queued={} running={} failed={} overdue={}".format(*counts),
+    )
 
 
 def check_storage(settings: AppSettings) -> bool:
@@ -92,6 +131,7 @@ def check_storage(settings: AppSettings) -> bool:
                 " ".join(f"{status}={count}" for status, count in sorted(job_rows.items()))
                 or "jobs=0",
             )
+            _check_memory_episode_backlog(db, tables=tables)
             vector_failures = int(db.execute(
                 "SELECT count(*) FROM retrieval_documents "
                 "WHERE status = 'active' AND embedding_eligible = 1 "
@@ -201,7 +241,7 @@ def check_live_persona(settings: AppSettings) -> bool:
     if not settings.llm_api_key or not settings.llm_base_url:
         _print("FAIL", "model_persona_live", "provider credentials missing")
         return False
-    usages = []
+    usages: list[LlmUsage] = []
     client = LlmClient(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,

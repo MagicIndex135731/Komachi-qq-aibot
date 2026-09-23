@@ -19,22 +19,14 @@ from pathlib import Path
 
 sys.path.insert(0, "/workspace")
 
-from sqlalchemy import text
 from sqlalchemy import select
 
+from app.config import AppSettings, load_runtime_config
 from app.core.memory_compaction import canonical_key
-from app.core.memory_background_service import SqlAlchemyMemoryBackgroundStore
+from app.main import MEMORY_COMPACTION_GENERATION, should_enable_memory_in_group
 from app.storage.db import build_engine, session_scope
 from app.storage.models import MemoryItem
 from app.storage.repositories import JobRepository
-
-
-def _store(engine):
-    return SqlAlchemyMemoryBackgroundStore(
-        engine,
-        max_attempts=3,
-        memory_enabled_group_ids=None,
-    )
 
 
 def cleanup_jobs(engine, dry_run: bool) -> int:
@@ -54,29 +46,17 @@ def cleanup_jobs(engine, dry_run: bool) -> int:
         )
 
 
-def requeue_episodes(engine, dry_run: bool) -> int:
-    store = _store(engine)
+def requeue_episodes(
+    engine, dry_run: bool, *, enabled_group_ids: frozenset[int] | None = None,
+) -> int:
     with session_scope(engine) as session:
-        rows = session.execute(
-            text(
-                "SELECT id, group_id, compaction_version FROM conversation_episodes "
-                "WHERE status='failed'"
-            )
-        ).all()
-        count = 0
-        for episode_id, group_id, compaction_version in rows:
-            if dry_run:
-                count += 1
-                continue
-            store.enqueue_episode_processing(
-                episode_id=int(episode_id),
-                group_id=int(group_id),
-                compaction_generation=str(compaction_version),
-                backfill_run_id=None,
-                now=datetime.now(UTC),
-            )
-            count += 1
-        return count
+        return JobRepository(session).recover_failed_episode_jobs(
+            now=datetime.now(UTC),
+            compaction_generation=MEMORY_COMPACTION_GENERATION,
+            enabled_group_ids=enabled_group_ids,
+            limit=5,
+            dry_run=dry_run,
+        )
 
 
 def backfill_canonical(engine, dry_run: bool) -> int:
@@ -144,7 +124,21 @@ def main() -> None:
     for name, handler in tasks:
         if args.tasks != "all" and args.tasks != name:
             continue
-        count = handler(engine, dry_run=dry_run)
+        if name == "requeue_episodes":
+            policy = load_runtime_config(AppSettings()).group_policy
+            enabled_group_ids = frozenset(
+                int(group_id)
+                for group_id in policy.get("groups", {})
+                if should_enable_memory_in_group(
+                    group_id=int(group_id), group_policy=policy,
+                )
+            )
+            count = requeue_episodes(
+                engine, dry_run=dry_run,
+                enabled_group_ids=enabled_group_ids,
+            )
+        else:
+            count = handler(engine, dry_run=dry_run)
         print(f"{name}: {'would process' if dry_run else 'processed'} {count}")
     engine.dispose()
 

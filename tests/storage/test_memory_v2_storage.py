@@ -1721,6 +1721,147 @@ def test_coalescing_failure_is_finite_and_failed_job_can_be_explicitly_retried(
         assert retried.last_error_code == ""
 
 
+def test_failed_episode_recovery_is_due_bounded_and_preserves_history(sqlite_engine) -> None:
+    now = datetime(2026, 7, 23, 9, 0, tzinfo=UTC)
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session)
+        for index in range(3):
+            message = _seed_group_message(
+                session, group_id=10001 + index, user_id=20001 + index,
+                platform_msg_id=f"recover-source-{index}",
+            )
+            episode = EpisodeRepository(session).create_episode(
+                group_id=message.group_id, start_message_id=message.id,
+                started_at=message.timestamp, segmentation_version="segment-v2",
+                status="failed",
+            )
+            episode.compaction_version = "compact-v2" if index < 2 else "old-v1"
+            session.flush()
+            row = jobs.enqueue_coalescing_job(
+                job_type="memory_episode_process",
+                job_key=f"episode:{episode.id}:{episode.compaction_version}",
+                payload_json={"group_id": message.group_id, "episode_id": episode.id},
+                run_at=now - timedelta(hours=1),
+                target_generation=episode.compaction_version,
+            )
+            row.status = "failed"
+            row.attempt_count = 3
+            row.max_attempts = 3
+            row.last_error_code = "HTTPStatusError"
+            row.completed_at = now.replace(tzinfo=None) + timedelta(hours=7)
+            if index == 1:
+                row.run_at = now.replace(tzinfo=None) + timedelta(hours=9)
+            session.flush()
+
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session)
+        assert jobs.recover_failed_episode_jobs(
+            now=now, compaction_generation="compact-v2",
+            enabled_group_ids=frozenset({10001, 10002}), limit=1,
+        ) == 1
+        second = jobs.recover_failed_episode_jobs(
+            now=now, compaction_generation="compact-v2",
+            enabled_group_ids=frozenset({10001, 10002}), limit=1,
+        )
+        assert second == 0
+        rows = jobs.list_jobs(job_type="memory_episode_process", statuses=["queued", "failed"])
+        assert [row.status for row in rows] == ["queued", "failed", "failed"]
+        assert rows[0].attempt_count == 3
+        assert rows[0].max_attempts == 6
+        assert rows[0].last_error_code == "HTTPStatusError"
+    from scripts.maintain_memory_integrity import audit_memory_integrity
+    report = audit_memory_integrity(sqlite_engine, now=now)
+    assert report["failed_episode_jobs"] == 2
+    assert report["failed_episode_http_errors"] == 2
+    assert report["oldest_failed_episode_terminal_age_seconds"] == 3600
+
+
+def test_replayed_older_current_fact_does_not_supersede_newer_state(sqlite_engine) -> None:
+    with session_scope(sqlite_engine) as session:
+        newer_source = _seed_group_message(
+            session, group_id=10001, user_id=20001,
+            platform_msg_id="current-newer-source",
+        )
+        older_source = _seed_group_message(
+            session, group_id=10001, user_id=20001,
+            platform_msg_id="current-older-source",
+        )
+        memories = MemoryRepository(session)
+        newer = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user",
+            subject_id="20001", memory_kind="current",
+            canonical_key="current|20001|watching|new", predicate="watching",
+            object_text="new", content="watching new series",
+            importance=3, confidence=0.9,
+            source_msg_ids=[newer_source.platform_msg_id],
+            valid_from=datetime(2026, 9, 23, tzinfo=UTC),
+            valid_until=datetime(2026, 9, 24, tzinfo=UTC),
+            replace_previous=True,
+        )
+        older = memories.upsert_canonical_memory(
+            scope_type="group", scope_id="10001", subject_type="user",
+            subject_id="20001", memory_kind="current",
+            canonical_key="current|20001|watching|old", predicate="watching",
+            object_text="old", content="watching old series",
+            importance=3, confidence=0.9,
+            source_msg_ids=[older_source.platform_msg_id],
+            valid_from=datetime(2026, 9, 20, tzinfo=UTC),
+            valid_until=datetime(2026, 9, 21, tzinfo=UTC),
+            replace_previous=True,
+        )
+        assert newer.status == "active"
+        assert older.status == "active"  # past validity remains auditable
+        assert newer.valid_until > older.valid_until
+
+
+def test_manual_episode_requeue_preserves_attempts_and_filters_disabled_groups(
+    sqlite_engine,
+) -> None:
+    from scripts.repair_memory_backlog import requeue_episodes
+
+    now = datetime.now(UTC)
+    with session_scope(sqlite_engine) as session:
+        jobs = JobRepository(session)
+        for group_id in (10001, 10002):
+            message = _seed_group_message(
+                session, group_id=group_id, user_id=group_id + 10000,
+                platform_msg_id=f"manual-requeue-{group_id}",
+            )
+            episode = EpisodeRepository(session).create_episode(
+                group_id=group_id, start_message_id=message.id,
+                started_at=message.timestamp, segmentation_version="segment-v2",
+                status="failed",
+            )
+            episode.compaction_version = "compact-v2"
+            session.flush()
+            job = jobs.enqueue_coalescing_job(
+                job_type="memory_episode_process",
+                job_key=f"episode:{episode.id}:compact-v2",
+                payload_json={"group_id": group_id, "episode_id": episode.id},
+                run_at=now - timedelta(days=1), target_generation="compact-v2",
+            )
+            job.status = "failed"
+            job.attempt_count = 3
+            job.max_attempts = 3
+            job.last_error_code = "HTTPStatusError"
+            session.flush()
+    enabled = frozenset({10001})
+    assert requeue_episodes(sqlite_engine, dry_run=True, enabled_group_ids=enabled) == 1
+    with session_scope(sqlite_engine) as session:
+        assert JobRepository(session).count_active_jobs(
+            job_type="memory_episode_process", statuses=["failed"],
+        ) == 2
+    assert requeue_episodes(sqlite_engine, dry_run=False, enabled_group_ids=enabled) == 1
+    with session_scope(sqlite_engine) as session:
+        rows = JobRepository(session).list_jobs(
+            job_type="memory_episode_process", statuses=["queued", "failed"],
+        )
+        assert [row.status for row in rows] == ["queued", "failed"]
+        assert rows[0].attempt_count == 3
+        assert rows[0].max_attempts == 6
+        assert rows[0].last_error_code == "HTTPStatusError"
+
+
 def test_stale_coalescing_owner_cannot_overwrite_new_owner_payload(
     sqlite_engine,
 ) -> None:

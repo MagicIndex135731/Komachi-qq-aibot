@@ -1528,6 +1528,74 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
     assert "kind: preference; observed_at:" in packed.text
 
 
+def test_recent_viewing_event_reaches_packed_context_for_member_query(
+    sqlite_engine,
+    tmp_path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        v2_enabled=True,
+        shadow_mode=True,
+        compaction_enabled=True,
+    ).model_copy(update={
+        "memory_raw_v3_enabled": True,
+        "memory_layered_memory_enabled": True,
+    })
+    observed_at = datetime.now(UTC) - timedelta(days=2)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001, group_name="group", enabled=True, speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001, nickname="A-Zha", group_card="阿渣",
+        )
+        UserRepository(session).upsert_user(
+            user_id=99, nickname="Questioner", group_card="提问者",
+        )
+        messages = MessageRepository(session)
+        messages.add_group_message(
+            platform_msg_id="recent-viewing-source", group_id=10001,
+            user_id=20001, timestamp=observed_at,
+            plain_text="我看完了《食戟之灵》。",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            msg_type="text", reply_to_msg_id=None, mentioned_bot=False,
+        )
+        query = messages.add_group_message(
+            platform_msg_id="recent-viewing-query", group_id=10001,
+            user_id=99, timestamp=observed_at + timedelta(minutes=1),
+            plain_text="阿渣最近在看什么动画？",
+            raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
+            msg_type="text", reply_to_msg_id=None, mentioned_bot=False,
+        )
+        session.flush()
+        MemoryRepository(session).add_memory(
+            scope_type="group", scope_id="10001", subject_type="user",
+            subject_id="20001", memory_kind="event",
+            content="该成员看完了《食戟之灵》。", importance=3,
+            confidence=0.9, source_msg_id="recent-viewing-source",
+            valid_from=observed_at,
+        )
+        documents = RetrievalDocumentRepository(session)
+        for row in messages.list_group_messages_chronological(group_id=10001):
+            documents.project_raw_message_v3(group_id=10001, message_id=int(row.id))
+        query_id = int(query.id)
+
+    runtime = build_memory_runtime(
+        settings=settings, engine=sqlite_engine,
+        llm_client=_NoopLlmClient(), bot_display_name="bot",
+    )
+    trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=query_id)
+    )
+    facts = trace.result.packed_context.facts
+    assert any(
+        fact.memory_kind == "event"
+        and "看完了《食戟之灵》" in fact.text
+        and "recent-viewing-source" in fact.source_msg_ids
+        for fact in facts
+    ), [(fact.memory_kind, fact.text) for fact in facts]
+
+
 def test_complete_portrait_composes_diverse_stable_memory_kinds(
     sqlite_engine,
     tmp_path,

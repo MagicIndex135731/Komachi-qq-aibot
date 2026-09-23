@@ -386,6 +386,15 @@ python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-i
 journal 写入 `memory_integrity_audit_alert`；缺少语义向量、缺少投影文档、重复
 候选和旧式非结构化记录仍作为观察指标，不触发告警。查看最近结果：
 
+`failed_episode_jobs` 记录仍在等待恢复的当前 episode；
+`failed_episode_jobs_overdue_24h` 超过一天时触发审计告警。群聊后台会按间隔、
+限速自动恢复匹配当前处理版本的失败 episode，并保留累计失败次数和错误码；
+日常审计本身仍然只读。持续失败时先检查上游接口与错误码，不要直接把失败任务
+标成完成。历史重放生成的“正在做”事实仍按原消息时间计算有效期。
+日常运行 `status-xiaomachi-wsl.bat` 或 `status.sh` 时，组件诊断中的
+`memory_episode_backlog` 会列出 `queued/running/failed/overdue` 数量；恢复中的
+积压显示 `WARN`，不会把仍在线的 QQ 网关误判为离线。
+
 ```bash
 systemctl status xiaomachi-memory-audit.timer --no-pager
 journalctl -u xiaomachi-memory-audit.service -n 20 --no-pager

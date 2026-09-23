@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sqlite3
 from typing import Sequence
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Integer, bindparam, cast, func, or_, select, text
 
@@ -38,6 +39,7 @@ CRITICAL_AUDIT_METRICS = (
     "active_index_states_with_impossible_counts",
     "retrieval_fts_rows_for_nonactive_documents",
     "active_documents_missing_retrieval_fts",
+    "failed_episode_jobs_overdue_24h",
 )
 
 
@@ -57,6 +59,9 @@ def _scalar(connection, statement: str) -> int:
 def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
     """Return content-free invariant counts for one database snapshot."""
     normalized_now = now.astimezone(UTC).replace(tzinfo=None)
+    normalized_job_now = now.astimezone(ZoneInfo("Asia/Shanghai")).replace(
+        tzinfo=None
+    )
     with engine.connect() as connection:
         table_names = set(
             connection.execute(
@@ -67,7 +72,12 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
         def optional_scalar(statement: str, *required_tables: str) -> int:
             if any(table not in table_names for table in required_tables):
                 return -1
-            return _scalar(connection, statement)
+            return int(
+                connection.execute(
+                    text(statement), {"now": normalized_job_now}
+                ).scalar_one()
+                or 0
+            )
 
         active_memory_ids = {
             int(memory_id)
@@ -173,7 +183,41 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 active_retrieval_pairs - active_retrieval_fts_pairs
             )
 
+        failed_episode_errors: list[tuple[str, datetime | None]] = []
+        if {"jobs", "conversation_episodes"}.issubset(table_names):
+            failed_episode_errors = [
+                (
+                    str(error_code or ""),
+                    datetime.fromisoformat(str(completed_at))
+                    if completed_at else None,
+                )
+                for error_code, completed_at in connection.execute(
+                    text(
+                        "SELECT j.last_error_code,j.completed_at FROM jobs j "
+                        "JOIN conversation_episodes e "
+                        "ON e.id=CAST(json_extract(j.payload_json,'$.episode_id') AS INTEGER) "
+                        "WHERE j.job_type='memory_episode_process' AND j.status='failed' "
+                        "AND e.is_current=1 AND e.status='failed' "
+                        "AND e.group_id=CAST(json_extract(j.payload_json,'$.group_id') AS INTEGER) "
+                        "AND e.compaction_version=j.target_generation"
+                    )
+                )
+            ]
+        oldest_terminal_at = min(
+            (completed_at for _, completed_at in failed_episode_errors if completed_at),
+            default=None,
+        )
         return {
+            "oldest_failed_episode_terminal_age_seconds": (
+                max(0, int((normalized_job_now - oldest_terminal_at).total_seconds()))
+                if oldest_terminal_at else 0
+            ),
+            "failed_episode_http_errors": sum(
+                error_code == "HTTPStatusError" for error_code, _ in failed_episode_errors
+            ),
+            "failed_episode_value_errors": sum(
+                error_code == "ValueError" for error_code, _ in failed_episode_errors
+            ),
             "missing_optional_schema_tables": sum(
                 table not in table_names
                 for table in (
@@ -211,6 +255,25 @@ def audit_memory_integrity(engine, *, now: datetime) -> dict[str, int]:
                 connection,
                 "SELECT COUNT(*) FROM jobs WHERE job_type='memory_compaction' "
                 "AND status IN ('queued','running','failed')",
+            ),
+            "failed_episode_jobs": optional_scalar(
+                "SELECT COUNT(*) FROM jobs j JOIN conversation_episodes e "
+                "ON e.id=CAST(json_extract(j.payload_json,'$.episode_id') AS INTEGER) "
+                "WHERE j.job_type='memory_episode_process' AND j.status='failed' "
+                "AND e.is_current=1 AND e.status='failed' "
+                "AND e.group_id=CAST(json_extract(j.payload_json,'$.group_id') AS INTEGER) "
+                "AND e.compaction_version=j.target_generation",
+                "jobs", "conversation_episodes",
+            ),
+            "failed_episode_jobs_overdue_24h": optional_scalar(
+                "SELECT COUNT(*) FROM jobs j JOIN conversation_episodes e "
+                "ON e.id=CAST(json_extract(j.payload_json,'$.episode_id') AS INTEGER) "
+                "WHERE j.job_type='memory_episode_process' AND j.status='failed' "
+                "AND e.is_current=1 AND e.status='failed' "
+                "AND e.group_id=CAST(json_extract(j.payload_json,'$.group_id') AS INTEGER) "
+                "AND e.compaction_version=j.target_generation "
+                "AND j.completed_at < datetime(:now, '-1 day')",
+                "jobs", "conversation_episodes",
             ),
             "semantic_vectors_for_nonactive_memories": optional_scalar(
                 "SELECT COUNT(*) FROM memory_item_semantic_vectors v "
