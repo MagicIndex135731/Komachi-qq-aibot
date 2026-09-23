@@ -95,6 +95,9 @@ class ResolvedMemoryQuery:
     topic_terms: tuple[str, ...] = ()
     topic_extraction: TopicExtraction = "fallback"
     subject_aliases_removed: tuple[str, ...] = ()
+    # Query text without the delivery-only @bot mention. Raw-reference ranking
+    # must not treat that mention as part of the member's activity.
+    reference_query: str | None = None
     subject_role: str = ""
     preferred_fact_kinds: tuple[str, ...] = ()
     semantic_general: bool = False
@@ -644,6 +647,7 @@ class MemoryQueryResolver:
             plan = self._with_topic_query(ResolvedMemoryQuery(
                 original_query=original,
                 retrieval_query=original,
+                reference_query=subject_query,
                 entities=(direct_member.matched_alias,),
                 speaker_ids=(
                     () if answer_mode == "mention" else direct_subject_ids

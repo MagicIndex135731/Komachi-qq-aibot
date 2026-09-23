@@ -78,6 +78,7 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
                 original_query=question, retrieval_query=question,
                 group_id=100, subject_ids=("300",), subject_binding="explicit",
                 subject_aliases_removed=("加菲猫",), answer_mode="current_fact",
+                reference_query=question.removeprefix("@比企谷小町 "),
             ),
             limit=10,
         )
@@ -85,6 +86,12 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
     assert [hit.document_id for hit in recall("加菲猫最近在看什么动画")][:1] == [viewing]
     assert [hit.document_id for hit in recall("加菲猫在哪里工作")][:1] == [work]
     assert {hit.document_id for hit in recall("加菲猫最近如何")} == {viewing, work}
+    _seed_document(
+        sqlite_engine, group_id=100, user_id=205,
+        platform_msg_id="question-echo", content="@比企谷小町 加菲猫最近在看什么动画",
+        document_kind="raw_message_v3",
+    )
+    assert [hit.document_id for hit in recall("@比企谷小町 加菲猫最近在看什么动画")][:1] == [viewing]
 
 
 def _seed_document(

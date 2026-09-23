@@ -29,6 +29,17 @@ def build_memory_answer_anchor(query: str, packed: object) -> str:
     """Point at one already-scoped answer source without elevating its content."""
 
     normalized_query = str(query or "").strip()
+    direct_sources = tuple(
+        str(value) for value in getattr(packed, "direct_current_source_ids", ()) if str(value)
+    )
+    if direct_sources:
+        return (
+            "Structured answer-source pointer: the latest directly matching member observation "
+            f"is at source_ids={direct_sources!r} in the dated untrusted evidence packet. "
+            "For a recent/current question, report what that observation says and when; "
+            "do not claim it proves the person's state now. Earlier recollections and the "
+            "current question are not newer observations."
+        )
     facts = tuple(getattr(packed, "facts", ()) or ())
     if "关系" in normalized_query:
         relationship_facts = tuple(
@@ -156,6 +167,7 @@ class PackedMemoryContext:
     source_msg_ids: tuple[str, ...] = ()
     blocked_output_present: bool = False
     grounding_policy: str = ""
+    direct_current_source_ids: tuple[str, ...] = ()
     recent_estimated_tokens: int = 0
     history_estimated_tokens: int = 0
     adaptive_enabled: bool = False

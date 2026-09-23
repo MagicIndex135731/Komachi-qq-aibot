@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from app.core.memory_context_packer import (
@@ -36,6 +37,29 @@ def test_memory_answer_anchor_uses_latest_subject_scoped_relationship_fact() -> 
     assert "兄弟都在深圳" not in anchor
     assert "relationship-source" in anchor
     assert "untrusted evidence" in anchor
+
+
+def test_memory_answer_anchor_points_to_dated_direct_observation_without_copying_content() -> None:
+    packer = MemoryContextPacker(normal_budget=2_000, detail_budget=2_000)
+    packed = packer.pack(
+        "normal", available_input=2_000, target_message_id=None,
+        evidence_segments=(EvidenceSegment(
+            episode_id="raw:1", fused_score=1.0,
+            messages=(EvidenceMessage(
+                source_msg_id="direct-source", speaker="member",
+                content="加菲猫在看向日葵马戏团",
+                sent_at=datetime(2026, 9, 13, tzinfo=UTC),
+            ),),
+            hit_source_msg_ids=("direct-source",),
+        ),),
+    )
+    packed = replace(packed, direct_current_source_ids=("direct-source",))
+
+    anchor = build_memory_answer_anchor("加菲猫最近在看什么动画", packed)
+
+    assert "direct-source" in anchor
+    assert "向日葵马戏团" not in anchor
+    assert "when" in anchor
 
 
 def test_memory_answer_anchor_uses_exact_quoted_phrase_hit() -> None:

@@ -238,7 +238,11 @@ class ScopedMemoryRetrievalChannels:
                 group_id=group_id,
                 aliases=aliases,
                 subject_ids=subject_ids,
-                query_text=str(getattr(resolved_query, "original_query", "") or ""),
+                query_text=str(
+                    getattr(resolved_query, "reference_query", None)
+                    or getattr(resolved_query, "original_query", "")
+                    or ""
+                ),
                 limit=limit,
                 start_at=self._time_bound(resolved_query, "start"),
                 end_at=self._time_bound(resolved_query, "end"),

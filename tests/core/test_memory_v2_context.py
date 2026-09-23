@@ -333,6 +333,7 @@ def request(*, group_id: int = 100) -> MemoryV2Request:
     ("question", "source", "retrospective"),
     [
         ("加菲猫最近在看什么动画", "加菲猫在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
+        ("@比企谷小町 加菲猫最近在看什么动画", "加菲猫在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
         ("阿渣最近在做什么项目", "阿渣在做新项目", "从去年开始做旧项目"),
         ("小林最近在学什么课程", "小林在学法语", "以前学过德语"),
     ],
@@ -340,13 +341,14 @@ def request(*, group_id: int = 100) -> MemoryV2Request:
 def test_direct_current_observation_beats_retrospective_event_across_topics(
     question: str, source: str, retrospective: str,
 ) -> None:
-    alias = question[:3] if question.startswith("加菲猫") else question[:2]
+    clean_question = question.removeprefix("@比企谷小町 ")
+    alias = clean_question[:3] if clean_question.startswith("加菲猫") else clean_question[:2]
     topic = "动画" if "动画" in question else "项目" if "项目" in question else "课程"
     resolved = ResolvedMemoryQuery(
         original_query=question, retrieval_query=topic, group_id=100,
         subject_ids=("42",), subject_binding="explicit",
         answer_mode="current_fact", subject_aliases_removed=(alias,),
-        topic_terms=(topic,),
+        topic_terms=(topic,), reference_query=clean_question,
     )
     direct = FusedRetrievalCandidate(
         document_id=1, group_id=100, document_kind="raw_message_v3",
