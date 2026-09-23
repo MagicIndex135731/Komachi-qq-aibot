@@ -51,6 +51,24 @@ def test_vector_only_candidate_survives_without_any_lexical_candidate() -> None:
     assert result.candidates[0].routes == ("vector",)
 
 
+def test_member_reference_top_sources_survive_lexical_pin_pressure() -> None:
+    retriever = HybridMemoryRetriever(
+        channels={
+            "bm25": lambda **_: [
+                candidate(index, lexical_match_kind="exact") for index in range(1, 9)
+            ],
+            "member_reference": lambda **_: [candidate(9), candidate(10), candidate(11)],
+        },
+        final_limit=12,
+    )
+
+    result = retriever.retrieve(group_id=100, resolved_query=object())
+
+    assert [item.document_id for item in result.candidates[:2]] == [9, 10]
+    assert all(item.pin_reason == "direct" for item in result.candidates[:2])
+    assert {item.document_id for item in result.candidates} == set(range(1, 12))
+
+
 def test_vector_cutoff_interleaves_only_the_near_boundary_slice() -> None:
     rows = tuple(candidate(index) for index in range(1, 21))
     retriever = HybridMemoryRetriever(

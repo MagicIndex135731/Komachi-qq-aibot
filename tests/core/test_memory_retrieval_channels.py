@@ -51,6 +51,42 @@ class _FakeEmbeddingProvider:
         return [self.embed_query(str(document)) for document in documents]
 
 
+def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engine) -> None:
+    viewing = _seed_document(
+        sqlite_engine, group_id=100, user_id=201, platform_msg_id="viewing",
+        content="加菲猫在看向日葵马戏团", document_kind="raw_message_v3",
+    )
+    work = _seed_document(
+        sqlite_engine, group_id=100, user_id=202, platform_msg_id="work",
+        content="加菲猫在咖啡店工作", document_kind="raw_message_v3",
+    )
+    _seed_document(
+        sqlite_engine, group_id=200, user_id=203, platform_msg_id="cross-group",
+        content="加菲猫在咖啡店工作", document_kind="raw_message_v3",
+    )
+    _seed_document(
+        sqlite_engine, group_id=100, user_id=204,
+        platform_msg_id="bot-reply-remembered", content="加菲猫在看一部动画",
+        document_kind="raw_message_v3",
+    )
+    channels = build_memory_retrieval_channels(sqlite_engine, raw_message_v3_only=True)
+
+    def recall(question: str):
+        return channels["member_reference"](
+            group_id=100,
+            resolved_query=ResolvedMemoryQuery(
+                original_query=question, retrieval_query=question,
+                group_id=100, subject_ids=("300",), subject_binding="explicit",
+                subject_aliases_removed=("加菲猫",), answer_mode="current_fact",
+            ),
+            limit=10,
+        )
+
+    assert [hit.document_id for hit in recall("加菲猫最近在看什么动画")][:1] == [viewing]
+    assert [hit.document_id for hit in recall("加菲猫在哪里工作")][:1] == [work]
+    assert {hit.document_id for hit in recall("加菲猫最近如何")} == {viewing, work}
+
+
 def _seed_document(
     engine,
     *,
@@ -59,6 +95,7 @@ def _seed_document(
     platform_msg_id: str,
     content: str,
     embedding_eligible: bool = False,
+    document_kind: str = "message",
 ):
     with session_scope(engine) as session:
         GroupRepository(session).upsert_group(
@@ -89,7 +126,7 @@ def _seed_document(
             scope_id=str(group_id),
             group_id=group_id,
             episode_id=None,
-            document_kind="message",
+            document_kind=document_kind,
             source_table="messages",
             source_id=str(message.id),
             start_at=message.timestamp,
@@ -821,8 +858,9 @@ def test_real_sqlite_parallel_channels_use_independent_short_sessions_and_scope_
 
     assert [candidate.document_id for candidate in result.candidates] == [target_id]
     assert all(candidate.group_id == 10001 for candidate in result.candidates)
-    assert len(created) == len(channels)
-    assert len({id(session) for session in created}) == len(channels)
+    # The member-reference route has no work for an unbound query.
+    assert len(created) == len(channels) - 1
+    assert len({id(session) for session in created}) == len(channels) - 1
     assert sorted(closed) == sorted(id(session) for session in created)
 
 

@@ -73,6 +73,7 @@ class ScopedMemoryRetrievalChannels:
             "vector": self.vector,
             "temporal": self.temporal,
             "entity": self.entity,
+            "member_reference": self.member_reference,
             "reply_graph": self.reply_graph,
             "exact_quote": self.exact_quote,
         }
@@ -215,6 +216,32 @@ class ScopedMemoryRetrievalChannels:
                 start_at=self._time_bound(resolved_query, "start"),
                 end_at=self._time_bound(resolved_query, "end"),
                 mentioned_user_ids=self._mentioned_user_ids(resolved_query),
+                excluded_speaker_ids=self._excluded_speaker_ids or None,
+            )
+            return self._adapt(group_id=group_id, hits=hits)
+
+    def member_reference(
+        self,
+        *,
+        group_id: int,
+        resolved_query: Any,
+        limit: int,
+    ) -> Sequence[RetrievalCandidate]:
+        if getattr(resolved_query, "subject_binding", "") != "explicit":
+            return ()
+        subject_ids = self._subject_ids(resolved_query)
+        aliases = self._string_tuple(getattr(resolved_query, "subject_aliases_removed", ()))
+        if not subject_ids:
+            return ()
+        with self._session_factory() as session:
+            hits = RetrievalDocumentRepository(session).search_group_member_reference_hits(
+                group_id=group_id,
+                aliases=aliases,
+                subject_ids=subject_ids,
+                query_text=str(getattr(resolved_query, "original_query", "") or ""),
+                limit=limit,
+                start_at=self._time_bound(resolved_query, "start"),
+                end_at=self._time_bound(resolved_query, "end"),
                 excluded_speaker_ids=self._excluded_speaker_ids or None,
             )
             return self._adapt(group_id=group_id, hits=hits)

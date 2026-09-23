@@ -3766,6 +3766,113 @@ class RetrievalDocumentRepository:
             mentioned_user_ids=mentioned_user_ids,
         )
 
+    def search_group_member_reference_hits(
+        self,
+        *,
+        group_id: int,
+        aliases: Sequence[str],
+        subject_ids: Sequence[str],
+        query_text: str,
+        limit: int,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        excluded_speaker_ids: Sequence[str] | None = None,
+    ) -> list[RetrievalDocumentHit]:
+        """Find raw utterances that explicitly name or @ a bound member.
+
+        This route deliberately does not constrain the author to the member:
+        third-party observations are useful evidence, with their own provenance.
+        """
+        normalized_aliases = tuple(dict.fromkeys(
+            alias.strip() for alias in aliases if len(alias.strip()) >= 2
+        ))[:8]
+        normalized_subjects = tuple(dict.fromkeys(
+            str(value).strip() for value in subject_ids if str(value).strip()
+        ))
+        if not normalized_subjects:
+            return []
+        conditions = [RetrievalDocument.content.contains(alias) for alias in normalized_aliases]
+        bot_reply_document_ids = (
+            select(RetrievalDocumentMessage.document_id)
+            .join(
+                Message,
+                (Message.id == RetrievalDocumentMessage.message_id)
+                & (Message.group_id == RetrievalDocumentMessage.group_id),
+            )
+            .where(
+                RetrievalDocumentMessage.group_id == int(group_id),
+                Message.group_id == int(group_id),
+                Message.platform_msg_id.like("bot-reply-%"),
+            )
+        )
+        scope_filters = [
+            RetrievalDocument.group_id == int(group_id),
+            RetrievalDocument.status == "active",
+            RetrievalDocument.document_kind == "raw_message_v3",
+            RetrievalDocument.id.not_in(bot_reply_document_ids),
+            *_retrieval_source_prefilters(
+                group_id=group_id,
+                speaker_ids=None,
+                excluded_speaker_ids=excluded_speaker_ids,
+            ),
+        ]
+        if start_at is not None:
+            scope_filters.append(RetrievalDocument.end_at >= _normalize_utc_sqlite_timestamp(start_at))
+        if end_at is not None:
+            scope_filters.append(RetrievalDocument.start_at < _normalize_utc_sqlite_timestamp(end_at))
+        # Inspect a bounded set of recent references, then rank by relation
+        # wording before recency. This keeps old but pertinent statements from
+        # disappearing behind newer unrelated mentions of the same member.
+        rows = []
+        if conditions:
+            rows = self.session.execute(
+                select(RetrievalDocument.id, RetrievalDocument.content)
+                .where(*scope_filters, or_(*conditions))
+                .order_by(RetrievalDocument.end_at.desc(), RetrievalDocument.id.desc())
+                .limit(max(200, int(limit) * 8))
+            ).all()
+        if not rows:
+            rows = self.session.execute(
+                select(RetrievalDocument.id, RetrievalDocument.content)
+                .where(
+                    *scope_filters,
+                    RetrievalDocument.id.in_(_retrieval_mention_document_ids(
+                        group_id=group_id, mentioned_user_ids=normalized_subjects,
+                    )),
+                )
+                .order_by(RetrievalDocument.end_at.desc(), RetrievalDocument.id.desc())
+                .limit(max(200, int(limit) * 8))
+            ).all()
+        topic = query_text
+        for filler in ("最近", "目前", "现在", "什么", "哪里", "哪儿", "如何", "怎么", "多少", "是否", "有没有"):
+            topic = topic.replace(filler, "")
+        fragments = {
+            topic[index:index + width]
+            for width in range(2, 7)
+            for index in range(max(0, len(topic) - width + 1))
+            if topic[index:index + width].strip()
+            and not any(char in "？?，,。！!：:、 　" for char in topic[index:index + width])
+            and all(topic[index:index + width] not in alias for alias in normalized_aliases)
+        }
+        ranked = sorted(
+            enumerate(rows),
+            key=lambda pair: (
+                -sum((len(fragment) - 1) for fragment in fragments if fragment in pair[1].content),
+                pair[0],
+            ),
+        )[:max(1, int(limit))]
+        return self._validated_hits(
+            group_id=group_id,
+            ranked_document_ids=[
+                (int(row.id), float(len(ranked) - rank))
+                for rank, (_index, row) in enumerate(ranked)
+            ],
+            document_kinds=("raw_message_v3",),
+            start_at=start_at,
+            end_at=end_at,
+            excluded_speaker_ids=excluded_speaker_ids,
+        )
+
     def search_group_fact_hits(
         self,
         *,

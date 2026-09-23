@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import re
 from typing import Protocol, Sequence
 
 from app.core.memory_query_resolver import MemoryQueryPlan
@@ -72,6 +73,22 @@ def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
     author_id = _string_attr(source_message, "user_id", "speaker_id", "sender_uin")
     if author_id in allowed:
         return True
+    if plan.subject_binding == "explicit":
+        mentioned = _string_sequence_attr(
+            source_message, "mentioned_uins", "mentioned_user_ids", "mention_uins"
+        )
+        if allowed.intersection(mentioned):
+            return True
+        content = _string_attr(source_message, "content") or ""
+        for alias in getattr(plan, "subject_aliases_removed", ()):
+            alias = str(alias).strip()
+            if len(alias) < 2:
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_]+", alias):
+                if re.search(rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])", content, re.I):
+                    return True
+            elif alias in content:
+                return True
     return False
 
 

@@ -20,6 +20,7 @@ DEFAULT_CHANNEL_WEIGHTS: dict[str, float] = {
     "exact_quote": 6.0,
     "reply_graph": 4.0,
     "entity": 3.0,
+    "member_reference": 4.5,
     "fact": 2.5,
     "bm25": 1.8,
     "vector": 1.8,
@@ -149,7 +150,7 @@ class HybridMemoryRetriever:
             # The time range remains a hard filter inside every scoped channel.
             # Semantic/lexical routes rank the relevant message within a busy
             # interval; the temporal route preserves complete window coverage.
-            planned_channels = ("bm25", "vector", "entity", "temporal")
+            planned_channels = ("bm25", "vector", "entity", "member_reference", "temporal")
         else:
             planned_channels = tuple(self.channels)
         channel_names = tuple(
@@ -340,7 +341,14 @@ class HybridMemoryRetriever:
         int,
     ]:
         priorities: tuple[tuple[PinReason, Callable[[FusedRetrievalCandidate], bool]], ...] = (
-            ("direct", lambda item: bool({"exact_quote", "reply_graph"}.intersection(item.routes))),
+            (
+                "direct",
+                lambda item: bool({"exact_quote", "reply_graph"}.intersection(item.routes))
+                or any(
+                    route == "member_reference" and rank <= 2
+                    for route, rank in item.route_ranks
+                ),
+            ),
             ("lexical", lambda item: item.lexical_match_kind == "exact"),
             (
                 "semantic",

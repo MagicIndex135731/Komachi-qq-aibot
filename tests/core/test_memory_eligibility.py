@@ -18,6 +18,7 @@ class Source:
     mentioned_uins: tuple[str, ...] = ()
     raw_json: object = None
     delivery_state: str = ""
+    content: str = ""
 
 
 def plan(**changes) -> MemoryQueryPlan:
@@ -130,3 +131,23 @@ def test_naive_sqlite_source_timestamp_is_interpreted_as_utc() -> None:
     source = Source("m1", 10, 42, datetime(2026, 7, 22, 8))
 
     assert eligible(source, plan()) is True
+
+
+def test_explicit_member_reference_admits_only_named_or_mentioned_third_party() -> None:
+    source = Source("m1", 10, 99, datetime(2026, 7, 22, 8, tzinfo=UTC))
+    member_plan = plan(
+        subject_ids=("42",), subject_binding="explicit",
+        subject_aliases_removed=("加菲猫",),
+    )
+    assert eligible(replace(source, content="加菲猫在看向日葵马戏团"), member_plan)
+    assert eligible(replace(source, mentioned_uins=("42",)), member_plan)
+    assert not eligible(replace(source, content="我也在看"), member_plan)
+    assert not eligible(replace(source, content="加菲在看"), member_plan)
+    assert not eligible(
+        replace(source, content="加菲猫在看向日葵马戏团", delivery_state="blocked"),
+        member_plan,
+    )
+    assert not eligible(
+        replace(source, content="加菲猫在看向日葵马戏团"),
+        replace(member_plan, subject_binding="requester"),
+    )
