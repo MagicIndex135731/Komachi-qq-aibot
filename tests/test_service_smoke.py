@@ -161,7 +161,7 @@ def test_build_group_image_reference_planner_uses_configured_chat_model() -> Non
 
 def test_build_group_image_service_uses_dedicated_image_model_and_finite_timeout(monkeypatch) -> None:
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
-    settings.llm_model = "gpt-5.6-terra"
+    settings.llm_model = "gpt-6-sol"
     settings.group_image_model = "gpt-image-2"
     captured: dict[str, object] = {}
     built_service = object()
@@ -372,7 +372,7 @@ def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> 
     settings = _settings_for_search(provider="tavily", search_api_key="search-key")
     settings.llm_text_endpoint = "responses"
     settings.llm_reasoning_effort = "medium"
-    settings.llm_web_search_model = "gpt-5.6-terra"
+    settings.llm_web_search_model = "gpt-6-sol"
     captured: dict[str, object] = {}
     built_client = object()
 
@@ -382,7 +382,7 @@ def test_build_llm_client_passes_reasoning_effort_for_responses(monkeypatch) -> 
 
     assert result is built_client
     assert captured["reasoning_effort"] == "medium"
-    assert captured["web_search_model"] == "gpt-5.6-terra"
+    assert captured["web_search_model"] == "gpt-6-sol"
 
 
 @pytest.mark.asyncio

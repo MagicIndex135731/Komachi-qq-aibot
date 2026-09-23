@@ -1829,13 +1829,13 @@ def test_responses_builtin_web_search_uses_structured_input() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-5.6-terra",
-        responses_model="gpt-5.6-terra",
+        model="gpt-6-sol",
+        responses_model="gpt-6-sol",
         builtin_web_search=True,
     )
 
     payload = client._build_responses_payload(
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         instructions=[],
         input_lines=["Target message: Alice: what happened today?"],
         allow_web_search=True,
@@ -1855,7 +1855,7 @@ def test_responses_builtin_web_search_uses_structured_input() -> None:
     assert payload["tools"] == [{"type": "web_search", "search_context_size": "high"}]
 
 
-def test_responses_model_fallback_uses_terra_on_responses_endpoint() -> None:
+def test_responses_model_fallback_uses_sol_on_responses_endpoint() -> None:
     captured_requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1864,11 +1864,11 @@ def test_responses_model_fallback_uses_terra_on_responses_endpoint() -> None:
         assert request.url.path == "/v1/responses"
         if payload["model"] == "gpt-5.6-luna":
             return httpx.Response(503, request=request, json={"error": "unavailable"})
-        assert payload["model"] == "gpt-5.6-terra"
+        assert payload["model"] == "gpt-6-sol"
         return httpx.Response(
             200,
             request=request,
-            text=_responses_stream_body(response_id="resp_terra", text="terra reply"),
+            text=_responses_stream_body(response_id="resp_sol", text="sol reply"),
             headers={"content-type": "text/event-stream"},
         )
 
@@ -1876,19 +1876,19 @@ def test_responses_model_fallback_uses_terra_on_responses_endpoint() -> None:
         base_url="https://api.example.test/v1",
         api_key="test-key",
         model="gpt-5.6-luna",
-        fallback_model="gpt-5.6-terra",
+        fallback_model="gpt-6-sol",
         responses_model="gpt-5.6-luna",
         responses_only=True,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     client._sleep_before_retry = lambda **_: None
 
-    assert client.generate_text(["System persona: Be concise.", "Target message: hi"]) == "terra reply"
+    assert client.generate_text(["System persona: Be concise.", "Target message: hi"]) == "sol reply"
     assert len(captured_requests) == client.REQUEST_MAX_ATTEMPTS + 1
     assert [request.url.path for request in captured_requests] == ["/v1/responses"] * len(captured_requests)
     assert [json.loads(request.content.decode("utf-8"))["model"] for request in captured_requests] == [
         "gpt-5.6-luna"
-    ] * client.REQUEST_MAX_ATTEMPTS + ["gpt-5.6-terra"]
+    ] * client.REQUEST_MAX_ATTEMPTS + ["gpt-6-sol"]
 
 
 def test_responses_only_never_falls_back_to_chat_completions() -> None:
@@ -1903,7 +1903,7 @@ def test_responses_only_never_falls_back_to_chat_completions() -> None:
         base_url="https://api.example.test/v1",
         api_key="test-key",
         model="gpt-5.6-luna",
-        fallback_model="gpt-5.6-terra",
+        fallback_model="gpt-6-sol",
         responses_model="gpt-5.6-luna",
         responses_only=True,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -1936,9 +1936,9 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-5.6-terra",
-        responses_model="gpt-5.6-terra",
-        image_responses_model="gpt-5.6-terra",
+        model="gpt-6-sol",
+        responses_model="gpt-6-sol",
+        image_responses_model="gpt-6-sol",
         reasoning_effort="medium",
         http_client=httpx.Client(transport=transport),
         usage_recorder=recorded.append,
@@ -1954,7 +1954,7 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
 
     assert captured["url"] == "https://api.example.test/v1/responses"
     assert captured["payload"] == {
-        "model": "gpt-5.6-terra",
+        "model": "gpt-6-sol",
         "stream": True,
         "input": [
             {
@@ -1970,7 +1970,7 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     assert result.images == [{"b64_json": "aW1hZ2U="}]
     assert result.artifacts[0].b64_json == "aW1hZ2U="
     assert len(recorded) == 1
-    assert recorded[0].model == "gpt-5.6-terra"
+    assert recorded[0].model == "gpt-6-sol"
     assert recorded[0].endpoint == "responses"
 
 
@@ -1992,9 +1992,9 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-5.6-terra",
-        responses_model="gpt-5.6-terra",
-        image_responses_model="gpt-5.6-terra",
+        model="gpt-6-sol",
+        responses_model="gpt-6-sol",
+        image_responses_model="gpt-6-sol",
         http_client=httpx.Client(transport=transport),
     )
 
