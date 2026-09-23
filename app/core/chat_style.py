@@ -9,8 +9,9 @@ MARKDOWN_INLINE_PATTERN = re.compile(r"[*_`~]+")
 MARKDOWN_HEADING_PATTERN = re.compile(r"^\s{0,3}(?:#{1,6}|>+)\s*")
 MODEL_THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 LIST_PREFIX_PATTERN = re.compile(r"^\s{0,3}(?:[-*+]\s+|(?:\d+|[A-Za-z])[.)]\s+)")
+# An ordinal is a list marker only with a delimiter; "第二名" is answer text.
 ORDERING_PREFIX_PATTERN = re.compile(
-    r"^(?:第[一二三四五六七八九十百千万0-9]+[、，.]?|首先[:：]?\s*|其次[:：]?\s*|再次[:：]?\s*|最后[:：]?\s*|另外[:：]?\s*|然后[:：]?\s*|再说[:：]?\s*|一是[:：]?\s*|二是[:：]?\s*)"
+    r"^(?:第[一二三四五六七八九十百千万0-9]+(?:[、，.．:：]\s*|\s+)|首先[:：]?\s*|其次[:：]?\s*|再次[:：]?\s*|最后[:：]?\s*|另外[:：]?\s*|然后[:：]?\s*|再说[:：]?\s*|一是[:：]?\s*|二是[:：]?\s*)"
 )
 CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 CLAUSE_PATTERN = re.compile(r"[^。！？!?~，、；;:：]+(?:[。！？!?~，、；;:：]|$)")

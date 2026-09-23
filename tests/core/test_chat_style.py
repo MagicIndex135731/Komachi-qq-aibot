@@ -125,6 +125,15 @@ def test_normalize_chat_reply_strips_headings_and_emphasis() -> None:
     assert normalize_chat_reply(raw) == "其实很简单 你现在就改 别拖了"
 
 
+def test_normalize_chat_reply_keeps_ordinal_at_start_of_answer() -> None:
+    reply = "第二名呀，主人～你超过的是原来的第二名嘛，自己就占第二名的位置啦 😼"
+
+    assert normalize_chat_reply(reply) == reply
+    assert normalize_chat_reply("第一名就是你。") == "第一名就是你。"
+    assert normalize_chat_reply("第2名是你。") == "第2名是你。"
+    assert normalize_chat_reply("第一、先看题。") == "先看题。"
+
+
 def test_normalize_proactive_chat_reply_keeps_full_content_for_normal_proactive_reply() -> None:
     raw = "是啊，半小时制这个设定一出来，瞬间从小贵升级成抢钱。真打两小时的话，钱包先累趴了。"
 
