@@ -14,6 +14,7 @@ from app.core.hybrid_memory_retriever import (
 from app.core.memory_context_packer import (
     EvidenceMessage,
     EvidenceSegment,
+    MemoryFact,
     MemoryContextPacker,
     PackedMemoryContext,
 )
@@ -326,6 +327,153 @@ def request(*, group_id: int = 100) -> MemoryV2Request:
         available_input=1000,
         now=datetime(2026, 7, 23, tzinfo=UTC),
     )
+
+
+@pytest.mark.parametrize(
+    ("question", "source", "retrospective"),
+    [
+        ("加菲猫最近在看什么动画", "加菲猫在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
+        ("阿渣最近在做什么项目", "阿渣在做新项目", "从去年开始做旧项目"),
+        ("小林最近在学什么课程", "小林在学法语", "以前学过德语"),
+    ],
+)
+def test_direct_current_observation_beats_retrospective_event_across_topics(
+    question: str, source: str, retrospective: str,
+) -> None:
+    alias = question[:3] if question.startswith("加菲猫") else question[:2]
+    topic = "动画" if "动画" in question else "项目" if "项目" in question else "课程"
+    resolved = ResolvedMemoryQuery(
+        original_query=question, retrieval_query=topic, group_id=100,
+        subject_ids=("42",), subject_binding="explicit",
+        answer_mode="current_fact", subject_aliases_removed=(alias,),
+        topic_terms=(topic,),
+    )
+    direct = FusedRetrievalCandidate(
+        document_id=1, group_id=100, document_kind="raw_message_v3",
+        episode_id=None, source_msg_ids=("direct",),
+        start_at=datetime(2026, 9, 13, tzinfo=UTC),
+        end_at=datetime(2026, 9, 13, tzinfo=UTC),
+        routes=("member_reference",), route_ranks=(("member_reference", 1),),
+        fused_score=1.0,
+    )
+    message = EvidenceMessage(
+        "direct", "observer", source, datetime(2026, 9, 13, tzinfo=UTC),
+        group_id=100, user_id=99,
+    )
+    direct_segment = EvidenceSegment(
+        episode_id="raw:1", document_id="1", fused_score=1.0,
+        messages=(message,), hit_source_msg_ids=("direct",),
+    )
+    older_segment = replace(direct_segment, episode_id="raw:2", document_id="2")
+    old_fact = MemoryFact(retrospective, ("old",), memory_kind="event")
+    current_fact = MemoryFact(source, ("direct",), memory_kind="current")
+
+    segments, facts = MemoryV2ContextProvider._prefer_direct_current_observation(
+        resolved=resolved, candidates=(direct,),
+        segments=(older_segment, direct_segment), facts=(old_fact, current_fact),
+    )
+
+    assert segments[0] is direct_segment
+    assert facts == (current_fact,)
+
+
+def test_question_does_not_displace_a_retrospective_event_fact() -> None:
+    resolved = ResolvedMemoryQuery(
+        original_query="加菲猫最近在看什么动画", retrieval_query="动画",
+        group_id=100, subject_ids=("42",), subject_binding="explicit",
+        answer_mode="current_fact", subject_aliases_removed=("加菲猫",),
+        topic_terms=("动画",),
+    )
+    direct = FusedRetrievalCandidate(
+        document_id=1, group_id=100, document_kind="raw_message_v3",
+        episode_id=None, source_msg_ids=("question",),
+        start_at=datetime(2026, 9, 13, tzinfo=UTC),
+        end_at=datetime(2026, 9, 13, tzinfo=UTC),
+        routes=("member_reference",), route_ranks=(("member_reference", 1),),
+        fused_score=1.0,
+    )
+    segment = EvidenceSegment(
+        episode_id="raw:1", document_id="1", fused_score=1.0,
+        messages=(EvidenceMessage(
+            "question", "observer", "加菲猫在看什么动画？",
+            datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
+        ),),
+        hit_source_msg_ids=("question",),
+    )
+    fact = MemoryFact("从第七集更新时开始追《MyGO》", ("old",), memory_kind="event")
+
+    segments, facts = MemoryV2ContextProvider._prefer_direct_current_observation(
+        resolved=resolved, candidates=(direct,), segments=(segment,), facts=(fact,),
+    )
+
+    assert segments == (segment,)
+    assert facts == (fact,)
+
+
+def test_current_fact_excludes_target_and_prior_echo_questions_from_evidence() -> None:
+    resolved = ResolvedMemoryQuery(
+        original_query="加菲猫最近在看什么动画", retrieval_query="动画",
+        group_id=100, subject_ids=("42",), subject_binding="explicit",
+        answer_mode="current_fact", subject_aliases_removed=("加菲猫",),
+    )
+    base = EvidenceMessage(
+        "direct", "observer", "加菲猫在看向日葵马戏团",
+        datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
+    )
+    sources = (
+        replace(base, source_msg_id="target", content="@bot 加菲猫最近在看什么动画"),
+        replace(base, source_msg_id="old-question", content="加菲猫最近在看什么动画"),
+        base,
+    )
+    segments = tuple(
+        EvidenceSegment(
+            episode_id=f"raw:{index}", fused_score=1.0, messages=(source,),
+            hit_source_msg_ids=(source.source_msg_id,),
+        )
+        for index, source in enumerate(sources)
+    )
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(), retriever=Retriever(), expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+
+    selected = provider._eligible_segments(
+        segments, resolved, target_message_id="target",
+    )
+
+    assert selected == (segments[2],)
+
+
+def test_direct_observation_keeps_non_retrospective_new_event() -> None:
+    resolved = ResolvedMemoryQuery(
+        original_query="阿渣最近在做什么项目", retrieval_query="项目",
+        group_id=100, subject_ids=("42",), subject_binding="explicit",
+        answer_mode="current_fact", subject_aliases_removed=("阿渣",),
+        topic_terms=("项目",),
+    )
+    candidate = FusedRetrievalCandidate(
+        document_id=1, group_id=100, document_kind="raw_message_v3",
+        episode_id=None, source_msg_ids=("direct",),
+        start_at=datetime(2026, 9, 13, tzinfo=UTC),
+        end_at=datetime(2026, 9, 13, tzinfo=UTC),
+        routes=("member_reference",), route_ranks=(("member_reference", 1),),
+        fused_score=1.0,
+    )
+    segment = EvidenceSegment(
+        episode_id="raw:1", document_id="1", fused_score=1.0,
+        messages=(EvidenceMessage(
+            "direct", "observer", "阿渣在做新项目",
+            datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
+        ),), hit_source_msg_ids=("direct",),
+    )
+    fresh_event = MemoryFact("今天开始做新项目", ("fresh",), memory_kind="event")
+
+    _segments, facts = MemoryV2ContextProvider._prefer_direct_current_observation(
+        resolved=resolved, candidates=(candidate,), segments=(segment,), facts=(fresh_event,),
+    )
+
+    assert facts == (fresh_event,)
 
 
 def test_v2_provider_runs_resolve_retrieve_expand_pack_and_returns_common_contract() -> None:

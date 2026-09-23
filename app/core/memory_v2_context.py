@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import logging
+import re
 from time import perf_counter
 from typing import Protocol
 
@@ -25,6 +26,14 @@ from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQu
 from app.core.member_identity import GroupMemberIdentity
 
 _PROFILE_MARKERS = ("画像", "介绍", "是什么样的人", "哪里人", "做什么的")
+_CURRENT_QUERY_FILLERS = (
+    "最近", "现在", "目前", "近期", "当下", "什么", "啥", "哪个", "哪些",
+    "哪里", "哪儿", "如何", "怎么", "多少", "是否", "有没有",
+)
+_RETROSPECTIVE_EVENT = re.compile(
+    r"曾经|以前|当年|那时|从.{1,24}开始|(?<!不)[\u4e00-\u9fff]过"
+)
+_QUESTION_WORDS = re.compile(r"[?？]|什么|哪(?:个|些|里|儿|部)|如何|怎么|为什么|是否|有没有")
 
 
 logger = logging.getLogger(__name__)
@@ -229,7 +238,9 @@ class MemoryV2ContextProvider:
             )
         )
         segments = self._pin_required_segments(
-            self._eligible_segments(expanded_segments, resolved),
+            self._eligible_segments(
+                expanded_segments, resolved, target_message_id=request.target_message_id
+            ),
             resolved,
         )
         if (
@@ -249,7 +260,9 @@ class MemoryV2ContextProvider:
                 )
             )
             segments = self._pin_required_segments(
-                self._eligible_segments(expanded_segments, resolved),
+                self._eligible_segments(
+                    expanded_segments, resolved, target_message_id=request.target_message_id
+                ),
                 resolved,
             )
         expansion_ms = (perf_counter() - expansion_started) * 1000
@@ -279,6 +292,14 @@ class MemoryV2ContextProvider:
             facts=facts,
             summaries=summaries,
         )
+        loaded_fact_count = len(facts)
+        segments, facts = self._prefer_direct_current_observation(
+            resolved=resolved,
+            candidates=candidates,
+            segments=segments,
+            facts=facts,
+        )
+        suppressed_retrospective_facts = loaded_fact_count - len(facts)
         derived_ms = (perf_counter() - derived_started) * 1000
         packing_started = perf_counter()
         recent_messages = request.recent_messages
@@ -362,6 +383,7 @@ class MemoryV2ContextProvider:
                 "candidate_units=%s expanded_sources=%s rejected_sources=%s "
                 "selected_source_count=%s recent_messages=%s history_messages=%s "
                 "selected_facts=%s selected_segments=%s selected_summaries=%s "
+                "suppressed_retrospective_facts=%s "
                 "effective_budget=%s recent_tokens=%s history_tokens=%s total_tokens=%s "
                 "spillover=%s degradation_reason=%s "
                 "resolve_ms=%.3f retrieval_ms=%.3f expansion_ms=%.3f "
@@ -411,6 +433,7 @@ class MemoryV2ContextProvider:
                 len(packed.facts),
                 len(packed.evidence_segments),
                 len(packed.summaries),
+                suppressed_retrospective_facts,
                 packed.budget,
                 packed.recent_estimated_tokens,
                 packed.history_estimated_tokens,
@@ -551,16 +574,29 @@ class MemoryV2ContextProvider:
         self,
         segments: Sequence[EvidenceSegment],
         resolved: ResolvedMemoryQuery,
+        *,
+        target_message_id: str | None = None,
     ) -> tuple[EvidenceSegment, ...]:
         """Revalidate every expanded raw source against the resolved plan."""
 
         validated: list[EvidenceSegment] = []
         direct_reply_counts: dict[str, int] = {}
+        normalized_query = (
+            re.sub(r"[\s?？。！!]", "", resolved.original_query)
+            if resolved.answer_mode == "current_fact"
+            else ""
+        )
         for segment in segments:
             allowed_messages = tuple(
                 message
                 for message in segment.messages
-                if not message.is_bot and eligible(message, resolved)
+                if not message.is_bot
+                and message.source_msg_id != target_message_id
+                and not (
+                    len(normalized_query) >= 4
+                    and re.sub(r"[\s?？。！!]", "", message.content).endswith(normalized_query)
+                )
+                and eligible(message, resolved)
             )
             allowed_ids = {message.source_msg_id for message in allowed_messages}
             # A hit source is the provenance that authorized this segment. If
@@ -606,6 +642,70 @@ class MemoryV2ContextProvider:
                 )
             )
         return tuple(validated)
+
+    @staticmethod
+    def _prefer_direct_current_observation(
+        *,
+        resolved: ResolvedMemoryQuery,
+        candidates: Sequence[object],
+        segments: Sequence[EvidenceSegment],
+        facts: Sequence[MemoryFact],
+    ) -> tuple[tuple[EvidenceSegment, ...], tuple[MemoryFact, ...]]:
+        """Keep a retrospective event from outranking direct current-state wording.
+
+        A fact's observed_at is its recording time, not necessarily the time of
+        the event it describes. Apply this only when a bound member's top raw
+        references directly match the action in a recent/current question.
+        """
+        unchanged = (tuple(segments), tuple(facts))
+        if (
+            resolved.answer_mode != "current_fact"
+            or resolved.subject_binding != "explicit"
+            or not resolved.subject_ids
+            or not temporal_recency_required(query=resolved.original_query)
+        ):
+            return unchanged
+        relation = resolved.original_query
+        for value in (*resolved.subject_aliases_removed, *resolved.topic_terms, *_CURRENT_QUERY_FILLERS):
+            relation = relation.replace(str(value), "")
+        relation = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", relation)
+        if len(relation) < 2:
+            return unchanged
+        phrases = {
+            relation[index:index + width]
+            for width in range(2, min(4, len(relation)) + 1)
+            for index in range(len(relation) - width + 1)
+        }
+        direct_ids = {
+            str(getattr(candidate, "document_id"))
+            for candidate in candidates
+            if any(
+                route == "member_reference" and rank <= 2
+                for route, rank in getattr(candidate, "route_ranks", ())
+            )
+        }
+        supporting = tuple(
+            segment for segment in segments
+            if segment.document_id in direct_ids
+            and any(
+                message.source_msg_id in segment.hit_source_msg_ids
+                and not _QUESTION_WORDS.search(message.content)
+                and any(phrase in message.content for phrase in phrases)
+                for message in segment.messages
+            )
+        )
+        if not supporting:
+            return unchanged
+        remaining = tuple(segment for segment in segments if segment not in supporting)
+        relevant_facts = tuple(
+            fact for fact in facts
+            if not (
+                fact.memory_kind == "event"
+                and _RETROSPECTIVE_EVENT.search(fact.text)
+                and not any(phrase in fact.text for phrase in phrases)
+            )
+        )
+        return (*supporting, *remaining), relevant_facts
 
     def _consume_direct_reply_quota(
         self,
