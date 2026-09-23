@@ -2285,6 +2285,11 @@ class InboundRouter:
                 if packed_memory_context is not None
                 else ""
             )
+            if packed_memory_context is not None and packed_memory_context.direct_current_source_ids:
+                # A directly matching, dated observation is already packed.
+                # Another broad search can surface older recollections and
+                # displace the stronger source during generation.
+                memory_tool_executor = None
             prompt_recent_lines = memory_context.recent_messages
             full_history_lines = memory_context.full_history_messages
             full_history_preamble = memory_context.full_history_preamble

@@ -36,9 +36,10 @@ def build_memory_answer_anchor(query: str, packed: object) -> str:
         return (
             "Structured answer-source pointer: the latest directly matching member observation "
             f"is at source_ids={direct_sources!r} in the dated untrusted evidence packet. "
-            "For a recent/current question, report what that observation says and when; "
-            "do not claim it proves the person's state now. Earlier recollections and the "
-            "current question are not newer observations."
+            "Answer with the content and actual timestamp of that source first. "
+            "Then say the record does not establish the person's state now. "
+            "Do not say there is no relevant record. Earlier recollections and repeated "
+            "questions are not newer observations."
         )
     facts = tuple(getattr(packed, "facts", ()) or ())
     if "关系" in normalized_query:

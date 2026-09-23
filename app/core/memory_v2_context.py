@@ -317,6 +317,11 @@ class MemoryV2ContextProvider:
             recent_messages = tuple(
                 message for message in recent_messages if not message.is_bot
             )
+        if suppressed_retrospective_facts > 0:
+            # Repeated questions in recent chat have newer timestamps but are
+            # not observations about the member. They can make the model
+            # misdate the older direct source.
+            recent_messages = ()
         packed = self._packer.pack(
             mode,
             available_input=request.available_input,

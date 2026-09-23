@@ -59,7 +59,7 @@ def test_memory_answer_anchor_points_to_dated_direct_observation_without_copying
 
     assert "direct-source" in anchor
     assert "向日葵马戏团" not in anchor
-    assert "when" in anchor
+    assert "actual timestamp" in anchor
 
 
 def test_memory_answer_anchor_uses_exact_quoted_phrase_hit() -> None:
