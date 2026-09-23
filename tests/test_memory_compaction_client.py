@@ -12,7 +12,7 @@ def _settings(monkeypatch) -> AppSettings:
     return AppSettings()
 
 
-def test_build_memory_compaction_client_uses_low_effort(monkeypatch) -> None:
+def test_build_memory_compaction_client_uses_medium_effort(monkeypatch) -> None:
     settings = _settings(monkeypatch)
     main_client = LlmClient(
         base_url="https://example.test",
@@ -27,7 +27,7 @@ def test_build_memory_compaction_client_uses_low_effort(monkeypatch) -> None:
     )
 
     assert compaction_client is not main_client
-    assert compaction_client.reasoning_effort == "low"
+    assert compaction_client.reasoning_effort == "medium"
 
 
 def test_build_memory_compaction_client_preserves_test_fakes(monkeypatch) -> None:

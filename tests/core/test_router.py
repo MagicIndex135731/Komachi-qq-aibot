@@ -886,6 +886,53 @@ async def test_router_sends_burst_reply_as_separate_messages(sqlite_engine) -> N
 
 
 @pytest.mark.asyncio
+async def test_router_removes_long_web_citation_before_burst_split(sqlite_engine) -> None:
+    sender = FakeSender()
+    answer = "搜到的更像是肉夹馍和凉皮搭配，不是把馍泡在凉皮汤里吃的固定做法，但听着还挺香。"
+    citation = "([source.example.com](https://source.example.com/story?froms=ggmp&utm_source=openai))"
+    llm = LongReplyLlm(answer + citation)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine, sender=sender, llm_client=llm
+    )
+    router.runtime.settings.group_reply_split_enabled = True
+    router.runtime.settings.group_reply_split_max_chars = 64
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="citation-before-burst-1",
+            plain_text="@Mira 帮我查一下这种吃法",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == [answer]
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_explicitly_requested_url_whole(sqlite_engine) -> None:
+    sender = FakeSender()
+    answer = "官网地址是 https://www.example.com/article?source=official，直接点这个就行。"
+    llm = LongReplyLlm(answer)
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine, sender=sender, llm_client=llm
+    )
+    router.runtime.settings.group_reply_split_enabled = True
+    router.runtime.settings.group_reply_split_max_chars = 20
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="explicit-url-whole-1",
+            plain_text="@Mira 把官网链接发我",
+        )
+    )
+
+    assert [outbound.text for outbound in sender.sent] == [answer]
+
+
+@pytest.mark.asyncio
 async def test_router_collapses_model_line_breaks_into_one_message(sqlite_engine) -> None:
     """Only over-long answers are split; the model's line breaks collapse."""
 

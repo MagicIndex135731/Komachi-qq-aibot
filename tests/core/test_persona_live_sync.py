@@ -572,10 +572,15 @@ def test_write_refreshed_profile_writes_valid_output_and_preserves_current_field
     refreshed = _valid_live_profile()
     refreshed["speaking_habits"] = ["确实"]
     del refreshed["speech_habits"]
+
+    def generate_valid(self, prompt):
+        assert self.reasoning_effort == "medium"
+        return yaml.safe_dump(refreshed, allow_unicode=True)
+
     monkeypatch.setattr(
         LlmClient,
         "generate_text",
-        lambda self, prompt: yaml.safe_dump(refreshed, allow_unicode=True),
+        generate_valid,
     )
 
     live_path = service._write_refreshed_profile(

@@ -119,7 +119,7 @@ class AppSettings(BaseSettings):
     memory_compaction_retry_limit: int = Field(default=3, alias="MEMORY_COMPACTION_RETRY_LIMIT")
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
     memory_compaction_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="MEMORY_COMPACTION_REASONING_EFFORT",
     )
     memory_compaction_max_output_tokens: int = Field(

@@ -841,6 +841,20 @@ class InboundRouter:
         # Delivery shape comes from settings, not from the persona: the persona
         # file only describes style and personality.
         burst = self._reply_split_config()
+        allow_urls = explicitly_requests_urls(event.plain_text)
+        # A long Markdown citation can contain dots that the burst splitter
+        # treats as sentence boundaries. Remove unwanted links while the reply
+        # is still whole, before per-segment delivery applies its final guard.
+        reply_text = filter_reply_urls(
+            reply_text,
+            allow_urls=allow_urls,
+        )
+        if allow_urls and any(
+            marker in reply_text for marker in ("http://", "https://", "www.")
+        ):
+            # Explicitly requested URLs must remain intact rather than being
+            # split on the dots in their hostnames.
+            burst = {**burst, "enabled": False}
         segments = split_burst_reply(reply_text, burst)
         impersonating = self._impersonating(event.group_id)
         base_id = self._outbound_platform_msg_id(event.platform_msg_id)

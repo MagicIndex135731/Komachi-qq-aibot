@@ -11,6 +11,7 @@ from app.core.member_memory_backfill import (
     build_slices,
     extract_facts_from_lines,
     parse_review_output,
+    review_facts,
     upsert_member_facts,
 )
 from app.storage.db import session_scope
@@ -47,6 +48,32 @@ def test_build_slices_overlaps_boundaries() -> None:
 
     assert slices[-1][:2] == ["二二二二二二二二", "三三三三三三三三"]
     assert "四四四四四四四四" in slices[-1]
+
+
+def test_fact_extraction_and_review_use_medium_reasoning(monkeypatch) -> None:
+    efforts: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            efforts.append(kwargs["reasoning_effort"])
+
+        def generate_text(self, messages):
+            if "候选：" in messages[0]:
+                return '{"drop": []}'
+            return '{"facts": []}'
+
+    monkeypatch.setattr(member_memory_backfill, "LlmClient", FakeClient)
+    settings = SimpleNamespace(
+        llm_base_url="http://example.invalid",
+        llm_api_key="test",
+        llm_model="test",
+        llm_fallback_model="test",
+    )
+
+    assert extract_facts_from_lines(settings, ["今天在学日语"]) == []
+    candidates = [{"fact": "在学日语", "evidence": "今天在学日语"}]
+    assert review_facts(settings, candidates) == candidates
+    assert efforts == ["medium", "medium"]
 
 
 def test_fact_extraction_uses_neighbors_only_for_target_evidence(

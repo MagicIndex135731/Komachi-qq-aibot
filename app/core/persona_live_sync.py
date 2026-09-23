@@ -431,7 +431,7 @@ class PersonaLiveSyncService:
             responses_model=self.settings.llm_model,
             max_output_tokens=16000,
             timeout_seconds=180.0,
-            reasoning_effort="low",
+            reasoning_effort="medium",
         )
         generated = client.generate_text([prompt])
         profile = _normalize_live_profile_contract(
