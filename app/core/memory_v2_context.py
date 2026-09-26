@@ -713,7 +713,16 @@ class MemoryV2ContextProvider:
             and any(
                 message.source_msg_id in segment.hit_source_msg_ids
                 and not _QUESTION_WORDS.search(message.content)
-                and any(phrase in message.content for phrase in phrases)
+                and (
+                    any(phrase in message.content for phrase in phrases)
+                    or (
+                        str(message.user_id) in {str(value) for value in resolved.subject_ids}
+                        and any(
+                            token in message.content
+                            for token in ("看", "追", "补", "玩", "用", "做", "学", "读", "听")
+                        )
+                    )
+                )
                 for message in segment.messages
             )
         )

@@ -243,6 +243,9 @@ class ScopedMemoryRetrievalChannels:
                     or getattr(resolved_query, "original_query", "")
                     or ""
                 ),
+                include_subject_authored=(
+                    getattr(resolved_query, "answer_mode", "") == "current_fact"
+                ),
                 limit=limit,
                 start_at=self._time_bound(resolved_query, "start"),
                 end_at=self._time_bound(resolved_query, "end"),

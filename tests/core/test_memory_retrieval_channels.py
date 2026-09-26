@@ -69,6 +69,14 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
         platform_msg_id="bot-reply-remembered", content="加菲猫在看一部动画",
         document_kind="raw_message_v3",
     )
+    self_activity = _seed_document(
+        sqlite_engine, group_id=100, user_id=300, platform_msg_id="self-activity",
+        content="我去看食戟之灵", document_kind="raw_message_v3",
+    )
+    self_activity_two = _seed_document(
+        sqlite_engine, group_id=100, user_id=300, platform_msg_id="self-activity-two",
+        content="我在看Pico动画", document_kind="raw_message_v3",
+    )
     channels = build_memory_retrieval_channels(sqlite_engine, raw_message_v3_only=True)
 
     def recall(question: str):
@@ -85,7 +93,12 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
 
     assert [hit.document_id for hit in recall("加菲猫最近在看什么动画")][:1] == [viewing]
     assert [hit.document_id for hit in recall("加菲猫在哪里工作")][:1] == [work]
-    assert {hit.document_id for hit in recall("加菲猫最近如何")} == {viewing, work}
+    assert {hit.document_id for hit in recall("加菲猫最近如何")} == {
+        viewing, work, self_activity, self_activity_two,
+    }
+    assert self_activity in {hit.document_id for hit in recall("加菲猫最近在看什么动画")}
+    multi_hits = {hit.document_id for hit in recall("加菲猫最近在看哪些动画")}
+    assert {self_activity, self_activity_two} <= multi_hits
     _seed_document(
         sqlite_engine, group_id=100, user_id=205,
         platform_msg_id="question-echo", content="@比企谷小町 加菲猫最近在看什么动画",

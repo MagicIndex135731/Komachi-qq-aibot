@@ -3777,6 +3777,7 @@ class RetrievalDocumentRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         excluded_speaker_ids: Sequence[str] | None = None,
+        include_subject_authored: bool = False,
     ) -> list[RetrievalDocumentHit]:
         """Find raw utterances that explicitly name or @ a bound member.
 
@@ -3792,6 +3793,19 @@ class RetrievalDocumentRepository:
         if not normalized_subjects:
             return []
         conditions = [RetrievalDocument.content.contains(alias) for alias in normalized_aliases]
+        authored_document_ids = (
+            select(RetrievalDocumentMessage.document_id)
+            .join(
+                Message,
+                (Message.id == RetrievalDocumentMessage.message_id)
+                & (Message.group_id == RetrievalDocumentMessage.group_id),
+            )
+            .where(
+                RetrievalDocumentMessage.group_id == int(group_id),
+                Message.group_id == int(group_id),
+                Message.user_id.in_(tuple(int(value) for value in normalized_subjects if value.isdigit())),
+            )
+        )
         bot_reply_document_ids = (
             select(RetrievalDocumentMessage.document_id)
             .join(
@@ -3824,10 +3838,13 @@ class RetrievalDocumentRepository:
         # wording before recency. This keeps old but pertinent statements from
         # disappearing behind newer unrelated mentions of the same member.
         rows = []
-        if conditions:
+        search_conditions = list(conditions)
+        if include_subject_authored and any(value.isdigit() for value in normalized_subjects):
+            search_conditions.append(RetrievalDocument.id.in_(authored_document_ids))
+        if search_conditions:
             rows = self.session.execute(
                 select(RetrievalDocument.id, RetrievalDocument.content)
-                .where(*scope_filters, or_(*conditions))
+                .where(*scope_filters, or_(*search_conditions))
                 .order_by(RetrievalDocument.end_at.desc(), RetrievalDocument.id.desc())
                 .limit(max(200, int(limit) * 8))
             ).all()
@@ -3843,9 +3860,33 @@ class RetrievalDocumentRepository:
                 .order_by(RetrievalDocument.end_at.desc(), RetrievalDocument.id.desc())
                 .limit(max(200, int(limit) * 8))
             ).all()
+        authored_ids: set[int] = set()
+        if include_subject_authored and any(value.isdigit() for value in normalized_subjects):
+            authored_ids = {
+                int(value)
+                for value in self.session.execute(
+                    select(RetrievalDocumentMessage.document_id)
+                    .join(
+                        Message,
+                        (Message.id == RetrievalDocumentMessage.message_id)
+                        & (Message.group_id == RetrievalDocumentMessage.group_id),
+                    )
+                    .where(
+                        RetrievalDocumentMessage.group_id == int(group_id),
+                        Message.group_id == int(group_id),
+                        Message.user_id.in_(tuple(
+                            int(value) for value in normalized_subjects if value.isdigit()
+                        )),
+                    )
+                ).scalars()
+            }
         topic = query_text
         for filler in ("最近", "目前", "现在", "什么", "哪里", "哪儿", "如何", "怎么", "多少", "是否", "有没有"):
             topic = topic.replace(filler, "")
+        activity_terms = tuple(
+            term for term in ("看", "追", "补", "玩", "用", "做", "学", "读", "听")
+            if term in topic
+        )
         fragments = {
             topic[index:index + width]
             for width in range(2, 7)
@@ -3857,7 +3898,16 @@ class RetrievalDocumentRepository:
         ranked = sorted(
             enumerate(rows),
             key=lambda pair: (
-                -sum((len(fragment) - 1) for fragment in fragments if fragment in pair[1].content),
+                -(
+                    sum((len(fragment) - 1) for fragment in fragments if fragment in pair[1].content)
+                    + (
+                        12
+                        if int(pair[1].id) in authored_ids
+                        and activity_terms
+                        and any(term in pair[1].content for term in activity_terms)
+                        else 0
+                    )
+                ),
                 pair[0],
             ),
         )[:max(1, int(limit))]
