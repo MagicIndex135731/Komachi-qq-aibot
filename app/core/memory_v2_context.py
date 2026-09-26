@@ -354,24 +354,21 @@ class MemoryV2ContextProvider:
                 facts=facts,
                 summaries=summaries,
             )
-        if (
-            resolved.answer_mode == "current_fact"
-            and temporal_recency_required(query=resolved.original_query)
-            and suppressed_retrospective_facts > 0
-            and segments
-            and any(
-                route == "member_reference" and rank <= 2
+        if resolved.answer_mode == "current_fact" and segments:
+            direct_candidate_ids = {
+                str(getattr(candidate, "document_id", ""))
                 for candidate in candidates
-                if str(getattr(candidate, "document_id", "")) == segments[0].document_id
-                for route, rank in getattr(candidate, "route_ranks", ())
-            )
-        ):
+                if any(route == "member_reference" and rank <= 10 for route, rank in getattr(candidate, "route_ranks", ()))
+            }
             direct_source_ids = tuple(
-                source_id for source_id in segments[0].hit_source_msg_ids
+                source_id
+                for segment in segments
+                if segment.document_id in direct_candidate_ids
+                for source_id in segment.hit_source_msg_ids
                 if source_id in packed.source_msg_ids
             )
             if direct_source_ids:
-                packed = replace(packed, direct_current_source_ids=direct_source_ids)
+                packed = replace(packed, direct_current_source_ids=tuple(dict.fromkeys(direct_source_ids)))
         packing_ms = (perf_counter() - packing_started) * 1000
         if packed.source_msg_ids and not self._source_scope_validator(
             request.group_id,

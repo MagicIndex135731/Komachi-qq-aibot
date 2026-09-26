@@ -33,10 +33,12 @@ def build_memory_answer_anchor(query: str, packed: object) -> str:
         str(value) for value in getattr(packed, "direct_current_source_ids", ()) if str(value)
     )
     if direct_sources:
+        list_request = any(token in normalized_query for token in ("哪些", "哪几", "几部", "多部"))
         return (
             "Structured answer-source pointer: the latest directly matching member observation "
             f"is at source_ids={direct_sources!r} in the dated untrusted evidence packet. "
-            "Answer with the content and actual timestamp of that source first. "
+            + ("This is a multi-item question: enumerate every distinct work directly supported by the packet, with dates/status when available. " if list_request else "")
+            + "Answer with the content and actual timestamp of that source first. "
             "Then say the record does not establish the person's state now. "
             "Do not say there is no relevant record. Earlier recollections and repeated "
             "questions are not newer observations."
