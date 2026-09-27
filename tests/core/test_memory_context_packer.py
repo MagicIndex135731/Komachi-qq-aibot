@@ -64,6 +64,39 @@ def test_memory_answer_anchor_points_to_dated_direct_observation_without_copying
     assert "never attribute a preceding speaker's statement" in anchor
 
 
+def test_memory_answer_anchor_requires_explicit_list_questions_to_cover_distinct_items() -> None:
+    packer = MemoryContextPacker(normal_budget=2_000, detail_budget=2_000)
+    packed = packer.pack(
+        "normal",
+        available_input=2_000,
+        target_message_id=None,
+        evidence_segments=(
+            EvidenceSegment(
+                episode_id="raw:1",
+                fused_score=1.0,
+                messages=(
+                    EvidenceMessage(
+                        source_msg_id="direct-source",
+                        speaker="member",
+                        content="继续做",
+                        sent_at=datetime(2026, 9, 13, tzinfo=UTC),
+                    ),
+                ),
+                hit_source_msg_ids=("direct-source",),
+            ),
+        ),
+    )
+    packed = replace(packed, direct_current_source_ids=("direct-source",))
+
+    anchor = build_memory_answer_anchor("小林最近在做哪些项目", packed)
+
+    assert "inspect every evidence block" in anchor
+    assert "each distinct matching item" in anchor
+    assert "instead of stopping after the newest one" in anchor
+    assert "mentioned, liked, recommended, or planned" in anchor
+    assert "项目" not in anchor
+
+
 def test_memory_answer_anchor_uses_exact_quoted_phrase_hit() -> None:
     message = EvidenceMessage(
         source_msg_id="raw-source",

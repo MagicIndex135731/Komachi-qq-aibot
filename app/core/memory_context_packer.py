@@ -34,10 +34,25 @@ def build_memory_answer_anchor(query: str, packed: object) -> str:
     )
     if direct_sources:
         list_request = any(token in normalized_query for token in ("哪些", "哪几", "几部", "多部"))
+        if list_request:
+            return (
+                "Structured answer-source pointer: directly matching member observations exist at "
+                f"source_ids={direct_sources!r} in the dated untrusted evidence packet. "
+                "This is an explicit multi-item question: inspect every evidence block and give a "
+                "compact list of each distinct matching item directly supported by a member statement "
+                "instead of stopping after the newest one. Preserve evidence strength: say the member "
+                "was doing something only when stated, and otherwise report the exact weaker status "
+                "such as mentioned, liked, recommended, or planned. A direct member reply may resolve "
+                "an omitted item from the immediately preceding lines in the same evidence block only "
+                "when the short conversational link is unambiguous; never attribute a preceding "
+                "speaker's statement by itself to the member. Include dates when available. An older "
+                "explicit ongoing statement remains an answerable historical record unless newer "
+                "evidence contradicts it; finish once by saying the records do not establish the "
+                "person's state now. Do not say there is no relevant record."
+            )
         return (
             "Structured answer-source pointer: the latest directly matching member observation "
             f"is at source_ids={direct_sources!r} in the dated untrusted evidence packet. "
-            + ("This is a multi-item question: enumerate every distinct work directly supported by the packet, with dates/status when available. " if list_request else "")
             + "A direct member reply may resolve an omitted item from the immediately preceding lines in the same evidence block only when the short conversational link is unambiguous; never attribute a preceding speaker's statement by itself to the member. "
             + "Answer with the content and actual timestamp of that source first. "
             "Then say the record does not establish the person's state now. "
