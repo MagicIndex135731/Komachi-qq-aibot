@@ -357,7 +357,7 @@ def _recency_score(timestamp: datetime | None, now: datetime) -> float:
 
 
 def _semantic_threshold(document: StyleDocument, lexical_score: float) -> float:
-    threshold = 0.56 if lexical_score > 0 else 0.68
+    threshold = 0.56 if lexical_score >= 0.25 else 0.68
     if document.situation_kind == "adjacent":
         threshold += 0.01
     elif document.situation_kind == "reply_only":
@@ -460,7 +460,10 @@ def rank_style_examples(
             lexical = _lexical_score(query.lexical_units, document)
             recency = _recency_score(document.timestamp, resolved_now)
             final = SEMANTIC_WEIGHT * semantic + LEXICAL_WEIGHT * lexical + RECENCY_WEIGHT * recency
-            if semantic < _semantic_threshold(document, lexical) or (lexical <= 0 and final < 0.60):
+            strong_lexical = lexical >= 0.25
+            if semantic < _semantic_threshold(document, lexical) or (
+                not strong_lexical and final < 0.60
+            ):
                 trace.threshold_rejected += 1
                 continue
             candidates.append(
@@ -474,7 +477,7 @@ def rank_style_examples(
                 )
             )
         all_scores = [row[0] for row in semantic_rows]
-        if candidates and not any(match.lexical_score > 0 for match in candidates):
+        if candidates and not any(match.lexical_score >= 0.25 for match in candidates):
             top = max(match.semantic_score for match in candidates)
             if all_scores and top - median(all_scores) < 0.08:
                 trace.threshold_rejected += len(candidates)

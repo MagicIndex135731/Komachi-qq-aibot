@@ -591,10 +591,10 @@ def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None
                     "group_id": 10001,
                     "user_id": 222,
                     "msg_id": "m-vec-1",
-                    "text": "在吗",
+                    "text": "我在",
                     "context_before": [],
                     "context_after": [],
-                    "reply_target": None,
+                    "reply_target": "在吗",
                 }
             ]
         )
@@ -618,7 +618,7 @@ def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None
     manager._group_keys[10001] = "test_self"
     assert manager.prewarm_examples(10001, "test_self") == 1
     assert first_provider.document_calls == 1
-    picked = manager.retrieve_examples(10001, ["有人在吗"], limit=1)
+    picked = manager.retrieve_examples(10001, ["在吗"], limit=1)
     assert picked
 
     with session_scope(sqlite_engine) as session:
@@ -635,7 +635,7 @@ def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None
     fresh._group_keys[10001] = "test_self"
     assert fresh.prewarm_examples(10001, "test_self") == 1
     assert fresh_provider.document_calls == 0
-    picked_again = fresh.retrieve_examples(10001, ["有人在吗"], limit=1)
+    picked_again = fresh.retrieve_examples(10001, ["在吗"], limit=1)
     assert picked_again
 
 
@@ -668,10 +668,10 @@ def test_example_vectors_ignore_and_purge_stale_persisted_rows(sqlite_engine) ->
                     "group_id": 10001,
                     "user_id": 222,
                     "msg_id": "m-vec-1",
-                    "text": "在吗",
+                    "text": "我在",
                     "context_before": [],
                     "context_after": [],
-                    "reply_target": None,
+                    "reply_target": "在吗",
                 }
             ]
         )
@@ -703,7 +703,7 @@ def test_example_vectors_ignore_and_purge_stale_persisted_rows(sqlite_engine) ->
     manager._group_keys[10001] = "test_self"
 
     assert manager.prewarm_examples(10001, "test_self") == 1
-    picked = manager.retrieve_examples(10001, ["有人在吗"], limit=1)
+    picked = manager.retrieve_examples(10001, ["在吗"], limit=1)
 
     assert picked
     with session_scope(sqlite_engine) as session:

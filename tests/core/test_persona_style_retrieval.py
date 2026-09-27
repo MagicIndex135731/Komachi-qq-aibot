@@ -173,6 +173,27 @@ def test_old_relevant_sample_beats_recent_irrelevant_sample() -> None:
     assert [match.document.msg_id for match in matches] == ["relevant"]
 
 
+def test_one_shared_word_does_not_lower_semantic_admission() -> None:
+    query = build_style_retrieval_query(
+        current_text="日本家庭主妇对工作回家的男主人说什么"
+    )
+    weak_overlap = _document(
+        "weak",
+        situation="看卡通去了",
+        reply="不如日本女人好看",
+    )
+
+    matches = rank_style_examples(
+        query=query,
+        documents=[weak_overlap],
+        vectors_by_id={"weak": [0.59, 0.8074]},
+        query_vector=[1.0, 0.0],
+        now=NOW,
+    )
+
+    assert matches == []
+
+
 def test_low_semantic_candidates_are_rejected_instead_of_filled() -> None:
     query = build_style_retrieval_query(current_text="完全陌生的新话题")
     documents = [
