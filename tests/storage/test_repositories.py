@@ -174,6 +174,60 @@ def test_message_repository_lists_all_direct_replies_in_group_and_time_order(tmp
     assert [row.platform_msg_id for row in bounded] == ["earlier", "second-parent"]
 
 
+def test_message_repository_loads_only_bounded_preceding_context(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+    base = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        for group_id in (10001, 10002):
+            groups.upsert_group(
+                group_id=group_id,
+                group_name=f"group-{group_id}",
+                enabled=True,
+                speak_enabled=True,
+            )
+        for user_id in (20001, 20002, 30001):
+            users.upsert_user(user_id=user_id, nickname=str(user_id), group_card="")
+        for source_id, group_id, user_id, seconds, state in (
+            ("outside-gap", 10001, 20001, 0, ""),
+            ("first-context", 10001, 20001, 61, ""),
+            ("excluded-bot", 10001, 30001, 90, ""),
+            ("second-context", 10001, 20002, 100, ""),
+            ("deleted-context", 10001, 20001, 110, "deleted"),
+            ("anchor", 10001, 20002, 120, ""),
+            ("after-anchor", 10001, 20001, 121, ""),
+            ("cross-group", 10002, 20001, 115, ""),
+        ):
+            messages.add_group_message(
+                platform_msg_id=source_id,
+                group_id=group_id,
+                user_id=user_id,
+                timestamp=base + timedelta(seconds=seconds),
+                plain_text=source_id,
+                raw_json={"delivery_state": state} if state else {},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+
+        rows = messages.list_preceding_group_message_context(
+            group_id=10001,
+            anchor_platform_msg_ids=["anchor"],
+            per_anchor_limit=2,
+            max_gap_seconds=60,
+            excluded_user_ids={30001},
+        )
+
+    assert [row.platform_msg_id for row in rows] == [
+        "first-context",
+        "second-context",
+    ]
+
+
 def test_message_repository_lists_all_delivered_group_messages_chronologically(tmp_path) -> None:
     engine = build_engine(tmp_path / "bot.db")
     create_all(engine)

@@ -15,6 +15,7 @@ from app.core.memory_context_packer import EvidenceMessage, EvidenceSegment
 ExpansionMode = Literal["normal", "detail"]
 EpisodeLoader = Callable[..., Sequence[EvidenceMessage]]
 SourceLoader = Callable[..., Sequence[EvidenceMessage]]
+ContextLoader = Callable[..., Sequence[EvidenceMessage]]
 
 
 class MemoryEvidenceExpander:
@@ -30,24 +31,32 @@ class MemoryEvidenceExpander:
         *,
         episode_loader: EpisodeLoader,
         source_loader: SourceLoader | None = None,
+        context_loader: ContextLoader | None = None,
         normal_radius: int = 5,
         detail_radius: int = 10,
         normal_segment_limit: int = 4,
         detail_segment_limit: int = 6,
         max_reply_depth: int = 2,
+        context_radius: int = 2,
+        context_max_gap_seconds: int = 120,
     ) -> None:
-        if min(normal_radius, detail_radius, max_reply_depth) < 0:
+        if min(normal_radius, detail_radius, max_reply_depth, context_radius) < 0:
             raise ValueError("expansion radii and reply depth cannot be negative")
+        if context_max_gap_seconds < 1:
+            raise ValueError("context max gap must be positive")
         if min(normal_segment_limit, detail_segment_limit) <= 0:
             raise ValueError("segment limits must be positive")
         self._episode_loader = episode_loader
         self._source_loader = source_loader
+        self._context_loader = context_loader
         self._radii = {"normal": normal_radius, "detail": detail_radius}
         self._limits = {
             "normal": normal_segment_limit,
             "detail": detail_segment_limit,
         }
         self._max_reply_depth = max_reply_depth
+        self._context_radius = context_radius
+        self._context_max_gap_seconds = context_max_gap_seconds
 
     def expand(
         self,
@@ -124,6 +133,33 @@ class MemoryEvidenceExpander:
             or any(source_id not in loaded_by_id for source_id in source_msg_ids)
         ):
             raise MemoryScopeViolation("unverified batched raw provenance")
+        context_source_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for candidate in raw_candidates
+                if "member_reference" in candidate.routes
+                for source_id in candidate.source_msg_ids
+            )
+        )
+        if context_source_ids and self._context_loader is not None:
+            context_rows = tuple(
+                self._context_loader(
+                    group_id=group_id,
+                    source_msg_ids=context_source_ids,
+                    limit_per_source=self._context_radius,
+                    max_gap_seconds=self._context_max_gap_seconds,
+                )
+            )
+            if (
+                len({row.source_msg_id for row in context_rows}) != len(context_rows)
+                or any(
+                    row.group_id is None or int(row.group_id) != int(group_id)
+                    for row in context_rows
+                )
+            ):
+                raise MemoryScopeViolation("unverified raw context provenance")
+            for row in context_rows:
+                loaded_by_id.setdefault(row.source_msg_id, row)
         return loaded_by_id
 
     def _expand_candidate(
@@ -270,6 +306,28 @@ class MemoryEvidenceExpander:
             for row in loaded_by_id.values()
             if row.reply_to_msg_id in hit_ids
         )
+        atomic_groups: list[tuple[str, ...]] = []
+        if "member_reference" in candidate.routes and self._context_radius > 0:
+            ordered_rows = tuple(
+                sorted(
+                    loaded_by_id.values(),
+                    key=lambda row: (row.sent_at, row.source_msg_id),
+                )
+            )
+            for hit_id in hit_ids:
+                hit = loaded_by_id[hit_id]
+                preceding = tuple(
+                    row
+                    for row in ordered_rows
+                    if row.sent_at < hit.sent_at
+                    and (hit.sent_at - row.sent_at).total_seconds()
+                    <= self._context_max_gap_seconds
+                )[-self._context_radius :]
+                if not preceding:
+                    continue
+                context_ids = tuple(row.source_msg_id for row in preceding)
+                selected_ids.update(context_ids)
+                atomic_groups.append((*context_ids, hit_id))
 
         blocked_output_present = any(
             loaded_by_id[source_id].blocked for source_id in selected_ids
@@ -292,6 +350,7 @@ class MemoryEvidenceExpander:
             messages=selected,
             hit_source_msg_ids=hit_ids,
             document_id=str(candidate.document_id),
+            atomic_source_groups=tuple(atomic_groups),
             pinned=bool(
                 candidate.pinned
                 or {"exact_quote", "reply_graph"}.intersection(candidate.routes)

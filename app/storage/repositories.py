@@ -8,7 +8,7 @@ import re
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Integer, String, bindparam, case, cast, func, or_, select, text, true
+from sqlalchemy import Integer, String, and_, bindparam, case, cast, func, or_, select, text, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -802,6 +802,74 @@ class MessageRepository:
             )
         )
         return list(self.session.scalars(stmt))
+
+    def list_preceding_group_message_context(
+        self,
+        *,
+        group_id: int,
+        anchor_platform_msg_ids: list[str],
+        per_anchor_limit: int = 2,
+        max_gap_seconds: int = 120,
+        excluded_user_ids: set[int] | None = None,
+    ) -> list[Message]:
+        """Load a small chronological context prefix for scoped messages.
+
+        Anchors are queried independently so distant historical hits cannot
+        become one unbounded time-range scan. The final rows are deduplicated
+        after applying the per-anchor limit.
+        """
+        if per_anchor_limit < 1 or max_gap_seconds < 1:
+            raise ValueError("context limits must be positive")
+        anchor_ids = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in anchor_platform_msg_ids
+                if str(item).strip()
+            )
+        )
+        if not anchor_ids:
+            return []
+        anchors = tuple(
+            self.session.scalars(
+                select(Message).where(
+                    Message.group_id == int(group_id),
+                    Message.platform_msg_id.in_(anchor_ids),
+                )
+            )
+        )
+        excluded = {int(value) for value in (excluded_user_ids or set())}
+        selected: dict[int, Message] = {}
+        for anchor in anchors:
+            anchor_time = _normalize_utc_sqlite_timestamp(anchor.timestamp)
+            stmt = (
+                select(Message)
+                .where(
+                    Message.group_id == int(group_id),
+                    Message.timestamp
+                    >= anchor_time - timedelta(seconds=max_gap_seconds),
+                    or_(
+                        Message.timestamp < anchor_time,
+                        and_(
+                            Message.timestamp == anchor_time,
+                            Message.id < int(anchor.id),
+                        ),
+                    ),
+                    ~func.coalesce(
+                        func.json_extract(Message.raw_json, "$.delivery_state"),
+                        "",
+                    ).in_(_INELIGIBLE_DELIVERY_STATES),
+                )
+                .order_by(Message.timestamp.desc(), Message.id.desc())
+                .limit(int(per_anchor_limit))
+            )
+            if excluded:
+                stmt = stmt.where(Message.user_id.not_in(excluded))
+            for row in self.session.scalars(stmt):
+                selected.setdefault(int(row.id), row)
+        return sorted(
+            selected.values(),
+            key=lambda row: (row.timestamp, int(row.id)),
+        )
 
     def is_late_group_message(
         self,

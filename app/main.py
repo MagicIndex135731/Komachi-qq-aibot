@@ -961,6 +961,35 @@ def build_memory_runtime(
                 )
             )
 
+    def load_source_context(
+        *,
+        group_id: int,
+        source_msg_ids: tuple[str, ...],
+        limit_per_source: int,
+        max_gap_seconds: int,
+    ):
+        with session_scope(engine) as session:
+            messages = MessageRepository(session)
+            rows = messages.list_preceding_group_message_context(
+                group_id=group_id,
+                anchor_platform_msg_ids=list(source_msg_ids),
+                per_anchor_limit=limit_per_source,
+                max_gap_seconds=max_gap_seconds,
+                excluded_user_ids={int(settings.bot_qq)},
+            )
+            users_by_id = UserRepository(session).get_users_by_ids(
+                [int(row.user_id) for row in rows]
+            )
+            return tuple(
+                _evidence_messages_from_rows(
+                    rows=rows,
+                    users_by_id=users_by_id,
+                    messages=messages,
+                    settings=settings,
+                    bot_display_name=bot_display_name,
+                )
+            )
+
     def load_facts(*, group_id: int, resolved_query):
         if settings.memory_raw_v3_enabled and not settings.memory_layered_memory_enabled:
             return ()
@@ -1307,6 +1336,7 @@ def build_memory_runtime(
     expander = MemoryEvidenceExpander(
         episode_loader=load_episode,
         source_loader=load_sources,
+        context_loader=load_source_context,
         normal_segment_limit=(
             (
                 settings.memory_adaptive_max_history_messages

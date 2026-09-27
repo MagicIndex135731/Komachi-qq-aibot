@@ -251,3 +251,72 @@ def test_raw_message_document_loads_direct_replies_for_later_eligibility_filteri
     )
     assert segment.hit_source_msg_ids == ("hit",)
     assert segment.atomic_source_groups == ()
+
+
+def test_member_reference_raw_hit_keeps_bounded_preceding_context_as_atomic_evidence() -> None:
+    context_calls: list[tuple[int, tuple[str, ...], int, int]] = []
+
+    def load_context(*, group_id, source_msg_ids, limit_per_source, max_gap_seconds):
+        context_calls.append(
+            (group_id, source_msg_ids, limit_per_source, max_gap_seconds)
+        )
+        return (
+            item("too-old", -1, group_id=group_id),
+            item("named-item", 0, group_id=group_id),
+            item("follow-up", 1, group_id=group_id),
+        )
+
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (item("member-reply", 2),),
+        context_loader=load_context,
+        context_radius=2,
+        context_max_gap_seconds=120,
+    )
+    raw_candidate = replace(
+        candidate(("member-reply",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert context_calls == [(100, ("member-reply",), 2, 120)]
+    assert tuple(message.source_msg_id for message in segment.messages) == (
+        "named-item",
+        "follow-up",
+        "member-reply",
+    )
+    assert segment.hit_source_msg_ids == ("member-reply",)
+    assert segment.atomic_source_groups == (
+        ("named-item", "follow-up", "member-reply"),
+    )
+
+
+def test_non_member_raw_hit_does_not_request_conversation_context() -> None:
+    calls: list[object] = []
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (item("hit", 2),),
+        context_loader=lambda **kwargs: calls.append(kwargs) or (),
+    )
+    raw_candidate = replace(
+        candidate(("hit",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("bm25",),
+        route_ranks=(("bm25", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert calls == []
+    assert tuple(message.source_msg_id for message in segment.messages) == ("hit",)

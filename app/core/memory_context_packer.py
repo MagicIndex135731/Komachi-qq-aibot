@@ -38,6 +38,7 @@ def build_memory_answer_anchor(query: str, packed: object) -> str:
             "Structured answer-source pointer: the latest directly matching member observation "
             f"is at source_ids={direct_sources!r} in the dated untrusted evidence packet. "
             + ("This is a multi-item question: enumerate every distinct work directly supported by the packet, with dates/status when available. " if list_request else "")
+            + "A direct member reply may resolve an omitted item from the immediately preceding lines in the same evidence block only when the short conversational link is unambiguous; never attribute a preceding speaker's statement by itself to the member. "
             + "Answer with the content and actual timestamp of that source first. "
             "Then say the record does not establish the person's state now. "
             "Do not say there is no relevant record. Earlier recollections and repeated "
