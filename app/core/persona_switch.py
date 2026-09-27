@@ -428,28 +428,53 @@ class PersonaManager:
         model = str(getattr(identity, "model", "") or "")
         version = str(getattr(identity, "version", "") or "")
         dimensions = int(getattr(identity, "dimensions", 0) or 0)
+        payloads: list[dict[str, object]] = []
+        for msg_id, vector in vectors.items():
+            document = documents_by_id.get(str(msg_id))
+            if document is None:
+                continue
+            payloads.append(
+                {
+                    "msg_id": str(msg_id),
+                    "user_id": int(user_id),
+                    "group_id": int(group_id),
+                    "provider": provider,
+                    "model": model,
+                    "embedding_version": version,
+                    "dimensions": dimensions,
+                    "document_schema": DOCUMENT_SCHEMA,
+                    "document_hash": document.document_hash,
+                    "vector_json": json.dumps(
+                        [float(value) for value in vector],
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+        if not payloads:
+            return
         with session_scope(self.engine) as session:
-            for msg_id, vector in vectors.items():
-                document = documents_by_id.get(str(msg_id))
-                if document is None:
-                    continue
-                session.merge(
-                    PersonaExampleVector(
-                        msg_id=str(msg_id),
-                        user_id=int(user_id),
-                        group_id=int(group_id),
-                        provider=provider,
-                        model=model,
-                        embedding_version=version,
-                        dimensions=dimensions,
-                        document_schema=DOCUMENT_SCHEMA,
-                        document_hash=document.document_hash,
-                        vector_json=json.dumps(
-                            [float(value) for value in vector],
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
+            # Startup prewarm and the live-sync worker can rebuild the same
+            # derived vector concurrently. A single SQLite upsert removes the
+            # SELECT/INSERT race inherent in ORM merge. The WHERE clause keeps
+            # the legacy global msg_id key from overwriting another group.
+            session.execute(
+                text(
+                    "INSERT INTO persona_example_vectors "
+                    "(msg_id,user_id,group_id,provider,model,embedding_version,"
+                    "dimensions,document_schema,document_hash,vector_json,updated_at) "
+                    "VALUES (:msg_id,:user_id,:group_id,:provider,:model,:embedding_version,"
+                    ":dimensions,:document_schema,:document_hash,:vector_json,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(msg_id) DO UPDATE SET "
+                    "provider=excluded.provider,model=excluded.model,"
+                    "embedding_version=excluded.embedding_version,"
+                    "dimensions=excluded.dimensions,document_schema=excluded.document_schema,"
+                    "document_hash=excluded.document_hash,vector_json=excluded.vector_json,"
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE persona_example_vectors.user_id=excluded.user_id "
+                    "AND persona_example_vectors.group_id=excluded.group_id"
+                ),
+                payloads,
+            )
 
     def _delete_persisted_example_vectors(
         self,
