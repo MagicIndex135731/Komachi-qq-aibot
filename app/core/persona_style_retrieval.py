@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 import hashlib
 import math
 import re
@@ -350,6 +351,24 @@ def _reply_ngram_jaccard(left: str, right: str) -> float:
     return len(left_units & right_units) / len(left_units | right_units)
 
 
+def _near_duplicate_text(left: object, right: object) -> bool:
+    """Reject query/recent-output echoes while keeping topical responses."""
+
+    normalized_left = re.sub(
+        r"[^\u3400-\u9fffa-zA-Z0-9]+", "", normalize_style_text(left).lower()
+    )
+    normalized_right = re.sub(
+        r"[^\u3400-\u9fffa-zA-Z0-9]+", "", normalize_style_text(right).lower()
+    )
+    if not normalized_left or not normalized_right:
+        return False
+    if normalized_left == normalized_right:
+        return True
+    if min(len(normalized_left), len(normalized_right)) < 6:
+        return False
+    return SequenceMatcher(None, normalized_left, normalized_right).ratio() >= 0.78
+
+
 def rank_style_examples(
     *,
     query: StyleRetrievalQuery,
@@ -366,15 +385,25 @@ def rank_style_examples(
     trace.query_chars = len(query.semantic_text)
     trace.candidate_count = len(documents)
     resolved_now = _normalized_timestamp(now) or datetime.now(UTC)
-    excluded = {normalize_style_text(value).lower() for value in exclude_texts if normalize_style_text(value)}
+    excluded = [
+        normalize_style_text(value).lower()
+        for value in exclude_texts
+        if normalize_style_text(value)
+    ]
     if query.current_text:
-        excluded.add(normalize_style_text(query.current_text).lower())
+        excluded.append(normalize_style_text(query.current_text).lower())
+
+    def reply_is_excluded(document: StyleDocument) -> bool:
+        return any(
+            _near_duplicate_text(document.reply, excluded_text)
+            for excluded_text in excluded
+        )
 
     if query_vector is None:
         trace.fallback_mode = "lexical"
         lexical_matches: list[StyleExampleMatch] = []
         for document in documents:
-            if normalize_style_text(document.reply).lower() in excluded:
+            if reply_is_excluded(document):
                 continue
             lexical = _lexical_score(query.lexical_units, document)
             if lexical <= 0:
@@ -404,7 +433,7 @@ def rank_style_examples(
         semantic_rows = semantic_rows[:32]
         candidates = []
         for semantic, document in semantic_rows:
-            if normalize_style_text(document.reply).lower() in excluded:
+            if reply_is_excluded(document):
                 continue
             lexical = _lexical_score(query.lexical_units, document)
             recency = _recency_score(document.timestamp, resolved_now)

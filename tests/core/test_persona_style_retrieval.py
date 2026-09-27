@@ -180,6 +180,30 @@ def test_low_semantic_candidates_are_rejected_instead_of_filled() -> None:
     assert matches == []
 
 
+def test_near_duplicate_of_current_question_is_excluded() -> None:
+    query = build_style_retrieval_query(current_text="阿渣最近在看哪些动画")
+    echoed_question = _document(
+        "echo",
+        situation="刚才在聊游戏",
+        reply="阿渣最近在看什么动画",
+    )
+    topical_response = _document(
+        "response",
+        situation="最近在看哪些动画",
+        reply="这季我就追了两部",
+    )
+
+    matches = rank_style_examples(
+        query=query,
+        documents=[echoed_question, topical_response],
+        vectors_by_id={"echo": [1.0, 0.0], "response": [0.99, 0.01]},
+        query_vector=[1.0, 0.0],
+        now=NOW,
+    )
+
+    assert [match.document.msg_id for match in matches] == ["response"]
+
+
 def test_embedding_failure_uses_strict_lexical_hit_or_empty() -> None:
     matching_query = build_style_retrieval_query(current_text="今晚打游戏吗")
     unrelated_query = build_style_retrieval_query(current_text="今天工作如何")
