@@ -228,6 +228,91 @@ def test_message_repository_loads_only_bounded_preceding_context(tmp_path) -> No
     ]
 
 
+def test_message_repository_loads_bounded_context_only_from_anchor_episode(tmp_path) -> None:
+    engine = build_engine(tmp_path / "bot.db")
+    create_all(engine)
+    base = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+    with session_scope(engine) as session:
+        groups = GroupRepository(session)
+        users = UserRepository(session)
+        messages = MessageRepository(session)
+        episodes = EpisodeRepository(session)
+        groups.upsert_group(group_id=10001, group_name="test", enabled=True, speak_enabled=True)
+        for user_id in (20001, 20002, 30001):
+            users.upsert_user(user_id=user_id, nickname=str(user_id), group_card="")
+        rows = []
+        for source_id, user_id, minute, state in (
+            ("anchor", 20001, 0, ""),
+            ("question", 20002, 5, ""),
+            ("blocked", 20002, 6, "blocked"),
+            ("answer", 20001, 10, ""),
+            ("other-episode", 20002, 7, ""),
+        ):
+            rows.append(
+                messages.add_group_message(
+                    platform_msg_id=source_id,
+                    group_id=10001,
+                    user_id=user_id,
+                    timestamp=base + timedelta(minutes=minute),
+                    plain_text=source_id,
+                    raw_json={"delivery_state": state} if state else {},
+                    msg_type="text",
+                    reply_to_msg_id=None,
+                    mentioned_bot=False,
+                )
+            )
+        session.flush()
+        first_episode = episodes.create_episode(
+            group_id=10001,
+            start_message_id=rows[0].id,
+            started_at=rows[0].timestamp,
+            segmentation_version="test-v1",
+        )
+        session.flush()
+        for ordinal, row in enumerate(rows[:4]):
+            episodes.add_message(
+                episode_id=first_episode.id,
+                group_id=10001,
+                message_id=row.id,
+                ordinal=ordinal,
+                estimated_tokens=1,
+            )
+        first_episode.status = "closed"
+        first_episode.is_current = False
+        first_episode.ended_at = rows[3].timestamp
+        session.add(first_episode)
+        session.flush()
+        other_episode = episodes.create_episode(
+            group_id=10001,
+            start_message_id=rows[4].id,
+            started_at=rows[4].timestamp,
+            segmentation_version="test-v1:late:1",
+        )
+        session.flush()
+        episodes.add_message(
+            episode_id=other_episode.id,
+            group_id=10001,
+            message_id=rows[4].id,
+            ordinal=0,
+            estimated_tokens=1,
+        )
+
+        loaded = messages.list_bounded_same_episode_message_context(
+            group_id=10001,
+            anchor_platform_msg_ids=["anchor"],
+            per_anchor_limit=12,
+            max_gap_seconds=900,
+            excluded_user_ids={30001},
+        )
+
+    assert [row.platform_msg_id for row in loaded] == [
+        "anchor",
+        "question",
+        "answer",
+    ]
+
+
 def test_message_repository_lists_all_delivered_group_messages_chronologically(tmp_path) -> None:
     engine = build_engine(tmp_path / "bot.db")
     create_all(engine)

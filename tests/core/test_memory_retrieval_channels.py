@@ -106,6 +106,23 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
     )
     assert [hit.document_id for hit in recall("@比企谷小町 加菲猫最近在看什么动画")][:1] == [viewing]
 
+    impersonated_hits = channels["member_reference"](
+        group_id=100,
+        resolved_query=ResolvedMemoryQuery(
+            original_query="最近在看哪些动画",
+            retrieval_query="动画",
+            group_id=100,
+            subject_ids=("300",),
+            subject_binding="impersonated",
+            answer_mode="current_fact",
+            topic_terms=("动画",),
+        ),
+        limit=10,
+    )
+    assert {self_activity, self_activity_two} <= {
+        hit.document_id for hit in impersonated_hits
+    }
+
 
 def _seed_document(
     engine,

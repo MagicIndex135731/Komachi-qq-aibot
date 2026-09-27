@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "synthetic_members": {
+    "persona": 900000101,
+    "requester": 900000102,
+    "other": 900000103,
+    "bot": 900000999
+  },
+  "cases": [
+    {
+      "id": "implicit-work-progress-and-company-tendency",
+      "query": "工作找的怎么样了，现在哪个公司概率最大",
+      "addressed": true,
+      "expected_binding": "impersonated",
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "工作",
+        "公司"
+      ],
+      "expected_fact_coverage": "multi_facet",
+      "expected_allowed_kinds": [
+        "current",
+        "event",
+        "plan",
+        "decision",
+        "relationship",
+        "profile"
+      ],
+      "must_include_source_ids": [
+        "source-progress",
+        "source-stage",
+        "source-tendency",
+        "source-confirmation"
+      ],
+      "must_exclude_source_ids": [
+        "source-other-member",
+        "source-expired-state"
+      ],
+      "answer_must_not_claim": [
+        "numeric_probability",
+        "final_offer",
+        "employment_outcome"
+      ]
+    },
+    {
+      "id": "implicit-plural-animation",
+      "query": "最近在看哪些动画",
+      "addressed": true,
+      "expected_binding": "impersonated",
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "动画"
+      ],
+      "expected_fact_coverage": "plural",
+      "expected_allowed_kinds": [
+        "current",
+        "event"
+      ],
+      "must_include_source_ids": [
+        "source-anime-a",
+        "source-anime-b"
+      ],
+      "must_exclude_source_ids": [
+        "source-discussion-only"
+      ]
+    },
+    {
+      "id": "implicit-thesis-process",
+      "query": "论文写得怎么样了",
+      "addressed": true,
+      "expected_binding": "impersonated",
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "论文"
+      ],
+      "expected_fact_coverage": "multi_facet",
+      "expected_allowed_kinds": [
+        "current",
+        "event",
+        "plan",
+        "decision",
+        "relationship",
+        "profile"
+      ]
+    },
+    {
+      "id": "general-advice-does-not-bind",
+      "query": "怎么找工作",
+      "addressed": true,
+      "expected_binding": "unbound"
+    },
+    {
+      "id": "external-company-assessment-does-not-bind",
+      "query": "华为怎么样",
+      "addressed": true,
+      "expected_binding": "unbound"
+    },
+    {
+      "id": "group-summary-does-not-bind",
+      "query": "昨天群里聊了什么",
+      "addressed": true,
+      "expected_binding": "unbound"
+    },
+    {
+      "id": "unaddressed-implicit-process-does-not-bind",
+      "query": "最近工作咋样",
+      "addressed": false,
+      "expected_binding": "unbound"
+    },
+    {
+      "id": "second-person-animation",
+      "query": "你最近在看什么动画",
+      "addressed": true,
+      "expected_binding": "impersonated",
+      "expected_subject_ids": [
+        "900000101"
+      ],
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "动画"
+      ],
+      "expected_fact_coverage": "single",
+      "expected_allowed_kinds": [
+        "current",
+        "event"
+      ]
+    },
+    {
+      "id": "explicit-other-member-process",
+      "query": "示例成员最近工作咋样",
+      "addressed": true,
+      "expected_binding": "explicit",
+      "expected_subject_ids": [
+        "900000103"
+      ],
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "工作"
+      ]
+    },
+    {
+      "id": "requester-first-person-process",
+      "query": "我最近工作咋样",
+      "addressed": true,
+      "expected_binding": "requester",
+      "expected_subject_ids": [
+        "900000102"
+      ],
+      "expected_answer_mode": "current_fact",
+      "topic_contains": [
+        "工作"
+      ]
+    },
+    {
+      "id": "unknown-person-fails-closed",
+      "query": "陌生成员最近工作咋样",
+      "addressed": true,
+      "expected_binding": "explicit",
+      "expected_subject_ids": [],
+      "expected_answer_mode": "current_fact"
+    },
+    {
+      "id": "bot-identity-does-not-load-person-memory",
+      "query": "你是谁",
+      "addressed": true,
+      "expected_binding": "unbound",
+      "expected_subject_ids": null,
+      "expected_subject_role": "bot"
+    }
+  ],
+  "clarification_cases": [
+    {
+      "id": "bounded-company-short-answer",
+      "anchor_source_ids": [
+        "source-answer"
+      ],
+      "messages": [
+        {
+          "source_msg_id": "source-anchor",
+          "user_id": "900000101",
+          "offset_seconds": 0,
+          "content": "我现在主要考虑两家公司"
+        },
+        {
+          "source_msg_id": "source-question",
+          "user_id": "900000103",
+          "offset_seconds": 20,
+          "content": "哪家？"
+        },
+        {
+          "source_msg_id": "source-answer",
+          "user_id": "900000101",
+          "offset_seconds": 40,
+          "content": "星河科技"
+        }
+      ],
+      "expected_atomic_groups": [
+        [
+          "source-anchor",
+          "source-question",
+          "source-answer"
+        ]
+      ]
+    },
+    {
+      "id": "competing-short-answer-is-rejected",
+      "anchor_source_ids": [
+        "source-conflicted-answer"
+      ],
+      "messages": [
+        {
+          "source_msg_id": "source-conflicted-anchor",
+          "user_id": "900000101",
+          "offset_seconds": 0,
+          "content": "我现在主要考虑两家公司"
+        },
+        {
+          "source_msg_id": "source-conflicted-question",
+          "user_id": "900000103",
+          "offset_seconds": 20,
+          "content": "哪家？"
+        },
+        {
+          "source_msg_id": "source-other-answer",
+          "user_id": "900000102",
+          "offset_seconds": 30,
+          "content": "另一家公司"
+        },
+        {
+          "source_msg_id": "source-conflicted-answer",
+          "user_id": "900000101",
+          "offset_seconds": 40,
+          "content": "星河科技"
+        }
+      ],
+      "expected_atomic_groups": []
+    }
+  ]
+}

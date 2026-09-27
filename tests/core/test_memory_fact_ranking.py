@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app.core.memory_fact_ranking import (
     PERSON_PORTRAIT_KINDS,
+    fact_intent_policy,
     fact_kinds_for_query,
     filter_member_query_features,
     is_composite_portrait_query,
@@ -17,6 +18,7 @@ from app.core.memory_fact_ranking import (
     select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
+    viewing_fallback_match_ids,
 )
 
 
@@ -53,6 +55,29 @@ def test_recent_viewing_event_fallback_requires_explicit_recent_viewing() -> Non
         last_seen_at=datetime(2026, 9, 22, tzinfo=UTC),
     )
     assert not prefer_recent_viewing_event(watched, matched_current=[newer_current])
+
+
+def test_plural_viewing_fallback_does_not_collapse_unmatched_candidates() -> None:
+    viewing_event = _fact(3, "该成员看完了《示例动画》。", memory_kind="event")
+
+    assert viewing_fallback_match_ids(
+        set(), viewing_event=viewing_event, coverage="plural"
+    ) == set()
+    assert viewing_fallback_match_ids(
+        {1, 2}, viewing_event=viewing_event, coverage="plural"
+    ) == {1, 2, 3}
+    assert viewing_fallback_match_ids(
+        {1, 2}, viewing_event=viewing_event, coverage="single"
+    ) == {3}
+
+
+def test_question_slot_features_bridge_different_clarification_wording() -> None:
+    features = memory_query_features(
+        query="现在哪个公司概率最大",
+        intent_query="现在哪个公司概率最大",
+    )
+
+    assert {"哪家", "哪个", "哪些", "什么"}.issubset(set(features))
 
 
 def _fact(
@@ -142,6 +167,45 @@ def test_fact_kinds_for_query_isolates_dynamic_intents() -> None:
         query="介绍一下阿渣",
         answer_mode="current_fact",
     ) == PERSON_PORTRAIT_KINDS
+
+
+def test_temporal_process_policy_preserves_all_time_bearing_fact_kinds() -> None:
+    policy = fact_intent_policy(
+        query="工作找的怎么样了，现在哪个公司概率最大",
+        answer_mode="current_fact",
+    )
+
+    assert policy.allowed_kinds == (
+        "current",
+        "event",
+        "plan",
+        "decision",
+        "relationship",
+        "profile",
+    )
+    assert policy.coverage == "multi_facet"
+    assert policy.reason == "temporal_process"
+
+
+def test_plural_current_viewing_policy_requests_multiple_items() -> None:
+    policy = fact_intent_policy(
+        query="最近在看哪些动画",
+        answer_mode="current_fact",
+    )
+
+    assert policy.allowed_kinds == ("current", "event")
+    assert policy.coverage == "plural"
+
+
+def test_reverse_order_plural_viewing_policy_stays_narrow() -> None:
+    policy = fact_intent_policy(
+        query="现在哪些作品在看",
+        answer_mode="current_fact",
+    )
+
+    assert policy.allowed_kinds == ("current", "event")
+    assert policy.coverage == "plural"
+    assert policy.reason == "current_viewing"
 
 
 def test_composite_portrait_query_is_distinct_from_single_attribute_query() -> None:
@@ -443,3 +507,36 @@ def test_broad_temporal_current_fact_keeps_multiple_recent_activities() -> None:
     )
 
     assert [fact.id for fact in selected] == [3, 2]
+
+
+def test_multi_facet_temporal_selection_keeps_distinct_progress_facets() -> None:
+    current = _fact(
+        3,
+        "用户目前同时推进三家公司",
+        predicate="候选流程",
+        memory_kind="current",
+        last_seen_at=datetime(2026, 9, 23, tzinfo=UTC),
+    )
+    relationship = _fact(
+        4,
+        "用户已经进入某公司的二面",
+        predicate="面试阶段",
+        memory_kind="relationship",
+        last_seen_at=datetime(2026, 9, 24, tzinfo=UTC),
+    )
+    decision = _fact(
+        2,
+        "用户认为另一家公司方向最好",
+        predicate="公司倾向",
+        memory_kind="decision",
+        last_seen_at=datetime(2026, 9, 23, tzinfo=UTC),
+    )
+
+    selected = select_temporal_current_facts(
+        (relationship, current, decision),
+        matching_fact_ids={2, 3, 4},
+        topic_specific=True,
+        coverage="multi_facet",
+    )
+
+    assert [fact.id for fact in selected] == [4, 3, 2]

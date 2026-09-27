@@ -20,9 +20,13 @@ from app.core.memory_context_packer import (
 )
 from app.core.memory_eligibility import eligible, eligible_context
 from app.core.hybrid_memory_retriever import HybridRetrievalResult, MemoryScopeViolation
-from app.core.memory_fact_ranking import temporal_recency_required
+from app.core.memory_fact_ranking import fact_intent_policy, temporal_recency_required
 from app.core.memory_orchestrator import MemoryContextResult
-from app.core.memory_query_resolver import RecentMemoryMessage, ResolvedMemoryQuery
+from app.core.memory_query_resolver import (
+    RecentMemoryMessage,
+    ResolvedMemoryQuery,
+    has_bound_member_subject,
+)
 from app.core.member_identity import GroupMemberIdentity
 
 _PROFILE_MARKERS = ("画像", "介绍", "是什么样的人", "哪里人", "做什么的")
@@ -52,6 +56,7 @@ class QueryResolver(Protocol):
         group_id: int | None = None,
         requester_id: int | None = None,
         impersonated_subject_id: int | None = None,
+        impersonated_subject_addressed: bool | None = None,
         addressed_bot_user_id: int | None = None,
     ) -> ResolvedMemoryQuery: ...
 
@@ -81,6 +86,7 @@ class MemoryV2Request:
     available_input: int
     now: datetime | None = None
     impersonated_subject_id: int | None = None
+    impersonated_subject_addressed: bool | None = None
     bot_user_id: int | None = None
 
 
@@ -163,6 +169,7 @@ class MemoryV2ContextProvider:
             "group_id": request.group_id,
             "requester_id": getattr(request, "current_user_id", None),
             "impersonated_subject_id": request.impersonated_subject_id,
+            "impersonated_subject_addressed": request.impersonated_subject_addressed,
             "addressed_bot_user_id": request.bot_user_id,
             "excluded_member_ids": frozenset(
                 {
@@ -179,6 +186,36 @@ class MemoryV2ContextProvider:
             resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
         resolve_started = perf_counter()
         resolved = self._resolver.resolve(request.query, **resolve_kwargs)
+        fact_policy = fact_intent_policy(
+            query=str(resolved.original_query or ""),
+            answer_mode=resolved.answer_mode,
+        )
+        subject_reason = str(resolved.subject_decision_reason or "")
+        if not subject_reason:
+            subject_reason = {
+                "explicit": "explicit_member",
+                "requester": "requester",
+                "impersonated": "impersonated",
+            }.get(resolved.subject_binding, "")
+        if not subject_reason and resolved.subject_role == "bot":
+            subject_reason = "bot_identity"
+        if not subject_reason and resolved.subject_role == "group":
+            subject_reason = "group_scope"
+        if not subject_reason and resolved.subject_ids == ():
+            subject_reason = "unknown_person"
+        if not subject_reason:
+            subject_reason = "unbound_general"
+        resolved = replace(
+            resolved,
+            preferred_fact_kinds=(
+                tuple(resolved.preferred_fact_kinds)
+                or fact_policy.preferred_kinds
+            ),
+            allowed_fact_kinds=fact_policy.allowed_kinds,
+            fact_coverage=fact_policy.coverage,
+            fact_policy_reason=fact_policy.reason,
+            subject_decision_reason=subject_reason,
+        )
         resolve_ms = (perf_counter() - resolve_started) * 1000
         retrieval_started = perf_counter()
         if self._should_skip_retrieval(resolved):
@@ -384,6 +421,10 @@ class MemoryV2ContextProvider:
             resolved_answer_mode=resolved.answer_mode,
             resolved_subject_ids=resolved.subject_ids,
             resolved_subject_binding=resolved.subject_binding,
+            resolved_subject_decision_reason=resolved.subject_decision_reason,
+            resolved_personal_memory_intent=resolved.personal_memory_intent,
+            resolved_fact_coverage=resolved.fact_coverage,
+            resolved_fact_policy_reason=resolved.fact_policy_reason,
         )
         total_ms = (perf_counter() - evaluation_started) * 1000
         if self._observability_route:
@@ -393,14 +434,29 @@ class MemoryV2ContextProvider:
             eligible_source_count = sum(
                 len(segment.messages) for segment in segments
             )
+            atomic_evidence_block_count = sum(
+                len(segment.atomic_source_groups) for segment in expanded_segments
+            )
+            clarification_link_count = sum(
+                int(getattr(segment, "clarification_thread_count", 0))
+                for segment in expanded_segments
+            )
+            direct_subject_authored_source_count = len(
+                tuple(getattr(packed, "direct_current_source_ids", ()) or ())
+            )
             logger.info(
                 "memory_query_metrics route=%s group_id=%s answer_mode=%s "
-                "coverage=%s subject_binding=%s has_subject=%s subject_ambiguous=%s has_time=%s "
+                "coverage=%s persona_candidate=%s persona_addressed=%s "
+                "subject_binding=%s subject_reason=%s personal_memory_intent=%s "
+                "has_subject=%s subject_ambiguous=%s has_time=%s "
                 "topic_extraction=%s topic_terms=%s "
+                "fact_coverage=%s fact_policy=%s allowed_fact_kinds=%s preferred_fact_kinds=%s "
                 "adaptive_enabled=%s expansion_mode=%s expansion_reasons=%s "
                 "attempted_channels=%s failed_channels=%s channel_counts=%s "
                 "pin_counts=%s pin_overflow=%s "
                 "candidate_units=%s expanded_sources=%s rejected_sources=%s "
+                "atomic_evidence_blocks=%s clarification_links=%s "
+                "direct_subject_authored_sources=%s "
                 "selected_source_count=%s recent_messages=%s history_messages=%s "
                 "selected_facts=%s selected_segments=%s selected_summaries=%s "
                 "suppressed_retrospective_facts=%s "
@@ -412,12 +468,20 @@ class MemoryV2ContextProvider:
                 request.group_id,
                 resolved.answer_mode,
                 resolved.coverage_mode,
+                request.impersonated_subject_id is not None,
+                request.impersonated_subject_addressed,
                 resolved.subject_binding,
+                resolved.subject_decision_reason or "unspecified",
+                resolved.personal_memory_intent,
                 resolved.subject_ids is not None,
                 resolved.subject_ids == (),
                 resolved.time_range is not None,
                 resolved.topic_extraction,
                 len(resolved.topic_terms),
+                resolved.fact_coverage,
+                resolved.fact_policy_reason,
+                len(resolved.allowed_fact_kinds),
+                len(resolved.preferred_fact_kinds),
                 self._adaptive_context_enabled,
                 expansion_mode,
                 json.dumps(list(expansion_reasons), separators=(",", ":")),
@@ -447,6 +511,9 @@ class MemoryV2ContextProvider:
                 len(candidates),
                 expanded_source_count,
                 max(0, expanded_source_count - eligible_source_count),
+                atomic_evidence_block_count,
+                clarification_link_count,
+                direct_subject_authored_source_count,
                 len(packed.source_msg_ids),
                 len(packed.recent_messages),
                 sum(len(segment.messages) for segment in packed.evidence_segments),
@@ -694,8 +761,7 @@ class MemoryV2ContextProvider:
         unchanged = (tuple(segments), tuple(facts))
         if (
             resolved.answer_mode != "current_fact"
-            or resolved.subject_binding != "explicit"
-            or not resolved.subject_ids
+            or not has_bound_member_subject(resolved)
             or not temporal_recency_required(query=resolved.original_query)
         ):
             return unchanged

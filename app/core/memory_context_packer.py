@@ -149,6 +149,7 @@ class EvidenceSegment:
     hit_source_msg_ids: tuple[str, ...] = ()
     document_id: str | None = None
     atomic_source_groups: tuple[tuple[str, ...], ...] = ()
+    clarification_thread_count: int = 0
     pinned: bool = False
     blocked_output_present: bool = False
 

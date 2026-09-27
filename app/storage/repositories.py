@@ -871,6 +871,103 @@ class MessageRepository:
             key=lambda row: (row.timestamp, int(row.id)),
         )
 
+    def list_bounded_same_episode_message_context(
+        self,
+        *,
+        group_id: int,
+        anchor_platform_msg_ids: list[str],
+        per_anchor_limit: int = 12,
+        max_gap_seconds: int = 900,
+        excluded_user_ids: set[int] | None = None,
+    ) -> list[Message]:
+        """Load a bounded before/after window from each anchor's own episode.
+
+        This loader intentionally returns raw scoped rows only.  The pure
+        clarification-thread resolver decides whether any three rows form an
+        unambiguous statement/question/short-answer unit.
+        """
+
+        if per_anchor_limit < 1 or max_gap_seconds < 1:
+            raise ValueError("context limits must be positive")
+        anchor_ids = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in anchor_platform_msg_ids
+                if str(item).strip()
+            )
+        )
+        if not anchor_ids:
+            return []
+        anchor_memberships = tuple(
+            self.session.execute(
+                select(Message, EpisodeMessage.episode_id)
+                .join(
+                    EpisodeMessage,
+                    (EpisodeMessage.message_id == Message.id)
+                    & (EpisodeMessage.group_id == Message.group_id),
+                )
+                .where(
+                    Message.group_id == int(group_id),
+                    EpisodeMessage.group_id == int(group_id),
+                    Message.platform_msg_id.in_(anchor_ids),
+                )
+            )
+        )
+        anchors_by_source: dict[str, list[tuple[Message, int]]] = {}
+        for anchor, episode_id in anchor_memberships:
+            anchors_by_source.setdefault(str(anchor.platform_msg_id), []).append(
+                (anchor, int(episode_id))
+            )
+        excluded = {int(value) for value in (excluded_user_ids or set())}
+        selected: dict[int, Message] = {}
+        for source_id in anchor_ids:
+            memberships = anchors_by_source.get(source_id, [])
+            # A source associated with zero or multiple episodes has no safe
+            # conversational boundary for implicit clarification linking.
+            if len(memberships) != 1:
+                continue
+            anchor, episode_id = memberships[0]
+            anchor_time = _normalize_utc_sqlite_timestamp(anchor.timestamp)
+            stmt = (
+                select(Message)
+                .join(
+                    EpisodeMessage,
+                    (EpisodeMessage.message_id == Message.id)
+                    & (EpisodeMessage.group_id == Message.group_id),
+                )
+                .where(
+                    Message.group_id == int(group_id),
+                    EpisodeMessage.group_id == int(group_id),
+                    EpisodeMessage.episode_id == int(episode_id),
+                    Message.timestamp
+                    >= anchor_time - timedelta(seconds=max_gap_seconds),
+                    Message.timestamp
+                    <= anchor_time + timedelta(seconds=max_gap_seconds),
+                    ~func.coalesce(
+                        func.json_extract(Message.raw_json, "$.delivery_state"),
+                        "",
+                    ).in_(_INELIGIBLE_DELIVERY_STATES),
+                )
+                .order_by(
+                    func.abs(
+                        func.julianday(Message.timestamp)
+                        - func.julianday(anchor_time)
+                    ).asc(),
+                    Message.id.asc(),
+                )
+                .limit(int(per_anchor_limit) * 2 + 1)
+            )
+            if excluded:
+                stmt = stmt.where(Message.user_id.not_in(excluded))
+            for row in self.session.scalars(stmt):
+                if self.is_qq_blocked_outbound(row):
+                    continue
+                selected.setdefault(int(row.id), row)
+        return sorted(
+            selected.values(),
+            key=lambda row: (row.timestamp, int(row.id)),
+        )
+
     def is_late_group_message(
         self,
         *,

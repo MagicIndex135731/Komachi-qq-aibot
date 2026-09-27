@@ -10,6 +10,7 @@ from app.core.hybrid_memory_retriever import (
     MemoryScopeViolation,
 )
 from app.core.memory_context_packer import EvidenceMessage, EvidenceSegment
+from app.core.memory_clarification_threads import resolve_clarification_threads
 
 
 ExpansionMode = Literal["normal", "detail"]
@@ -32,6 +33,7 @@ class MemoryEvidenceExpander:
         episode_loader: EpisodeLoader,
         source_loader: SourceLoader | None = None,
         context_loader: ContextLoader | None = None,
+        thread_context_loader: ContextLoader | None = None,
         normal_radius: int = 5,
         detail_radius: int = 10,
         normal_segment_limit: int = 4,
@@ -39,16 +41,23 @@ class MemoryEvidenceExpander:
         max_reply_depth: int = 2,
         context_radius: int = 2,
         context_max_gap_seconds: int = 120,
+        clarification_turn_limit: int = 12,
+        clarification_max_gap_seconds: int = 900,
     ) -> None:
         if min(normal_radius, detail_radius, max_reply_depth, context_radius) < 0:
             raise ValueError("expansion radii and reply depth cannot be negative")
-        if context_max_gap_seconds < 1:
+        if min(
+            context_max_gap_seconds,
+            clarification_turn_limit,
+            clarification_max_gap_seconds,
+        ) < 1:
             raise ValueError("context max gap must be positive")
         if min(normal_segment_limit, detail_segment_limit) <= 0:
             raise ValueError("segment limits must be positive")
         self._episode_loader = episode_loader
         self._source_loader = source_loader
         self._context_loader = context_loader
+        self._thread_context_loader = thread_context_loader
         self._radii = {"normal": normal_radius, "detail": detail_radius}
         self._limits = {
             "normal": normal_segment_limit,
@@ -57,6 +66,8 @@ class MemoryEvidenceExpander:
         self._max_reply_depth = max_reply_depth
         self._context_radius = context_radius
         self._context_max_gap_seconds = context_max_gap_seconds
+        self._clarification_turn_limit = clarification_turn_limit
+        self._clarification_max_gap_seconds = clarification_max_gap_seconds
 
     def expand(
         self,
@@ -76,6 +87,7 @@ class MemoryEvidenceExpander:
         for candidate in selected_candidates:
             if candidate.episode_id is None:
                 segment = self._expand_loaded_source_document(
+                    group_id=group_id,
                     candidate=candidate,
                     loaded_by_id=raw_sources,
                 )
@@ -283,6 +295,7 @@ class MemoryEvidenceExpander:
                 f"unverified raw provenance document_id={candidate.document_id}"
             )
         return self._expand_loaded_source_document(
+            group_id=group_id,
             candidate=candidate,
             loaded_by_id=by_id,
         )
@@ -290,6 +303,7 @@ class MemoryEvidenceExpander:
     def _expand_loaded_source_document(
         self,
         *,
+        group_id: int,
         candidate: FusedRetrievalCandidate,
         loaded_by_id: dict[str, EvidenceMessage],
     ) -> EvidenceSegment | None:
@@ -307,6 +321,7 @@ class MemoryEvidenceExpander:
             if row.reply_to_msg_id in hit_ids
         )
         atomic_groups: list[tuple[str, ...]] = []
+        clarification_thread_count = 0
         if "member_reference" in candidate.routes and self._context_radius > 0:
             ordered_rows = tuple(
                 sorted(
@@ -328,6 +343,56 @@ class MemoryEvidenceExpander:
                 context_ids = tuple(row.source_msg_id for row in preceding)
                 selected_ids.update(context_ids)
                 atomic_groups.append((*context_ids, hit_id))
+
+            # Load and resolve each hit independently.  The repository loader
+            # guarantees that one call returns rows from the anchor's episode;
+            # batching multiple anchors here would erase that boundary and
+            # could synthesize a thread across adjacent episodes.
+            if self._thread_context_loader is not None:
+                for hit_id in hit_ids:
+                    thread_rows = tuple(
+                        self._thread_context_loader(
+                            group_id=group_id,
+                            source_msg_ids=(hit_id,),
+                            limit_per_source=self._clarification_turn_limit,
+                            max_gap_seconds=self._clarification_max_gap_seconds,
+                        )
+                    )
+                    if (
+                        len({row.source_msg_id for row in thread_rows})
+                        != len(thread_rows)
+                        or any(
+                            row.group_id is None
+                            or int(row.group_id) != int(group_id)
+                            for row in thread_rows
+                        )
+                    ):
+                        raise MemoryScopeViolation(
+                            "unverified clarification context provenance"
+                        )
+                    rows_by_id = {row.source_msg_id: row for row in thread_rows}
+                    threads = resolve_clarification_threads(
+                        thread_rows,
+                        anchor_source_ids=(hit_id,),
+                        max_turns=self._clarification_turn_limit,
+                        max_gap_seconds=self._clarification_max_gap_seconds,
+                    )
+                    for thread in threads:
+                        for source_id in thread.source_msg_ids:
+                            row = rows_by_id.get(source_id)
+                            if row is None:
+                                raise MemoryScopeViolation(
+                                    "clarification thread lost source provenance"
+                                )
+                            existing = loaded_by_id.get(source_id)
+                            if existing is not None and existing != row:
+                                raise MemoryScopeViolation(
+                                    "conflicting clarification source provenance"
+                                )
+                            loaded_by_id[source_id] = row
+                        selected_ids.update(thread.source_msg_ids)
+                        atomic_groups.append(thread.source_msg_ids)
+                    clarification_thread_count += len(threads)
 
         blocked_output_present = any(
             loaded_by_id[source_id].blocked for source_id in selected_ids
@@ -351,6 +416,7 @@ class MemoryEvidenceExpander:
             hit_source_msg_ids=hit_ids,
             document_id=str(candidate.document_id),
             atomic_source_groups=tuple(atomic_groups),
+            clarification_thread_count=clarification_thread_count,
             pinned=bool(
                 candidate.pinned
                 or {"exact_quote", "reply_graph"}.intersection(candidate.routes)

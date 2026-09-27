@@ -18,16 +18,19 @@ def item(
     reply_to: str | None = None,
     is_bot: bool = False,
     blocked: bool = False,
+    user_id: int | None = 10,
+    content: str | None = None,
 ) -> EvidenceMessage:
     return EvidenceMessage(
         source_msg_id=identifier,
         speaker="bot" if is_bot else "member",
-        content=f"text-{identifier}",
+        content=content if content is not None else f"text-{identifier}",
         sent_at=datetime(2026, 7, 23, tzinfo=UTC) + timedelta(minutes=offset),
         blocked=blocked,
         group_id=group_id,
         reply_to_msg_id=reply_to,
         is_bot=is_bot,
+        user_id=user_id,
     )
 
 
@@ -320,3 +323,224 @@ def test_non_member_raw_hit_does_not_request_conversation_context() -> None:
 
     assert calls == []
     assert tuple(message.source_msg_id for message in segment.messages) == ("hit",)
+
+
+def test_member_reference_links_bounded_clarification_thread_atomically() -> None:
+    rows = (
+        item("anchor", 0, user_id=30, content="我这边已经有一个大保底了"),
+        item("noise", 3, user_id=30, content="面"),
+        item("question", 9, user_id=20, content="大保底了哪家？"),
+        item("guess", 10, user_id=40, content="示例公司"),
+        item("answer", 13, user_id=30, content="示例公司"),
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (rows[0],),
+        context_loader=lambda **_: (),
+        thread_context_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("anchor",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == (
+        "anchor",
+        "question",
+        "answer",
+    )
+    assert ("anchor", "question", "answer") in segment.atomic_source_groups
+
+
+def test_clarification_thread_rejects_conflicting_third_party_answer() -> None:
+    rows = (
+        item("anchor", 0, user_id=30, content="我这边已经有一个大保底了"),
+        item("question", 5, user_id=20, content="大保底了哪家？"),
+        item("conflict", 6, user_id=40, content="另一家公司"),
+        item("answer", 7, user_id=30, content="示例公司"),
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (rows[0],),
+        context_loader=lambda **_: (),
+        thread_context_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("anchor",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == ("anchor",)
+    assert ("anchor", "question", "answer") not in segment.atomic_source_groups
+
+
+def test_clarification_question_cue_selects_unique_matching_anchor() -> None:
+    rows = (
+        item("anchor", 0, user_id=30, content="我这边已经有一个大保底了"),
+        item("unrelated-a", 3, user_id=30, content="刚吃完饭准备回去"),
+        item("unrelated-b", 5, user_id=30, content="路上还挺凉快"),
+        item("question", 8, user_id=20, content="大保底了哪家？"),
+        item("guess", 9, user_id=40, content="示例公司"),
+        item("answer", 12, user_id=30, content="示例公司"),
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (rows[0],),
+        context_loader=lambda **_: (),
+        thread_context_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("anchor",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == (
+        "anchor",
+        "question",
+        "answer",
+    )
+    assert ("anchor", "question", "answer") in segment.atomic_source_groups
+
+
+def test_clarification_thread_rejects_multiple_possible_anchors() -> None:
+    rows = (
+        item("older-anchor", 0, user_id=30, content="我已经拿到一个明确结果了"),
+        item("newer-anchor", 1, user_id=30, content="我还在同时推进另一个选择"),
+        item("question", 2, user_id=20, content="哪家？"),
+        item("answer", 3, user_id=30, content="示例公司"),
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (rows[0],),
+        context_loader=lambda **_: (),
+        thread_context_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("older-anchor",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == (
+        "older-anchor",
+    )
+    assert segment.atomic_source_groups == ()
+
+
+@pytest.mark.parametrize("unsafe_kind", ("blocked_answer", "bot_question", "timeout"))
+def test_clarification_thread_rejects_unsafe_or_unbounded_rows(
+    unsafe_kind: str,
+) -> None:
+    question = item("question", 1, user_id=20, content="哪家？")
+    answer = item("answer", 2, user_id=30, content="示例公司")
+    if unsafe_kind == "blocked_answer":
+        answer = replace(answer, blocked=True)
+    elif unsafe_kind == "bot_question":
+        question = replace(question, is_bot=True)
+    else:
+        answer = item("answer", 17, user_id=30, content="示例公司")
+    rows = (
+        item("anchor", 0, user_id=30, content="我已经有一个明确结果了"),
+        question,
+        answer,
+    )
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **_: (rows[0],),
+        context_loader=lambda **_: (),
+        thread_context_loader=lambda **_: rows,
+    )
+    raw_candidate = replace(
+        candidate(("anchor",), episode_id=None),
+        document_kind="raw_message_v3",
+        routes=("member_reference",),
+        route_ranks=(("member_reference", 1),),
+    )
+
+    segment = expander.expand(
+        group_id=100,
+        candidates=(raw_candidate,),
+        mode="normal",
+    )[0]
+
+    assert tuple(message.source_msg_id for message in segment.messages) == ("anchor",)
+    assert segment.atomic_source_groups == ()
+
+
+def test_clarification_loader_preserves_each_anchor_episode_boundary() -> None:
+    calls: list[tuple[str, ...]] = []
+    sources = {
+        "anchor-a": item("anchor-a", 0, user_id=30, content="我有一个结果"),
+        "anchor-b": item("anchor-b", 30, user_id=40, content="我也有一个结果"),
+    }
+
+    def load_threads(*, source_msg_ids, **_kwargs):
+        calls.append(tuple(source_msg_ids))
+        anchor = source_msg_ids[0]
+        row = sources[anchor]
+        return (
+            row,
+            item(f"question-{anchor}", 1 if anchor == "anchor-a" else 31, user_id=20, content="哪家？"),
+            item(f"answer-{anchor}", 2 if anchor == "anchor-a" else 32, user_id=row.user_id, content=f"答案-{anchor}"),
+        )
+
+    expander = MemoryEvidenceExpander(
+        episode_loader=lambda **_: (),
+        source_loader=lambda **kwargs: tuple(
+            sources[source_id] for source_id in kwargs["source_msg_ids"]
+        ),
+        context_loader=lambda **_: (),
+        thread_context_loader=load_threads,
+        normal_segment_limit=2,
+    )
+    candidates = tuple(
+        replace(
+            candidate((source_id,), episode_id=None),
+            document_id=f"doc-{source_id}",
+            document_kind="raw_message_v3",
+            routes=("member_reference",),
+            route_ranks=(("member_reference", 1),),
+        )
+        for source_id in ("anchor-a", "anchor-b")
+    )
+
+    segments = expander.expand(group_id=100, candidates=candidates, mode="normal")
+
+    assert calls == [("anchor-a",), ("anchor-b",)]
+    assert segments[0].atomic_source_groups == (
+        ("anchor-a", "question-anchor-a", "answer-anchor-a"),
+    )
+    assert segments[1].atomic_source_groups == (
+        ("anchor-b", "question-anchor-b", "answer-anchor-b"),
+    )

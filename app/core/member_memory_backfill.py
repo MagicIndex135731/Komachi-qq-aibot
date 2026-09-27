@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Mapping, Sequence
 
 import yaml
 from zoneinfo import ZoneInfo
@@ -17,14 +18,42 @@ from app.core.message_mentions import (
     collect_bot_display_names,
     message_mentions_bot,
 )
+from app.core.memory_clarification_threads import resolve_clarification_threads
+from app.core.memory_context_packer import EvidenceMessage
 from app.core.worker_status import write_worker_status
 from app.providers.llm_client import LlmClient
 from app.storage.db import session_scope
 from app.storage.models import MemberFactRefreshState, MemoryItem
-from app.storage.repositories import MemoryRepository
+from app.storage.repositories import MemoryRepository, MessageRepository
 
 
 logger = logging.getLogger(__name__)
+
+
+_TEMPORAL_PROCESS_EVALUATION = re.compile(
+    r"(?:目前|现在|当前|眼下|手上).{0,48}"
+    r"(?:流程|候选|方向|方案|选择|机会|公司|岗位|项目).{0,48}"
+    r"(?:最好|更好|优先|倾向|更可能|概率|保底)|"
+    r"(?:流程|候选|方向|方案|选择|机会|公司|岗位|项目).{0,48}"
+    r"(?:最好|更好|优先|倾向|更可能|概率|保底).{0,24}"
+    r"(?:目前|现在|当前|眼下|手上)"
+)
+
+
+def _normalize_extracted_fact_kind(
+    kind: str,
+    *,
+    evidence: str,
+    fact_text: str,
+) -> str:
+    """Correct provider drift for a time-scoped comparison of alternatives."""
+
+    normalized = str(kind or "fact").strip()
+    if normalized != "preference":
+        return normalized
+    if _TEMPORAL_PROCESS_EVALUATION.search(f"{evidence} {fact_text}"):
+        return "decision"
+    return normalized
 
 
 _FACT_PROMPT = (
@@ -35,6 +64,12 @@ _FACT_PROMPT = (
     ' "context_evidence": ["仅在用于消歧时逐字引用相邻上下文"]}]}。'
     "要求：只提取能直接推断的事实；明确陈述正在/最近在看、玩、做、学或所处状态时用 current，"
     "明确陈述一次已发生的活动用 event，打算/准备/计划和已作决定分别用 plan/decision；"
+    "preference 只用于相对稳定的喜好；如果发言是在比较当前流程、候选、方向、方案或机会，"
+    "并表达现阶段哪个更好、更可能、优先或更倾向，应使用 decision（必要时另提 current），"
+    "不能把这种带时点的过程判断只写成 durable preference；"
+    "同一句目标发言可能同时表达多个独立切面，例如当前阶段、已经发生的里程碑、"
+    "关系和明确倾向；必须逐个评估并可输出多条不同 kind 的事实，不能因为先识别出"
+    "relationship 就丢掉同句里的 current/event/decision；每条仍只能写证据直接支持的内容；"
     "不要仅因讨论作品剧情、角色、地点或某个计划，就推断目标成员正在进行、身处其中或已有该计划；"
     "不要从玩笑、反讽、虚构故事或'又失忆了'这类梗里反推事实；"
     "不要把'评价/排行低于某对象'写成'讨厌某对象'，讨厌类事实必须有明确的讨厌/不喜欢表述；"
@@ -77,6 +112,8 @@ def extract_facts_from_lines(
     slice_chars: int = 16000,
     overlap_lines: int = 2,
     context_lines: list[str] | None = None,
+    source_records: Sequence[Mapping[str, object]] | None = None,
+    context_records: Sequence[Mapping[str, object]] | None = None,
 ) -> list[dict]:
     slices = build_slices(
         lines,
@@ -99,10 +136,42 @@ def extract_facts_from_lines(
     )
     facts: list[dict] = []
     for index, lines_slice in enumerate(slices):
-        prompt = _FACT_PROMPT + "\n".join(lines_slice)
-        bounded_context = [str(line).strip() for line in (context_lines or []) if str(line).strip()]
+        source_text = "\n".join(lines_slice)
+        source_line_set = frozenset(lines_slice)
+        normalized_source_records = [
+            dict(record)
+            for record in (source_records or ())
+            if str(record.get("content") or "").strip() in source_line_set
+        ]
+        if normalized_source_records:
+            prompt = _FACT_PROMPT + "\n".join(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                for record in normalized_source_records
+            )
+        else:
+            prompt = _FACT_PROMPT + source_text
+        normalized_context_records = [
+            dict(record)
+            for record in (context_records or ())
+            if str(record.get("content") or "").strip()
+        ]
+        bounded_context = [
+            str(record.get("content") or "").strip()
+            for record in normalized_context_records
+        ] or [
+            str(line).strip()
+            for line in (context_lines or [])
+            if str(line).strip()
+        ]
         if bounded_context:
-            prompt += "\n\n相邻上下文（仅用于消歧）：\n" + "\n".join(bounded_context[:400])
+            if normalized_context_records:
+                rendered_context = "\n".join(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    for record in normalized_context_records[:400]
+                )
+            else:
+                rendered_context = "\n".join(bounded_context[:400])
+            prompt += "\n\n相邻上下文（仅用于消歧）：\n" + rendered_context
         generated = client.generate_text([prompt])
         if not str(generated or "").strip():
             raise ValueError("member fact provider returned empty text")
@@ -118,8 +187,7 @@ def extract_facts_from_lines(
         candidates = data.get("facts") if isinstance(data, dict) else None
         if not isinstance(candidates, list):
             raise ValueError("member fact provider response has no facts list")
-        source_text = "\n".join(lines_slice)
-        context_text = "\n".join(bounded_context)
+        context_evidence_set = frozenset(bounded_context)
         for fact in candidates:
             if not isinstance(fact, dict):
                 continue
@@ -129,7 +197,11 @@ def extract_facts_from_lines(
                 continue
             if evidence not in source_text:
                 continue
-            kind = str(fact.get("kind") or "fact").strip()
+            kind = _normalize_extracted_fact_kind(
+                str(fact.get("kind") or "fact").strip(),
+                evidence=evidence,
+                fact_text=fact_text,
+            )
             if kind not in {
                 "current", "event", "plan", "decision", "preference",
                 "taboo", "profile", "relationship", "fact",
@@ -141,7 +213,7 @@ def extract_facts_from_lines(
             context_evidence = [
                 str(item).strip()
                 for item in raw_context_evidence
-                if str(item).strip() and str(item).strip() in context_text
+                if str(item).strip() and str(item).strip() in context_evidence_set
             ]
             if len(context_evidence) != len(
                 [item for item in raw_context_evidence if str(item).strip()]
@@ -172,16 +244,19 @@ def upsert_member_facts(
     user_id: int,
     facts: list[dict],
     source_message_ids: set[int] | None = None,
+    context_source_message_ids: set[int] | None = None,
 ) -> int:
     imported = 0
     with session_scope(engine) as session:
         repo = MemoryRepository(session)
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for fact in facts:
             fact_text = str(fact.get("fact") or "").strip()
-            if not fact_text or fact_text in seen:
+            kind = str(fact.get("kind") or "fact")
+            seen_key = (kind, fact_text)
+            if not fact_text or seen_key in seen:
                 continue
-            seen.add(fact_text)
+            seen.add(seen_key)
             evidence = str(fact.get("evidence") or "").strip()
             source = _find_source_message(
                 session,
@@ -199,19 +274,18 @@ def upsert_member_facts(
                     group_id=group_id,
                     evidence=str(context_evidence),
                     anchor_message_id=int(source.id),
+                    allowed_message_ids=context_source_message_ids,
                 )
                 if context_source is None:
                     raise ValueError("member fact context source could not be resolved")
                 source_ids.append(str(context_source.platform_msg_id))
             observed_at = source.timestamp
-            kind = str(fact.get("kind") or "fact")
             category = str(fact.get("category") or "fact")
             canonical_key = _member_fact_canonical_key(
                 group_id=group_id,
                 user_id=user_id,
                 kind=kind,
-                category=category,
-                evidence=evidence,
+                source_msg_id=str(source.platform_msg_id),
             )
             memory = repo.upsert_canonical_memory(
                 scope_type="group",
@@ -255,8 +329,6 @@ def upsert_member_facts(
                 }
                 if (
                     str(source.platform_msg_id) in duplicate_sources
-                    and str(duplicate.predicate or "").strip().casefold()
-                    == category.strip().casefold()
                 ):
                     repo.mark_superseded(
                         memory_id=int(duplicate.id),
@@ -272,16 +344,14 @@ def _member_fact_canonical_key(
     group_id: int,
     user_id: int,
     kind: str,
-    category: str,
-    evidence: str,
+    source_msg_id: str,
 ) -> str:
     identity = "\n".join(
         (
             str(int(group_id)),
             str(int(user_id)),
             str(kind).strip().casefold(),
-            str(category).strip().casefold(),
-            " ".join(str(evidence).split()).casefold(),
+            str(source_msg_id).strip(),
         )
     )
     return "member-fact|" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -387,6 +457,7 @@ def _find_context_source_message(
     group_id: int,
     evidence: str,
     anchor_message_id: int | None,
+    allowed_message_ids: set[int] | None = None,
 ):
     from sqlalchemy import select
 
@@ -399,16 +470,25 @@ def _find_context_source_message(
         Message.group_id == int(group_id),
         Message.plain_text == text,
     ]
-    if anchor_message_id is not None:
+    if allowed_message_ids is not None:
+        if not allowed_message_ids:
+            return None
+        filters.append(Message.id.in_(sorted(int(value) for value in allowed_message_ids)))
+    elif anchor_message_id is not None:
         filters.extend(
             (
                 Message.id >= max(1, int(anchor_message_id) - 2),
                 Message.id <= int(anchor_message_id) + 2,
             )
         )
-    return session.scalars(
-        select(Message).where(*filters).order_by(Message.id.desc())
-    ).first()
+    stmt = select(Message).where(*filters)
+    if anchor_message_id is not None:
+        from sqlalchemy import func
+
+        stmt = stmt.order_by(func.abs(Message.id - int(anchor_message_id)), Message.id.desc())
+    else:
+        stmt = stmt.order_by(Message.id.desc())
+    return session.scalars(stmt).first()
 
 
 class MemberFactRefreshService:
@@ -532,21 +612,32 @@ class MemberFactRefreshService:
         }
         if dry_run or not eligible:
             return report
+        context_rows = self._fact_context_rows(
+            group_id=group_id,
+            target_rows=eligible,
+        )
         facts = extract_facts_from_lines(
             self.settings,
             [str(row.plain_text) for row in eligible],
-            context_lines=self._neighbor_context_lines(
-                group_id=group_id,
-                target_rows=eligible,
-            ),
+            source_records=self._fact_prompt_records(eligible, role="target"),
+            context_records=self._fact_prompt_records(context_rows, role="context"),
         )
         facts = review_facts(self.settings, facts)
+        facts.extend(
+            self._clarification_facts_for_targets(
+                group_id=group_id,
+                target_rows=eligible,
+            )
+        )
         imported = upsert_member_facts(
             self.engine,
             group_id=group_id,
             user_id=user_id,
             facts=facts,
             source_message_ids={int(row.id) for row in eligible},
+            context_source_message_ids={
+                int(row.id) for row in (*eligible, *context_rows)
+            },
         )
         report["facts"] = len(facts)
         report["imported"] = int(imported)
@@ -627,21 +718,32 @@ class MemberFactRefreshService:
             )
             return
 
+        context_rows = self._fact_context_rows(
+            group_id=group_id,
+            target_rows=new_lines,
+        )
         facts = extract_facts_from_lines(
             self.settings,
             [str(row.plain_text) for row in new_lines],
-            context_lines=self._neighbor_context_lines(
-                group_id=group_id,
-                target_rows=new_lines,
-            ),
+            source_records=self._fact_prompt_records(new_lines, role="target"),
+            context_records=self._fact_prompt_records(context_rows, role="context"),
         )
         facts = review_facts(self.settings, facts)
+        facts.extend(
+            self._clarification_facts_for_targets(
+                group_id=group_id,
+                target_rows=new_lines,
+            )
+        )
         imported = upsert_member_facts(
             self.engine,
             group_id=group_id,
             user_id=user_id,
             facts=facts,
             source_message_ids={int(row.id) for row in new_lines},
+            context_source_message_ids={
+                int(row.id) for row in (*new_lines, *context_rows)
+            },
         )
         self._commit_refresh_state(
             group_id=group_id,
@@ -658,6 +760,116 @@ class MemberFactRefreshService:
 
     def _neighbor_context_lines(self, *, group_id: int, target_rows) -> list[str]:
         """Load a bounded same-group window used only to disambiguate targets."""
+
+        return [
+            str(row.plain_text)
+            for row in self._neighbor_context_rows(
+                group_id=group_id,
+                target_rows=target_rows,
+            )
+        ]
+
+    def _fact_context_rows(self, *, group_id: int, target_rows) -> list:
+        """Combine local neighbors with verified same-episode clarification questions."""
+
+        rows = self._neighbor_context_rows(
+            group_id=group_id,
+            target_rows=target_rows,
+        )
+        rows.extend(
+            self._clarification_context_rows(
+                group_id=group_id,
+                target_rows=target_rows,
+            )
+        )
+        deduped = {int(row.id): row for row in rows}
+        return [deduped[key] for key in sorted(deduped)]
+
+    def _clarification_facts_for_targets(self, *, group_id: int, target_rows) -> list[dict]:
+        """Materialize verified short answers as source-stable structured facts.
+
+        A terse answer such as ``哇为`` can be meaningful only together with
+        the bounded question and its member-authored anchor.  Preserve that
+        atomic provenance deterministically so offline refresh does not depend
+        on an extractor deciding whether a typo is a company name.
+        """
+
+        if not target_rows:
+            return []
+        facts: list[dict] = []
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            for target in target_rows:
+                anchor_id = str(target.platform_msg_id)
+                rows = messages.list_bounded_same_episode_message_context(
+                    group_id=int(group_id),
+                    anchor_platform_msg_ids=[anchor_id],
+                    per_anchor_limit=12,
+                    max_gap_seconds=900,
+                    excluded_user_ids=self.bot_qqs,
+                )
+                evidence = tuple(
+                    EvidenceMessage(
+                        source_msg_id=str(row.platform_msg_id),
+                        speaker=str(row.user_id),
+                        content=str(row.plain_text or ""),
+                        sent_at=row.timestamp,
+                        blocked=messages.is_qq_blocked_outbound(row),
+                        group_id=(
+                            int(row.group_id) if row.group_id is not None else None
+                        ),
+                        reply_to_msg_id=row.reply_to_msg_id,
+                        is_bot=int(row.user_id) in self.bot_qqs,
+                        user_id=int(row.user_id),
+                        delivery_state=(
+                            str(row.raw_json.get("delivery_state") or "")
+                            .strip()
+                            .casefold()
+                            if isinstance(row.raw_json, dict)
+                            else ""
+                        ),
+                    )
+                    for row in rows
+                )
+                threads = resolve_clarification_threads(
+                    evidence,
+                    anchor_source_ids=(anchor_id,),
+                    max_turns=12,
+                    max_gap_seconds=900,
+                )
+                row_by_source = {str(row.platform_msg_id): row for row in rows}
+                for thread in threads:
+                    if thread.answer_source_id != anchor_id:
+                        continue
+                    question = row_by_source.get(thread.question_source_id)
+                    answer = row_by_source.get(thread.answer_source_id)
+                    if question is None or answer is None:
+                        continue
+                    slot_kind = str(thread.slot_kind or "item")
+                    kind = (
+                        "decision"
+                        if slot_kind in {"company", "item", "place", "person", "count"}
+                        else "fact"
+                    )
+                    facts.append(
+                        {
+                            "kind": kind,
+                            "category": "澄清回答",
+                            "fact": (
+                                f"该成员在被问到“{str(question.plain_text or '').strip()}”时，"
+                                f"回答为“{str(answer.plain_text or '').strip()}”。"
+                            ),
+                            "evidence": str(answer.plain_text or "").strip(),
+                            "context_evidence": [
+                                str(question.plain_text or "").strip(),
+                                str(row_by_source[thread.anchor_source_id].plain_text or "").strip(),
+                            ],
+                        }
+                    )
+        return facts
+
+    def _neighbor_context_rows(self, *, group_id: int, target_rows) -> list:
+        """Load the existing narrow ID-neighbor context without widening it."""
 
         if not target_rows:
             return []
@@ -684,7 +896,7 @@ class MemberFactRefreshService:
                 )
             )
         return [
-            str(row.plain_text)
+            row
             for row in rows
             if int(row.id) not in target_ids
             and int(row.user_id) not in self.bot_qqs
@@ -693,6 +905,86 @@ class MemberFactRefreshService:
                 bot_qqs=self.bot_qqs,
                 bot_text_names=self.bot_text_names,
             )
+        ]
+
+    def _clarification_context_rows(self, *, group_id: int, target_rows) -> list:
+        """Return non-target rows from per-anchor verified clarification threads."""
+
+        if not target_rows:
+            return []
+        target_user_ids = {int(row.user_id) for row in target_rows}
+        if len(target_user_ids) != 1:
+            return []
+        target_user_id = next(iter(target_user_ids))
+        target_ids = {int(row.id) for row in target_rows}
+        selected: dict[int, object] = {}
+        with session_scope(self.engine) as session:
+            messages = MessageRepository(session)
+            for target in target_rows:
+                anchor_id = str(target.platform_msg_id)
+                rows = messages.list_bounded_same_episode_message_context(
+                    group_id=int(group_id),
+                    anchor_platform_msg_ids=[anchor_id],
+                    per_anchor_limit=12,
+                    max_gap_seconds=900,
+                    excluded_user_ids=self.bot_qqs,
+                )
+                evidence = tuple(
+                    EvidenceMessage(
+                        source_msg_id=str(row.platform_msg_id),
+                        speaker=str(row.user_id),
+                        content=str(row.plain_text or ""),
+                        sent_at=row.timestamp,
+                        blocked=messages.is_qq_blocked_outbound(row),
+                        group_id=(
+                            int(row.group_id) if row.group_id is not None else None
+                        ),
+                        reply_to_msg_id=row.reply_to_msg_id,
+                        is_bot=int(row.user_id) in self.bot_qqs,
+                        user_id=int(row.user_id),
+                        delivery_state=(
+                            str(row.raw_json.get("delivery_state") or "")
+                            .strip()
+                            .casefold()
+                            if isinstance(row.raw_json, dict)
+                            else ""
+                        ),
+                    )
+                    for row in rows
+                )
+                threads = resolve_clarification_threads(
+                    evidence,
+                    anchor_source_ids=(anchor_id,),
+                    max_turns=12,
+                    max_gap_seconds=900,
+                )
+                source_ids = {
+                    source_id
+                    for thread in threads
+                    if thread.subject_id == str(target_user_id)
+                    for source_id in thread.source_msg_ids
+                }
+                for row in rows:
+                    if (
+                        int(row.id) not in target_ids
+                        and str(row.platform_msg_id) in source_ids
+                    ):
+                        selected[int(row.id)] = row
+        return [selected[key] for key in sorted(selected)]
+
+    @staticmethod
+    def _fact_prompt_records(rows, *, role: str) -> list[dict[str, object]]:
+        """Render source identity and chronology without changing evidence text."""
+
+        return [
+            {
+                "role": str(role),
+                "source_msg_id": str(row.platform_msg_id),
+                "user_id": str(row.user_id),
+                "sent_at": row.timestamp.isoformat(),
+                "content": str(row.plain_text or ""),
+            }
+            for row in rows
         ]
 
     def _pending_member_lines(

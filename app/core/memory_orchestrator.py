@@ -26,6 +26,10 @@ class MemoryContextResult:
     resolved_answer_mode: str = ""
     resolved_subject_ids: tuple[str, ...] | None = None
     resolved_subject_binding: str = ""
+    resolved_subject_decision_reason: str = ""
+    resolved_personal_memory_intent: bool = False
+    resolved_fact_coverage: str = ""
+    resolved_fact_policy_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)

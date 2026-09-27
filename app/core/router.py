@@ -233,15 +233,6 @@ def _scrub_impersonation_reply(
     return cleaned.strip()
 
 
-def _should_bind_impersonated_self(text: str) -> bool:
-    """True when the query addresses the bot as 'you' and is not first-person
-    about the requester (whose '我' must stay bound to the requester)."""
-
-    normalized = str(text or "")
-    if "你" not in normalized:
-        return False
-    return not any(token in normalized for token in ("我", "咱"))
-
 REQUESTER_IDENTITY_INSTRUCTION = (
     "For this requester identity question, 'I/me' means the current human requester. "
     "Treat the literal question 'who am I' as a request for a remembered portrait, not "
@@ -1051,10 +1042,15 @@ class InboundRouter:
         active_persona: dict,
         context_lines: list[str],
         group_id: int,
+        *,
+        answer_mode: str = "current_fact",
     ) -> str:
         if self.persona_manager is not None:
             picked = self.persona_manager.retrieve_facts(
-                group_id, context_lines, limit=5
+                group_id,
+                context_lines,
+                limit=5,
+                answer_mode=answer_mode,
             )
         else:
             picked = retrieve_relevant_facts(
@@ -1076,42 +1072,6 @@ class InboundRouter:
             "特别注意：'评价/排行低于某作品'不等于'讨厌'，讨厌类结论必须有明确的讨厌/不喜欢依据）：\n"
             + "\n".join(lines)
         )
-
-    def _impersonation_facts_target_self(
-        self,
-        query: str,
-        *,
-        persona: dict,
-        requester_user_id: int,
-        users_by_id: dict[int, object],
-        bot_qq: int,
-    ) -> bool:
-        """Decide whether persona facts should be injected for this query.
-
-        Facts describe the impersonated member. When the question clearly
-        targets the requester ("如何评价我") or another named member
-        ("逆蝶蝶的动画喜好"), injecting the impersonated member's facts makes
-        the model answer about itself. In those cases skip persona facts and
-        let the shared-memory retrieval answer for the real subject.
-        """
-
-        persona_name = str(persona.get("name") or "").strip()
-        persona_user_id = int(persona.get("source_user_id") or 0)
-        if persona_name and persona_name in query:
-            return True
-        for user in users_by_id.values():
-            user_id = int(getattr(user, "user_id", 0) or 0)
-            if user_id in (bot_qq, persona_user_id):
-                continue
-            for alias in (
-                str(getattr(user, "group_card", "") or "").strip(),
-                str(getattr(user, "nickname", "") or "").strip(),
-            ):
-                if len(alias) >= 2 and alias in query:
-                    return False
-        if "我" in query and "你" not in query:
-            return False
-        return True
 
     def _impersonation_bot_labels(self, group_id: int) -> set[str]:
         labels = {str(self.runtime.persona.get("name", "") or "").strip()}
@@ -1988,16 +1948,6 @@ class InboundRouter:
                     f"{self._member_label_for_user(user_id=event.user_id, users_by_id=users_by_id, group_id=event.group_id)}: {event.plain_text}",
                     *recent_lines,
                 ]
-                if self._impersonation_facts_target_self(
-                    event.plain_text,
-                    persona=active_persona,
-                    requester_user_id=int(event.user_id),
-                    users_by_id=users_by_id,
-                    bot_qq=int(self.runtime.settings.bot_qq),
-                ):
-                    persona_text = self._with_relevant_facts(
-                        persona_text, active_persona, query_lines, event.group_id
-                    )
             bot_names = self._build_bot_names(persona_name)
             reply_to_bot = self._is_reply_to_bot(
                 event=event,
@@ -2331,14 +2281,17 @@ class InboundRouter:
                 and self._query_mentions_member(event.plain_text, users_by_id)
             )
             impersonated_subject_id = None
-            if impersonating and _should_bind_impersonated_self(event.plain_text):
-                raw_subject_id = active_persona.get("source_user_id")
-                if (
-                    not isinstance(raw_subject_id, bool)
-                    and str(raw_subject_id or "").strip().isdigit()
-                    and int(raw_subject_id) > 0
-                ):
-                    impersonated_subject_id = int(raw_subject_id)
+            raw_subject_id = active_persona.get("source_user_id")
+            if (
+                impersonating
+                and not isinstance(raw_subject_id, bool)
+                and str(raw_subject_id or "").strip().isdigit()
+                and int(raw_subject_id) > 0
+            ):
+                # This is a candidate supplied from the active session.  The
+                # memory resolver is the only component allowed to decide
+                # whether the query actually binds to it.
+                impersonated_subject_id = int(raw_subject_id)
             memory_request = GroupMemoryContextRequest(
                 group_id=event.group_id,
                 query=event.plain_text,
@@ -2351,6 +2304,9 @@ class InboundRouter:
                 use_full_history=use_full_history,
                 recent_limit=recent_context_limit,
                 impersonated_subject_id=impersonated_subject_id,
+                impersonated_subject_addressed=(
+                    bool(addressed_turn) if impersonated_subject_id is not None else None
+                ),
                 bot_user_id=(
                     int(self.runtime.settings.bot_qq)
                     if event.mentioned_bot
@@ -2361,6 +2317,32 @@ class InboundRouter:
                 memory_result = self.memory_orchestrator.build_context(memory_request)
             else:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
+            if (
+                impersonated_subject_id is not None
+                and addressed_turn
+                and memory_result.resolved_personal_memory_intent
+                and memory_result.resolved_subject_binding == "unbound"
+            ):
+                logger.warning(
+                    "persona_memory_subject_unbound group_id=%s persona_candidate=true "
+                    "addressed=true personal_memory_intent=true subject_reason=%s",
+                    event.group_id,
+                    memory_result.resolved_subject_decision_reason or "unspecified",
+                )
+            if (
+                impersonating
+                and impersonated_subject_id is not None
+                and memory_result.resolved_subject_binding == "impersonated"
+                and memory_result.resolved_subject_ids
+                == (str(impersonated_subject_id),)
+            ):
+                persona_text = self._with_relevant_facts(
+                    persona_text,
+                    active_persona,
+                    query_lines,
+                    event.group_id,
+                    answer_mode=(memory_result.resolved_answer_mode or "current_fact"),
+                )
             memory_context, packed_memory_context = self._split_memory_prompt_context(memory_result)
             if self._impersonating(event.group_id):
                 packed_memory_context = self._sanitize_packed_context(

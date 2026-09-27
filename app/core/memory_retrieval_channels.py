@@ -15,6 +15,7 @@ from app.core.hybrid_memory_retriever import (
     RetrievalCandidate,
     RetrievalChannel,
 )
+from app.core.memory_query_resolver import has_bound_member_subject
 from app.providers.semantic_embeddings import EmbeddingProvider
 from app.storage.repositories import (
     RetrievalDocumentHit,
@@ -227,7 +228,7 @@ class ScopedMemoryRetrievalChannels:
         resolved_query: Any,
         limit: int,
     ) -> Sequence[RetrievalCandidate]:
-        if getattr(resolved_query, "subject_binding", "") != "explicit":
+        if not has_bound_member_subject(resolved_query):
             return ()
         subject_ids = self._subject_ids(resolved_query)
         aliases = self._string_tuple(getattr(resolved_query, "subject_aliases_removed", ()))

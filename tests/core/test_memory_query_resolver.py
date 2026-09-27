@@ -52,6 +52,182 @@ def test_typed_impersonated_subject_binds_without_rewriting_query() -> None:
     assert result.answer_mode == "current_fact"
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_topic"),
+    (
+        ("最近在看什么动画", "动画"),
+        ("最近工作找得怎么样", "工作"),
+        ("论文写得怎么样了", "论文"),
+        ("搬家进展如何", "搬家"),
+        ("现在忙什么", None),
+        ("接下来怎么打算", None),
+        ("平时喜欢啥", None),
+        ("讨厌啥", None),
+        ("现在哪些作品在看", None),
+        ("现在哪个公司概率最大", None),
+    ),
+)
+def test_addressed_persona_candidate_binds_implicit_personal_processes(
+    query: str,
+    expected_topic: str | None,
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert result.subject_ids == ("222",)
+    assert result.subject_binding == "impersonated"
+    assert result.subject_decision_reason == "impersonated_implicit_personal"
+    assert result.personal_memory_intent is True
+    assert result.answer_mode == "current_fact"
+    if expected_topic is not None:
+        assert expected_topic in (result.topic_query or "")
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "今天天气怎么样",
+        "怎么找工作",
+        "华为怎么样",
+        "昨天群里聊了什么",
+    ),
+)
+def test_addressed_persona_candidate_does_not_bind_general_or_group_queries(
+    query: str,
+) -> None:
+    result = MemoryQueryResolver().resolve(
+        query,
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert result.subject_binding != "impersonated"
+    assert result.subject_ids != ("222",)
+
+
+def test_unaddressed_persona_candidate_does_not_bind_implicit_subject() -> None:
+    result = MemoryQueryResolver().resolve(
+        "最近工作咋样",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=False,
+    )
+
+    assert result.subject_binding == "unbound"
+
+
+def test_company_choice_question_is_not_parsed_as_location() -> None:
+    result = MemoryQueryResolver().resolve(
+        "工作找的怎么样了，现在哪个公司概率最大",
+        recent_messages=(),
+        now=NOW,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert result.subject_binding == "impersonated"
+    assert result.answer_mode == "current_fact"
+    assert "工作" in (result.topic_query or "")
+    assert "公司" in (result.topic_query or "")
+
+
+def test_addressed_persona_candidate_keeps_requester_and_explicit_member_precedence() -> None:
+    members = (
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="加菲猫", in_scope=True),
+    )
+    requester = MemoryQueryResolver().resolve(
+        "我最近工作咋样",
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=members,
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+    explicit = MemoryQueryResolver().resolve(
+        "加菲猫最近工作咋样",
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=members,
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert requester.subject_ids == ("111",)
+    assert requester.subject_binding == "requester"
+    assert explicit.subject_ids == ("333",)
+    assert explicit.subject_binding == "explicit"
+
+
+def test_addressed_persona_candidate_keeps_quoted_member_precedence() -> None:
+    quoted = Recent(
+        "quoted-other",
+        "加菲猫",
+        "我找到新工作了",
+        datetime(2026, 9, 27, 12, 0),
+        user_id=333,
+    )
+    result = MemoryQueryResolver().resolve(
+        "最近工作怎么样",
+        recent_messages=(quoted,),
+        quoted_message=quoted,
+        now=NOW,
+        requester_id=111,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+            GroupMemberIdentity(user_id=333, nickname="加菲猫", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert result.subject_ids == ("333",)
+    assert result.subject_binding == "explicit"
+    assert result.subject_decision_reason == "quoted_reference"
+    assert result.reference_msg_ids == ("quoted-other",)
+
+
+def test_unknown_person_process_query_never_falls_back_to_persona_candidate() -> None:
+    result = MemoryQueryResolver().resolve(
+        "陌生猫最近工作咋样",
+        recent_messages=(),
+        now=NOW,
+        requester_id=111,
+        group_members=(
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        ),
+        impersonated_subject_id=222,
+        impersonated_subject_addressed=True,
+    )
+
+    assert result.subject_ids == ()
+    assert result.subject_binding == "explicit"
+
+
 def test_bot_address_alias_does_not_override_typed_impersonated_subject() -> None:
     members = (
         GroupMemberIdentity(
@@ -2835,6 +3011,31 @@ def test_semantic_rewrite_general_keeps_rule_bound_member_subject() -> None:
     assert result.subject_ids == ("900000102",)
     assert result.subject_binding == "explicit"
     assert result.retrieval_query == "laptop display output ports"
+
+
+def test_semantic_rewrite_general_keeps_rule_bound_requester_subject() -> None:
+    resolver = MemoryQueryResolver(
+        rewrite_provider=_rewrite_provider(
+            {
+                "resolved_query": "laptop model and ports",
+                "answer_mode": "general",
+                "subject_role": "none",
+                "confidence": 0.98,
+            }
+        )
+    )
+
+    result = resolver.resolve(
+        "我最近用什么电脑",
+        recent_messages=(),
+        now=NOW,
+        requester_id=10001,
+    )
+
+    assert result.rewrite_used is True
+    assert result.subject_ids == ("10001",)
+    assert result.subject_binding == "requester"
+    assert result.retrieval_query == "laptop model and ports"
 
 
 def test_semantic_rewrite_member_role_without_id_is_ignored() -> None:

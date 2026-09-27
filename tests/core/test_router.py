@@ -47,15 +47,6 @@ class FakeSender:
         self.private_sent.append(outbound)
 
 
-def test_should_bind_impersonated_self() -> None:
-    from app.core.router import _should_bind_impersonated_self
-
-    assert _should_bind_impersonated_self("你最近面了哪些企业") is True
-    assert _should_bind_impersonated_self("逆蝶蝶喜欢什么") is False
-    assert _should_bind_impersonated_self("如何评价我") is False
-    assert _should_bind_impersonated_self("你如何评价我") is False
-
-
 def test_impersonation_style_retrieval_ignores_sixty_old_topics_in_prompt(
     sqlite_engine,
 ) -> None:
@@ -195,40 +186,6 @@ def test_style_retrieval_without_manager_uses_strict_fallback_and_total_budget(
     dynamic_block = rendered[len("persona-text") :]
     assert "相似情境下的说话方式示例" in dynamic_block
     assert len(dynamic_block) <= 600
-
-
-def test_impersonation_facts_target_self_heuristic() -> None:
-    persona = {"name": "阿渣", "source_user_id": "999001"}
-
-    class _User:
-        def __init__(self, user_id, nickname, group_card):
-            self.user_id = user_id
-            self.nickname = nickname
-            self.group_card = group_card
-
-    users = {
-        999002: _User(999002, "不知道叫什么", "逆蝶蝶"),
-        999003: _User(999003, "加菲猫", ""),
-        999001: _User(999001, "阿渣", "喜泽满灰多"),
-    }
-    router = object.__new__(InboundRouter)
-
-    def target(query: str, requester: int = 999002) -> bool:
-        return router._impersonation_facts_target_self(
-            query,
-            persona=persona,
-            requester_user_id=requester,
-            users_by_id=users,
-            bot_qq=999000,
-        )
-
-    assert target("你最近面了哪些企业")
-    assert target("最近工作咋样")
-    assert target("你最讨厌什么动画")
-    assert target("阿渣最近面了哪些企业")
-    assert not target("如何评价我")
-    assert not target("逆蝶蝶的动画喜好是什么")
-    assert not target("你觉得加菲猫这人咋样")
 
 
 class FailingSenderOnce:
@@ -546,7 +503,105 @@ async def test_router_passes_impersonated_subject_without_mutating_query(
     assert len(memory.requests) == 1
     assert memory.requests[0].query == "你最近在学什么"
     assert memory.requests[0].impersonated_subject_id == 30001
+    assert memory.requests[0].impersonated_subject_addressed is True
     assert memory.requests[0].bot_user_id == router.runtime.settings.bot_qq
+
+
+@pytest.mark.asyncio
+async def test_router_passes_addressed_persona_candidate_for_implicit_subject(
+    sqlite_engine,
+) -> None:
+    memory = CapturingMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_orchestrator=memory,
+    )
+    router.persona_manager.personas["member_persona"] = {
+        "name": "测试成员",
+        "identity": "group member",
+        "source_user_id": 30001,
+    }
+    router.persona_manager.set_persona_key(10001, "member_persona")
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            user_id=20001,
+            mentioned_bot=True,
+            message_id="implicit-persona-subject",
+            plain_text="最近工作找得怎么样",
+        )
+    )
+
+    assert memory.requests[0].query == "最近工作找得怎么样"
+    assert memory.requests[0].impersonated_subject_id == 30001
+    assert memory.requests[0].impersonated_subject_addressed is True
+
+
+@pytest.mark.asyncio
+async def test_router_injects_persona_facts_only_from_final_subject_decision(
+    sqlite_engine,
+    monkeypatch,
+) -> None:
+    class ResolvedMemoryOrchestrator(CapturingMemoryOrchestrator):
+        def build_context(self, request):
+            self.requests.append(request)
+            return MemoryContextResult(
+                group_id=request.group_id,
+                packed_context=LegacyMemoryPromptContext(
+                    recent_messages=[],
+                    full_history_messages=[],
+                    full_history_preamble=[],
+                    full_history_enabled=False,
+                    member_focus_lines=[],
+                    summaries=[],
+                    relevant_history_messages=[],
+                    memories=[],
+                    history_detail=False,
+                ),
+                selected_source_msg_ids=(),
+                estimated_tokens=0,
+                mode="v2",
+                resolved_answer_mode="current_fact",
+                resolved_subject_ids=("30001",),
+                resolved_subject_binding="impersonated",
+            )
+
+    memory = ResolvedMemoryOrchestrator()
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+        memory_orchestrator=memory,
+    )
+    router.persona_manager.personas["member_persona"] = {
+        "name": "测试成员",
+        "identity": "group member",
+        "source_user_id": 30001,
+    }
+    router.persona_manager.set_persona_key(10001, "member_persona")
+    calls: list[tuple[str, int]] = []
+
+    def retrieve_facts(group_id, context_lines, *, limit, now=None, answer_mode):
+        del context_lines, now
+        calls.append((answer_mode, limit))
+        return [{"category": "工作", "fact": "测试成员正在推进一个项目。"}]
+
+    monkeypatch.setattr(router.persona_manager, "retrieve_facts", retrieve_facts)
+
+    await router.handle_group_message(
+        make_event(
+            group_id=10001,
+            user_id=20001,
+            mentioned_bot=True,
+            message_id="resolved-persona-facts",
+            plain_text="最近工作咋样",
+        )
+    )
+
+    assert calls == [("current_fact", 5)]
 
 
 @pytest.mark.asyncio
@@ -585,6 +640,7 @@ async def test_router_carries_bot_id_for_raw_onebot_mention_in_impersonation(
     assert len(memory.requests) == 1
     assert memory.requests[0].query == "@比企谷小町 你最近在看什么动画"
     assert memory.requests[0].impersonated_subject_id == 30001
+    assert memory.requests[0].impersonated_subject_addressed is True
     assert memory.requests[0].bot_user_id == router.runtime.settings.bot_qq
 
 

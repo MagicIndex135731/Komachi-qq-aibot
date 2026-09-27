@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Protocol, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 from app.core.time_utils import stored_as_utc
 
@@ -11,8 +12,10 @@ from app.core.time_utils import stored_as_utc
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
 _CURRENT_VIEWING_INTENT_PATTERN = re.compile(
     r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
-    r"(?:看|追|补)(?:着)?(?:什么|啥)|"
-    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
+    r"(?:看|追|补)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:最近|现在|目前|近期|当下).{0,8}?(?:什么|啥|哪个|哪些)"
+    r"(?:动画|作品|番|剧|游戏|书|歌).{0,6}?(?:在)?(?:看|追|补|玩|读|听))"
 )
 _CURRENT_VIEWING_FEATURES = ("在看", "观看", "追看", "追番", "补番", "补剧")
 _CURRENT_ACTIVITY_INTENT_PATTERN = re.compile(
@@ -23,7 +26,18 @@ _CURRENT_ACTIVITY_INTENT_PATTERN = re.compile(
 )
 _CURRENT_STATE_INTENT_PATTERN = re.compile(
     r"(?:(?:现在|目前|最近|近期|当下).{0,12}?)?"
-    r"(?:在哪|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+    r"(?:在哪(?!个|些|位)|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+)
+_PROCESS_STATE_INTENT_PATTERN = re.compile(
+    r"(?:"
+    r"(?:最近|现在|目前|近期|当下).{0,18}?"
+    r"(?:工作|求职|面试|论文|项目|学习|考试|搬家|装修|健身|治疗|申请|实习|研究|准备)"
+    r".{0,8}?(?:怎么样|咋样|如何|什么情况)|"
+    r"(?:工作|求职|面试|论文|项目|学习|考试|搬家|装修|健身|治疗|申请|实习|研究|准备)?"
+    r"(?:找|写|做|学|准备|推进|申请|面试|装修|搬|练|治疗)(?:得|的)?"
+    r"(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)|"
+    r"[A-Za-z0-9_\-\u4e00-\u9fff]{1,20}(?:的)?进展(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)?"
+    r")"
 )
 
 # Storage kinds stay separate so each fact keeps one lifecycle and canonical
@@ -52,6 +66,20 @@ _KIND_INTENT_PATTERNS: tuple[tuple[tuple[str, ...], re.Pattern[str]], ...] = (
     (("profile",), re.compile(r"哪里人|做什么的")),
 )
 
+FactCoverage = Literal["single", "plural", "multi_facet"]
+
+
+@dataclass(frozen=True, slots=True)
+class FactIntentPolicy:
+    allowed_kinds: tuple[str, ...]
+    preferred_kinds: tuple[str, ...]
+    temporal: bool
+    coverage: FactCoverage
+    reason: str
+
+
+_PLURAL_FACT_PATTERN = re.compile(r"哪些|哪几|几部|多部|都(?:有|是|在)|分别")
+
 
 def fact_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...]:
     """Return the bounded storage-kind policy for member-fact injection.
@@ -62,34 +90,7 @@ def fact_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...]:
     plan is never profile knowledge.
     """
 
-    preferred = preferred_kinds_for_query(query=query, answer_mode=answer_mode)
-    preferred_set = frozenset(preferred)
-    if preferred == PERSON_PORTRAIT_KINDS:
-        return PERSON_PORTRAIT_KINDS
-    if preferred == ("preference", "taboo", "profile"):
-        # This is the resolver's generic current-fact fallback, not a proven
-        # preference intent. Keep legacy durable facts available.
-        return ("fact", "relationship", "profile", "preference", "taboo")
-    if preferred_set & {"current", "event"}:
-        allowed = ["current", "event"]
-        if "profile" in preferred_set:
-            allowed.append("profile")
-        return tuple(allowed)
-    if preferred_set & {"plan", "decision"}:
-        return ("plan", "decision")
-    if preferred_set & {"preference", "taboo"}:
-        return tuple(
-            kind for kind in ("preference", "taboo") if kind in preferred_set
-        )
-    if "relationship" in preferred_set:
-        return ("relationship", "profile", "fact")
-    if preferred_set & set(PERSON_PORTRAIT_KINDS):
-        return PERSON_PORTRAIT_KINDS
-    if "profile" in preferred_set:
-        return ("profile", "fact")
-    # Preserve the pre-existing durable-fact behavior for queries without a
-    # recognized dynamic intent.
-    return ("fact", "relationship")
+    return fact_intent_policy(query=query, answer_mode=answer_mode).allowed_kinds
 
 
 _RECENCY_INTENT_PATTERN = re.compile(
@@ -112,18 +113,109 @@ def preferred_kinds_for_query(*, query: str, answer_mode: str) -> tuple[str, ...
     running_joke, "我讨厌什么" boosts taboo, and "最近在做什么" boosts current
     instead of being crowded out by preference/profile facts.
     """
+    return fact_intent_policy(query=query, answer_mode=answer_mode).preferred_kinds
+
+
+def fact_intent_policy(*, query: str, answer_mode: str) -> FactIntentPolicy:
+    """Return the single storage and coverage policy for a member-fact query."""
+
     text = str(query or "").strip()
+    plural = bool(_PLURAL_FACT_PATTERN.search(text))
+    temporal = bool(_RECENCY_INTENT_PATTERN.search(text))
+
+    if _CURRENT_VIEWING_INTENT_PATTERN.search(text):
+        return FactIntentPolicy(
+            allowed_kinds=("current", "event"),
+            preferred_kinds=("current", "event"),
+            temporal=True,
+            coverage="plural" if plural else "single",
+            reason="current_viewing",
+        )
+    if _CURRENT_ACTIVITY_INTENT_PATTERN.search(text):
+        return FactIntentPolicy(
+            allowed_kinds=("current", "event"),
+            preferred_kinds=("current",),
+            temporal=True,
+            coverage="plural" if plural else "single",
+            reason="current_activity",
+        )
+    if _CURRENT_STATE_INTENT_PATTERN.search(text):
+        return FactIntentPolicy(
+            allowed_kinds=("current", "event"),
+            preferred_kinds=("current", "event"),
+            temporal=True,
+            coverage="single",
+            reason="current_state",
+        )
+    if _PROCESS_STATE_INTENT_PATTERN.search(text):
+        return FactIntentPolicy(
+            allowed_kinds=_TEMPORAL_FACT_KINDS,
+            preferred_kinds=_TEMPORAL_FACT_KINDS,
+            temporal=True,
+            coverage="plural" if plural else "multi_facet",
+            reason="temporal_process",
+        )
+
     for kinds, pattern in _KIND_INTENT_PATTERNS:
-        if pattern.search(text):
-            return kinds
-    if _RECENCY_INTENT_PATTERN.search(text):
-        # Temporal questions are not limited to one activity vocabulary.
-        # Location, employment, study, relationship and other state changes
-        # may be stored under several time-bearing fact kinds.
-        return _TEMPORAL_FACT_KINDS
+        if not pattern.search(text):
+            continue
+        preferred = tuple(kinds)
+        preferred_set = frozenset(preferred)
+        if preferred == PERSON_PORTRAIT_KINDS:
+            allowed = PERSON_PORTRAIT_KINDS
+            coverage: FactCoverage = "multi_facet"
+        elif preferred_set & {"plan", "decision"}:
+            allowed = ("plan", "decision")
+            coverage = "plural" if plural else "single"
+        elif preferred_set & {"preference", "taboo"}:
+            allowed = tuple(
+                kind for kind in ("preference", "taboo") if kind in preferred_set
+            )
+            coverage = "plural" if plural else "single"
+        elif "relationship" in preferred_set:
+            allowed = ("relationship", "profile", "fact")
+            coverage = "multi_facet"
+        elif "profile" in preferred_set:
+            allowed = ("profile", "fact")
+            coverage = "single"
+        elif preferred_set & {"current", "event"}:
+            allowed = ("current", "event")
+            coverage = "plural" if plural else "single"
+        else:
+            allowed = preferred
+            coverage = "plural" if plural else "single"
+        return FactIntentPolicy(
+            allowed_kinds=allowed,
+            preferred_kinds=preferred,
+            temporal=temporal,
+            coverage=coverage,
+            reason="explicit_kind_intent",
+        )
+
+    if temporal and answer_mode == "current_fact":
+        return FactIntentPolicy(
+            allowed_kinds=_TEMPORAL_FACT_KINDS,
+            preferred_kinds=_TEMPORAL_FACT_KINDS,
+            temporal=True,
+            coverage="plural" if plural else "multi_facet",
+            reason="temporal_process",
+        )
+
     if answer_mode == "current_fact":
-        return ("preference", "taboo", "profile")
-    return ()
+        return FactIntentPolicy(
+            allowed_kinds=("fact", "relationship", "profile", "preference", "taboo"),
+            preferred_kinds=("preference", "taboo", "profile"),
+            temporal=temporal,
+            coverage="plural" if plural else "single",
+            reason="current_fact_fallback",
+        )
+    return FactIntentPolicy(
+        allowed_kinds=("fact", "relationship"),
+        preferred_kinds=(),
+        temporal=temporal,
+        coverage="single",
+        reason="durable_fallback",
+    )
 
 
 def is_composite_portrait_query(query: str) -> bool:
@@ -216,6 +308,30 @@ def prefer_recent_viewing_event(
     return _recency_value(event) > newest_current
 
 
+def viewing_fallback_match_ids(
+    matching_fact_ids: set[int],
+    *,
+    viewing_event: RankableMemoryFact,
+    coverage: FactCoverage,
+) -> set[int]:
+    """Keep a single-item fallback from collapsing plural evidence.
+
+    The fallback exists for queries whose lexical features (for example
+    ``动画``) do not occur in a concrete title fact.  A singular question may
+    safely narrow to the freshest explicit viewing event.  A plural question
+    must keep the broader ranked candidate set when no lexical match exists;
+    otherwise one fallback row silently turns ``哪些`` back into a one-item
+    answer before the diversity selector can run.
+    """
+
+    event_id = int(viewing_event.id or 0)
+    if coverage == "single":
+        return {event_id}
+    if matching_fact_ids:
+        return {*matching_fact_ids, event_id}
+    return set()
+
+
 def _recency_value(fact: RankableMemoryFact) -> float:
     for attribute in ("last_seen_at", "valid_from"):
         value = getattr(fact, attribute, None)
@@ -270,6 +386,11 @@ def memory_query_features(
         # “什么动画”.  Keep both terms so a title-only fact (for example an
         # abbreviation such as RW0) can still match through its predicate.
         features.update(("动画", "动漫", "番剧"))
+    if re.search(r"哪家|哪个|哪些|哪位|什么|谁", intent_text):
+        # Clarification-derived facts preserve the original slot wording. A
+        # query may ask “哪个公司” while the source question says “哪家”；
+        # treat these slot forms as one retrieval family.
+        features.update(("哪家", "哪个", "哪些", "哪位", "什么", "谁"))
     return tuple(sorted(features))
 
 
@@ -388,7 +509,8 @@ def select_temporal_current_facts(
     *,
     matching_fact_ids: set[int],
     topic_specific: bool,
-    broad_limit: int = 5,
+    coverage: FactCoverage = "single",
+    broad_limit: int = 10,
     broad_horizon_days: int = 14,
 ) -> list[RankableMemoryFact]:
     """Reduce a current-state query to the freshest relevant fact set.
@@ -402,16 +524,45 @@ def select_temporal_current_facts(
         return []
     matched = [fact for fact in facts if int(fact.id or 0) in matching_fact_ids]
     candidates = matched or list(facts)
-    if topic_specific:
+    if topic_specific and coverage == "single":
         return candidates[:1]
     newest = max((_recency_value(fact) for fact in candidates), default=0.0)
     cutoff = newest - max(1, int(broad_horizon_days)) * 86_400 if newest else 0.0
-    selected = [
+    recent = [
         fact
         for fact in candidates
         if not newest or _recency_value(fact) >= cutoff
     ]
-    return selected[: max(1, int(broad_limit))]
+    if coverage == "single":
+        return recent[: max(1, int(broad_limit))]
+
+    selected: list[RankableMemoryFact] = []
+    seen_facets: set[tuple[str, ...]] = set()
+    for fact in recent:
+        kind = str(getattr(fact, "memory_kind", "") or "")
+        predicate = " ".join(str(getattr(fact, "predicate", "") or "").split()).casefold()
+        object_text = " ".join(str(getattr(fact, "object_text", "") or "").split()).casefold()
+        if coverage == "multi_facet":
+            # Same-kind facts may still represent different alternatives or
+            # states (for example two ``decision/work`` rows for separate
+            # companies). Keep the normalized content as a tie-break facet
+            # when no structured object is available.
+            facet = (
+                kind,
+                predicate,
+                object_text or " ".join(str(fact.content).split()).casefold(),
+            )
+        else:
+            # Multi-item questions need distinct objects even when all rows
+            # share the same lifecycle kind and category.
+            facet = (predicate, object_text or " ".join(str(fact.content).split()).casefold())
+        if facet in seen_facets:
+            continue
+        seen_facets.add(facet)
+        selected.append(fact)
+        if len(selected) >= max(1, int(broad_limit)):
+            break
+    return selected
 
 
 def matching_member_fact_ids(

@@ -101,6 +101,11 @@ class ResolvedMemoryQuery:
     subject_role: str = ""
     preferred_fact_kinds: tuple[str, ...] = ()
     semantic_general: bool = False
+    subject_decision_reason: str = ""
+    personal_memory_intent: bool = False
+    allowed_fact_kinds: tuple[str, ...] = ()
+    fact_coverage: str = "single"
+    fact_policy_reason: str = ""
 
     @property
     def resolved_query(self) -> str:
@@ -145,6 +150,14 @@ class ResolvedMemoryQuery:
 MemoryQueryPlan = ResolvedMemoryQuery
 
 
+def has_bound_member_subject(plan: object) -> bool:
+    """Whether a plan has one safely resolved human member subject."""
+
+    return bool(getattr(plan, "subject_ids", None)) and str(
+        getattr(plan, "subject_binding", "")
+    ) in {"explicit", "requester", "impersonated"}
+
+
 RewriteProvider = Callable[[str, tuple[RecentMemoryMessage, ...], float], str]
 IdentityValidator = Callable[[str], bool]
 
@@ -168,7 +181,7 @@ _FIRST_PERSON_SUBJECT_PATTERN = re.compile(
     r"^\s*(?:给出|给|帮我|来|要|想要)?\s*(?:我|我的).{0,8}?画像|"
     r"^\s*(?:介绍一下|介绍)\s*我|"
     r"^\s*(?:(?:最近|现在|目前)\s*)?(?:我|我的)(?:[^，。！？!?]{0,24}?)?"
-    r"(?:什么|啥|吗|呢|哪|怎么|如何|多少|几|是谁)"
+    r"(?:什么|啥|吗|呢|哪|怎么|如何|咋样|怎么样|进展|状态|多少|几|是谁)"
 )
 _FIRST_PERSON_OWNERSHIP_PATTERN = re.compile(
     r"(?:我|我的).{0,24}?(?:主人|爹爹|爸爸|妈妈|称呼)"
@@ -253,8 +266,10 @@ _REQUESTER_MENTION_PATTERN = re.compile(
 )
 _CURRENT_VIEWING_QUERY_PATTERN = (
     r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
-    r"(?:看|追|补)(?:着)?(?:什么|啥)|"
-    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥))"
+    r"(?:看|追|补)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:正在|在)(?:看|追|补)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:最近|现在|目前|近期|当下).{0,8}?(?:什么|啥|哪个|哪些)"
+    r"(?:动画|作品|番|剧|游戏|书|歌).{0,6}?(?:在)?(?:看|追|补|玩|读|听))"
 )
 _CURRENT_ACTIVITY_QUERY_PATTERN = (
     r"(?:(?:最近|现在|目前|近期|当下).{0,12}?(?:正在|在)?"
@@ -263,17 +278,38 @@ _CURRENT_ACTIVITY_QUERY_PATTERN = (
 )
 _CURRENT_STATE_QUERY_PATTERN = (
     r"(?:(?:现在|目前|最近|近期|当下).{0,12}?)?"
-    r"(?:在哪|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+    r"(?:在哪(?!个|些|位)|在哪里|哪里工作|在哪工作|忙什么|什么状态)"
+)
+_PROCESS_STATE_QUERY_PATTERN = (
+    r"(?:"
+    r"(?:最近|现在|目前|近期|当下).{0,18}?"
+    r"(?:工作|求职|面试|论文|项目|学习|考试|搬家|装修|健身|治疗|申请|实习|研究|准备)"
+    r".{0,8}?(?:怎么样|咋样|如何|什么情况)|"
+    r"(?:工作|求职|面试|论文|项目|学习|考试|搬家|装修|健身|治疗|申请|实习|研究|准备)?"
+    r"(?:找|写|做|学|准备|推进|申请|面试|装修|搬|练|治疗)(?:得|的)?"
+    r"(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)|"
+    r"[A-Za-z0-9_\-\u4e00-\u9fff]{1,20}(?:的)?进展(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)?"
+    r")"
 )
 _FUTURE_FACT_QUERY_PATTERN = (
     r"(?:接下来|之后|下一步|未来).{0,12}?(?:打算|准备|计划|决定).{0,12}?"
     r"(?:什么|啥|怎么|哪些|吗|呢|有)|"
+    r"(?:接下来|之后|下一步|以后|未来).{0,8}?(?:怎么|如何|怎样)"
+    r"(?:打算|准备|计划|决定)|"
     r"(?:有什么|有啥|有哪些)(?:打算|准备|计划|决定)|"
     r"(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢)"
 )
+_PREFERENCE_FACT_QUERY_PATTERN = (
+    r"(?:平时|一般|通常)?(?:最?喜欢|爱)(?:看|听|玩|用|吃|喝|读|追)?"
+    r"(?:什么|啥|哪些)|(?:讨厌|不喜欢|反感)(?:什么|啥|哪些)"
+)
+_PERSONAL_CHOICE_QUERY_PATTERN = (
+    r"(?:现在|目前|最近|近期).{0,10}?(?:哪个|哪些|哪家)"
+    r"(?:公司|学校|项目|方向|岗位).{0,10}?(?:概率|可能|机会|希望|最大|最好|更高)?"
+)
 _CURRENT_FACT_PATTERN = re.compile(
-    r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么|还记得|记得|"
+    r"最喜欢|(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?(?:什么|啥)|"
+    r"讨厌(?:什么|啥)|不喜欢(?:什么|啥)|还记得|记得|"
     r"画像|是什么样的人|哪里人|做什么的|介绍一下|什么关系|和谁|"
     r"主人|称呼我|叫我|"
     + _CURRENT_VIEWING_QUERY_PATTERN
@@ -282,7 +318,13 @@ _CURRENT_FACT_PATTERN = re.compile(
     + "|"
     + _CURRENT_STATE_QUERY_PATTERN
     + "|"
+    + _PROCESS_STATE_QUERY_PATTERN
+    + "|"
     + _FUTURE_FACT_QUERY_PATTERN
+    + "|"
+    + _PREFERENCE_FACT_QUERY_PATTERN
+    + "|"
+    + _PERSONAL_CHOICE_QUERY_PATTERN
 )
 _TOPIC_PUNCTUATION_PATTERN = re.compile(r"^[\s，。！？、,.!?：:；;]+|[\s，。！？、,.!?：:；;]+$")
 _TOPIC_TERM_SPLIT_PATTERN = re.compile(r"[\s，。！？、,.!?：:；;]+")
@@ -304,11 +346,35 @@ _ASSESSMENT_SCAFFOLD_PATTERN = re.compile(
     r"(?:评价|点评|分析|看待)(?:一下)?|怎么看"
 )
 _CURRENT_FACT_SCAFFOLD_PATTERN = re.compile(
-    r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
-    r"讨厌什么|不喜欢什么|还记得|记得|给出|完整|个人|介绍一下|"
+    r"(?:平时|一般|通常)?(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?(?:什么|啥)|"
+    r"讨厌(?:什么|啥)|不喜欢(?:什么|啥)|还记得|记得|给出|完整|个人|介绍一下|"
     r"(?:我|我的)?(?:最近|现在|目前|近期|当下)?(?:我|我的)?"
-    r"(?:正在|在)?(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥)|"
-    r"(?:接下来|之后|下一步|未来)?(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢|有)"
+    r"(?:正在|在)?(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥|哪个|哪些)|"
+    r"(?:最近|现在|目前|近期|当下).{0,8}?(?:什么|啥|哪个|哪些)"
+    r"(?:动画|作品|番|剧|游戏|书|歌).{0,6}?(?:在)?(?:看|追|补|玩|读|听)|"
+    r"(?:接下来|之后|下一步|未来)?(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢|有)|"
+    r"(?:接下来|之后|下一步|以后|未来).{0,8}?(?:怎么|如何|怎样)"
+    r"(?:打算|准备|计划|决定)|"
+    r"(?:找|写|做|学|准备|推进|申请|面试|装修|搬|练|治疗)(?:得|的)?"
+    r"(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)(?:了)?|"
+    r"(?:的)?进展(?:怎么样|咋样|如何|到哪(?:一步)?|什么情况)?"
+)
+
+_GROUP_LEVEL_PERSONA_EXCLUSION_PATTERN = re.compile(
+    r"(?:群里|群内|本群|大家|所有人|谁).{0,12}?(?:聊|说|提到|发生|消息|发言)|"
+    r"(?:总结|汇总|概括).{0,12}?(?:群|大家)"
+)
+_GENERAL_ADVICE_PATTERN = re.compile(
+    r"(?:怎么|如何|怎样)(?:去|才能|可以|应该)?(?:找工作|求职|面试|写论文|学习|搬家|装修|健身)|"
+    r"(?:有什么|有啥)(?:建议|方法|技巧|攻略)"
+)
+_EXTERNAL_STATE_PATTERN = re.compile(
+    r"(?:天气|新闻|股价|行情|软件|产品|公司|学校|城市|电影|动画|游戏|作品)"
+    r"(?:最近|现在|目前|近期)?(?:怎么样|咋样|如何|什么情况)"
+)
+_SECOND_PERSON_PERSONAL_PATTERN = re.compile(
+    r"(?:你|您)(?:最近|现在|目前|近期|当下|平时|一般|通常|接下来|以后|未来)|"
+    r"(?:你|您).{0,20}?(?:喜欢|讨厌|打算|计划|决定|怎么看|什么看法|什么状态|进展)"
 )
 _HISTORY_SCAFFOLD_PATTERN = re.compile(
     r"说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么|"
@@ -353,12 +419,20 @@ _EXPLICIT_GROUP_HISTORY_TOPIC_PATTERN = re.compile(
     r"(?:说过什么|说了什么|发过什么|发了什么|提过什么|聊过什么)$"
 )
 _PERSON_MEMORY_SUBJECT_PATTERN = re.compile(
-    r"^\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
+    r"^\s*(?!(?:最近|现在|目前|近期|当下|接下来|之后|下一步|未来))"
+    r"(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
     r"(?:(?:最?喜欢|爱|想)(?:看|听|玩|用|吃|喝|读|追)?什么|"
     r"讨厌什么|不喜欢什么|"
     r"(?:最近|现在|目前|近期|当下)?(?:正在|在)?"
     r"(?:看|追|补|玩|做|学|忙|干)(?:着)?(?:什么|啥)|"
     r"(?:接下来|之后|下一步|未来)?.{0,8}?(?:打算|准备|计划|决定).{0,12}?(?:什么|啥|怎么|哪些|吗|呢|有))"
+)
+_PERSON_PROCESS_SUBJECT_PATTERN = re.compile(
+    r"^\s*(?!(?:最近|现在|目前|近期|当下|接下来|之后|下一步|未来))"
+    r"(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)"
+    r"(?:最近|现在|目前|近期|当下)?"
+    r"(?:工作|求职|面试|论文|项目|学习|考试|搬家|装修|健身|治疗|申请|实习|研究|准备)"
+    r".{0,8}?(?:怎么样|咋样|如何|进展|到哪(?:一步)?|什么情况)"
 )
 _REMEMBER_PERSON_PATTERN = re.compile(
     r"^\s*(?:还)?记得\s*(?P<subject>[A-Za-z0-9_\-\u4e00-\u9fff]{1,16}?)(?:吗|么|的|曾经|以前|喜欢|讨厌|[？?]|$)"
@@ -418,6 +492,11 @@ _NON_PERSON_MEMORY_SUBJECTS = frozenset(
         "所有人",
         "我们",
         "你们",
+        "最近",
+        "现在",
+        "目前",
+        "近期",
+        "当下",
         "他们",
         "她们",
         "它们",
@@ -515,6 +594,7 @@ class MemoryQueryResolver:
         requester_id: int | str | None = None,
         requester_uin: int | str | None = None,
         impersonated_subject_id: int | str | None = None,
+        impersonated_subject_addressed: bool | None = None,
         addressed_bot_user_id: int | str | None = None,
     ) -> ResolvedMemoryQuery:
         """Return a typed retrieval query without reading persistence.
@@ -545,6 +625,10 @@ class MemoryQueryResolver:
         time_range = self._parse_time_range(original, current_time)
         needs_detail = bool(_DETAIL_PATTERN.search(original))
         answer_mode = self._answer_mode(original, time_range, quoted_message)
+        personal_memory_intent = self._personal_memory_intent(
+            subject_query,
+            answer_mode=answer_mode,
+        )
         coverage_mode = self._coverage_mode(answer_mode, time_range)
         needs_history = bool(
             time_range
@@ -592,6 +676,8 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode="current_fact",
                 coverage_mode="relevance",
+                subject_decision_reason="requester",
+                personal_memory_intent=personal_memory_intent,
             )
 
         if (
@@ -616,6 +702,8 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason="requester",
+                personal_memory_intent=personal_memory_intent,
             ), aliases=("我的", "我"), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
@@ -669,6 +757,10 @@ class MemoryQueryResolver:
                 ),
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason=(
+                    "mention" if answer_mode == "mention" else "explicit_member"
+                ),
+                personal_memory_intent=personal_memory_intent,
             ), aliases=(direct_member.matched_alias,), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
@@ -730,6 +822,8 @@ class MemoryQueryResolver:
                 subject_binding="explicit",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason="ambiguous_member",
+                personal_memory_intent=personal_memory_intent,
             )
 
         if normalized_requester_id is not None and (
@@ -754,6 +848,8 @@ class MemoryQueryResolver:
                 subject_binding="requester",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason="requester",
+                personal_memory_intent=personal_memory_intent,
             ), aliases=("我的", "我"), topic_source=subject_query)
             if (
                 self._rewrite_provider is not None
@@ -770,46 +866,10 @@ class MemoryQueryResolver:
                     )
             return plan
 
-        if normalized_impersonated_id is not None:
-            impersonated_member = next(
-                (
-                    member
-                    for member in group_members
-                    if member.in_scope
-                    and int(member.user_id) not in excluded_member_ids
-                    and str(member.user_id) == normalized_impersonated_id
-                ),
-                None,
-            )
-            if impersonated_member is not None:
-                impersonated_subject = (normalized_impersonated_id,)
-                return self._with_topic_query(
-                    ResolvedMemoryQuery(
-                        original_query=original,
-                        retrieval_query=subject_query,
-                        entities=(
-                            str(
-                                impersonated_member.group_card
-                                or impersonated_member.nickname
-                                or normalized_impersonated_id
-                            ),
-                        ),
-                        speaker_ids=impersonated_subject,
-                        subject_ids=impersonated_subject,
-                        time_range=time_range,
-                        retrieval_mode="temporal" if time_range else "hybrid",
-                        needs_history=needs_history,
-                        needs_detail=needs_detail,
-                        group_id=normalized_group_id,
-                        requester_id=normalized_requester_id,
-                        subject_binding="impersonated",
-                        answer_mode=answer_mode,
-                        coverage_mode=coverage_mode,
-                    ),
-                    aliases=("你", "您"),
-                    topic_source=subject_query,
-                )
-
+        # A reliable quoted-message author is a real subject reference.  Resolve
+        # it before considering the active persona as an omitted subject; a
+        # personal-state question replying to another member must stay about
+        # that quoted member.
         if answer_mode == "mention":
             return ResolvedMemoryQuery(
                 original_query=original,
@@ -825,7 +885,120 @@ class MemoryQueryResolver:
                 subject_binding="unbound",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason="mention",
+                personal_memory_intent=personal_memory_intent,
             )
+
+        if quoted_message is not None:
+            quoted_reference = self._resolve_reference(original, recent, quoted_message)
+            if quoted_reference is not None:
+                retrieval_query, entities, speaker_ids, source_ids = quoted_reference
+                return ResolvedMemoryQuery(
+                    original_query=original,
+                    retrieval_query=retrieval_query,
+                    entities=entities,
+                    speaker_ids=speaker_ids,
+                    subject_ids=(
+                        speaker_ids or None
+                        if personal_memory_intent
+                        else None
+                    ),
+                    time_range=time_range,
+                    reference_msg_ids=source_ids,
+                    retrieval_mode="exact_quote",
+                    needs_history=needs_history,
+                    needs_detail=needs_detail,
+                    group_id=normalized_group_id,
+                    requester_id=normalized_requester_id,
+                    subject_binding="explicit" if speaker_ids else "unbound",
+                    answer_mode=answer_mode,
+                    coverage_mode=coverage_mode,
+                    subject_decision_reason=(
+                        "quoted_reference" if speaker_ids else "unbound_general"
+                    ),
+                    personal_memory_intent=personal_memory_intent,
+                )
+
+        if (
+            normalized_impersonated_id is not None
+            and impersonated_subject_addressed is True
+            and self._is_person_memory_query(subject_query)
+        ):
+            return ResolvedMemoryQuery(
+                original_query=original,
+                retrieval_query=original,
+                subject_ids=(),
+                time_range=time_range,
+                retrieval_mode="temporal" if time_range else "hybrid",
+                needs_history=needs_history,
+                needs_detail=needs_detail,
+                group_id=normalized_group_id,
+                requester_id=normalized_requester_id,
+                subject_binding="explicit",
+                answer_mode=answer_mode,
+                coverage_mode=coverage_mode,
+                subject_decision_reason="unknown_person",
+                personal_memory_intent=personal_memory_intent,
+            )
+
+        persona_default_allowed = (
+            normalized_impersonated_id is not None
+            and (
+                impersonated_subject_addressed is None
+                or (
+                    bool(impersonated_subject_addressed)
+                    and personal_memory_intent
+                )
+            )
+        )
+        if persona_default_allowed:
+            impersonated_member = next(
+                (
+                    member
+                    for member in group_members
+                    if member.in_scope
+                    and int(member.user_id) not in excluded_member_ids
+                    and str(member.user_id) == normalized_impersonated_id
+                ),
+                None,
+            )
+            if impersonated_member is not None:
+                impersonated_subject = (normalized_impersonated_id,)
+                return replace(
+                    self._with_topic_query(
+                        ResolvedMemoryQuery(
+                            original_query=original,
+                            retrieval_query=subject_query,
+                            entities=(
+                                str(
+                                    impersonated_member.group_card
+                                    or impersonated_member.nickname
+                                    or normalized_impersonated_id
+                                ),
+                            ),
+                            speaker_ids=impersonated_subject,
+                            subject_ids=impersonated_subject,
+                            time_range=time_range,
+                            retrieval_mode="temporal" if time_range else "hybrid",
+                            needs_history=needs_history,
+                            needs_detail=needs_detail,
+                            group_id=normalized_group_id,
+                            requester_id=normalized_requester_id,
+                            subject_binding="impersonated",
+                            answer_mode=answer_mode,
+                            coverage_mode=coverage_mode,
+                            subject_decision_reason=(
+                                "impersonated_second_person"
+                                if re.search(r"(?:你|您)", subject_query)
+                                else "impersonated_implicit_personal"
+                            ),
+                            personal_memory_intent=True,
+                        ),
+                        aliases=("你", "您"),
+                        topic_source=subject_query,
+                    ),
+                    personal_memory_intent=True,
+                )
 
         deterministic = self._resolve_reference(original, recent, quoted_message)
         if deterministic is not None:
@@ -848,6 +1021,10 @@ class MemoryQueryResolver:
                 subject_binding="explicit" if speaker_ids else "unbound",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                subject_decision_reason=(
+                    "recent_reference" if speaker_ids else "unbound_general"
+                ),
+                personal_memory_intent=personal_memory_intent,
             )
             if quoted_message is None and speaker_ids:
                 return self._with_topic_query(
@@ -923,6 +1100,12 @@ class MemoryQueryResolver:
             subject_role=(
                 "group" if _GROUP_SCOPE_QUERY_PATTERN.search(original) else ""
             ),
+            subject_decision_reason=(
+                "group_scope"
+                if _GROUP_SCOPE_QUERY_PATTERN.search(original)
+                else "unbound_general"
+            ),
+            personal_memory_intent=personal_memory_intent,
         )
         if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(original):
             return self._with_explicit_group_history_topic(plan)
@@ -1838,6 +2021,7 @@ class MemoryQueryResolver:
             return False
         for pattern in (
             _PERSON_MEMORY_SUBJECT_PATTERN,
+            _PERSON_PROCESS_SUBJECT_PATTERN,
             _REMEMBER_PERSON_PATTERN,
             _PERSON_SPEECH_SUBJECT_PATTERN,
             _PERSON_ASSESSMENT_SUBJECT_PATTERN,
@@ -1869,6 +2053,41 @@ class MemoryQueryResolver:
     @staticmethod
     def _is_requester_mention_query(query: str) -> bool:
         return bool(_REQUESTER_MENTION_PATTERN.search(query))
+
+    @staticmethod
+    def _personal_memory_intent(
+        query: str,
+        *,
+        answer_mode: AnswerMode,
+    ) -> bool:
+        """Whether an addressed persona turn asks about the persona's own memory.
+
+        The router supplies only session metadata (active persona + addressed
+        turn).  This resolver owns the language decision so persona facts and
+        normal memory retrieval cannot drift into separate subject heuristics.
+        """
+
+        text = str(query or "").strip()
+        if not text:
+            return False
+        if (
+            _GROUP_LEVEL_PERSONA_EXCLUSION_PATTERN.search(text)
+            or _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(text)
+            or _GROUP_SCOPE_QUERY_PATTERN.search(text)
+            or _MENTION_PATTERN.search(text)
+            or _GENERAL_ADVICE_PATTERN.search(text)
+            or _EXTERNAL_STATE_PATTERN.search(text)
+        ):
+            return False
+        if _SECOND_PERSON_PERSONAL_PATTERN.search(text):
+            return True
+        if _CURRENT_FACT_PATTERN.search(text):
+            return True
+        if re.search(_PROCESS_STATE_QUERY_PATTERN, text):
+            return True
+        if answer_mode == "assessment" and re.search(r"(?:你|您).{0,8}?(?:看|觉得|认为)", text):
+            return True
+        return False
 
     @staticmethod
     def _answer_mode(
@@ -2270,7 +2489,7 @@ class MemoryQueryResolver:
         speaker ids. The model supplies intent and retrieval text, not identity.
         """
         if rewritten.semantic_general:
-            if plan.subject_binding == "explicit":
+            if has_bound_member_subject(plan):
                 # A general/commonsense rewrite must not drop a rule-bound
                 # member or requester identity. "Look up X's laptop ports"
                 # still needs X's own history even when the model labels the

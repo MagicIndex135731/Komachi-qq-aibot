@@ -15,7 +15,15 @@ from app.core.member_memory_backfill import (
     upsert_member_facts,
 )
 from app.storage.db import session_scope
-from app.storage.models import Group, MemberFactRefreshState, MemoryItem, Message, User
+from app.storage.models import (
+    ConversationEpisode,
+    EpisodeMessage,
+    Group,
+    MemberFactRefreshState,
+    MemoryItem,
+    Message,
+    User,
+)
 
 
 def test_parse_review_output_extracts_drop_set() -> None:
@@ -76,6 +84,37 @@ def test_fact_extraction_and_review_use_medium_reasoning(monkeypatch) -> None:
     assert efforts == ["medium", "medium"]
 
 
+def test_fact_extraction_reclassifies_current_process_ranking_as_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def generate_text(self, _messages):
+            return (
+                '{"facts":[{"kind":"preference","category":"工作",'
+                '"fact":"该成员认为目前手上的流程中华为方向最好",'
+                '"evidence":"目前手上的流程好像还真是华为的方向最好",'
+                '"context_evidence":[]}]}'
+            )
+
+    monkeypatch.setattr(member_memory_backfill, "LlmClient", FakeClient)
+    settings = SimpleNamespace(
+        llm_base_url="http://example.invalid",
+        llm_api_key="test",
+        llm_model="test",
+        llm_fallback_model="test",
+    )
+
+    facts = extract_facts_from_lines(
+        settings,
+        ["目前手上的流程好像还真是华为的方向最好"],
+    )
+
+    assert facts[0]["kind"] == "decision"
+
+
 def test_fact_extraction_uses_neighbors_only_for_target_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,6 +167,60 @@ def test_fact_extraction_uses_neighbors_only_for_target_evidence(
         }
     ]
     assert unsupported == []
+
+
+def test_fact_extraction_prompt_preserves_structured_source_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompts: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def generate_text(self, messages):
+            prompts.append(messages[0])
+            return (
+                '{"facts":[{"kind":"decision","category":"工作",'
+                '"fact":"他选择星河科技","evidence":"星河科技",'
+                '"context_evidence":["哪家？"]}]}'
+            )
+
+    monkeypatch.setattr(member_memory_backfill, "LlmClient", FakeClient)
+    settings = SimpleNamespace(
+        llm_base_url="http://example.invalid",
+        llm_api_key="test",
+        llm_model="test",
+        llm_fallback_model="test",
+    )
+
+    facts = extract_facts_from_lines(
+        settings,
+        ["星河科技"],
+        source_records=[
+            {
+                "role": "target",
+                "source_msg_id": "answer",
+                "user_id": "101",
+                "sent_at": "2026-09-27T12:00:40+00:00",
+                "content": "星河科技",
+            }
+        ],
+        context_records=[
+            {
+                "role": "context",
+                "source_msg_id": "question",
+                "user_id": "102",
+                "sent_at": "2026-09-27T12:00:20+00:00",
+                "content": "哪家？",
+            }
+        ],
+    )
+
+    assert facts[0]["context_evidence"] == ["哪家？"]
+    assert '"source_msg_id":"answer"' in prompts[0]
+    assert '"source_msg_id":"question"' in prompts[0]
+    assert '"role":"target"' in prompts[0]
 
 
 def test_fact_extraction_rejects_empty_provider_text(
@@ -239,6 +332,156 @@ def test_current_fact_upsert_keeps_target_and_neighbor_provenance(
         assert row.valid_until == (observed_at + timedelta(days=14)).replace(
             tzinfo=None
         )
+
+
+def test_upsert_member_facts_keeps_multiple_kinds_from_one_source(
+    fact_refresh_database,
+) -> None:
+    _seed_member_message(
+        fact_refresh_database,
+        platform_msg_id="multi-facet-source",
+        plain_text="二面的面试官还是我实习时的面试官",
+    )
+    common = {
+        "category": "工作",
+        "fact": "该成员进入了二面阶段",
+        "evidence": "二面的面试官还是我实习时的面试官",
+    }
+
+    imported = upsert_member_facts(
+        fact_refresh_database,
+        group_id=900000001,
+        user_id=900000101,
+        facts=[
+            {**common, "kind": "event"},
+            {**common, "kind": "relationship"},
+        ],
+    )
+
+    assert imported == 2
+    with session_scope(fact_refresh_database) as session:
+        rows = session.query(MemoryItem).order_by(MemoryItem.memory_kind).all()
+        assert [row.memory_kind for row in rows] == ["event", "relationship"]
+        assert all(row.source_msg_ids == ["multi-facet-source"] for row in rows)
+
+
+def test_offline_refresh_uses_verified_clarification_thread_sources(
+    fact_refresh_database,
+) -> None:
+    started_at = datetime(2026, 9, 27, 5, tzinfo=UTC)
+    with session_scope(fact_refresh_database) as session:
+        session.add(User(user_id=900000102, nickname="questioner", group_card="questioner"))
+        session.flush()
+        rows = [
+            Message(
+                platform_msg_id="clarify-anchor",
+                group_id=900000001,
+                user_id=900000101,
+                timestamp=started_at,
+                raw_json={},
+                plain_text="我现在主要考虑两家公司",
+                msg_type="text",
+                mentioned_bot=False,
+            ),
+            Message(
+                platform_msg_id="clarify-question",
+                group_id=900000001,
+                user_id=900000102,
+                timestamp=started_at + timedelta(seconds=10),
+                raw_json={},
+                plain_text="哪家？",
+                msg_type="text",
+                mentioned_bot=False,
+            ),
+            Message(
+                platform_msg_id="clarify-followup-1",
+                group_id=900000001,
+                user_id=900000102,
+                timestamp=started_at + timedelta(seconds=20),
+                raw_json={},
+                plain_text="哪个公司呀？",
+                msg_type="text",
+                mentioned_bot=False,
+            ),
+            Message(
+                platform_msg_id="clarify-followup-2",
+                group_id=900000001,
+                user_id=900000102,
+                timestamp=started_at + timedelta(seconds=30),
+                raw_json={},
+                plain_text="哪个方向？",
+                msg_type="text",
+                mentioned_bot=False,
+            ),
+            Message(
+                platform_msg_id="clarify-answer",
+                group_id=900000001,
+                user_id=900000101,
+                timestamp=started_at + timedelta(seconds=40),
+                raw_json={},
+                plain_text="星河科技",
+                msg_type="text",
+                mentioned_bot=False,
+            ),
+        ]
+        session.add_all(rows)
+        session.flush()
+        episode = ConversationEpisode(
+            group_id=900000001,
+            start_message_id=int(rows[0].id),
+            end_message_id=int(rows[-1].id),
+            started_at=started_at,
+            ended_at=started_at + timedelta(seconds=40),
+            status="closed",
+            is_current=False,
+            message_count=len(rows),
+        )
+        session.add(episode)
+        session.flush()
+        session.add_all(
+            EpisodeMessage(
+                episode_id=int(episode.id),
+                message_id=int(row.id),
+                group_id=900000001,
+                ordinal=index,
+            )
+            for index, row in enumerate(rows)
+        )
+        answer_id = int(rows[-1].id)
+
+    service = _fact_refresh_service(fact_refresh_database)
+    with session_scope(fact_refresh_database) as session:
+        answer = session.query(Message).filter_by(platform_msg_id="clarify-answer").one()
+        context_rows = service._clarification_context_rows(
+            group_id=900000001,
+            target_rows=[answer],
+        )
+
+    context_by_text = {str(row.plain_text): int(row.id) for row in context_rows}
+    assert "我现在主要考虑两家公司" in context_by_text
+    assert context_by_text["哪家？"] < answer_id - 2
+
+    imported = upsert_member_facts(
+        fact_refresh_database,
+        group_id=900000001,
+        user_id=900000101,
+        facts=[
+            {
+                "kind": "decision",
+                "category": "工作",
+                "fact": "该成员更倾向星河科技",
+                "evidence": "星河科技",
+                "context_evidence": ["哪家？"],
+            }
+        ],
+        source_message_ids={answer_id},
+        context_source_message_ids=set(context_by_text.values()),
+    )
+
+    assert imported == 1
+    with session_scope(fact_refresh_database) as session:
+        row = session.query(MemoryItem).one()
+        assert row.source_msg_ids == ["clarify-answer", "clarify-question"]
 
 
 def _seed_member_message(
@@ -472,14 +715,20 @@ def test_bounded_replay_apply_is_idempotent_and_preserves_watermark(
         member_allowlist={900000101},
     )
     monkeypatch.setattr(service, "_refresh_bot_names", lambda: None)
-    phrasings = iter(("他最近在学日语", "该成员目前正在学习日语"))
+    phrasings = iter(
+        (
+            ("他最近在学日语", "学习"),
+            ("该成员目前正在学习日语", "生活"),
+        )
+    )
 
     def extract_with_variable_wording(*_args, **_kwargs):
+        fact, category = next(phrasings)
         return [
             {
                 "kind": "current",
-                "category": "学习",
-                "fact": next(phrasings),
+                "category": category,
+                "fact": fact,
                 "evidence": "我最近在学日语",
                 "context_evidence": [],
             }

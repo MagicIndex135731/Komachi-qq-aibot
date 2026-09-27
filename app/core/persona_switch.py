@@ -29,7 +29,7 @@ from app.core.persona_style_retrieval import (
     rank_style_examples,
 )
 from app.core.memory_fact_ranking import (
-    fact_kinds_for_query,
+    fact_intent_policy,
     matching_member_fact_ids,
     memory_query_features,
     preferred_kinds_for_query,
@@ -518,14 +518,12 @@ class PersonaManager:
         if user_id is None:
             return []
         query_text = str(context_lines[0] if context_lines else "").split(":", 1)[-1].strip()
-        allowed_kinds = fact_kinds_for_query(
+        policy = fact_intent_policy(
             query=query_text,
             answer_mode=answer_mode,
         )
-        preferred_kinds = preferred_kinds_for_query(
-            query=query_text,
-            answer_mode=answer_mode,
-        )
+        allowed_kinds = policy.allowed_kinds
+        preferred_kinds = policy.preferred_kinds
         with session_scope(self.engine) as session:
             rows = [
                 row
@@ -572,6 +570,7 @@ class PersonaManager:
                     query_features=query_features,
                 ),
                 topic_specific=True,
+                coverage=policy.coverage,
             )
         bank = [
             {

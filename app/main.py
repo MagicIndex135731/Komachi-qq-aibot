@@ -37,7 +37,7 @@ from app.core.memory_background_service import (
 from app.core.memory_compaction_service import MemoryCompactionService
 from app.core.memory_fact_ranking import (
     PERSON_PORTRAIT_KINDS,
-    fact_kinds_for_query,
+    fact_intent_policy,
     filter_member_query_features,
     is_composite_portrait_query,
     matching_member_fact_ids,
@@ -49,6 +49,7 @@ from app.core.memory_fact_ranking import (
     select_diverse_portrait_facts,
     select_temporal_current_facts,
     temporal_recency_required,
+    viewing_fallback_match_ids,
 )
 from app.core.memory_fact_semantics import SemanticFactRanker
 from app.core.memory_context_packer import (
@@ -990,6 +991,35 @@ def build_memory_runtime(
                 )
             )
 
+    def load_thread_context(
+        *,
+        group_id: int,
+        source_msg_ids: tuple[str, ...],
+        limit_per_source: int,
+        max_gap_seconds: int,
+    ):
+        with session_scope(engine) as session:
+            messages = MessageRepository(session)
+            rows = messages.list_bounded_same_episode_message_context(
+                group_id=group_id,
+                anchor_platform_msg_ids=list(source_msg_ids),
+                per_anchor_limit=limit_per_source,
+                max_gap_seconds=max_gap_seconds,
+                excluded_user_ids={int(settings.bot_qq)},
+            )
+            users_by_id = UserRepository(session).get_users_by_ids(
+                [int(row.user_id) for row in rows]
+            )
+            return tuple(
+                _evidence_messages_from_rows(
+                    rows=rows,
+                    users_by_id=users_by_id,
+                    messages=messages,
+                    settings=settings,
+                    bot_display_name=bot_display_name,
+                )
+            )
+
     def load_facts(*, group_id: int, resolved_query):
         if settings.memory_raw_v3_enabled and not settings.memory_layered_memory_enabled:
             return ()
@@ -1005,12 +1035,14 @@ def build_memory_runtime(
                 )
             )
             subject_ids = resolved_query.subject_ids
+            policy = fact_intent_policy(
+                query=str(resolved_query.original_query),
+                answer_mode=resolved_query.answer_mode,
+            )
             allowed_fact_kinds = (
                 frozenset(
-                    fact_kinds_for_query(
-                        query=str(resolved_query.original_query),
-                        answer_mode=resolved_query.answer_mode,
-                    )
+                    tuple(getattr(resolved_query, "allowed_fact_kinds", ()) or ())
+                    or policy.allowed_kinds
                 )
                 if subject_ids and resolved_query.answer_mode == "current_fact"
                 else None
@@ -1144,11 +1176,22 @@ def build_memory_runtime(
                                 viewing_event,
                                 *[row for row in ranked_rows if row.id != viewing_event.id],
                             ]
-                            matching_ids = {int(viewing_event.id)}
+                            matching_ids = viewing_fallback_match_ids(
+                                matching_ids,
+                                viewing_event=viewing_event,
+                                coverage=str(
+                                    getattr(resolved_query, "fact_coverage", "")
+                                    or policy.coverage
+                                ),
+                            )
                         ranked_rows = select_temporal_current_facts(
                             ranked_rows,
                             matching_fact_ids=matching_ids,
                             topic_specific=bool(resolved_query.topic_terms),
+                            coverage=str(
+                                getattr(resolved_query, "fact_coverage", "")
+                                or policy.coverage
+                            ),
                         )
                         if temporal_current_fact_ids is None:
                             temporal_current_fact_ids = set()
@@ -1337,6 +1380,7 @@ def build_memory_runtime(
         episode_loader=load_episode,
         source_loader=load_sources,
         context_loader=load_source_context,
+        thread_context_loader=load_thread_context,
         normal_segment_limit=(
             (
                 settings.memory_adaptive_max_history_messages
