@@ -82,7 +82,7 @@ def test_build_reply_split_config_uses_group_settings_and_safe_defaults() -> Non
     assert configured["max_delay_seconds"] == 1.5
 
 
-def test_format_example_pairs_includes_context_after() -> None:
+def test_format_example_pairs_uses_canonical_situation_without_context_after() -> None:
     entries = [
         {
             "text": "来了",
@@ -92,7 +92,8 @@ def test_format_example_pairs_includes_context_after() -> None:
         }
     ]
     rendered = format_example_pairs(entries)
-    assert "上文「加菲猫: 上号」→ 他回「来了」→ 下文「人呢」" in rendered
+    assert "情境「上号」→ 本人原话「来了」" in rendered
+    assert "人呢" not in rendered
 
 
 def test_build_human_chat_style_lines_for_proactive_turn_pushes_short_human_interjections() -> None:

@@ -56,6 +56,147 @@ def test_should_bind_impersonated_self() -> None:
     assert _should_bind_impersonated_self("你如何评价我") is False
 
 
+def test_impersonation_style_retrieval_ignores_sixty_old_topics_in_prompt(
+    sqlite_engine,
+) -> None:
+    from app.storage.repositories import PersonaStyleExampleRepository
+
+    class _TopicEmbedding:
+        available = True
+        identity = type(
+            "Identity",
+            (),
+            {"provider": "test", "model": "topic", "version": "v1", "dimensions": 2},
+        )()
+
+        @staticmethod
+        def _vector(text):
+            return [1.0, 0.0] if "动画" in str(text) else [0.0, 1.0]
+
+        def embed_documents(self, texts):
+            return [self._vector(text) for text in texts]
+
+        def embed_query(self, text):
+            return self._vector(text)
+
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+    )
+    router.persona_manager.embedding_provider = _TopicEmbedding()
+    router.persona_manager.personas["member"] = {
+        "name": "测试群友",
+        "identity": "group member",
+        "source_user_id": 222,
+        "source_group_id": 10001,
+    }
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(
+            group_id=10001,
+            group_name="测试群",
+            enabled=True,
+            speak_enabled=True,
+        )
+        UserRepository(session).upsert_user(
+            user_id=20001,
+            nickname="提问者",
+            group_card="",
+        )
+        message_repo = MessageRepository(session)
+        for index in range(60):
+            message_repo.add_group_message(
+                platform_msg_id=f"old-noise-{index}",
+                group_id=10001,
+                user_id=20001,
+                timestamp=datetime(2026, 5, 9, 8, 0, tzinfo=UTC) + timedelta(seconds=index),
+                plain_text=f"旧足球工作吃饭话题{index}",
+                raw_json={},
+                msg_type="text",
+                reply_to_msg_id=None,
+                mentioned_bot=False,
+            )
+        PersonaStyleExampleRepository(session).insert_many(
+            [
+                {
+                    "group_id": 10001,
+                    "user_id": 222,
+                    "msg_id": "animation-style",
+                    "text": "最近在补老动画",
+                    "reply_target": "群友: 最近在看什么动画",
+                    "context_before": [],
+                    "timestamp": datetime(2026, 5, 1, tzinfo=UTC),
+                },
+                {
+                    "group_id": 10001,
+                    "user_id": 222,
+                    "msg_id": "unrelated-style",
+                    "text": "无关地点候选绝不能出现",
+                    "reply_target": "群友: 足球踢完去哪吃饭",
+                    "context_before": [],
+                    "timestamp": datetime(2026, 5, 8, tzinfo=UTC),
+                },
+            ]
+        )
+    router.persona_manager.load_style_banks()
+    router.persona_manager.set_persona_key(10001, "member")
+    assert router.persona_manager.prewarm_examples(10001, "member") == 2
+
+    prepared = router._prepare_group_reply(
+        make_event(
+            group_id=10001,
+            mentioned_bot=True,
+            message_id="current-animation-query",
+            plain_text="@Mira 最近在看什么动画",
+            timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
+        ),
+        quoted_raw_payload=None,
+    )
+
+    prompt = "\n".join(prepared.prompt_lines or [])
+    assert "相似情境下的说话方式示例（仅模仿风格）" in prompt
+    assert "最近在补老动画" in prompt
+    assert "无关地点候选绝不能出现" not in prompt
+    assert "只用于学习句长、语气、用词和节奏，不是事实来源" in prompt
+
+
+def test_style_retrieval_without_manager_uses_strict_fallback_and_total_budget(
+    sqlite_engine,
+) -> None:
+    router = InboundRouter.build_for_test(
+        sqlite_engine=sqlite_engine,
+        sender=FakeSender(),
+        llm_client=FakeLlm(),
+    )
+    router.persona_manager = None
+    unrelated = router._with_relevant_examples(
+        "persona-text",
+        {"example_bank": ["明天看球"]},
+        ["提问者: 今天工作如何"],
+        10001,
+    )
+    assert unrelated == "persona-text"
+
+    long_entries = [
+        {
+            "msg_id": f"style-{index}",
+            "text": "马上来" + ("呀" * 70) + str(index),
+            "reply_target": "群友: 今晚打游戏" + ("吗" * 60),
+        }
+        for index in range(3)
+    ]
+    rendered = router._with_relevant_examples(
+        "persona-text",
+        {"example_bank": long_entries},
+        ["提问者: 今晚打游戏吗"],
+        10001,
+    )
+
+    dynamic_block = rendered[len("persona-text") :]
+    assert "相似情境下的说话方式示例" in dynamic_block
+    assert len(dynamic_block) <= 600
+
+
 def test_impersonation_facts_target_self_heuristic() -> None:
     persona = {"name": "阿渣", "source_user_id": "999001"}
 

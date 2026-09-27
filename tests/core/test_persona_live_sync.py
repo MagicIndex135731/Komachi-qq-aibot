@@ -68,7 +68,7 @@ def test_build_examples_keeps_context_and_reply_target() -> None:
     assert [item["speaker"] for item in example["context_before"]] == ["路人甲"]
 
 
-def test_build_examples_drops_bot_lines_from_context() -> None:
+def test_build_examples_drops_replies_to_bot_from_style_evidence() -> None:
     rows = [
         _row(1, "m1", 111, "在吗", card="路人甲"),
         _row(2, "m2", 900001, "在的", card="测试小町"),
@@ -82,10 +82,26 @@ def test_build_examples_drops_bot_lines_from_context() -> None:
         bot_text_names={"测试小町"},
     )
 
-    assert len(examples) == 1
-    example = examples[0]
-    assert example["reply_target"] is None
-    assert [item["speaker"] for item in example["context_before"]] == ["路人甲"]
+    assert examples == []
+
+
+def test_build_examples_drops_reply_to_bot_resolved_outside_sync_window() -> None:
+    rows = [
+        _row(30, "member-reply", 222, "知道了", card="测试君", reply_to="old-bot"),
+    ]
+    quoted_rows = {
+        "old-bot": _row(1, "old-bot", 900001, "很久以前的机器人回复", card="测试小町")
+    }
+
+    examples = _build_examples(
+        rows,
+        user_id=222,
+        bot_qqs={900001},
+        bot_text_names={"测试小町"},
+        quoted_rows=quoted_rows,
+    )
+
+    assert examples == []
 
 
 def test_build_examples_keeps_context_after() -> None:

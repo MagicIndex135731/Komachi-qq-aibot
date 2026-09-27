@@ -566,14 +566,19 @@ def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None
     class _FakeEmbedding:
         available = True
 
+        def __init__(self):
+            self.document_calls = 0
+
         class _Identity:
             provider = "test"
             model = "fake"
+            version = "v1"
             dimensions = 4
 
         identity = _Identity()
 
         def embed_documents(self, texts):
+            self.document_calls += 1
             return [[1.0, 0.0, 0.0, 0.0]] * len(texts)
 
         def embed_query(self, text):
@@ -602,29 +607,35 @@ def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None
             "source_group_id": 10001,
         },
     }
+    first_provider = _FakeEmbedding()
     manager = PersonaManager(
         engine=sqlite_engine,
         personas=personas,
         default_persona=personas["default"],
-        embedding_provider=_FakeEmbedding(),
+        embedding_provider=first_provider,
     )
     manager.load_state()
     manager._group_keys[10001] = "test_self"
-    picked = manager.retrieve_examples(10001, ["在吗"], limit=1)
+    assert manager.prewarm_examples(10001, "test_self") == 1
+    assert first_provider.document_calls == 1
+    picked = manager.retrieve_examples(10001, ["有人在吗"], limit=1)
     assert picked
 
     with session_scope(sqlite_engine) as session:
         assert session.query(PersonaExampleVector).filter_by(user_id=222).count() == 1
 
+    fresh_provider = _FakeEmbedding()
     fresh = PersonaManager(
         engine=sqlite_engine,
         personas=personas,
         default_persona=personas["default"],
-        embedding_provider=_FakeEmbedding(),
+        embedding_provider=fresh_provider,
     )
     fresh.load_state()
     fresh._group_keys[10001] = "test_self"
-    picked_again = fresh.retrieve_examples(10001, ["在吗"], limit=1)
+    assert fresh.prewarm_examples(10001, "test_self") == 1
+    assert fresh_provider.document_calls == 0
+    picked_again = fresh.retrieve_examples(10001, ["有人在吗"], limit=1)
     assert picked_again
 
 
@@ -691,7 +702,8 @@ def test_example_vectors_ignore_and_purge_stale_persisted_rows(sqlite_engine) ->
     manager.load_state()
     manager._group_keys[10001] = "test_self"
 
-    picked = manager.retrieve_examples(10001, ["在吗"], limit=1)
+    assert manager.prewarm_examples(10001, "test_self") == 1
+    picked = manager.retrieve_examples(10001, ["有人在吗"], limit=1)
 
     assert picked
     with session_scope(sqlite_engine) as session:
@@ -701,3 +713,119 @@ def test_example_vectors_ignore_and_purge_stale_persisted_rows(sqlite_engine) ->
             .count()
             == 0
         )
+
+
+def test_style_bank_is_scoped_by_source_group(sqlite_engine) -> None:
+    from app.core.persona_switch import PersonaManager
+    from app.storage.db import session_scope
+    from app.storage.repositories import PersonaStyleExampleRepository
+
+    with session_scope(sqlite_engine) as session:
+        PersonaStyleExampleRepository(session).insert_many(
+            [
+                {
+                    "group_id": 10001,
+                    "user_id": 222,
+                    "msg_id": "source-group",
+                    "text": "本群说法",
+                    "context_before": [],
+                },
+                {
+                    "group_id": 10002,
+                    "user_id": 222,
+                    "msg_id": "other-group",
+                    "text": "其他群说法",
+                    "context_before": [],
+                },
+            ]
+        )
+    personas = {
+        "default": {"name": "测试小町"},
+        "member": {
+            "name": "测试君",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+    )
+
+    manager.load_style_banks()
+    bank = manager.style_bank(10001, persona_key="member")
+
+    assert [entry["msg_id"] for entry in bank] == ["source-group"]
+
+
+def test_style_retrieval_log_contains_metrics_but_not_chat_text(
+    sqlite_engine,
+    caplog,
+) -> None:
+    from app.core.persona_style_retrieval import build_style_retrieval_query
+    from app.core.persona_switch import PersonaManager
+    from app.storage.db import session_scope
+    from app.storage.repositories import PersonaStyleExampleRepository
+
+    class _FakeEmbedding:
+        available = True
+        identity = type(
+            "Identity",
+            (),
+            {"provider": "test", "model": "fake", "version": "v1", "dimensions": 2},
+        )()
+
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    with session_scope(sqlite_engine) as session:
+        PersonaStyleExampleRepository(session).insert_many(
+            [
+                {
+                    "group_id": 10001,
+                    "user_id": 222,
+                    "msg_id": "safe-log-id",
+                    "text": "这是绝密候选正文",
+                    "reply_target": "群友: 绝密查询词相关吗",
+                    "context_before": [],
+                }
+            ]
+        )
+    personas = {
+        "default": {"name": "测试小町"},
+        "member": {
+            "name": "测试君",
+            "source_user_id": 222,
+            "source_group_id": 10001,
+        },
+    }
+    manager = PersonaManager(
+        engine=sqlite_engine,
+        personas=personas,
+        default_persona=personas["default"],
+        embedding_provider=_FakeEmbedding(),
+    )
+    manager.load_style_banks()
+    manager.prewarm_examples(10001, "member")
+    caplog.clear()
+
+    with caplog.at_level("INFO"):
+        manager.retrieve_examples(
+            10001,
+            build_style_retrieval_query(
+                current_text="绝密查询词是什么",
+                current_message_id="query-id",
+            ),
+            persona_key="member",
+        )
+
+    output = caplog.text
+    assert "persona_style_retrieval" in output
+    assert "selected_count=" in output
+    assert "query-id" in output
+    assert "绝密查询词是什么" not in output
+    assert "这是绝密候选正文" not in output

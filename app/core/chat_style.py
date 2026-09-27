@@ -566,28 +566,12 @@ def retrieve_relevant_examples(
     return [entry for _, _, entry in scored[: max(0, limit)]]
 
 
-def format_example_pairs(entries: list[dict], *, max_pairs: int = 4) -> str:
-    """Render retrieved examples as context→reply pairs."""
+def format_example_pairs(entries: list[dict], *, max_pairs: int = 3) -> str:
+    """Compatibility wrapper for the canonical bounded style formatter."""
 
-    def _text(value: object) -> str:
-        if isinstance(value, dict):
-            return str(value.get("text") or "").strip()
-        return str(value or "").strip()
+    from app.core.persona_style_retrieval import format_style_example_block
 
-    pairs: list[str] = []
-    for entry in entries[: max(0, max_pairs)]:
-        before = entry.get("context_before") or []
-        after = entry.get("context_after") or []
-        lead = _text(entry.get("reply_target")) or _text(before[-1] if before else "")
-        after_lead = _text(after[-1] if after else "")
-        text = _text(entry.get("text"))
-        if lead and after_lead:
-            pairs.append(f"上文「{lead}」→ 他回「{text}」→ 下文「{after_lead}」")
-        elif lead:
-            pairs.append(f"上文「{lead}」→ 他回「{text}」")
-        else:
-            pairs.append(f"他回「{text}」")
-    return "；".join(pairs)
+    return format_style_example_block(entries, max_pairs=max_pairs)
 
 
 def retrieve_relevant_facts(

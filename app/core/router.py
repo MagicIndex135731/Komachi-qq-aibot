@@ -33,15 +33,22 @@ from app.core.chat_style import (
     burst_delays,
     build_human_chat_style_lines,
     build_reply_split_config,
-    format_example_pairs,
     normalize_brief_group_interjection_reply,
     normalize_chat_reply,
     normalize_chat_reply_burst_aware,
     normalize_proactive_chat_reply,
-    retrieve_relevant_examples,
     retrieve_relevant_facts,
     scrub_banned_address_terms,
     split_burst_reply,
+)
+from app.core.persona_style_retrieval import (
+    MAX_PROMPT_BLOCK_CHARS,
+    MAX_SELECTED_EXAMPLES,
+    StyleRetrievalQuery,
+    build_style_document,
+    build_style_retrieval_query,
+    format_style_example_block,
+    rank_style_examples,
 )
 from app.core.context_builder import ContextBuilder
 from app.core.group_image_generation import GroupImageGenerationRequest
@@ -943,7 +950,7 @@ class InboundRouter:
             "评价别人时只给一句短评（几个字到十几个字），不要分析、总结或列举。"
         )
         text += (
-            "\n用词纪律：优先直接引用上方真实原话示例里的说法；"
+            "\n用词纪律：根据真实示例学习句长、语气、用词和节奏，不要照抄整句；"
             "不要使用他从未说过、示例和事实里不存在的网络热梗（如'遥遥领先'之类）。"
         )
         burst = active_persona.get("burst") if isinstance(active_persona, dict) else None
@@ -966,16 +973,35 @@ class InboundRouter:
         active_persona: dict,
         context_lines: list[str],
         group_id: int,
+        *,
+        style_query: StyleRetrievalQuery | None = None,
+        exclude_texts: Sequence[str] = (),
     ) -> str:
+        style_preamble = (
+            "\n相似情境下的说话方式示例（仅模仿风格）："
+            "以下内容只用于学习句长、语气、用词和节奏，不是事实来源；"
+            "不要照抄整句，不要把示例中的人物、作品或事件带入当前回答。"
+        )
+        example_budget = max(0, MAX_PROMPT_BLOCK_CHARS - len(style_preamble))
+        if style_query is None:
+            current_text = str(context_lines[0] if context_lines else "").split(":", 1)[-1]
+            style_query = build_style_retrieval_query(current_text=current_text)
         if self.persona_manager is not None:
             picked = self.persona_manager.retrieve_examples(
-                group_id, context_lines, limit=6
+                group_id,
+                style_query,
+                limit=MAX_SELECTED_EXAMPLES,
+                exclude_texts=list(exclude_texts),
             )
             if picked:
-                return (
-                    f"{persona_text}\n相关话题下他的原话示例："
-                    f"{format_example_pairs(picked, max_pairs=4)}"
+                examples = format_style_example_block(
+                    picked,
+                    max_pairs=MAX_SELECTED_EXAMPLES,
+                    max_chars=example_budget,
                 )
+                if not examples:
+                    return persona_text
+                return f"{persona_text}{style_preamble}{examples}"
             bank = self.persona_manager.style_bank(group_id)
         else:
             bank = []
@@ -985,11 +1011,39 @@ class InboundRouter:
                 or active_persona.get("example_lines")
                 or []
             )
-        picked = retrieve_relevant_examples(bank, context_lines, limit=6)
+        fallback_entries = [
+            (
+                {"msg_id": f"fallback-{index}", "text": str(entry).strip()}
+                if not isinstance(entry, dict)
+                else {**entry, "msg_id": str(entry.get("msg_id") or f"fallback-{index}")}
+            )
+            for index, entry in enumerate(bank)
+            if str(entry.get("text") if isinstance(entry, dict) else entry).strip()
+        ]
+        documents = [
+            document
+            for entry in fallback_entries
+            if (document := build_style_document(entry)) is not None
+        ]
+        matches = rank_style_examples(
+            query=style_query,
+            documents=documents,
+            vectors_by_id={},
+            query_vector=None,
+            limit=MAX_SELECTED_EXAMPLES,
+            exclude_texts=exclude_texts,
+        )
+        picked = [match.entry for match in matches]
         if not picked:
             return persona_text
-        examples = format_example_pairs(picked, max_pairs=4)
-        return f"{persona_text}\n相关话题下他的原话示例：{examples}"
+        examples = format_style_example_block(
+            picked,
+            max_pairs=MAX_SELECTED_EXAMPLES,
+            max_chars=example_budget,
+        )
+        if not examples:
+            return persona_text
+        return f"{persona_text}{style_preamble}{examples}"
 
     def _with_relevant_facts(
         self,
@@ -1895,8 +1949,36 @@ class InboundRouter:
                 recent_lines = self._sanitize_impersonation_lines(
                     recent_lines, group_id=event.group_id
                 )
+                quoted_style_text = self._flatten_raw_message_text(quoted_raw_payload)
+                style_query = build_style_retrieval_query(
+                    current_text=event.plain_text,
+                    quoted_text=quoted_style_text,
+                    recent_messages=recent_messages,
+                    current_timestamp=event.timestamp,
+                    current_message_id=event.platform_msg_id,
+                    bot_user_id=int(self.runtime.settings.bot_qq),
+                )
+                fixed_examples = [
+                    str(value)
+                    for value in (
+                        active_persona.get("example_lines")
+                        or active_persona.get("example_bank")
+                        or []
+                    )
+                    if str(value).strip()
+                ]
+                recent_bot_replies = [
+                    str(message.plain_text or "")
+                    for message in recent_messages[-3:]
+                    if int(message.user_id) == int(self.runtime.settings.bot_qq)
+                ]
                 persona_text = self._with_relevant_examples(
-                    persona_text, active_persona, recent_lines, event.group_id
+                    persona_text,
+                    active_persona,
+                    [style_query.semantic_text],
+                    event.group_id,
+                    style_query=style_query,
+                    exclude_texts=[*fixed_examples, *recent_bot_replies],
                 )
                 query_lines = [
                     f"{self._member_label_for_user(user_id=event.user_id, users_by_id=users_by_id, group_id=event.group_id)}: {event.plain_text}",

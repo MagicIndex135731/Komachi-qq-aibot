@@ -23,6 +23,7 @@ from app.core.style_distill import merge_persona_lists
 from app.core.worker_status import write_worker_status
 from app.storage.db import session_scope
 from app.storage.repositories import (
+    MessageRepository,
     PersonaStyleExampleRepository,
     PersonaStyleSyncStateRepository,
 )
@@ -253,15 +254,38 @@ class PersonaLiveSyncService:
                 {"group_id": group_id, "watermark": watermark},
             ).mappings().all()
             rows = list(reversed(pre_rows)) + list(new_rows)
+            quoted_ids = [
+                str(row.get("reply_to_msg_id") or "")
+                for row in rows
+                if str(row.get("reply_to_msg_id") or "")
+            ]
+            quoted_messages = MessageRepository(session).get_group_messages_by_platform_msg_ids(
+                group_id=group_id,
+                platform_msg_ids=quoted_ids,
+            )
+            quoted_rows = {
+                msg_id: {
+                    "platform_msg_id": message.platform_msg_id,
+                    "group_id": message.group_id,
+                    "user_id": message.user_id,
+                    "plain_text": message.plain_text,
+                    "msg_type": message.msg_type,
+                    "reply_to_msg_id": message.reply_to_msg_id,
+                    "raw_json": message.raw_json,
+                    "timestamp": message.timestamp,
+                }
+                for msg_id, message in quoted_messages.items()
+            }
             examples = _build_examples(
                 rows,
                 user_id=user_id,
                 bot_qqs=self.bot_qqs,
                 bot_text_names=self.bot_text_names,
+                quoted_rows=quoted_rows,
             )
-            inserted = PersonaStyleExampleRepository(session).insert_many(examples)
+            inserted, updated = PersonaStyleExampleRepository(session).upsert_many(examples)
             trimmed = PersonaStyleExampleRepository(session).trim_to(
-                user_id=user_id, keep=1800
+                user_id=user_id, group_id=group_id, keep=1800
             )
             new_target_count = sum(
                 1
@@ -282,16 +306,20 @@ class PersonaLiveSyncService:
                 last_msg_id=str(last_id),
                 new_count=new_target_count,
             )
-        if inserted or trimmed:
+        if inserted or updated or trimmed:
             logger.info(
-                "persona_live_bank_sync persona_key=%s user_id=%s inserted=%s trimmed=%s",
+                "persona_live_bank_sync persona_key=%s user_id=%s inserted=%s updated=%s trimmed=%s",
                 persona_key,
                 user_id,
                 inserted,
+                updated,
                 trimmed,
             )
-        if inserted:
+        if inserted or updated or trimmed:
             self.manager.load_style_banks()
+            # This service already runs off the reply path. Rebuild changed
+            # style documents here so group replies only read compatible data.
+            self.manager.prewarm_examples(group_id, persona_key)
         return inserted
 
     def _refresh_bot_names(self) -> None:
@@ -379,11 +407,13 @@ class PersonaLiveSyncService:
             if last_refresh is None:
                 examples = repo.load_active(
                     user_id=user_id,
+                    group_id=group_id,
                     limit=int(self.refresh_threshold),
                 )
             else:
                 examples = repo.load_since(
                     user_id=user_id,
+                    group_id=group_id,
                     since=last_refresh,
                     limit=int(self.refresh_threshold),
                 )
@@ -576,9 +606,17 @@ def _build_examples(
     user_id: int,
     bot_qqs: set[int],
     bot_text_names: set[str],
+    quoted_rows: dict[str, dict] | None = None,
 ) -> list[dict]:
     new_rows = [dict(row) for row in rows]
     by_id = {str(row.get("platform_msg_id")): row for row in new_rows if row.get("plain_text")}
+    by_id.update(
+        {
+            str(msg_id): dict(row)
+            for msg_id, row in (quoted_rows or {}).items()
+            if str(row.get("plain_text") or "").strip()
+        }
+    )
     ordered = [row for row in new_rows if str(row.get("plain_text") or "").strip()]
     examples: list[dict] = []
     for index, row in enumerate(ordered):
@@ -590,6 +628,11 @@ def _build_examples(
             bot_text_names=bot_text_names,
         ):
             # Human-to-AI turns must never become style samples.
+            continue
+        quoted_for_style = by_id.get(str(row.get("reply_to_msg_id") or ""))
+        if quoted_for_style is not None and int(quoted_for_style.get("user_id") or 0) in bot_qqs:
+            # A reply to the bot is conditioned on generated content, so it is
+            # not independent evidence of how this member talks with humans.
             continue
         if str(row.get("msg_type") or "text") != "text":
             continue
@@ -613,7 +656,7 @@ def _build_examples(
                 {"speaker": label, "text": str(other.get("plain_text") or "").strip()}
             )
         reply_target = None
-        quoted = by_id.get(str(row.get("reply_to_msg_id") or ""))
+        quoted = quoted_for_style
         if (
             quoted is not None
             and int(quoted.get("user_id") or 0) not in bot_qqs

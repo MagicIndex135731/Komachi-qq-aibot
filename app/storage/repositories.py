@@ -435,11 +435,20 @@ class PersonaStyleExampleRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def load_active(self, *, user_id: int, limit: int = 600) -> list[PersonaStyleExample]:
+    def load_active(
+        self,
+        *,
+        user_id: int,
+        group_id: int | None = None,
+        limit: int = 600,
+    ) -> list[PersonaStyleExample]:
+        filters = [PersonaStyleExample.user_id == int(user_id)]
+        if group_id is not None:
+            filters.append(PersonaStyleExample.group_id == int(group_id))
         return list(
             self.session.scalars(
                 select(PersonaStyleExample)
-                .where(PersonaStyleExample.user_id == int(user_id))
+                .where(*filters)
                 .order_by(PersonaStyleExample.timestamp.desc())
                 .limit(limit)
             )
@@ -449,19 +458,23 @@ class PersonaStyleExampleRepository:
         self,
         *,
         user_id: int,
+        group_id: int | None = None,
         since,
         limit: int = 100,
     ) -> list[PersonaStyleExample]:
         """Samples strictly newer than ``since`` (no overlap with the
         previous refresh window)."""
 
+        filters = [
+            PersonaStyleExample.user_id == int(user_id),
+            PersonaStyleExample.timestamp > since,
+        ]
+        if group_id is not None:
+            filters.append(PersonaStyleExample.group_id == int(group_id))
         return list(
             self.session.scalars(
                 select(PersonaStyleExample)
-                .where(
-                    PersonaStyleExample.user_id == int(user_id),
-                    PersonaStyleExample.timestamp > since,
-                )
+                .where(*filters)
                 .order_by(PersonaStyleExample.timestamp.asc())
                 .limit(limit)
             )
@@ -476,12 +489,60 @@ class PersonaStyleExampleRepository:
             inserted += 1
         return inserted
 
-    def trim_to(self, *, user_id: int, keep: int) -> int:
+    def upsert_many(self, rows: list[dict]) -> tuple[int, int]:
+        """Insert new samples and enrich overlap rows when context arrives later."""
+
+        inserted = 0
+        updated = 0
+        mutable_fields = (
+            "text",
+            "context_before",
+            "context_after",
+            "reply_target",
+            "timestamp",
+        )
+        for row in rows:
+            existing = self.session.get(PersonaStyleExample, row["msg_id"])
+            if existing is None:
+                self.session.add(PersonaStyleExample(**row))
+                inserted += 1
+                continue
+            if (
+                int(existing.user_id) != int(row.get("user_id") or 0)
+                or int(existing.group_id) != int(row.get("group_id") or 0)
+            ):
+                # The legacy table has a global msg_id key. Never overwrite a
+                # row belonging to another member/group until a composite-key
+                # migration is performed.
+                continue
+            changed = False
+            for field_name in mutable_fields:
+                if field_name not in row:
+                    continue
+                value = row[field_name]
+                if getattr(existing, field_name) != value:
+                    setattr(existing, field_name, value)
+                    changed = True
+            if changed:
+                self.session.add(existing)
+                updated += 1
+        return inserted, updated
+
+    def trim_to(
+        self,
+        *,
+        user_id: int,
+        group_id: int | None = None,
+        keep: int,
+    ) -> int:
+        filters = [PersonaStyleExample.user_id == int(user_id)]
+        if group_id is not None:
+            filters.append(PersonaStyleExample.group_id == int(group_id))
         ids = [
             example.msg_id
             for example in self.session.scalars(
                 select(PersonaStyleExample)
-                .where(PersonaStyleExample.user_id == int(user_id))
+                .where(*filters)
                 .order_by(PersonaStyleExample.timestamp.desc())
                 .offset(keep)
             )

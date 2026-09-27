@@ -10,13 +10,24 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import time
 from datetime import UTC, datetime
 
 from sqlalchemy import text
 
-from app.core.chat_style import retrieve_relevant_examples, retrieve_relevant_facts
+from app.core.chat_style import retrieve_relevant_facts
+from app.core.persona_style_retrieval import (
+    DOCUMENT_SCHEMA,
+    MAX_SELECTED_EXAMPLES,
+    StyleDocument,
+    StyleRetrievalQuery,
+    StyleRetrievalTrace,
+    build_style_document,
+    build_style_retrieval_query,
+    rank_style_examples,
+)
 from app.core.memory_fact_ranking import (
     fact_kinds_for_query,
     matching_member_fact_ids,
@@ -105,13 +116,15 @@ class PersonaManager:
         self._group_keys: dict[int, str] = {}
         self._card_snapshots: dict[int, str] = {}
         self._account_avatar_snapshot: str | None = None
-        self._style_banks: dict[int, list[dict]] = {}
+        self._style_banks: dict[tuple[int, int], list[dict]] = {}
         self._member_aliases: dict[int | None, dict[int, str]] = {}
         self._member_aliases_loaded_at: float = 0.0
         self.embedding_provider = embedding_provider
         self._example_vectors: dict[
-            int, tuple[str, list[list[float]] | None, list[dict]]
+            tuple[int, int, str, str, str, int, str],
+            tuple[dict[str, StyleDocument], dict[str, list[float]]],
         ] = {}
+        self._example_prewarm_status: dict[tuple[int, int], dict[str, object]] = {}
 
     def load_state(self) -> None:
         self._group_keys.clear()
@@ -135,6 +148,7 @@ class PersonaManager:
     def load_style_banks(self) -> None:
         """Load live style examples per member, seeding from baked banks."""
 
+        self._style_banks.clear()
         for persona_key, persona in self.personas.items():
             if persona_key == DEFAULT_PERSONA_KEY:
                 continue
@@ -144,7 +158,11 @@ class PersonaManager:
                 continue
             with session_scope(self.engine) as session:
                 repo = PersonaStyleExampleRepository(session)
-                rows = repo.load_active(user_id=user_id, limit=1800)
+                rows = repo.load_active(
+                    user_id=user_id,
+                    group_id=group_id,
+                    limit=1800,
+                )
                 if not rows:
                     baked = [
                         str(value).strip()
@@ -165,10 +183,16 @@ class PersonaManager:
                                 for index, text in enumerate(baked)
                             ]
                         )
-                        rows = repo.load_active(user_id=user_id, limit=600)
-                self._style_banks[user_id] = [
+                        rows = repo.load_active(
+                            user_id=user_id,
+                            group_id=group_id,
+                            limit=600,
+                        )
+                self._style_banks[(user_id, group_id)] = [
                     {
                         "msg_id": row.msg_id,
+                        "user_id": row.user_id,
+                        "group_id": row.group_id,
                         "text": row.text,
                         "context_before": row.context_before or [],
                         "context_after": row.context_after or [],
@@ -186,11 +210,18 @@ class PersonaManager:
     ) -> list[dict]:
         persona = self._resolve_persona(group_id, persona_key)
         user_id = _as_positive_int(persona.get("source_user_id"))
-        if user_id is not None and self._style_banks.get(user_id):
-            return list(self._style_banks[user_id])
+        source_group_id = _as_positive_int(persona.get("source_group_id"))
+        if (
+            user_id is not None
+            and source_group_id is not None
+            and self._style_banks.get((user_id, source_group_id))
+        ):
+            return list(self._style_banks[(user_id, source_group_id)])
         return [
             {
                 "msg_id": f"baked-{index}",
+                "user_id": user_id or 0,
+                "group_id": source_group_id or int(group_id),
                 "text": str(value).strip(),
                 "context_before": [],
                 "context_after": [],
@@ -203,137 +234,191 @@ class PersonaManager:
     def retrieve_examples(
         self,
         group_id: int,
-        context_lines: list[str],
+        query: StyleRetrievalQuery | list[str],
         *,
-        limit: int = 6,
+        limit: int = MAX_SELECTED_EXAMPLES,
         persona_key: str | None = None,
+        exclude_texts: tuple[str, ...] | list[str] = (),
     ) -> list[dict]:
-        """Retrieve examples by embedding similarity when available."""
+        """Read compatible vectors and retrieve; never embed documents here."""
 
+        started_at = time.perf_counter()
+        if not isinstance(query, StyleRetrievalQuery):
+            first = str(query[0] if query else "").split(":", 1)[-1].strip()
+            query = build_style_retrieval_query(current_text=first)
+        trace = StyleRetrievalTrace(
+            query_fragment_count=query.fragment_count,
+            query_chars=len(query.semantic_text),
+        )
         bank = self.style_bank(group_id, persona_key=persona_key)
-        if not bank or self.embedding_provider is None:
-            return retrieve_relevant_examples(bank, context_lines, limit=limit)
+        if not bank or not query.semantic_text:
+            trace.rejection_reason = "empty_bank" if not bank else "empty_query"
+            self._log_style_retrieval(
+                group_id=group_id,
+                query=query,
+                trace=trace,
+                selected_count=0,
+                started_at=started_at,
+            )
+            return []
         persona = self._resolve_persona(group_id, persona_key)
         user_id = _as_positive_int(persona.get("source_user_id"))
-        cache_key = int(user_id) if user_id is not None else hash(repr(persona.get("name")))
+        source_group_id = _as_positive_int(persona.get("source_group_id"))
+        if user_id is None or source_group_id is None:
+            documents = [
+                document
+                for entry in bank
+                if (document := build_style_document(entry)) is not None
+            ]
+            trace.quality_rejected = len(bank) - len(documents)
+            matches = rank_style_examples(
+                query=query,
+                documents=documents,
+                vectors_by_id={},
+                query_vector=None,
+                limit=limit,
+                exclude_texts=exclude_texts,
+                trace=trace,
+            )
+            self._log_style_retrieval(
+                group_id=group_id,
+                query=query,
+                trace=trace,
+                selected_count=len(matches),
+                started_at=started_at,
+            )
+            return [match.entry for match in matches]
+
+        documents = self._documents_for_bank(
+            bank,
+            user_id=user_id,
+            group_id=source_group_id,
+        )
+        trace.quality_rejected = len(bank) - len(documents)
+        cache_key = self._example_cache_key(user_id, source_group_id)
         cached = self._example_vectors.get(cache_key)
-        entries_by_id: dict[str, dict] = {}
+        documents_by_id: dict[str, StyleDocument] = {}
         vectors_by_id: dict[str, list[float]] = {}
         if cached is not None:
-            entries_by_id, vectors_by_id = cached
-        elif user_id is not None:
-            vectors_by_id = self._load_persisted_example_vectors(user_id)
-        bank_ids = {str(entry.get("msg_id") or "") for entry in bank if entry.get("msg_id")}
-        stale_ids = (set(entries_by_id) | set(vectors_by_id)) - bank_ids
-        for stale_id in stale_ids:
-            entries_by_id.pop(stale_id, None)
-            vectors_by_id.pop(stale_id, None)
-        if stale_ids and user_id is not None:
-            self._delete_persisted_example_vectors(user_id, stale_ids)
-        missing = [
-            entry
-            for entry in bank
-            if str(entry.get("msg_id") or "") not in entries_by_id
-        ]
-        if missing:
-            texts = [
-                " ".join(
-                    [
-                        entry.get("reply_target") or "",
-                        entry.get("text") or "",
-                        *[
-                            str(item.get("text") or "")
-                            for item in (entry.get("context_before") or [])[-2:]
-                            if isinstance(item, dict)
-                        ],
-                        *[
-                            str(item.get("text") or "")
-                            for item in (entry.get("context_after") or [])[:1]
-                            if isinstance(item, dict)
-                        ],
-                    ]
-                )
-                for entry in missing
-            ]
-            new_vectors = self.embedding_provider.embed_documents(texts)
-            for entry, vector in zip(missing, new_vectors):
-                entries_by_id[str(entry.get("msg_id") or "")] = entry
-                vectors_by_id[str(entry.get("msg_id") or "")] = vector
-            if user_id is not None and new_vectors:
-                self._save_persisted_example_vectors(
-                    user_id,
-                    group_id,
-                    {
-                        str(entry.get("msg_id") or ""): vector
-                        for entry, vector in zip(missing, new_vectors)
-                        if vector
-                    },
-                )
-        self._example_vectors[cache_key] = (entries_by_id, vectors_by_id)
-        query_text = " ".join(
-            str(line).split(":", 1)[-1] for line in context_lines
+            documents_by_id, vectors_by_id = cached
+        elif self.embedding_provider is not None:
+            vectors_by_id = self._load_persisted_example_vectors(
+                user_id,
+                source_group_id,
+                {document.msg_id: document for document in documents},
+            )
+            documents_by_id = {
+                document.msg_id: document
+                for document in documents
+                if document.msg_id in vectors_by_id
+            }
+            self._example_vectors[cache_key] = (documents_by_id, vectors_by_id)
+
+        query_vector = None
+        if self.embedding_provider is not None and vectors_by_id:
+            try:
+                query_vector = self.embedding_provider.embed_query(query.semantic_text)
+            except Exception:
+                logger.exception("persona_style_query_embedding_failed group_id=%s", group_id)
+        ranked_documents = list(documents_by_id.values()) if query_vector is not None else documents
+        matches = rank_style_examples(
+            query=query,
+            documents=ranked_documents,
+            vectors_by_id=vectors_by_id,
+            query_vector=query_vector,
+            limit=limit,
+            exclude_texts=exclude_texts,
+            trace=trace,
         )
-        query_vector = self.embedding_provider.embed_query(query_text)
-        if not vectors_by_id or query_vector is None:
-            return retrieve_relevant_examples(bank, context_lines, limit=limit)
-        now = datetime.now(UTC)
-        scored: list[tuple[float, dict]] = []
-        for msg_id, vector in vectors_by_id.items():
-            if not vector:
-                continue
-            entry = entries_by_id[msg_id]
-            base = self._cosine(query_vector, vector)
-            age_days = 0.0
-            timestamp = entry.get("timestamp")
-            if isinstance(timestamp, datetime):
-                ts = timestamp
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
-            decay = 1.0 / (1.0 + age_days / 45.0)
-            scored.append((base * decay, entry))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        picked: list[dict] = []
-        picked_vectors: list[list[float]] = []
-        for _, entry in scored:
-            if len(picked) >= max(0, limit):
-                break
-            entry_vector = vectors_by_id.get(str(entry.get("msg_id") or ""))
-            if any(
-                self._cosine(entry_vector, existing) > 0.92
-                for existing in picked_vectors
-                if entry_vector
-            ):
-                continue
-            picked.append(entry)
-            if entry_vector:
-                picked_vectors.append(entry_vector)
-        return picked
+        self._log_style_retrieval(
+            group_id=group_id,
+            query=query,
+            trace=trace,
+            selected_count=len(matches),
+            started_at=started_at,
+        )
+        return [match.entry for match in matches]
+
+    @staticmethod
+    def _log_style_retrieval(
+        *,
+        group_id: int,
+        query: StyleRetrievalQuery,
+        trace: StyleRetrievalTrace,
+        selected_count: int,
+        started_at: float,
+    ) -> None:
+        logger.info(
+            "persona_style_retrieval group_id=%s query_msg_id=%s query_source_count=%s "
+            "query_chars=%s candidate_count=%s quality_rejected=%s threshold_rejected=%s "
+            "selected_count=%s selected_ids=%s selected_scores=%s fallback=%s reason=%s duration_ms=%.1f",
+            int(group_id),
+            query.current_message_id or "none",
+            trace.query_fragment_count,
+            trace.query_chars,
+            trace.candidate_count,
+            trace.quality_rejected,
+            trace.threshold_rejected,
+            selected_count,
+            trace.selected_ids,
+            trace.selected_scores,
+            trace.fallback_mode,
+            trace.rejection_reason or "none",
+            (time.perf_counter() - started_at) * 1000.0,
+        )
 
     def _load_persisted_example_vectors(
         self,
         user_id: int,
+        group_id: int,
+        documents_by_id: dict[str, StyleDocument],
     ) -> dict[str, list[float]]:
         vectors: dict[str, list[float]] = {}
+        identity = getattr(self.embedding_provider, "identity", None)
+        provider = str(getattr(identity, "provider", "") or "")
+        model = str(getattr(identity, "model", "") or "")
+        version = str(getattr(identity, "version", "") or "")
+        dimensions = int(getattr(identity, "dimensions", 0) or 0)
         with session_scope(self.engine) as session:
             rows = (
                 session.query(PersonaExampleVector)
-                .filter(PersonaExampleVector.user_id == int(user_id))
+                .filter(
+                    PersonaExampleVector.user_id == int(user_id),
+                    PersonaExampleVector.group_id == int(group_id),
+                )
                 .all()
             )
             for row in rows:
+                document = documents_by_id.get(str(row.msg_id))
+                if (
+                    document is None
+                    or str(row.provider or "") != provider
+                    or str(row.model or "") != model
+                    or str(row.embedding_version or "") != version
+                    or int(row.dimensions or 0) != dimensions
+                    or str(row.document_schema or "") != DOCUMENT_SCHEMA
+                    or str(row.document_hash or "") != document.document_hash
+                ):
+                    continue
                 try:
                     parsed = json.loads(row.vector_json or "[]")
-                except (json.JSONDecodeError, TypeError):
+                    values = [float(value) for value in parsed]
+                except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
                     parsed = []
-                if isinstance(parsed, list) and parsed:
-                    vectors[str(row.msg_id)] = [float(value) for value in parsed]
+                    values = []
+                if (
+                    isinstance(parsed, list)
+                    and len(values) == dimensions
+                    and all(math.isfinite(value) for value in values)
+                ):
+                    vectors[str(row.msg_id)] = values
         return vectors
 
     def _save_persisted_example_vectors(
         self,
         user_id: int,
         group_id: int,
+        documents_by_id: dict[str, StyleDocument],
         vectors: dict[str, list[float]],
     ) -> None:
         if not vectors:
@@ -341,9 +426,13 @@ class PersonaManager:
         identity = self.embedding_provider.identity if self.embedding_provider else None
         provider = str(getattr(identity, "provider", "") or "")
         model = str(getattr(identity, "model", "") or "")
+        version = str(getattr(identity, "version", "") or "")
         dimensions = int(getattr(identity, "dimensions", 0) or 0)
         with session_scope(self.engine) as session:
             for msg_id, vector in vectors.items():
+                document = documents_by_id.get(str(msg_id))
+                if document is None:
+                    continue
                 session.merge(
                     PersonaExampleVector(
                         msg_id=str(msg_id),
@@ -351,7 +440,10 @@ class PersonaManager:
                         group_id=int(group_id),
                         provider=provider,
                         model=model,
+                        embedding_version=version,
                         dimensions=dimensions,
+                        document_schema=DOCUMENT_SCHEMA,
+                        document_hash=document.document_hash,
                         vector_json=json.dumps(
                             [float(value) for value in vector],
                             ensure_ascii=False,
@@ -362,6 +454,7 @@ class PersonaManager:
     def _delete_persisted_example_vectors(
         self,
         user_id: int,
+        group_id: int,
         msg_ids: set[str],
     ) -> None:
         if not msg_ids:
@@ -369,6 +462,7 @@ class PersonaManager:
         with session_scope(self.engine) as session:
             session.query(PersonaExampleVector).filter(
                 PersonaExampleVector.user_id == int(user_id),
+                PersonaExampleVector.group_id == int(group_id),
                 PersonaExampleVector.msg_id.in_(sorted(msg_ids)),
             ).delete(synchronize_session=False)
 
@@ -620,18 +714,147 @@ class PersonaManager:
         return self._member_alias_map(group_id=group_id).get(int(user_id))
 
     def prewarm_examples(self, group_id: int, persona_key: str) -> int:
-        """Build the example vector cache for one persona (memory-only)."""
+        """Build compatible document vectors outside the message reply path."""
 
         bank = self.style_bank(int(group_id), persona_key=persona_key)
         if not bank or self.embedding_provider is None:
             return 0
-        self.retrieve_examples(
-            int(group_id),
-            ["预热示例向量"],
-            limit=1,
-            persona_key=persona_key,
+        persona = self._resolve_persona(group_id, persona_key)
+        user_id = _as_positive_int(persona.get("source_user_id"))
+        source_group_id = _as_positive_int(persona.get("source_group_id"))
+        if user_id is None or source_group_id is None:
+            return 0
+        documents = self._documents_for_bank(
+            bank,
+            user_id=user_id,
+            group_id=source_group_id,
         )
-        return len(bank)
+        documents_by_id = {document.msg_id: document for document in documents}
+        persisted = self._load_persisted_example_vectors(
+            user_id,
+            source_group_id,
+            documents_by_id,
+        )
+        with session_scope(self.engine) as session:
+            persisted_ids = {
+                str(row.msg_id)
+                for row in session.query(PersonaExampleVector).filter(
+                    PersonaExampleVector.user_id == int(user_id),
+                    PersonaExampleVector.group_id == int(source_group_id),
+                )
+            }
+        stale_ids = persisted_ids - set(persisted)
+        if stale_ids:
+            self._delete_persisted_example_vectors(
+                user_id,
+                source_group_id,
+                stale_ids,
+            )
+        missing = [document for document in documents if document.msg_id not in persisted]
+        failed = 0
+        if missing:
+            try:
+                new_vectors = self.embedding_provider.embed_documents(
+                    [document.canonical_text for document in missing]
+                )
+            except Exception:
+                logger.exception(
+                    "persona_style_document_embedding_failed persona=%s samples=%s",
+                    persona_key,
+                    len(missing),
+                )
+                new_vectors = None
+            if new_vectors is None:
+                failed = len(missing)
+            else:
+                valid_new: dict[str, list[float]] = {}
+                dimensions = int(getattr(self.embedding_provider.identity, "dimensions", 0) or 0)
+                for document, vector in zip(missing, new_vectors):
+                    try:
+                        values = [float(value) for value in vector]
+                    except (TypeError, ValueError, OverflowError):
+                        failed += 1
+                        continue
+                    if len(values) != dimensions or not all(math.isfinite(value) for value in values):
+                        failed += 1
+                        continue
+                    valid_new[document.msg_id] = values
+                if len(new_vectors) != len(missing):
+                    failed += abs(len(missing) - len(new_vectors))
+                if valid_new:
+                    self._save_persisted_example_vectors(
+                        user_id,
+                        source_group_id,
+                        documents_by_id,
+                        valid_new,
+                    )
+                    persisted.update(valid_new)
+        ready_documents = {
+            msg_id: document
+            for msg_id, document in documents_by_id.items()
+            if msg_id in persisted
+        }
+        self._example_vectors[self._example_cache_key(user_id, source_group_id)] = (
+            ready_documents,
+            persisted,
+        )
+        self._example_prewarm_status[(user_id, source_group_id)] = {
+            "user_id": user_id,
+            "group_id": source_group_id,
+            "document_schema": DOCUMENT_SCHEMA,
+            "samples": len(bank),
+            "quality_ready": len(documents),
+            "vectors_ready": len(persisted),
+            "missing": max(0, len(documents) - len(persisted)),
+            "stale": len(stale_ids),
+            "failed": failed,
+        }
+        return len(persisted)
+
+    def example_vector_status(self, group_id: int, persona_key: str) -> dict[str, object]:
+        persona = self._resolve_persona(group_id, persona_key)
+        user_id = _as_positive_int(persona.get("source_user_id"))
+        source_group_id = _as_positive_int(persona.get("source_group_id"))
+        if user_id is None or source_group_id is None:
+            return {}
+        return dict(self._example_prewarm_status.get((user_id, source_group_id), {}))
+
+    def _documents_for_bank(
+        self,
+        bank: list[dict],
+        *,
+        user_id: int,
+        group_id: int,
+    ) -> list[StyleDocument]:
+        return [
+            document
+            for entry in bank
+            if (
+                document := build_style_document(
+                    entry,
+                    expected_user_id=user_id,
+                    expected_group_id=group_id,
+                )
+            )
+            is not None
+            and document.msg_id
+        ]
+
+    def _example_cache_key(
+        self,
+        user_id: int,
+        group_id: int,
+    ) -> tuple[int, int, str, str, str, int, str]:
+        identity = getattr(self.embedding_provider, "identity", None)
+        return (
+            int(user_id),
+            int(group_id),
+            str(getattr(identity, "provider", "") or ""),
+            str(getattr(identity, "model", "") or ""),
+            str(getattr(identity, "version", "") or ""),
+            int(getattr(identity, "dimensions", 0) or 0),
+            DOCUMENT_SCHEMA,
+        )
 
     def _resolve_persona(self, group_id: int, persona_key: str | None) -> dict:
         if persona_key is None:

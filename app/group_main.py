@@ -150,6 +150,7 @@ def _prewarm_persona_example_vectors(
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
         prewarmed: list[str] = []
+        persona_statuses: list[dict[str, object]] = []
         for persona_key, persona in personas.items():
             if not isinstance(persona, dict) or not persona.get("live_refresh"):
                 continue
@@ -161,14 +162,40 @@ def _prewarm_persona_example_vectors(
                 continue
             count = manager.prewarm_examples(int(group_id), persona_key)
             prewarmed.append(f"{persona_key}={count}")
+            status = manager.example_vector_status(int(group_id), persona_key)
+            if status:
+                persona_statuses.append({"persona_key": persona_key, **status})
             logging.info(
                 "persona_embedding_prewarm persona=%s samples=%s",
                 persona_key,
                 count,
             )
         payload = {
-            "state": "ready",
+            "state": (
+                "failed"
+                if any(
+                    int(item.get("failed") or 0) > 0
+                    or int(item.get("missing") or 0) > 0
+                    for item in persona_statuses
+                )
+                else "ready"
+            ),
             "personas": prewarmed,
+            "provider": str(getattr(manager.embedding_provider.identity, "provider", "")),
+            "model": str(getattr(manager.embedding_provider.identity, "model", "")),
+            "embedding_version": str(
+                getattr(manager.embedding_provider.identity, "version", "")
+            ),
+            "dimensions": int(
+                getattr(manager.embedding_provider.identity, "dimensions", 0)
+            ),
+            "document_schema": (
+                persona_statuses[0].get("document_schema")
+                if persona_statuses
+                else "style-situation-v2"
+            ),
+            "coverage": persona_statuses,
+            "pid": os.getpid(),
             "updated_at": datetime.now(ASIA_SHANGHAI).isoformat(),
         }
     except Exception:

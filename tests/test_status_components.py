@@ -65,7 +65,8 @@ def test_storage_probe_rejects_invalid_persisted_persona(tmp_path, capsys) -> No
     settings = _settings(tmp_path)
     with sqlite3.connect(settings.sqlite_path) as db:
         for table in (
-            "messages", "users", "persona_style_examples", "persona_style_sync_state",
+            "messages", "users", "persona_style_examples", "persona_example_vectors",
+            "persona_style_sync_state",
             "member_fact_refresh_state", "memory_items", "conversation_episodes",
             "retrieval_documents", "jobs", "usage_records",
         ):
@@ -86,6 +87,16 @@ def test_storage_probe_rejects_invalid_persisted_persona(tmp_path, capsys) -> No
             elif table == "retrieval_documents":
                 db.execute(
                     f"CREATE TABLE {table} (status TEXT, embedding_eligible INTEGER, embedding_status TEXT)"
+                )
+            elif table == "persona_style_examples":
+                db.execute(
+                    f"CREATE TABLE {table} (msg_id TEXT, user_id INTEGER, group_id INTEGER)"
+                )
+            elif table == "persona_example_vectors":
+                db.execute(
+                    f"CREATE TABLE {table} (msg_id TEXT, user_id INTEGER, group_id INTEGER, "
+                    "provider TEXT, model TEXT, embedding_version TEXT, dimensions INTEGER, "
+                    "document_schema TEXT, document_hash TEXT)"
                 )
             else:
                 db.execute(f"CREATE TABLE {table} (id INTEGER)")

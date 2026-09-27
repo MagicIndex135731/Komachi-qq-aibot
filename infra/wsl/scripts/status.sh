@@ -46,6 +46,14 @@ memory_embedding_provider="${memory_embedding_provider:-local}"
 memory_embedding_device="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_DEVICE[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
 memory_embedding_device="$(strip_optional_env_quotes "${memory_embedding_device}")"
 memory_embedding_device="${memory_embedding_device:-cpu}"
+memory_embedding_model="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_MODEL[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+memory_embedding_model="$(strip_optional_env_quotes "${memory_embedding_model}")"
+memory_embedding_model="${memory_embedding_model:-BAAI/bge-small-zh-v1.5}"
+memory_embedding_dimensions="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_DIMENSIONS[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+memory_embedding_dimensions="$(strip_optional_env_quotes "${memory_embedding_dimensions}")"
+memory_embedding_dimensions="${memory_embedding_dimensions:-512}"
+memory_embedding_version="$(sed -n 's/^[[:space:]]*MEMORY_EMBEDDING_VERSION[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+memory_embedding_version="$(strip_optional_env_quotes "${memory_embedding_version}")"
 case "${platform}" in
   llbot)
     compose_file="docker-compose.llbot.yml"
@@ -165,11 +173,44 @@ if [[ "${embedding_prewarm_ok}" != true ]]; then
 fi
 
 echo "Persona embedding prewarm:"
-persona_prewarm_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/persona.embedding.ready.json 2>/dev/null || true)"
-if [[ -z "${persona_prewarm_payload}" ]]; then
-  echo "  (background prewarm in progress or not yet written; startup is not blocked)"
-else
-  echo "  ${persona_prewarm_payload}"
+persona_prewarm_ok=false
+for attempt in $(seq 1 24); do
+  persona_prewarm_payload="$(docker exec "${bot_container_name}" cat /workspace/data/logs/persona.embedding.ready.json 2>/dev/null || true)"
+  if python3 - "${persona_prewarm_payload}" "${bot_started_at}" "${memory_embedding_provider}" "${memory_embedding_model}" "${memory_embedding_dimensions}" "${memory_embedding_version}" <<'PY'
+import json, re, sys
+from datetime import datetime, timezone
+if not sys.argv[1]: raise SystemExit(1)
+d = json.loads(sys.argv[1])
+started_text = re.sub(r"(\.\d{6})\d+", r"\1", str(sys.argv[2]))
+started = datetime.fromisoformat(started_text.replace("Z", "+00:00"))
+if started.tzinfo is None: started = started.replace(tzinfo=timezone.utc)
+t = datetime.fromisoformat(str(d.get("updated_at", "")).replace("Z", "+00:00"))
+if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+if (t.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds() < -5:
+    raise SystemExit(1)
+if d.get("state") != "ready" or d.get("document_schema") != "style-situation-v2":
+    raise SystemExit(1)
+if str(d.get("provider", "")) != str(sys.argv[3]): raise SystemExit(1)
+if str(d.get("model", "")) != str(sys.argv[4]): raise SystemExit(1)
+if int(d.get("dimensions") or 0) != int(sys.argv[5]): raise SystemExit(1)
+if str(d.get("embedding_version", "")) != str(sys.argv[6]): raise SystemExit(1)
+for item in d.get("coverage") or []:
+    if int(item.get("missing") or 0) or int(item.get("failed") or 0):
+        raise SystemExit(1)
+PY
+  then
+    persona_prewarm_ok=true
+    echo "  ${persona_prewarm_payload}"
+    break
+  fi
+  echo "  waiting for persona embedding prewarm (${attempt}/24)"
+  sleep 5
+done
+if [[ "${persona_prewarm_ok}" != true ]]; then
+  echo "Persona embedding prewarm did not reach compatible full coverage."
+  echo "  ${persona_prewarm_payload:-missing marker}"
+  docker compose -f "${compose_file}" logs --tail=80 xiaomachi
+  exit 1
 fi
 
 echo "Local group policy probe:"

@@ -204,6 +204,23 @@ def _apply_schema_migrations(connection) -> None:
             },
         )
 
+    if "persona_example_vectors" in table_names:
+        _add_missing_columns(
+            connection,
+            "persona_example_vectors",
+            {
+                "embedding_version": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "document_schema": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "document_hash": "VARCHAR(64) NOT NULL DEFAULT ''",
+            },
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_pev_user_group "
+                "ON persona_example_vectors (user_id, group_id)"
+            )
+        )
+
     if "memory_items" in table_names:
         _add_missing_columns(
             connection,

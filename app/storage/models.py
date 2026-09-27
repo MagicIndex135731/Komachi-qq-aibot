@@ -110,7 +110,10 @@ class PersonaExampleVector(Base):
     group_id: Mapped[int] = mapped_column(Integer)
     provider: Mapped[str] = mapped_column(String(64), default="")
     model: Mapped[str] = mapped_column(String(128), default="")
+    embedding_version: Mapped[str] = mapped_column(String(64), default="")
     dimensions: Mapped[int] = mapped_column(Integer, default=0)
+    document_schema: Mapped[str] = mapped_column(String(64), default="")
+    document_hash: Mapped[str] = mapped_column(String(64), default="")
     vector_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

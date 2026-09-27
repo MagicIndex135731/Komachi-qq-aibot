@@ -103,7 +103,7 @@ def check_storage(settings: AppSettings) -> bool:
             }
             required = {
                 "messages", "users", "persona_style_examples", "persona_style_sync_state",
-                "member_fact_refresh_state", "memory_items", "conversation_episodes",
+                "persona_example_vectors", "member_fact_refresh_state", "memory_items", "conversation_episodes",
                 "retrieval_documents", "jobs", "usage_records",
             }
             missing = sorted(required - tables)
@@ -167,13 +167,73 @@ def _check_persona_state(db: sqlite3.Connection, settings: AppSettings) -> bool:
         backlog = int(db.execute(
             "SELECT count(*) FROM persona_style_sync_state WHERE new_since_refresh >= 100"
         ).fetchone()[0])
+        vector_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(persona_example_vectors)")
+        }
+        required_vector_columns = {
+            "embedding_version", "document_schema", "document_hash"
+        }
+        if not required_vector_columns <= vector_columns:
+            raise ValueError("persona vector metadata columns are missing")
+        stale_vectors = int(db.execute(
+            "SELECT count(*) FROM persona_example_vectors v "
+            "LEFT JOIN persona_style_examples e ON e.msg_id=v.msg_id "
+            "WHERE e.msg_id IS NULL OR v.user_id<>e.user_id OR v.group_id<>e.group_id "
+            "OR v.provider<>? OR v.model<>? OR v.embedding_version<>? "
+            "OR v.dimensions<>? OR v.document_schema<>'style-situation-v2' "
+            "OR v.document_hash=''",
+            (
+                settings.memory_embedding_provider,
+                settings.memory_embedding_model,
+                settings.memory_embedding_version,
+                settings.memory_embedding_dimensions,
+            ),
+        ).fetchone()[0])
+        sample_count = _table_count(db, "persona_style_examples")
+        marker_path = settings.log_dir / "persona.embedding.ready.json"
+        marker_detail = "marker=pending"
+        marker_ok = sample_count == 0
+        if marker_path.is_file():
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            coverage = marker.get("coverage") or []
+            marker_ok = (
+                marker.get("state") == "ready"
+                and marker.get("document_schema") == "style-situation-v2"
+                and str(marker.get("provider") or "")
+                == str(settings.memory_embedding_provider)
+                and str(marker.get("model") or "")
+                == str(settings.memory_embedding_model)
+                and str(marker.get("embedding_version") or "")
+                == str(settings.memory_embedding_version)
+                and int(marker.get("dimensions") or 0)
+                == int(settings.memory_embedding_dimensions)
+                and (bool(coverage) or sample_count == 0)
+                and all(
+                    int(item.get("missing") or 0) == 0
+                    and int(item.get("failed") or 0) == 0
+                    and int(item.get("vectors_ready") or 0)
+                    == int(item.get("quality_ready") or 0)
+                    for item in coverage
+                    if isinstance(item, dict)
+                )
+            )
+            marker_detail = f"marker={marker.get('state')} personas={len(coverage)}"
         _print(
             "OK" if backlog == 0 else "WARN", "persona_sync",
             f"states={state_count} refreshed={refreshed_count} "
             f"valid_live_files={len(files)} pending_threshold={backlog}",
         )
-        return True
-    except (OSError, yaml.YAMLError, ValueError) as exc:
+        vector_ok = stale_vectors == 0 and marker_ok
+        _print(
+            "OK" if vector_ok else "FAIL",
+            "persona_vectors",
+            f"samples={sample_count} "
+            f"vectors={_table_count(db, 'persona_example_vectors')} "
+            f"stale={stale_vectors} {marker_detail}",
+        )
+        return vector_ok
+    except (OSError, yaml.YAMLError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
         _print("FAIL", "persona_sync", f"{type(exc).__name__}: {exc}")
         return False
 
