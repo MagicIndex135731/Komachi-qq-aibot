@@ -30,21 +30,7 @@ def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
     are always normalized to aware UTC values by the resolver.
     """
 
-    if source_message is None or plan.group_id is None:
-        return False
-    if _integer_attr(source_message, "group_id") != plan.group_id:
-        return False
-    if not _stable_source_id(source_message):
-        return False
-    if _is_ineligible(source_message):
-        return False
-
-    sent_at = _source_time(source_message)
-    if sent_at is None:
-        return False
-    if plan.start_at_utc is not None and sent_at < _as_utc(plan.start_at_utc):
-        return False
-    if plan.end_at_utc is not None and sent_at >= _as_utc(plan.end_at_utc):
+    if not eligible_context(source_message, plan):
         return False
 
     subject_ids = plan.subject_ids
@@ -90,6 +76,33 @@ def eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:
             elif alias in content:
                 return True
     return False
+
+
+def eligible_context(source_message: object | None, plan: MemoryQueryPlan) -> bool:
+    """Check hard group, provenance, delivery, and time boundaries only.
+
+    Conversation expansion may retain a nearby message from another speaker to
+    resolve an omitted entity in an eligible member reply. Such a row is
+    context, never a subject-authored hit, so it must pass every hard boundary
+    without being required to match the subject identity itself.
+    """
+    if source_message is None or plan.group_id is None:
+        return False
+    if _integer_attr(source_message, "group_id") != plan.group_id:
+        return False
+    if not _stable_source_id(source_message):
+        return False
+    if _is_ineligible(source_message):
+        return False
+
+    sent_at = _source_time(source_message)
+    if sent_at is None:
+        return False
+    if plan.start_at_utc is not None and sent_at < _as_utc(plan.start_at_utc):
+        return False
+    if plan.end_at_utc is not None and sent_at >= _as_utc(plan.end_at_utc):
+        return False
+    return True
 
 
 def is_memory_source_eligible(source_message: object | None, plan: MemoryQueryPlan) -> bool:

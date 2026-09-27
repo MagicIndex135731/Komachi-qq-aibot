@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import logging
 
 import pytest
@@ -445,6 +445,72 @@ def test_current_fact_excludes_target_and_prior_echo_questions_from_evidence() -
     )
 
     assert selected == (segments[2],)
+
+
+def test_member_reply_keeps_safe_cross_speaker_entity_context_only_when_atomic() -> None:
+    resolved = ResolvedMemoryQuery(
+        original_query="小林最近在做哪些项目",
+        retrieval_query="项目",
+        group_id=100,
+        subject_ids=("42",),
+        subject_binding="explicit",
+        answer_mode="current_fact",
+        subject_aliases_removed=("小林",),
+    )
+    base = datetime(2026, 9, 13, tzinfo=UTC)
+    named_context = EvidenceMessage(
+        "named-context",
+        "other member",
+        "星港计划要不要继续做？",
+        base,
+        group_id=100,
+        user_id=99,
+    )
+    unrelated = replace(
+        named_context,
+        source_msg_id="unrelated",
+        content="另一个人提到无关计划",
+    )
+    deleted_context = replace(
+        named_context,
+        source_msg_id="deleted-context",
+        content="已删除的上下文",
+        delivery_state="deleted",
+    )
+    member_reply = EvidenceMessage(
+        "member-reply",
+        "member",
+        "继续做",
+        base + timedelta(seconds=20),
+        group_id=100,
+        user_id=42,
+    )
+    segment = EvidenceSegment(
+        episode_id="raw:1",
+        fused_score=1.0,
+        messages=(named_context, unrelated, deleted_context, member_reply),
+        hit_source_msg_ids=("member-reply",),
+        atomic_source_groups=(
+            ("named-context", "member-reply"),
+            ("deleted-context", "member-reply"),
+        ),
+    )
+    provider = MemoryV2ContextProvider(
+        resolver=Resolver(),
+        retriever=Retriever(),
+        expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+    )
+
+    selected = provider._eligible_segments((segment,), resolved)
+
+    assert tuple(
+        message.source_msg_id for message in selected[0].messages
+    ) == ("named-context", "member-reply")
+    assert selected[0].atomic_source_groups == (
+        ("named-context", "member-reply"),
+    )
 
 
 def test_direct_observation_keeps_non_retrospective_new_event() -> None:

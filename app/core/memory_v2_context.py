@@ -18,7 +18,7 @@ from app.core.memory_context_packer import (
     MemoryFact,
     MemorySummary,
 )
-from app.core.memory_eligibility import eligible
+from app.core.memory_eligibility import eligible, eligible_context
 from app.core.hybrid_memory_retriever import HybridRetrievalResult, MemoryScopeViolation
 from app.core.memory_fact_ranking import temporal_recency_required
 from app.core.memory_orchestrator import MemoryContextResult
@@ -607,6 +607,15 @@ class MemoryV2ContextProvider:
             else ""
         )
         for segment in segments:
+            hit_ids = frozenset(segment.hit_source_msg_ids)
+            contextual_ids = frozenset(
+                source_id
+                for group in segment.atomic_source_groups
+                if segment.episode_id.startswith("raw:")
+                and hit_ids.intersection(group)
+                for source_id in group
+                if source_id not in hit_ids
+            )
             allowed_messages = tuple(
                 message
                 for message in segment.messages
@@ -616,7 +625,13 @@ class MemoryV2ContextProvider:
                     len(normalized_query) >= 4
                     and re.sub(r"[\s?？。！!]", "", message.content).endswith(normalized_query)
                 )
-                and eligible(message, resolved)
+                and (
+                    eligible(message, resolved)
+                    or (
+                        message.source_msg_id in contextual_ids
+                        and eligible_context(message, resolved)
+                    )
+                )
             )
             allowed_ids = {message.source_msg_id for message in allowed_messages}
             # A hit source is the provenance that authorized this segment. If
@@ -629,7 +644,6 @@ class MemoryV2ContextProvider:
                 continue
             if not allowed_messages:
                 continue
-            hit_ids = frozenset(segment.hit_source_msg_ids)
             if segment.episode_id.startswith("raw:"):
                 allowed_messages = tuple(
                     message
