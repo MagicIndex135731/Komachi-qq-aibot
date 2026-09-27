@@ -112,6 +112,7 @@ def replay(args) -> dict[str, object]:
             current_timestamp=event_time,
             current_message_id=event["platform_msg_id"],
             bot_user_id=int(settings.bot_qq),
+            subject_terms=[persona.get("name"), *(persona.get("aliases") or [])],
         )
         sample_rows = connection.execute(
             "SELECT msg_id, user_id, group_id, text, context_before, context_after, "

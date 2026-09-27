@@ -145,6 +145,22 @@ def _query_fragment(value: object) -> str:
     return text[:MAX_QUERY_FRAGMENT_CHARS].strip()
 
 
+def _without_subject_terms(value: object, subject_terms: Iterable[object]) -> str:
+    text = normalize_style_text(value)
+    terms = sorted(
+        {
+            normalize_style_text(term)
+            for term in subject_terms
+            if len(normalize_style_text(term)) >= 2
+        },
+        key=len,
+        reverse=True,
+    )
+    for term in terms:
+        text = re.sub(re.escape(term), "", text, flags=re.IGNORECASE)
+    return text.strip(" ，,。.!！？?：:、")
+
+
 def lexical_units(value: object) -> frozenset[str]:
     """Return discriminative Chinese 2/3-grams and complete latin tokens."""
 
@@ -172,11 +188,12 @@ def build_style_retrieval_query(
     current_timestamp: datetime | None = None,
     current_message_id: object = "",
     bot_user_id: int | None = None,
+    subject_terms: Iterable[object] = (),
 ) -> StyleRetrievalQuery:
     """Build a narrow query; the general prompt history is never accepted."""
 
-    current = _query_fragment(current_text)
-    quoted = _query_fragment(quoted_text)
+    current = _query_fragment(_without_subject_terms(current_text, subject_terms))
+    quoted = _query_fragment(_without_subject_terms(quoted_text, subject_terms))
     fragments: list[tuple[str, str]] = []
     if current:
         fragments.append(("当前问题", current))
@@ -200,7 +217,12 @@ def build_style_retrieval_query(
                     break
                 if age < -5:
                     continue
-            fragment = _query_fragment(_field(message, "plain_text", _field(message, "text", "")))
+            fragment = _query_fragment(
+                _without_subject_terms(
+                    _field(message, "plain_text", _field(message, "text", "")),
+                    subject_terms,
+                )
+            )
             if not fragment or fragment in {current, quoted, *continuation}:
                 continue
             continuation.append(fragment)

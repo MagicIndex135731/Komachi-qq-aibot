@@ -81,6 +81,17 @@ def test_quoted_followup_uses_quote_but_not_older_topics() -> None:
     assert "足球" not in query.semantic_text
 
 
+def test_active_persona_name_is_not_topic_evidence() -> None:
+    query = build_style_retrieval_query(
+        current_text="阿渣最近在看哪些动画",
+        subject_terms=["阿渣", "渣哥"],
+    )
+
+    assert "阿渣" not in query.semantic_text
+    assert "最近在看哪些动画" in query.semantic_text
+    assert not (query.lexical_units & {"阿渣", "渣最"})
+
+
 def test_short_followup_takes_only_two_messages_inside_time_boundary() -> None:
     recent = [
         _message(30, "太旧的话题", seconds=10),

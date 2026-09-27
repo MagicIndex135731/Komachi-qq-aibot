@@ -1957,6 +1957,10 @@ class InboundRouter:
                     current_timestamp=event.timestamp,
                     current_message_id=event.platform_msg_id,
                     bot_user_id=int(self.runtime.settings.bot_qq),
+                    subject_terms=[
+                        active_persona.get("name"),
+                        *(active_persona.get("aliases") or []),
+                    ],
                 )
                 fixed_examples = [
                     str(value)
