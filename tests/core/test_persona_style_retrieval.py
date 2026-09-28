@@ -81,6 +81,24 @@ def test_quoted_followup_uses_quote_but_not_older_topics() -> None:
     assert "足球" not in query.semantic_text
 
 
+def test_short_quoted_anchor_adds_bounded_local_scene_fragments() -> None:
+    query = build_style_retrieval_query(
+        current_text="你定",
+        quoted_text="地方你定",
+        recent_messages=[
+            _message(3, "明天吃什么", seconds=20),
+            _message(2, "可以，几点", seconds=10),
+            _message(1, "哪里集合", seconds=5),
+            _message(30, "两小时前的旧话题", seconds=10),
+        ],
+        current_timestamp=NOW,
+    )
+
+    assert query.continuation_lines == ("明天吃什么", "可以，几点", "哪里集合")
+    assert query.fragment_count == 4
+    assert "两小时前" not in query.semantic_text
+
+
 def test_active_persona_name_is_not_topic_evidence() -> None:
     query = build_style_retrieval_query(
         current_text="阿渣最近在看哪些动画",
@@ -210,6 +228,56 @@ def test_low_semantic_candidates_are_rejected_instead_of_filled() -> None:
     )
 
     assert matches == []
+
+
+def test_semantic_empty_allows_one_strong_lexical_fallback_for_rich_scene() -> None:
+    query = build_style_retrieval_query(
+        current_text="你定",
+        quoted_text="地方你定",
+        recent_messages=[
+            _message(3, "明天吃什么", seconds=20),
+            _message(2, "可以，几点", seconds=10),
+            _message(1, "哪里集合", seconds=5),
+        ],
+        current_timestamp=NOW,
+    )
+    document = _document(
+        "scene",
+        situation="明天地方吃饭几点哪里集合",
+        reply="地方吃饭你定",
+    )
+    trace = StyleRetrievalTrace()
+
+    matches = rank_style_examples(
+        query=query,
+        documents=[document],
+        vectors_by_id={"scene": [0.0, 1.0]},
+        query_vector=[1.0, 0.0],
+        now=NOW,
+        trace=trace,
+    )
+
+    assert [match.document.msg_id for match in matches] == ["scene"]
+    assert trace.fallback_mode == "semantic_then_lexical"
+    assert trace.rejection_reason == "semantic_empty_strong_lexical"
+
+
+def test_semantic_empty_short_or_weak_scene_stays_empty() -> None:
+    query = build_style_retrieval_query(current_text="你定")
+    document = _document("weak-scene", situation="明天吃饭", reply="随便")
+    trace = StyleRetrievalTrace()
+
+    matches = rank_style_examples(
+        query=query,
+        documents=[document],
+        vectors_by_id={"weak-scene": [0.0, 1.0]},
+        query_vector=[1.0, 0.0],
+        now=NOW,
+        trace=trace,
+    )
+
+    assert matches == []
+    assert trace.fallback_mode == "safe_empty"
 
 
 def test_near_duplicate_of_current_question_is_excluded() -> None:

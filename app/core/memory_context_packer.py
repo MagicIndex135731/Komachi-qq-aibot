@@ -279,7 +279,21 @@ class MemoryContextPacker:
         evidence_segments: Sequence[EvidenceSegment] = (),
         facts: Sequence[MemoryFact] = (),
         summaries: Sequence[MemorySummary] = (),
+        recent_only: bool = False,
     ) -> PackedMemoryContext:
+        if recent_only:
+            # Transport-level conversation anchors are current-turn context,
+            # not memory evidence. Keep the quoted turn and a small recent
+            # window while making history/facts/summaries structurally empty.
+            return self._pack_legacy(
+                mode,
+                available_input=min(int(available_input), 1_500),
+                target_message_id=target_message_id,
+                recent_messages=tuple(recent_messages)[-12:],
+                evidence_segments=(),
+                facts=(),
+                summaries=(),
+            )
         if self._adaptive_enabled:
             return self._pack_adaptive(
                 mode,

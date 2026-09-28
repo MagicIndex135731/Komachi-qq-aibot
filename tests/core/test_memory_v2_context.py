@@ -160,6 +160,64 @@ class Retriever:
         return HybridRetrievalResult(())
 
 
+def test_conversation_anchor_skips_memory_channels_and_uses_recent_only_profile() -> None:
+    calls = {"retrieve": 0, "facts": 0, "summaries": 0}
+
+    class CountingRetriever:
+        def retrieve(self, **_):
+            calls["retrieve"] += 1
+            return HybridRetrievalResult(())
+
+    recent = tuple(
+        EvidenceMessage(
+            f"recent-{index}",
+            "member",
+            f"当前对话内容 {index}",
+            datetime(2026, 7, 23, tzinfo=UTC) + timedelta(seconds=index),
+            group_id=100,
+        )
+        for index in range(20)
+    )
+    quoted = EvidenceMessage(
+        "quoted-place",
+        "小町",
+        "地方你定",
+        datetime(2026, 7, 23, tzinfo=UTC) + timedelta(seconds=19),
+        group_id=100,
+        is_bot=True,
+        user_id=999,
+    )
+    provider = MemoryV2ContextProvider(
+        resolver=MemoryQueryResolver(),
+        retriever=CountingRetriever(),
+        expander=Expander(),
+        packer=MemoryContextPacker(),
+        source_scope_validator=lambda _group_id, _source_ids: True,
+        fact_loader=lambda **_: calls.__setitem__("facts", calls["facts"] + 1) or (),
+        summary_loader=lambda **_: calls.__setitem__("summaries", calls["summaries"] + 1) or (),
+    )
+
+    result = provider(
+        MemoryV2Request(
+            group_id=100,
+            query="你定",
+            recent_messages=recent,
+            quoted_message=quoted,
+            target_message_id="target",
+            available_input=20_000,
+        )
+    )
+
+    assert result.resolved_quote_role == "conversation_anchor"
+    assert result.memory_search_allowed is False
+    assert calls == {"retrieve": 0, "facts": 0, "summaries": 0}
+    assert result.packed_context.evidence_segments == ()
+    assert result.packed_context.facts == ()
+    assert result.packed_context.summaries == ()
+    assert len(result.packed_context.recent_messages) <= 12
+    assert result.estimated_tokens <= 1_500
+
+
 class FailedRetriever:
     def retrieve(self, **_):
         return HybridRetrievalResult(

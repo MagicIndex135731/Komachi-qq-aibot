@@ -59,6 +59,7 @@ AnswerMode = Literal[
     "current_fact",
     "general_history",
 ]
+QuoteRole = Literal["none", "conversation_anchor", "memory_reference"]
 CoverageMode = Literal["relevance", "chronological", "time_buckets"]
 SubjectBinding = Literal["explicit", "requester", "impersonated", "unbound"]
 TopicExtraction = Literal["none", "deterministic", "fallback"]
@@ -106,6 +107,7 @@ class ResolvedMemoryQuery:
     allowed_fact_kinds: tuple[str, ...] = ()
     fact_coverage: str = "single"
     fact_policy_reason: str = ""
+    quote_role: QuoteRole = "none"
 
     @property
     def resolved_query(self) -> str:
@@ -166,6 +168,13 @@ _NAME_PATTERN = re.compile(r"(?<![\u4e00-\u9fff])([\u4e00-\u9fff]{2,3})(?![\u4e0
 _SPEECH_NAME_PATTERN = re.compile(r"([\u4e00-\u9fff]{2,3})(?=说|表示|提到|认为)")
 _JOINED_NAME_PATTERN = re.compile(r"([\u4e00-\u9fff]{2})(?=和|、)|(?:和|、)([\u4e00-\u9fff]{2})(?=都|和|、|说|表示|提到|认为)")
 _FOLLOW_UP_PATTERN = re.compile(r"详细讲讲|后来呢|之前那个|那个人|他说了什么|她说了什么|最后怎么样")
+_QUOTE_MEMORY_REFERENCE_PATTERN = re.compile(
+    r"谁说|谁讲|哪句话|哪一句|原话|之前怎么说|之前说过|当时发生|这里指|指什么|什么意思|"
+    r"引用消息|引用|直接回复|回复是什么|"
+    r"详细讲|后来呢|之前那个|那个人|他说了什么|她说了什么|最后怎么样|来源|依据|证据|核实|验证|"
+    r"\b(?:verify|verified|check|source|evidence|reference|quote)\b",
+    re.IGNORECASE,
+)
 _HISTORY_PATTERN = re.compile(
     r"以前|曾经|过去|历史|之前|当时|那时|说过|发过|提过|聊过|发言|"
     r"自称|哪条|哪句话|哪一句|什么时候|哪一次|原话"
@@ -624,7 +633,8 @@ class MemoryQueryResolver:
         recent = tuple(recent_messages[-self._recent_limit :])
         time_range = self._parse_time_range(original, current_time)
         needs_detail = bool(_DETAIL_PATTERN.search(original))
-        answer_mode = self._answer_mode(original, time_range, quoted_message)
+        quote_role = self._quote_role(original, quoted_message)
+        answer_mode = self._answer_mode(original, time_range, quoted_message, quote_role)
         personal_memory_intent = self._personal_memory_intent(
             subject_query,
             answer_mode=answer_mode,
@@ -636,6 +646,8 @@ class MemoryQueryResolver:
             or _HISTORY_PATTERN.search(original)
             or answer_mode in {"mention", "summary", "assessment"}
         )
+        if quote_role == "conversation_anchor":
+            needs_history = False
 
         if is_bot_self_identity_query(original):
             # Second-person bot identity is persona knowledge, not member
@@ -655,6 +667,7 @@ class MemoryQueryResolver:
                 coverage_mode="relevance",
                 subject_role="bot",
                 semantic_general=True,
+                quote_role=quote_role,
             )
 
         if (
@@ -822,6 +835,7 @@ class MemoryQueryResolver:
                 subject_binding="explicit",
                 answer_mode=answer_mode,
                 coverage_mode=coverage_mode,
+                quote_role=quote_role,
                 subject_decision_reason="ambiguous_member",
                 personal_memory_intent=personal_memory_intent,
             )
@@ -887,9 +901,10 @@ class MemoryQueryResolver:
                 coverage_mode=coverage_mode,
                 subject_decision_reason="mention",
                 personal_memory_intent=personal_memory_intent,
+                quote_role=quote_role,
             )
 
-        if quoted_message is not None:
+        if quoted_message is not None and quote_role == "memory_reference":
             quoted_reference = self._resolve_reference(original, recent, quoted_message)
             if quoted_reference is not None:
                 retrieval_query, entities, speaker_ids, source_ids = quoted_reference
@@ -917,6 +932,7 @@ class MemoryQueryResolver:
                         "quoted_reference" if speaker_ids else "unbound_general"
                     ),
                     personal_memory_intent=personal_memory_intent,
+                    quote_role=quote_role,
                 )
 
         if (
@@ -939,6 +955,7 @@ class MemoryQueryResolver:
                 coverage_mode=coverage_mode,
                 subject_decision_reason="unknown_person",
                 personal_memory_intent=personal_memory_intent,
+                quote_role=quote_role,
             )
 
         persona_default_allowed = (
@@ -993,6 +1010,7 @@ class MemoryQueryResolver:
                                 else "impersonated_implicit_personal"
                             ),
                             personal_memory_intent=True,
+                            quote_role=quote_role,
                         ),
                         aliases=("你", "您"),
                         topic_source=subject_query,
@@ -1000,7 +1018,11 @@ class MemoryQueryResolver:
                     personal_memory_intent=True,
                 )
 
-        deterministic = self._resolve_reference(original, recent, quoted_message)
+        deterministic = (
+            None
+            if quote_role == "conversation_anchor"
+            else self._resolve_reference(original, recent, quoted_message)
+        )
         if deterministic is not None:
             retrieval_query, entities, speaker_ids, source_ids = deterministic
             plan = ResolvedMemoryQuery(
@@ -1025,6 +1047,7 @@ class MemoryQueryResolver:
                     "recent_reference" if speaker_ids else "unbound_general"
                 ),
                 personal_memory_intent=personal_memory_intent,
+                quote_role=quote_role,
             )
             if quoted_message is None and speaker_ids:
                 return self._with_topic_query(
@@ -1106,6 +1129,7 @@ class MemoryQueryResolver:
                 else "unbound_general"
             ),
             personal_memory_intent=personal_memory_intent,
+            quote_role=quote_role,
         )
         if _SUBJECTLESS_GROUP_HISTORY_PATTERN.search(original):
             return self._with_explicit_group_history_topic(plan)
@@ -2094,8 +2118,9 @@ class MemoryQueryResolver:
         query: str,
         time_range: TimeRange | None,
         quoted_message: RecentMemoryMessage | None,
+        quote_role: QuoteRole = "none",
     ) -> AnswerMode:
-        if quoted_message is not None:
+        if quoted_message is not None and quote_role == "memory_reference":
             return "exact"
         if _MENTION_PATTERN.search(query):
             return "mention"
@@ -2108,6 +2133,27 @@ class MemoryQueryResolver:
         if time_range is not None:
             return "dated_history"
         return "general_history"
+
+    @staticmethod
+    def _quote_role(
+        query: str,
+        quoted_message: RecentMemoryMessage | None,
+    ) -> QuoteRole:
+        if quoted_message is None:
+            return "none"
+        text = str(query or "").strip()
+        if _QUOTE_MEMORY_REFERENCE_PATTERN.search(text) or _HISTORY_PATTERN.search(text):
+            return "memory_reference"
+        # A current personal-memory question remains a memory reference even
+        # when transport quote metadata is present; the quote identifies the
+        # member/subject rather than merely continuing the current turn.
+        if _CURRENT_FACT_PATTERN.search(text) or _FIRST_PERSON_HISTORY_PATTERN.search(text):
+            return "memory_reference"
+        # Quote transport is not evidence of a history lookup.  Long natural
+        # language replies can still be ordinary turn continuation (for
+        # example, a detailed answer to a quoted planning message).  Only an
+        # explicit history/fact/reference signal should opt into retrieval.
+        return "conversation_anchor"
 
     @staticmethod
     def _coverage_mode(

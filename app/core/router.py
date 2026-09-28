@@ -2317,6 +2317,10 @@ class InboundRouter:
                 memory_result = self.memory_orchestrator.build_context(memory_request)
             else:
                 memory_result = self.memory_orchestrator.recent_provider(memory_request)
+            if not getattr(memory_result, "memory_search_allowed", True):
+                # A transport quote used only to continue the current turn is
+                # conversation context, not permission to expose memory tools.
+                memory_tool_executor = None
             if (
                 impersonated_subject_id is not None
                 and addressed_turn

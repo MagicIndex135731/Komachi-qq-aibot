@@ -30,6 +30,8 @@ class MemoryContextResult:
     resolved_personal_memory_intent: bool = False
     resolved_fact_coverage: str = ""
     resolved_fact_policy_reason: str = ""
+    resolved_quote_role: str = "none"
+    memory_search_allowed: bool = True
 
 
 @dataclass(frozen=True, slots=True)

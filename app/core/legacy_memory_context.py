@@ -15,6 +15,7 @@ from app.core.memory_engine import (
     retrieve_relevant_memories,
 )
 from app.core.memory_orchestrator import MemoryContextResult
+from app.core.memory_query_resolver import MemoryQueryResolver
 from app.core.memory_v2_context import MemoryV2Request
 from app.storage.db import session_scope
 from app.storage.repositories import (
@@ -155,6 +156,16 @@ class LegacyMemoryContext:
         return self._build(request, recent_only=True)
 
     def _build(self, request: GroupMemoryContextRequest, *, recent_only: bool) -> MemoryContextResult:
+        # Keep the legacy/fallback path subject to the same transport quote
+        # contract as V2.  A quote used only to continue the current turn must
+        # not accidentally load history/facts or expose memory tools when V2
+        # is unavailable.
+        quote_role = MemoryQueryResolver._quote_role(
+            request.query_text,
+            request.quoted_message,
+        )
+        conversation_anchor = quote_role == "conversation_anchor"
+        recent_only = bool(recent_only or conversation_anchor)
         with session_scope(self.engine) as session:
             users = UserRepository(session)
             messages = MessageRepository(session)
@@ -163,7 +174,11 @@ class LegacyMemoryContext:
 
             recent_messages = messages.list_recent_group_messages(
                 group_id=request.group_id,
-                limit=request.recent_limit or self.settings.context_recent_limit,
+                limit=(
+                    min(12, request.recent_limit or self.settings.context_recent_limit)
+                    if conversation_anchor
+                    else request.recent_limit or self.settings.context_recent_limit
+                ),
             )
             full_history_messages = (
                 messages.list_group_messages_chronological(
@@ -200,6 +215,14 @@ class LegacyMemoryContext:
             ]
 
             if recent_only:
+                if conversation_anchor:
+                    # Match V2's transport-anchor budget even when the
+                    # orchestrator falls back to the legacy provider.  Keep a
+                    # contiguous newest suffix and never reintroduce history.
+                    recent_lines = ContextBuilder.take_latest_history_within_budget(
+                        recent_lines,
+                        1_500,
+                    )
                 context = LegacyMemoryPromptContext(
                     recent_messages=recent_lines,
                     full_history_messages=[],
@@ -217,6 +240,7 @@ class LegacyMemoryContext:
                     context=context,
                     selected_source_msg_ids=selected_source_msg_ids,
                     mode="recent",
+                    resolved_quote_role=quote_role,
                 )
 
             history_detail = is_history_detail_query(request.query_text)
@@ -270,6 +294,7 @@ class LegacyMemoryContext:
                 context=context,
                 selected_source_msg_ids=selected_source_msg_ids,
                 mode="v1",
+                resolved_quote_role=quote_role,
             )
 
     def _select_summaries(
@@ -586,6 +611,7 @@ class LegacyMemoryContext:
         context: LegacyMemoryPromptContext,
         selected_source_msg_ids: list[str],
         mode: str,
+        resolved_quote_role: str = "none",
     ) -> MemoryContextResult:
         sections = [
             *context.recent_messages,
@@ -602,4 +628,6 @@ class LegacyMemoryContext:
             selected_source_msg_ids=tuple(dict.fromkeys(selected_source_msg_ids)),
             estimated_tokens=ContextBuilder.estimate_prompt_tokens(sections),
             mode=mode,
+            resolved_quote_role=resolved_quote_role,
+            memory_search_allowed=resolved_quote_role != "conversation_anchor",
         )

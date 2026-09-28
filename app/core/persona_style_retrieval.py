@@ -201,9 +201,18 @@ def build_style_retrieval_query(
         fragments.append(("引用内容", quoted))
 
     continuation: list[str] = []
-    if not quoted and is_short_followup(current):
+    short_quote_anchor = bool(quoted and is_short_followup(current))
+    if (not quoted and is_short_followup(current)) or short_quote_anchor:
         now = _normalized_timestamp(current_timestamp)
-        for message in reversed(list(recent_messages)):
+        ordered_recent = sorted(
+            recent_messages,
+            key=lambda message: (
+                _normalized_timestamp(_field(message, "timestamp", None))
+                or datetime.min.replace(tzinfo=UTC),
+                str(_field(message, "platform_msg_id", _field(message, "msg_id", "")) or ""),
+            ),
+        )
+        for message in reversed(ordered_recent):
             msg_id = str(_field(message, "platform_msg_id", _field(message, "msg_id", "")) or "")
             if msg_id and msg_id == str(current_message_id or ""):
                 continue
@@ -226,7 +235,7 @@ def build_style_retrieval_query(
             if not fragment or fragment in {current, quoted, *continuation}:
                 continue
             continuation.append(fragment)
-            if len(continuation) >= 2:
+            if len(continuation) >= 3:
                 break
         continuation.reverse()
         fragments.extend(("紧邻上文", value) for value in continuation)
@@ -483,6 +492,39 @@ def rank_style_examples(
                 trace.threshold_rejected += len(candidates)
                 candidates = []
                 trace.rejection_reason = "ambiguous_semantic"
+        if not candidates:
+            # A short quoted scene can be semantically underrepresented in a
+            # sparse style bank. Permit one bounded lexical retry only when
+            # enough scene fragments survived and one candidate has strong
+            # direct overlap. Never lower the global semantic threshold or
+            # fill an otherwise unrelated query.
+            lexical_fallback: list[StyleExampleMatch] = []
+            if query.fragment_count >= 3:
+                for document in documents:
+                    if reply_is_excluded(document):
+                        continue
+                    lexical = _lexical_score(query.lexical_units, document)
+                    if lexical < 0.5:
+                        continue
+                    recency = _recency_score(document.timestamp, resolved_now)
+                    lexical_fallback.append(
+                        StyleExampleMatch(
+                            entry=document.entry,
+                            document=document,
+                            semantic_score=0.0,
+                            lexical_score=lexical,
+                            recency_score=recency,
+                            final_score=0.95 * lexical + 0.05 * recency,
+                        )
+                    )
+            if lexical_fallback:
+                candidates = lexical_fallback
+                trace.fallback_mode = "semantic_then_lexical"
+                trace.rejection_reason = "semantic_empty_strong_lexical"
+            else:
+                trace.fallback_mode = "safe_empty"
+                if not trace.rejection_reason:
+                    trace.rejection_reason = "no_qualified_style_match"
 
     candidates.sort(
         key=lambda item: (

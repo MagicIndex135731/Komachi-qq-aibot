@@ -481,8 +481,55 @@ def test_deterministic_follow_up_uses_quoted_message_without_rewrite() -> None:
 
     assert result.retrieval_query == quoted.content
     assert result.reference_msg_ids == ("42",)
+    assert result.quote_role == "memory_reference"
     assert result.subject_ids is None
     assert result.rewrite_used is False
+
+
+def test_short_transport_quote_is_conversation_anchor_without_memory_reference() -> None:
+    quoted = Recent(
+        "quoted-place",
+        "小町",
+        "地方你定",
+        datetime(2026, 7, 22, 23, 55),
+        user_id=99999,
+        is_bot=True,
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "你定",
+        recent_messages=(quoted,),
+        quoted_message=quoted,
+        now=NOW,
+    )
+
+    assert result.quote_role == "conversation_anchor"
+    assert result.answer_mode == "general_history"
+    assert result.reference_msg_ids == ()
+    assert result.retrieval_mode == "hybrid"
+    assert result.needs_history is False
+
+
+def test_long_transport_quote_without_memory_intent_stays_conversation_anchor() -> None:
+    quoted = Recent(
+        "quoted-plan",
+        "小町",
+        "明天去哪吃饭你来定",
+        datetime(2026, 7, 22, 23, 55),
+        user_id=99999,
+        is_bot=True,
+    )
+
+    result = MemoryQueryResolver().resolve(
+        "我觉得这个安排挺好的，明天你看着时间方便的时候再告诉我就行",
+        recent_messages=(quoted,),
+        quoted_message=quoted,
+        now=NOW,
+    )
+
+    assert result.quote_role == "conversation_anchor"
+    assert result.reference_msg_ids == ()
+    assert result.needs_history is False
 
 
 def test_explicit_quote_does_not_require_a_textual_follow_up_marker() -> None:

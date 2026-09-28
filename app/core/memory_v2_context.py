@@ -374,6 +374,7 @@ class MemoryV2ContextProvider:
             evidence_segments=segments,
             facts=facts,
             summaries=summaries,
+            recent_only=resolved.quote_role == "conversation_anchor",
         )
         if (
             self._historical_no_hit_omit_recent
@@ -425,6 +426,8 @@ class MemoryV2ContextProvider:
             resolved_personal_memory_intent=resolved.personal_memory_intent,
             resolved_fact_coverage=resolved.fact_coverage,
             resolved_fact_policy_reason=resolved.fact_policy_reason,
+            resolved_quote_role=resolved.quote_role,
+            memory_search_allowed=resolved.quote_role != "conversation_anchor",
         )
         total_ms = (perf_counter() - evaluation_started) * 1000
         if self._observability_route:
@@ -448,6 +451,7 @@ class MemoryV2ContextProvider:
                 "memory_query_metrics route=%s group_id=%s answer_mode=%s "
                 "coverage=%s persona_candidate=%s persona_addressed=%s "
                 "subject_binding=%s subject_reason=%s personal_memory_intent=%s "
+                "quote_role=%s retrieval_skipped_reason=%s memory_search_allowed=%s "
                 "has_subject=%s subject_ambiguous=%s has_time=%s "
                 "topic_extraction=%s topic_terms=%s "
                 "fact_coverage=%s fact_policy=%s allowed_fact_kinds=%s preferred_fact_kinds=%s "
@@ -473,6 +477,9 @@ class MemoryV2ContextProvider:
                 resolved.subject_binding,
                 resolved.subject_decision_reason or "unspecified",
                 resolved.personal_memory_intent,
+                resolved.quote_role,
+                "conversation_anchor" if retrieval_skipped else "",
+                resolved.quote_role != "conversation_anchor",
                 resolved.subject_ids is not None,
                 resolved.subject_ids == (),
                 resolved.time_range is not None,
@@ -645,6 +652,8 @@ class MemoryV2ContextProvider:
     @staticmethod
     def _should_skip_retrieval(resolved: ResolvedMemoryQuery) -> bool:
         """True for plain general questions that need no memory retrieval."""
+        if getattr(resolved, "quote_role", "none") == "conversation_anchor":
+            return True
         if resolved.answer_mode != "general_history":
             return False
         if resolved.needs_history or resolved.time_range is not None:
