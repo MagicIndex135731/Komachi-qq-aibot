@@ -2368,6 +2368,14 @@ class InboundRouter:
             full_history_enabled = memory_context.full_history_enabled
             member_focus_lines = memory_context.member_focus_lines
             relevant_history_lines = memory_context.relevant_history_messages
+            resolver_memory_tool_eligible = self._memory_tools_eligible_from_result(
+                memory_result,
+                addressed_turn=addressed_turn,
+                use_full_history=use_full_history,
+                relevant_history_lines=relevant_history_lines,
+                mentions_member=mentions_member,
+                packed_memory_context=packed_memory_context,
+            )
             relevant_memories = memory_context.memories
             relevant_summaries = memory_context.summaries
             if self._impersonating(event.group_id):
@@ -2800,13 +2808,7 @@ class InboundRouter:
                 allow_web_search=builtin_web_search_eligible,
                 use_memory_tools=(
                     memory_tool_executor is not None
-                    and (
-                        addressed_turn
-                        or use_full_history
-                        or bool(relevant_history_lines)
-                        or packed_memory_context is not None
-                        or mentions_member
-                    )
+                    and resolver_memory_tool_eligible
                 ),
                 memory_tool_executor=memory_tool_executor,
                 memory_source_ids=(
@@ -2850,6 +2852,44 @@ class InboundRouter:
             if str(value).strip()
         }
         return any(label and label in query for label in member_labels)
+
+    @staticmethod
+    def _memory_tools_eligible_from_result(
+        memory_result,
+        *,
+        addressed_turn: bool,
+        use_full_history: bool,
+        relevant_history_lines,
+        mentions_member: bool,
+        packed_memory_context,
+    ) -> bool:
+        """Expose memory tools from typed resolver intent, including zero hits.
+
+        Addressing and local evidence are useful compatibility signals, but
+        neither is a reliable proxy for retrieval intent.  The resolver result
+        is authoritative for history/current-personal questions.  A plain
+        quote continuation is a hard negative through ``memory_search_allowed``.
+        """
+
+        if not bool(getattr(memory_result, "memory_search_allowed", True)):
+            return False
+        answer_mode = str(getattr(memory_result, "resolved_answer_mode", "") or "")
+        resolver_positive = bool(
+            getattr(memory_result, "resolved_personal_memory_intent", False)
+            or getattr(memory_result, "resolved_needs_history", False)
+            or getattr(memory_result, "resolved_quote_role", "") == "memory_reference"
+            or bool(getattr(memory_result, "resolved_subject_ids", None))
+            or answer_mode
+            in {"current_fact", "assessment", "summary", "dated_history", "exact", "mention"}
+        )
+        compatibility_positive = bool(
+            addressed_turn
+            or use_full_history
+            or relevant_history_lines
+            or packed_memory_context is not None
+            or mentions_member
+        )
+        return resolver_positive or compatibility_positive
 
     def _reserve_outbound_reply(
         self,

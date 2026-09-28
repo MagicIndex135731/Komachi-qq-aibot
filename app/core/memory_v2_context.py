@@ -427,6 +427,7 @@ class MemoryV2ContextProvider:
             resolved_fact_coverage=resolved.fact_coverage,
             resolved_fact_policy_reason=resolved.fact_policy_reason,
             resolved_quote_role=resolved.quote_role,
+            resolved_needs_history=resolved.needs_history,
             memory_search_allowed=resolved.quote_role != "conversation_anchor",
         )
         total_ms = (perf_counter() - evaluation_started) * 1000

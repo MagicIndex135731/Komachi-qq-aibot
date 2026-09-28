@@ -6137,6 +6137,82 @@ def test_query_mentions_member_detects_nickname_card_and_id() -> None:
     assert router._query_mentions_member("八仙怎么样？", users) is False
 
 
+def test_memory_tools_follow_resolver_intent_even_without_local_hits() -> None:
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(
+        memory_search_allowed=True,
+        resolved_answer_mode="general_history",
+        resolved_personal_memory_intent=False,
+        resolved_needs_history=False,
+        resolved_quote_role="none",
+        resolved_subject_ids=(),
+    )
+    assert InboundRouter._memory_tools_eligible_from_result(
+        result,
+        addressed_turn=False,
+        use_full_history=False,
+        relevant_history_lines=(),
+        mentions_member=False,
+        packed_memory_context=None,
+    ) is False
+
+    result = SimpleNamespace(
+        memory_search_allowed=True,
+        resolved_answer_mode="general_history",
+        resolved_personal_memory_intent=False,
+        resolved_needs_history=True,
+        resolved_quote_role="memory_reference",
+        resolved_subject_ids=(),
+    )
+    assert InboundRouter._memory_tools_eligible_from_result(
+        result,
+        addressed_turn=False,
+        use_full_history=False,
+        relevant_history_lines=(),
+        mentions_member=False,
+        packed_memory_context=None,
+    ) is True
+
+
+def test_memory_tools_follow_personal_subject_and_keep_quote_anchor_blocked() -> None:
+    from types import SimpleNamespace
+
+    personal = SimpleNamespace(
+        memory_search_allowed=True,
+        resolved_answer_mode="current_fact",
+        resolved_personal_memory_intent=True,
+        resolved_needs_history=False,
+        resolved_quote_role="none",
+        resolved_subject_ids=("43",),
+    )
+    assert InboundRouter._memory_tools_eligible_from_result(
+        personal,
+        addressed_turn=False,
+        use_full_history=False,
+        relevant_history_lines=(),
+        mentions_member=False,
+        packed_memory_context=None,
+    ) is True
+
+    anchor = SimpleNamespace(
+        memory_search_allowed=False,
+        resolved_answer_mode="current_fact",
+        resolved_personal_memory_intent=True,
+        resolved_needs_history=False,
+        resolved_quote_role="conversation_anchor",
+        resolved_subject_ids=("43",),
+    )
+    assert InboundRouter._memory_tools_eligible_from_result(
+        anchor,
+        addressed_turn=True,
+        use_full_history=True,
+        relevant_history_lines=("recent",),
+        mentions_member=True,
+        packed_memory_context=object(),
+    ) is False
+
+
 class FakeProactiveJudgeLlm:
     def __init__(self, decision: bool) -> None:
         self.decision = decision

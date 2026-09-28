@@ -31,6 +31,7 @@ class MemoryContextResult:
     resolved_fact_coverage: str = ""
     resolved_fact_policy_reason: str = ""
     resolved_quote_role: str = "none"
+    resolved_needs_history: bool = False
     memory_search_allowed: bool = True
 
 

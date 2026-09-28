@@ -612,6 +612,7 @@ class LegacyMemoryContext:
         selected_source_msg_ids: list[str],
         mode: str,
         resolved_quote_role: str = "none",
+        resolved_needs_history: bool = False,
     ) -> MemoryContextResult:
         sections = [
             *context.recent_messages,
@@ -629,5 +630,6 @@ class LegacyMemoryContext:
             estimated_tokens=ContextBuilder.estimate_prompt_tokens(sections),
             mode=mode,
             resolved_quote_role=resolved_quote_role,
+            resolved_needs_history=resolved_needs_history,
             memory_search_allowed=resolved_quote_role != "conversation_anchor",
         )
