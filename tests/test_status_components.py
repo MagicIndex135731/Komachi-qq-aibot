@@ -16,7 +16,7 @@ def _settings(tmp_path: Path) -> AppSettings:
         data_dir=tmp_path,
         llm_base_url="https://example.invalid/v1",
         llm_api_key="test-key",
-        llm_model="gpt-6-sol",
+        llm_model="gpt-6.1-sol",
         llm_timeout_seconds=30.0,
     )
 

@@ -1829,13 +1829,13 @@ def test_responses_builtin_web_search_uses_structured_input() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-6-sol",
-        responses_model="gpt-6-sol",
+        model="gpt-6.1-sol",
+        responses_model="gpt-6.1-sol",
         builtin_web_search=True,
     )
 
     payload = client._build_responses_payload(
-        model="gpt-6-sol",
+        model="gpt-6.1-sol",
         instructions=[],
         input_lines=["Target message: Alice: what happened today?"],
         allow_web_search=True,
@@ -1864,7 +1864,7 @@ def test_responses_model_fallback_uses_sol_on_responses_endpoint() -> None:
         assert request.url.path == "/v1/responses"
         if payload["model"] == "gpt-5.6-luna":
             return httpx.Response(503, request=request, json={"error": "unavailable"})
-        assert payload["model"] == "gpt-6-sol"
+        assert payload["model"] == "gpt-6.1-sol"
         return httpx.Response(
             200,
             request=request,
@@ -1876,7 +1876,7 @@ def test_responses_model_fallback_uses_sol_on_responses_endpoint() -> None:
         base_url="https://api.example.test/v1",
         api_key="test-key",
         model="gpt-5.6-luna",
-        fallback_model="gpt-6-sol",
+        fallback_model="gpt-6.1-sol",
         responses_model="gpt-5.6-luna",
         responses_only=True,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -1888,7 +1888,7 @@ def test_responses_model_fallback_uses_sol_on_responses_endpoint() -> None:
     assert [request.url.path for request in captured_requests] == ["/v1/responses"] * len(captured_requests)
     assert [json.loads(request.content.decode("utf-8"))["model"] for request in captured_requests] == [
         "gpt-5.6-luna"
-    ] * client.REQUEST_MAX_ATTEMPTS + ["gpt-6-sol"]
+    ] * client.REQUEST_MAX_ATTEMPTS + ["gpt-6.1-sol"]
 
 
 def test_responses_only_never_falls_back_to_chat_completions() -> None:
@@ -1903,7 +1903,7 @@ def test_responses_only_never_falls_back_to_chat_completions() -> None:
         base_url="https://api.example.test/v1",
         api_key="test-key",
         model="gpt-5.6-luna",
-        fallback_model="gpt-6-sol",
+        fallback_model="gpt-6.1-sol",
         responses_model="gpt-5.6-luna",
         responses_only=True,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -1936,9 +1936,9 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-6-sol",
-        responses_model="gpt-6-sol",
-        image_responses_model="gpt-6-sol",
+        model="gpt-6.1-sol",
+        responses_model="gpt-6.1-sol",
+        image_responses_model="gpt-6.1-sol",
         reasoning_effort="medium",
         http_client=httpx.Client(transport=transport),
         usage_recorder=recorded.append,
@@ -1954,7 +1954,7 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
 
     assert captured["url"] == "https://api.example.test/v1/responses"
     assert captured["payload"] == {
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "stream": True,
         "input": [
             {
@@ -1970,7 +1970,7 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     assert result.images == [{"b64_json": "aW1hZ2U="}]
     assert result.artifacts[0].b64_json == "aW1hZ2U="
     assert len(recorded) == 1
-    assert recorded[0].model == "gpt-6-sol"
+    assert recorded[0].model == "gpt-6.1-sol"
     assert recorded[0].endpoint == "responses"
 
 
@@ -1992,9 +1992,9 @@ def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> 
     client = LlmClient(
         base_url="https://api.example.test/v1",
         api_key="test-key",
-        model="gpt-6-sol",
-        responses_model="gpt-6-sol",
-        image_responses_model="gpt-6-sol",
+        model="gpt-6.1-sol",
+        responses_model="gpt-6.1-sol",
+        image_responses_model="gpt-6.1-sol",
         http_client=httpx.Client(transport=transport),
     )
 

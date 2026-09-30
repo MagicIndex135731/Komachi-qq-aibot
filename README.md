@@ -60,7 +60,7 @@ QQ_PLATFORM=snowluma
 
 LLM_BASE_URL=https://你的模型接口地址
 LLM_API_KEY=你的API密钥
-LLM_MODEL=gpt-6-sol
+LLM_MODEL=gpt-6.1-sol
 LLM_TEXT_ENDPOINT=responses
 ```
 
