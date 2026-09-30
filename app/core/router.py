@@ -958,6 +958,21 @@ class InboundRouter:
     def _safety_lines_for(self) -> list[str]:
         return render_safety_lines(self.runtime.safety)
 
+    def _bot_addressing_instruction(self, *, impersonating: bool) -> str:
+        """Disambiguate the transport target from the active speaking persona."""
+
+        if impersonating:
+            return (
+                "Addressing fact: the current message explicitly mentions this bot account. "
+                "The mention name (for example, 小町) is the bot's call name, not a request "
+                "to discuss that name as a third person. Reply directly as the currently "
+                "active impersonated group member."
+            )
+        return (
+            "Addressing fact: the current message explicitly mentions this bot account, "
+            "so answer the sender directly."
+        )
+
     def _with_relevant_examples(
         self,
         persona_text: str,
@@ -2452,6 +2467,11 @@ class InboundRouter:
                 )
             if addressing_rule_lines:
                 group_policy_lines = [*group_policy_lines, *addressing_rule_lines]
+            if event.mentioned_bot:
+                group_policy_lines = [
+                    *group_policy_lines,
+                    self._bot_addressing_instruction(impersonating=impersonating),
+                ]
             packed_blocked_output_present = (
                 packed_memory_context is not None
                 and packed_memory_context.blocked_output_present

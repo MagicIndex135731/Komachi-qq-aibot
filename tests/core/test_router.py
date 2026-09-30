@@ -1230,6 +1230,8 @@ async def test_router_skips_addressing_rules_while_impersonating(
 
     assert llm.calls
     impersonation_prompt = "\n".join(llm.calls[0])
+    assert "current message explicitly mentions this bot account" in impersonation_prompt
+    assert "currently active impersonated group member" in impersonation_prompt
     assert "Active addressing rule" not in impersonation_prompt
     assert "称呼该用户为主人" not in impersonation_prompt
 
