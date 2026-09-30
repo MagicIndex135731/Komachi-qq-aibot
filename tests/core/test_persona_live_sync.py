@@ -590,7 +590,7 @@ def test_write_refreshed_profile_writes_valid_output_and_preserves_current_field
     del refreshed["speech_habits"]
 
     def generate_valid(self, prompt):
-        assert self.reasoning_effort == "medium"
+        assert self.reasoning_effort == "low"
         return yaml.safe_dump(refreshed, allow_unicode=True)
 
     monkeypatch.setattr(

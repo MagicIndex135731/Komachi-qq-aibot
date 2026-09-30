@@ -24,7 +24,7 @@ def _settings(tmp_path: Path) -> AppSettings:
 def test_live_persona_probe_validates_model_and_temp_file(tmp_path, monkeypatch) -> None:
     class FakeClient:
         def __init__(self, **kwargs):
-            assert kwargs["reasoning_effort"] == "medium"
+            assert kwargs["reasoning_effort"] == "low"
             assert kwargs["max_output_tokens"] <= 1200
             self.http_client = self
 

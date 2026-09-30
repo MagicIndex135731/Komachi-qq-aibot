@@ -97,7 +97,7 @@ class LlmClient:
         builtin_web_search: bool = False,
         web_search_context_size: str = "high",
         web_search_model: str | None = None,
-        reasoning_effort: str = "",
+        reasoning_effort: str = "low",
         max_output_tokens: int = 8192,
         temperature: float | None = None,
         timeout_seconds: float = 30.0,

@@ -69,9 +69,9 @@ RESUME_SOURCE_GLOBS = (
 DEFAULT_INPUT_PRICE_MT = 1.25
 DEFAULT_OUTPUT_PRICE_MT = 5.00
 DEFAULT_ANSWER_MODEL = "gpt-5.6-luna"
-DEFAULT_ANSWER_EFFORT = "high"
+DEFAULT_ANSWER_EFFORT = "low"
 DEFAULT_AUX_MODEL = "gpt-5.6-luna"
-DEFAULT_AUX_EFFORT = "medium"
+DEFAULT_AUX_EFFORT = "low"
 PROVIDER_ATTEMPTS = 5
 PROVIDER_BACKOFF_SECONDS = 3.0
 PROVIDER_PREFLIGHT_CASES = 10
@@ -235,7 +235,7 @@ def _build_eval_clients(
 ) -> tuple[LlmClient, LlmClient]:
     """Build separate Luna clients: final answers vs auxiliary calls.
 
-    Auxiliary calls (judge, citation repair) use the medium-effort Luna profile;
+    Auxiliary calls (judge, citation repair) default to low effort;
     final answers use the configured answer profile. The rewrite provider
     already constructs its own low-effort client from settings.
     """

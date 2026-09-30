@@ -567,11 +567,7 @@ def _build_query_rewrite_provider(*, settings: AppSettings, llm_client, engine=N
     # high-reasoning latency (~12s observed) on every addressed question.
     # Test fakes keep their injected client untouched.
     rewrite_llm = llm_client
-    if isinstance(llm_client, LlmClient) and llm_client.reasoning_effort not in (
-        "",
-        "low",
-        "minimal",
-    ):
+    if isinstance(llm_client, LlmClient) and llm_client.reasoning_effort != "low":
         rewrite_llm = LlmClient(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,

@@ -1800,6 +1800,7 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
+        "reasoning": {"effort": "low"},
         "instructions": (
             "System persona: You are Mira.\n\n"
             "Safety rules: Stay safe.\n\n"
@@ -2806,6 +2807,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
+        "reasoning": {"effort": "low"},
         "input": [
             {
                 "role": "user",
@@ -2819,6 +2821,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
+        "reasoning": {"effort": "low"},
         "input": [
             {
                 "role": "user",
@@ -2871,6 +2874,7 @@ def test_llm_client_routes_images_to_responses_with_input_image_when_configured(
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
+        "reasoning": {"effort": "low"},
         "input": [
             {
                 "role": "user",

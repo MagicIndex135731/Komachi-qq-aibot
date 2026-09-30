@@ -30,7 +30,7 @@ from app.storage.repositories import (
 
 
 logger = logging.getLogger(__name__)
-PERSONA_REFRESH_REASONING_EFFORT = "medium"
+PERSONA_REFRESH_REASONING_EFFORT = "low"
 
 
 _LIVE_PROFILE_REQUIRED_TYPES: dict[str, type] = {

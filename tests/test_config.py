@@ -104,6 +104,14 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     monkeypatch.delenv("LLM_FALLBACK_MODEL", raising=False)
     monkeypatch.delenv("LLM_TEXT_ENDPOINT", raising=False)
     monkeypatch.delenv("LLM_WEB_SEARCH_MODEL", raising=False)
+    for effort_key in (
+        "LLM_REASONING_EFFORT",
+        "MEMORY_COMPACTION_REASONING_EFFORT",
+        "MEMORY_EPISODE_TOPIC_JUDGE_REASONING_EFFORT",
+        "MEMORY_EPISODE_POST_SEGMENT_REASONING_EFFORT",
+        "PROACTIVE_JUDGE_REASONING_EFFORT",
+    ):
+        monkeypatch.delenv(effort_key, raising=False)
     monkeypatch.delenv("GROUP_IMAGE_CHAT_BASE_URL", raising=False)
     monkeypatch.delenv("GROUP_IMAGE_CHAT_API_KEY", raising=False)
 
@@ -118,7 +126,11 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.context_recent_limit == 60
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
-    assert settings.memory_compaction_reasoning_effort == "medium"
+    assert settings.llm_reasoning_effort == "low"
+    assert settings.memory_compaction_reasoning_effort == "low"
+    assert settings.memory_episode_topic_judge_reasoning_effort == "low"
+    assert settings.memory_episode_post_segment_reasoning_effort == "low"
+    assert settings.proactive_judge_reasoning_effort == "low"
     assert settings.memory_compaction_max_output_tokens == 4096
     assert settings.llm_model == "gpt-5.4-mini"
     assert settings.llm_fallback_model == "gpt-5.4"

@@ -132,7 +132,7 @@ def extract_facts_from_lines(
         responses_model=settings.llm_model,
         max_output_tokens=8000,
         timeout_seconds=300.0,
-        reasoning_effort="medium",
+        reasoning_effort="low",
     )
     facts: list[dict] = []
     for index, lines_slice in enumerate(slices):
@@ -386,7 +386,7 @@ def review_facts(settings, facts: list[dict]) -> list[dict]:
         responses_model=settings.llm_model,
         max_output_tokens=4000,
         timeout_seconds=300.0,
-        reasoning_effort="medium",
+        reasoning_effort="low",
     )
     generated = client.generate_text([prompt])
     if not str(generated or "").strip():

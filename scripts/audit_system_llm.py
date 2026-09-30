@@ -216,7 +216,7 @@ def judge_scenario(
     payload = {
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
-        "reasoning_effort": "minimal",
+        "reasoning_effort": "low",
         "max_tokens": 1024,
         "temperature": 0.2,
     }

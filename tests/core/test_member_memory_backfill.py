@@ -58,7 +58,7 @@ def test_build_slices_overlaps_boundaries() -> None:
     assert "四四四四四四四四" in slices[-1]
 
 
-def test_fact_extraction_and_review_use_medium_reasoning(monkeypatch) -> None:
+def test_fact_extraction_and_review_use_low_reasoning(monkeypatch) -> None:
     efforts: list[str] = []
 
     class FakeClient:
@@ -81,7 +81,7 @@ def test_fact_extraction_and_review_use_medium_reasoning(monkeypatch) -> None:
     assert extract_facts_from_lines(settings, ["今天在学日语"]) == []
     candidates = [{"fact": "在学日语", "evidence": "今天在学日语"}]
     assert review_facts(settings, candidates) == candidates
-    assert efforts == ["medium", "medium"]
+    assert efforts == ["low", "low"]
 
 
 def test_fact_extraction_reclassifies_current_process_ranking_as_decision(
