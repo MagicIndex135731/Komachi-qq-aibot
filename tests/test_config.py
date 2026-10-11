@@ -57,6 +57,23 @@ def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
     assert runtime.safety["deny_prompt_leak"] is True
 
 
+def test_project_default_persona_is_tieba_and_komachi_remains_switchable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_QQ", "123456789")
+    monkeypatch.setenv("OWNER_QQ", "987654321")
+
+    settings = AppSettings(_env_file=None, config_dir=Path("configs"), data_dir=tmp_path / "data")
+    runtime = load_runtime_config(settings)
+
+    assert runtime.persona["name"] == "串子小町"
+    assert runtime.persona["chat_voice"] == "tieba"
+    assert runtime.personas["komachi_clingy"]["name"] == "比企谷小町"
+    assert runtime.personas["komachi_clingy"]["aliases"] == ["粘人小町", "撒娇小町", "小町"]
+    assert runtime.personas["mouthy_komachi"]["chat_voice"] == "komachi"
+
+
 def test_groups_local_overlay_replaces_placeholder_groups(tmp_path, monkeypatch) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()

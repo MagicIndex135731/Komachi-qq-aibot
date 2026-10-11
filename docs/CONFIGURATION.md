@@ -12,7 +12,7 @@
 | `configs/groups.local.yaml` | 真实群号和策略 | 私有，群表整体覆盖模板 |
 | `configs/social.yaml` | 社交、计算、服务许可模板 | 可公开 |
 | `configs/social.local.yaml` | 本机授权对象与社交设置 | 私有，递归覆盖模板 |
-| `configs/persona.yaml` | 默认小町角色 | 仅公开通用角色描述 |
+| `configs/persona.yaml` | 启动默认“串子小町”角色 | 仅公开通用角色描述 |
 | `configs/persona_variants.yaml` | 默认角色的变体覆盖 | 可公开 |
 | `configs/personas/`、`data/personas/` | 本地成员人格与动态覆盖 | 私有 |
 

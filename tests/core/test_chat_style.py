@@ -384,3 +384,21 @@ def test_clingy_voice_is_ignored_without_the_komachi_style() -> None:
         voice="clingy",
         komachi_style=False,
     ) == build_human_chat_style_lines(komachi_style=False)
+
+
+def test_tieba_voice_uses_serial_forum_register_without_mesugaki_roast() -> None:
+    joined = "\n".join(build_human_chat_style_lines(voice="tieba"))
+
+    assert "Baidu Tieba veteran" in joined
+    assert "串场 is playful contextual riffing" in joined
+    assert "mesugaki" not in joined
+    assert "sharp roast" not in joined
+
+
+def test_tieba_proactive_voice_is_short_and_does_not_dogpile() -> None:
+    joined = "\n".join(build_human_chat_style_lines(proactive_turn=True, voice="tieba"))
+
+    assert "familiar forum regular" in joined
+    assert "playful串场" in joined
+    assert "do not bait, dogpile, shame" in joined
+    assert "sharp roast" not in joined
