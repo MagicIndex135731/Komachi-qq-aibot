@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import re
 
+from app.core.time_utils import shanghai_aware
+
 
 FOLLOWUP_PHRASES = (
     "你觉得呢",
@@ -546,7 +548,7 @@ def needs_current_datetime_context(text: str) -> bool:
 
 
 def build_current_datetime_facts(now: datetime) -> list[str]:
-    local_now = now.astimezone()
+    local_now = shanghai_aware(now)
     return [
         f"Current local datetime: {local_now.strftime('%Y-%m-%d %H:%M:%S %z')[:-2] + ':' + local_now.strftime('%Y-%m-%d %H:%M:%S %z')[-2:]}",
         f"Current local date: {local_now.strftime('%Y-%m-%d')}",
@@ -559,7 +561,7 @@ def normalize_relative_time_query(query: str, *, now: datetime) -> str:
     if not normalized:
         return normalized
 
-    local_now = now.astimezone()
+    local_now = shanghai_aware(now)
     replacements = (
         ("今年", f"{local_now.year}年"),
         ("明年", f"{local_now.year + 1}年"),

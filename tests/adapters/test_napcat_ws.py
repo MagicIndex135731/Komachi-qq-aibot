@@ -262,3 +262,66 @@ async def test_connect_and_consume_does_not_block_live_messages_while_on_connect
     await asyncio.wait_for(handler_called.wait(), timeout=0.2)
     release_on_connect.set()
     await task
+
+
+@pytest.mark.asyncio
+async def test_gateway_capacity_overflow_disconnects_without_unbounded_handler_tasks(monkeypatch) -> None:
+    gateway = NapCatGateway(ws_url="ws://example", max_handler_tasks=1)
+    socket = FakeIncomingWebSocket([
+        json.dumps({"post_type": "message", "message_id": str(index)})
+        for index in range(3)
+    ])
+    monkeypatch.setattr("app.adapters.napcat_ws.websockets.connect", lambda *_args, **_kwargs: socket)
+    connections, entered, cancelled = [], [], []
+    gateway.on_connection_change = connections.append
+
+    async def slow_handler(payload):
+        entered.append(payload["message_id"])
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.append(payload["message_id"])
+
+    with pytest.raises(RuntimeError, match="handler capacity exceeded"):
+        await asyncio.wait_for(gateway.connect_and_consume(slow_handler), timeout=3)
+
+    assert entered == cancelled == ["0"]
+    assert connections == [True, False]
+    assert gateway.websocket is None
+    assert gateway._handler_tasks == set()
+    assert gateway._pending_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_cancellation_stops_live_handler_and_connect_callback_promptly(monkeypatch) -> None:
+    gateway = NapCatGateway(ws_url="ws://example", max_handler_tasks=1)
+    socket = FakeDuplexWebSocket([{"post_type": "message", "message_id": "live-1"}])
+    monkeypatch.setattr("app.adapters.napcat_ws.websockets.connect", lambda *_args, **_kwargs: socket)
+    handler_entered, connect_entered = asyncio.Event(), asyncio.Event()
+    connections, cancelled = [], []
+    gateway.on_connection_change = connections.append
+
+    async def handler(_payload):
+        handler_entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.append("handler")
+
+    async def on_connect():
+        connect_entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.append("on-connect")
+
+    task = asyncio.create_task(gateway.connect_and_consume(handler, on_connect=on_connect))
+    await asyncio.wait_for(asyncio.gather(handler_entered.wait(), connect_entered.wait()), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert set(cancelled) == {"handler", "on-connect"}
+    assert connections == [True, False]
+    assert gateway.websocket is None
+    assert gateway._handler_tasks == set()

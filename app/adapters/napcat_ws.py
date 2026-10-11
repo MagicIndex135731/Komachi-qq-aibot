@@ -24,6 +24,7 @@ class NapCatGateway:
         access_token: str | None = None,
         reconnect_forever: bool = False,
         reconnect_delay_seconds: float = 2.0,
+        max_handler_tasks: int = 128,
     ) -> None:
         self.ws_url = ws_url
         self.access_token = access_token
@@ -32,6 +33,8 @@ class NapCatGateway:
         self.websocket = None
         self._pending_calls: dict[str, asyncio.Future] = {}
         self._handler_tasks: set[asyncio.Task] = set()
+        self.max_handler_tasks = max(1, int(max_handler_tasks))
+        self.on_connection_change: Callable[[bool], None] | None = None
 
     async def connect_and_consume(
         self,
@@ -43,9 +46,12 @@ class NapCatGateway:
             disconnect_error = ConnectionError("NapCat websocket disconnected")
             should_reconnect = False
             on_connect_task: asyncio.Task | None = None
+            cancelled = False
             try:
                 async with websockets.connect(self.ws_url, additional_headers=headers) as websocket:
                     self.websocket = websocket
+                    if self.on_connection_change is not None:
+                        self.on_connection_change(True)
                     if on_connect is not None:
                         on_connect_task = asyncio.create_task(self._run_on_connect(on_connect))
                         await asyncio.sleep(0)
@@ -57,10 +63,17 @@ class NapCatGateway:
                             if not future.done():
                                 future.set_result(payload)
                             continue
+                        if len(self._handler_tasks) >= self.max_handler_tasks:
+                            # Reconnect/backfill reports a gap instead of growing without bound.
+                            raise RuntimeError("OneBot inbound handler capacity exceeded")
                         task = asyncio.create_task(self._run_handler(handler, payload))
                         self._handler_tasks.add(task)
                         task.add_done_callback(self._handler_tasks.discard)
+                        # Let fast durable-ingest handlers complete during bursts.
+                        # The reader still keeps running while slow handlers await RPCs.
+                        await asyncio.sleep(0)
             except asyncio.CancelledError:
+                cancelled = True
                 raise
             except Exception:
                 if not self.reconnect_forever:
@@ -73,11 +86,21 @@ class NapCatGateway:
                     logging.warning("NapCat websocket closed; reconnecting")
             finally:
                 self.websocket = None
+                if self.on_connection_change is not None:
+                    self.on_connection_change(False)
                 self._fail_pending_calls(disconnect_error)
                 if on_connect_task is not None and not on_connect_task.done():
                     on_connect_task.cancel()
                 pending_tasks = list(self._handler_tasks)
                 if pending_tasks:
+                    # Allow already received messages to reach the durable inbox, but
+                    # never let a slow model handler delay reconnect/shutdown forever.
+                    if cancelled:
+                        unfinished = pending_tasks
+                    else:
+                        _, unfinished = await asyncio.wait(pending_tasks, timeout=2.0)
+                    for task in unfinished:
+                        task.cancel()
                     await asyncio.gather(*pending_tasks, return_exceptions=True)
                 self._handler_tasks.clear()
                 if on_connect_task is not None:

@@ -1,0 +1,44 @@
+# Optional overlay: append after the selected host-network OneBot stack.
+# Build both targets explicitly; start only xiaomachi-sandbox with --profile sandbox.
+services:
+  sandbox-base:
+    profiles: [sandbox-build]
+    image: xiaomachi-sandbox-base:py312
+    build:
+      context: ../..
+      dockerfile: infra/wsl/Dockerfile.sandbox-base
+      network: host
+    command: [python, -c, pass]
+
+  xiaomachi-sandbox:
+    profiles: [sandbox]
+    image: xiaomachi-sandbox-gateway:py312
+    build:
+      context: ../../app
+      dockerfile: ../infra/wsl/Dockerfile.sandbox-gateway
+      network: host
+    container_name: xiaomachi-sandbox
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 96
+    stop_grace_period: 15s
+    tmpfs:
+      - /tmp:size=32m,nosuid,nodev,noexec
+    # Only the trusted RPC server receives this secret. Model code runs in a
+    # separate clean container without this environment, network or socket.
+    environment:
+      XIAOMACHI_SANDBOX_TOKEN: ${XIAOMACHI_SANDBOX_TOKEN:-}
+      XIAOMACHI_SANDBOX_DATA_DIR: /data/sandbox
+      XIAOMACHI_SANDBOX_BIND: 127.0.0.1
+      XIAOMACHI_SANDBOX_PORT: "8217"
+    volumes:
+      - sandbox_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  sandbox_data:

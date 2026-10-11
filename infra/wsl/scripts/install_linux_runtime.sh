@@ -37,6 +37,10 @@ shared_runtime="${shared_dir}/runtime"
 shared_config_dir="${shared_dir}/configs"
 shared_groups_config="${shared_config_dir}/groups.local.yaml"
 previous_release="$(readlink -f "${INSTALL_ROOT}/current" 2>/dev/null || true)"
+previous_image_id="$(docker inspect xiaomachi-bot --format '{{.Image}}' 2>/dev/null || true)"
+if [[ -n "${previous_image_id}" ]]; then
+  docker image tag "${previous_image_id}" "xiaomachi-bot:rollback-${release_id,,}"
+fi
 memory_audit_timer_was_enabled=false
 if systemctl is-enabled --quiet xiaomachi-memory-audit.timer 2>/dev/null; then
   memory_audit_timer_was_enabled=true
@@ -90,6 +94,11 @@ recreate_bot_only() {
 restore_previous_runtime() {
   if [[ "${install_succeeded}" == true ]]; then
     return
+  fi
+  # Building replaces :local even before activation. Restore the exact image
+  # used by the old container, so a restart or rollback cannot pick the candidate.
+  if [[ -n "${previous_image_id}" ]]; then
+    docker image tag "${previous_image_id}" xiaomachi-bot:local >/dev/null 2>&1 || true
   fi
   if [[ "${activation_started}" != true ]]; then
     return
@@ -262,12 +271,20 @@ install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-memory-audi
 install -m 0644 "${INSTALL_ROOT}/current/infra/wsl/systemd/xiaomachi-memory-audit.timer" \
   "${SYSTEMD_DIR}/xiaomachi-memory-audit.timer"
 
+mihomo_required="$(python3 "${INSTALL_ROOT}/current/infra/wsl/scripts/runtime_egress.py" \
+  --env-file "${shared_dir}/.env" --unit-file "${SYSTEMD_DIR}/xiaomachi-stack.service")"
 systemctl daemon-reload
 systemctl disable xiaomachi-watchdog.service xiaomachi-stack.service >/dev/null 2>&1 || true
 systemctl enable xiaomachi-memory-audit.timer
-if [[ -x /usr/local/bin/mihomo && -s "${shared_dir}/mihomo/config.yaml" ]]; then
+if [[ "${mihomo_required}" == true ]]; then
+  if [[ ! -x /usr/local/bin/mihomo || ! -s "${shared_dir}/mihomo/config.yaml" ]]; then
+    echo "The configured WSL provider proxy requires a validated Mihomo service." >&2
+    exit 1
+  fi
   /usr/local/bin/mihomo -t -d "${shared_dir}/mihomo"
   systemctl enable --now xiaomachi-mihomo.service
+else
+  systemctl disable --now xiaomachi-mihomo.service >/dev/null 2>&1 || true
 fi
 if [[ -n "${previous_release}" ]]; then
   # An upgrade must retain LLBot's session and container identity.  The stack

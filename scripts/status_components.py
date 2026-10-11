@@ -19,12 +19,11 @@ import yaml
 
 from app.config import AppSettings
 from app.core.persona_live_sync import (
-    PERSONA_REFRESH_REASONING_EFFORT,
     _normalize_live_profile_contract,
     write_live_profile,
 )
 from app.core.style_distill import parse_persona_yaml
-from app.providers.llm_client import LlmClient, LlmUsage
+from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort, LlmUsage
 
 
 PROBE_OUTPUT_TOKEN_CAP = 1200
@@ -308,7 +307,7 @@ def check_live_persona(settings: AppSettings) -> bool:
         model=settings.llm_model,
         responses_model=settings.llm_model,
         responses_only=True,
-        reasoning_effort=PERSONA_REFRESH_REASONING_EFFORT,
+        reasoning_effort=default_auxiliary_reasoning_effort(settings.llm_model),
         max_output_tokens=PROBE_OUTPUT_TOKEN_CAP,
         timeout_seconds=min(90.0, settings.llm_timeout_seconds),
         usage_recorder=usages.append,
@@ -332,7 +331,7 @@ def check_live_persona(settings: AppSettings) -> bool:
         )
         _print(
             "OK", "model_persona_live",
-            f"model={settings.llm_model} reasoning={PERSONA_REFRESH_REASONING_EFFORT} "
+            f"model={settings.llm_model} reasoning={default_auxiliary_reasoning_effort(settings.llm_model)} "
             "schema=valid temp_file_roundtrip=ok "
             f"output_cap={PROBE_OUTPUT_TOKEN_CAP}{token_detail}",
         )

@@ -109,7 +109,7 @@ def render_persona(persona: dict) -> str:
             continue
         member = str(relationship.get("member") or "").strip()
         relation = str(relationship.get("relation") or "").strip()
-        how_talks = str(relationship.get("how_azha_talks") or "").strip()
+        how_talks = str(relationship.get("how_member_alpha_talks") or "").strip()
         address_terms = _normalize_traits(relationship.get("address_terms"))
         if not member and not relation:
             continue

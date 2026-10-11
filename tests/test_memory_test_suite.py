@@ -112,12 +112,12 @@ def _minimal_db(path):
             source_start_msg_id TEXT, source_end_msg_id TEXT, status TEXT
         );
         INSERT INTO messages VALUES
-          (1, 1001, 'p1', 11, '2026-08-01T10:00:00+08:00', '阿渣喜欢看动画', NULL, 0),
+          (1, 1001, 'p1', 11, '2026-08-01T10:00:00+08:00', '小甲喜欢看动画', NULL, 0),
           (2, 1001, 'p2', 12, '2026-08-01T10:01:00+08:00', '小町 昨天说的计划', NULL, 1);
-        INSERT INTO users VALUES (11, '阿渣', '阿渣'), (12, '逆蝶蝶', '逆蝶蝶');
+        INSERT INTO users VALUES (11, '小甲', '小甲'), (12, '小乙乙', '小乙乙');
         INSERT INTO memory_items VALUES
           (1, 'group', '1001', '11', 'preference', 'likes', '动画',
-           '阿渣喜欢看动画', 'p1', '["p1"]', 'active', NULL);
+           '小甲喜欢看动画', 'p1', '["p1"]', 'active', NULL);
         """
     )
     connection.commit()

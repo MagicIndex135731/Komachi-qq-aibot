@@ -1,587 +1,252 @@
-# WSL/Docker 运行目录
+# Windows / WSL2 / Docker 部署运维
 
-这里是小町当前唯一受支持的运行栈。仓库示例配置使用 `QQ_PLATFORM=snowluma`；也可选择 `llbot` 或 `napcat`。三个平台共享小町业务代码、数据库和模型配置，但 QQ 登录态各自独立保存，同一账号不能同时在多个平台登录。
+用途：操作指南；读者：首次部署者与维护者；维护者：项目维护者。支持栈为 Windows + WSL2 Ubuntu/systemd + WSL 内 Docker Engine/Compose；不要混用另一套 Docker 数据根或把 Windows 运行缓存作为生产卷。
 
-## 启动链路
+项目介绍见 [README](../../README.md)，配置见 [CONFIGURATION](../../docs/CONFIGURATION.md)，原理见 [ARCHITECTURE](../../docs/ARCHITECTURE.md)。
 
-```text
-start-xiaomachi-wsl.bat
-  -> WSL /usr/local/bin/xiaomachi-wsl-entry
-  -> 当前发布版本的 infra/wsl/scripts/start.sh
-  -> 启动当前 QQ 平台容器
-  -> 条件打开当前 QQ 平台 WebUI
-  -> 无依赖启动小町群聊容器（OneBot 未就绪时自动重连）
-  -> 无依赖启动小町私聊容器（xiaomachi-private）
-  -> OneBot、向量预热、群聊/私聊心跳与组件状态检查
+## 1. 运行要求
+
+- Python 3.12、Git、Linux `python3-venv`、tar 和 systemd。
+- WSL 内 Docker Engine/Compose，root 可调用 Docker；`systemctl show-environment` 应成功。
+- 可用模型 API 和一个用于机器人运行的 QQ 账号。
+- 足够磁盘容纳 CUDA 基础镜像、QQ 客户端和持久数据；GPU 可选。
+
+WSL 的 `/etc/wsl.conf` 需启用 systemd：
+
+```ini
+[boot]
+systemd=true
 ```
 
-停止和状态入口使用同一个固定脚本，分别调用 `stop.sh` 和 `status.sh`。
+修改后在 Windows 执行 `wsl --shutdown` 再进入 WSL。此命令影响运行中的 WSL 服务，应在安装前或受控维护时使用。Windows BAT 入口使用默认发行版，先用 `wsl -l -v`、`wsl --set-default <发行版名称>` 确认目标。
 
-改完人格 / 配置 / 代码后要生效，用 **`rebuild-xiaomachi-wsl.bat`**：
-
-```text
-rebuild-xiaomachi-wsl.bat
-  -> infra/wsl/scripts/install_linux_runtime.sh
-  -> 把当前仓库装成新 release（含 configs/、app/、scripts/）
-  -> 重建镜像并重建 xiaomachi-bot + xiaomachi-private
-  -> QQ 平台容器（SnowLuma / LLBot / NapCat）保持不动，登录态不受影响
-  -> 跑一遍 status.sh 确认 readiness
-```
-
-`start-xiaomachi-wsl.bat` 只在**首次安装**时会走 install；装好之后它只负责启动与
-状态检查，不会重建镜像，所以改完文件必须用 `rebuild-xiaomachi-wsl.bat`（或同样的
-install 命令）才会生效。
-
-Windows 可能在最后一个交互式 `wsl.exe` 退出后回收 WSL VM。生产机应安装登录级
-任务计划，让独立进程持有运行锚点并在登录后恢复 systemd 服务：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File `
-  infra/wsl/scripts/install_windows_runtime_task.ps1
-```
-
-任务名为 `Xiaomachi WSL Runtime`，不会修改 Windows 系统代理。需要卸载时传入
-`-Action Remove`。BAT 仍是人工启动、停止和状态检查入口；start 会优先启动已安装
-的任务实例，stop 会先停止任务再关闭 systemd 服务。任务启动器会在发布期间 anchor
-短暂退出后立即重建它，避免 WSL 在重建间隙关机；但明确执行 stop 后不会把小町
-重新拉起。
-
-## 初始化
-
-在 WSL 中执行：
+在 WSL 检查基础环境：
 
 ```bash
-cd "/mnt/d/qq群ai小人"
+python3 --version
+docker version
+docker compose version
+systemctl show-environment
+```
+
+本栈 Compose 使用 host 网络；不依赖 bridge 端口映射。QQ 管理页、OneBot 和侧车端口仍需本机/防火墙保护。
+
+## 2. 初始化配置
+
+在 Windows PowerShell 的项目目录：
+
+```powershell
+Copy-Item infra/wsl/.env.example infra/wsl/.env
+Copy-Item configs/groups.yaml configs/groups.local.yaml
+```
+
+只在本地 `.env` 填写机器人/主人账号、模型地址/密钥/实际模型名、QQ 平台和 VNC 密码。公开模板不包含 `BOT_QQ` / `OWNER_QQ` 的实际值，需要自行添加。`LLM_TEXT_ENDPOINT` 选择服务确实支持的 `responses` 或 `chat_completions`。
+
+新数据库先设置 `MEMORY_RAW_V3_ENABLED=false`，按 [记忆与索引流程](../../docs/MEMORY.md) 完成准备/评测/激活。可先开启按群记忆基础流程、分层工具和本地 embedding；这不等于 raw V3 已有合格活动代际。
+
+完整基础编排使用 `MEMORY_ORCHESTRATION_V2_ENABLED=true`。Memory V3 发布与回滚的唯一命令来源为 [记忆指南](../../docs/MEMORY.md#raw-v3-准备评测激活与回滚)，不能跳过其质量门。
+
+`configs/groups.local.yaml` 的群表会整体替换占位模板，删除不需要的示例群并加入自己的真实群。每群至少确认 `enabled`、`speak`、`archive`、`memory_enabled`、`image_generation` 和主动间隔。私聊按主人/固定名单/可选动态好友许可设置。
+
+在 WSL 进入克隆目录：
+
+```bash
 bash infra/wsl/scripts/bootstrap_wsl.sh
 ```
 
-脚本会创建：
+bootstrap 创建初始本地运行目录、缺失的 `.env` 和持久 watchdog Python 环境；它不负责安装 Docker/systemd，也不替你填写账号密钥。
 
-- `infra/wsl/.env`：从 `.env.example` 生成，需要手工填入本地密钥。
-- `infra/wsl/runtime/napcat/config/onebot11.json`：NapCat 备选平台的 OneBot WebSocket 配置。
-- `/opt/xiaomachi/shared/venv`：watchdog 和 OneBot 探针环境。
+## 3. 首次安装与 QQ 登录
 
-`.env.example` 展示的是已完成 V3 激活的配置。首次安装没有 V3 索引时，
-先把本地 `.env` 的 `MEMORY_RAW_V3_ENABLED` 设为 `false`；准备、评测并激活
-generation 后再改为 `true`，详见下方 [Memory V3 发布与回滚](#memory-v3-发布与回滚)。
-
-## 操作命令
-
-推荐从 Windows 使用仓库根目录的 BAT。安装后在 WSL 中应针对当前发布版本运行，而不是误把工作区文件当成已部署版本：
-
-```bash
-sudo /usr/local/bin/xiaomachi-wsl-entry start
-sudo /usr/local/bin/xiaomachi-wsl-entry status
-sudo bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh --deep
-sudo /usr/local/bin/xiaomachi-wsl-entry stop
-```
-
-普通 `status.sh` 在容器、QQ/OneBot、群聊与私聊心跳、向量预热之外，还会只读检查
-SQLite 完整性、记忆/检索表、成员事实刷新状态、人格同步状态和现有人格文件契约，
-模型/生图/搜索配置，以及人格同步与成员事实后台任务的进度标记，不消耗模型 token。
-`--deep` 额外使用当前文本模型的 Responses 接口发起一次合成语料请求
-（与生产人格更新共用 `low` 推理强度、最多 1200 输出 token、至多一次上游请求，
-不调用联网或生图），验证返回字段类型，
-并在临时目录用与真实人格更新相同的写入逻辑进行 YAML 落盘和读回；
-真实人格文件、消息及数据库均不会被探针修改。上游临时过载或格式不符时深度检测失败，
-可稍后重试；启动流程只运行零 token 的普通模式。
-
-`start.sh` 先启动当前 QQ 平台并尝试打开 WebUI，再启动小町，避免 Compose 的健康依赖阻塞登录页面。示例平台 SnowLuma 的 WebUI 为 `http://127.0.0.1:5099/`，OneBot WebSocket 为 `ws://127.0.0.1:3001`；LLBot 使用 `3080` 和默认 `3002`，NapCat 使用 `6099` 和 `3001`。浏览器启动失败不会阻断容器。
-
-文本模型使用 Responses 端点且上游支持内置搜索时，可在 `.env` 设置 `LLM_BUILTIN_WEB_SEARCH=true`。明确“联网/搜索/查资料”的群请求会强制检索；工具事件保存在 bot 数据卷的 `/workspace/data/logs/responses-tool-events.jsonl`，不进入 Git。
-
-### 私聊容器（xiaomachi-private）
-
-群聊和私聊是同一镜像里的两个容器：OneBot 把每个事件广播给所有已连接的
-WebSocket 客户端，但群聊进程只处理群消息，所以私聊必须有独立进程接管。
-
-- `xiaomachi-bot` 运行 `python -m app.group_main`，只处理 `message_type=group`；
-- `xiaomachi-private` 运行 `python -m app.private_main`，只处理
-  `message_type=private`（人格对话、私聊生图、提醒），不运行群聊的
-  embedding 预热、记忆回填和启动窗口重放；
-- 私聊回复与主群共用同一套工作方式（记忆系统与人格模仿除外）：
-  `app/core/chat_style.py` 的真人化风格行（`chat_context="private"` 只改开场白）、
-  `GROUP_REPLY_SPLIT_*` 的拆条、未被明确要求时剥离链接、引用消息原文与代词
-  指代提示；私聊生图同样走 `build_image_reference_search_client` +
-  `build_group_image_reference_planner_client` 的参考图链路；
-- 两个容器共享 `NAPCAT_WS_URL` 和 `xiaomachi-bot-data` 卷；SQLite 以 WAL +
-  `busy_timeout=30000` 串行写入，私聊与群聊可以同时落库；
-- 私聊容器不需要 GPU（`docker-compose.gpu.yml` 只给 `xiaomachi` 加设备），
-  私聊生图走商用图片 API；
-- 未知的 `message_type` 不会被静默丢弃：两个进程都会记录
-  `inbound_message_unhandled`（含原始值与 payload 字段名），已知但不属于本进程
-  的类型（群聊进程收到私聊）也会留下 `inbound_message_ignored`。
-- `.env` 只在容器创建时读取：改动 `LLM_*`、`PRIVATE_CHAT_QQS` 或
-  代理变量后，需要同时重建 `xiaomachi` 与 `xiaomachi-private`（`--no-deps`，
-  不得重启 QQ 平台容器）。
-
-验证：
-
-```bash
-docker compose -f infra/wsl/docker-compose.snowluma.yml ps
-docker exec xiaomachi-private cat /workspace/data/logs/private.heartbeat.json
-docker logs --tail 50 xiaomachi-private
-```
-
-`status.sh` 在群聊就绪后还会检查 `xiaomachi-private` 容器和
-`private.heartbeat.json` 的新鲜度；私聊进程不存活时 status 直接失败，避免出现
-“群聊正常、私聊已经死掉”的假健康。发布时 `install_linux_runtime.sh` 只重建
-`xiaomachi` 与 `xiaomachi-private`（`--no-deps`），不会重启 QQ 平台容器。
-
-### WSL 内置 Mihomo 上游代理
-
-可选的生产代理拓扑使用 WSL 内独立的 Mihomo 规则实例，不依赖 Windows Clash、WSL NAT
-网关或反向 TCP 中继。配置由 Windows Clash Verge 当前合并配置生成，但私有
-节点、订阅和规则数据库只写入 `/opt/xiaomachi/shared/mihomo/`，不会进入 Git。
-
-在 Windows 仓库根目录同步当前 Clash Verge 配置并安装服务：
+从 Windows 双击或在 PowerShell 执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File `
-  infra/wsl/scripts/sync_mihomo_from_clash_verge.ps1
+.\start-xiaomachi-wsl.bat
 ```
 
-生成器会创建 `XIAOMACHI-NOVA-HK` 健康选择组，只包含当前配置里的香港节点；
-`ai.novacode.top` 优先走该组，QQ、本地与私网规则优先 `DIRECT`，其余规则继承
-当前机场配置。渲染脚本还给 `deepseek.com` 加一条托管的 `DIRECT` 规则；这只是
-域名路由，不表示当前模型一定使用 DeepSeek。实际文本、搜索和生图请求分别取决于
-对应的接口配置与域名。Mihomo 仅监听 WSL 回环地址，不启用 TUN，也不接管 Windows
-系统代理。示例运行配置：
+首次调用安装脚本，将运行源码/配置复制到 `/opt/xiaomachi/releases/<id>`，准备共享环境和数据卷，构建镜像并启用 systemd。之后正常 start 复用已安装镜像，缺失才构建。
 
-```dotenv
-XIAOMACHI_HTTP_PROXY=http://127.0.0.1:7897
-XIAOMACHI_HTTPS_PROXY=http://127.0.0.1:7897
-DOCKER_HTTP_PROXY=
-DOCKER_HTTPS_PROXY=
-```
+| 平台 | QQ_PLATFORM | 管理入口 | 主要端口 |
+|---|---|---|---|
+| SnowLuma | `snowluma` | `open-snowluma-webui.bat`、`open-snowluma-desktop.bat` | WebUI 5099、noVNC 6081、VNC 5900、OneBot 3000/3001 |
+| LLBot | `llbot` | `open-llbot-webui.bat` | WebUI 3080、WS 默认 3002 |
+| NapCat | `napcat` | `open-napcat-webui.bat` | WebUI 6099、WS 3001 |
 
-QQ 接入容器不读取 `XIAOMACHI_*`，QQ 与 OneBot 始终直连。修改 `.env` 后要
-重建 `xiaomachi` 和 `xiaomachi-private` 两个应用容器；不要重建 QQ 接入容器。
-订阅更新后重新运行同步脚本即可，脚本会先渲染和校验新配置，再
-重启 Mihomo。
+平台容器分别为 `xiaomachi-snowluma`、`xiaomachi-llbot` 和 `xiaomachi-napcat`。
 
-Windows 快捷方式（`*.bat`）必须保持 CRLF 行尾：cmd.exe 无法解析 LF-only 脚本里的
-`goto` 标签，错误分支会变成"闪退"（看不到任何提示）。`.gitattributes` 已用
-`*.bat text eol=crlf` 固定这一点；改动这些脚本后如果 Windows 端仍是 LF，重新
-检出一次即可。
+一次只运行一个平台登录同一个 QQ。三个平台的登录态卷彼此独立；切换后需要对应平台登录。
 
-任一 QQ 平台返回 `retcode=1200 / waitForSelfEcho timeout`、等待回执超时或发送过程中断线时，
-系统会将本次投递标记为“结果未确认”。由于 QQ 可能已经收到消息，机器人不会自动重试、
-切片补发或发送额外失败提示，以避免同一回复重复出现。该记录保留在近期上下文中以维持
-对话连续性，但不参与自动摘要和长期记忆压缩；同一入站消息重放时也不会再次生成回复。
+### SnowLuma
 
-### QQ 平台选择与 SnowLuma
+Compose 固定使用上游维护的 `motricseven7/snowluma` 镜像及 digest。使用者需阅读发行包 EULA/隐私协议后确认相关变量。WebUI 初始密码由启动生成，入口脚本可帮助取得本机初始密码；登录后修改为自己的密码。
 
-主用 QQ 桥接现在是 **SnowLuma**（`QQ_PLATFORM=snowluma`）：它是同类的
-"挂官方 QQ 客户端 → 转 OneBot v11"运行时。下面的冷启动行为是当前安装环境
-在 2026-09 的实测记录，不应理解为所有平台版本都具有相同限制。
+打开桌面入口完成手机 QQ 扫码，再在 WebUI 确认 OneBot 11 HTTP/正向 WebSocket 已启用。当前应用连接 `ws://127.0.0.1:3001`，配置默认不发送 access token；采用这个方案时清空 SnowLuma OneBot 连接的 token，并把端口限制在可信本机网络。不要把 WebUI 登录 token 与 OneBot token 混淆。
 
-| 平台 | `QQ_PLATFORM` | 容器 | WebUI | OneBot v11 |
-|---|---|---|---|---|
-| SnowLuma | `snowluma` | `xiaomachi-snowluma` | 5099（noVNC 6081，VNC 5900） | 3001/3000 |
-| LLBot | `llbot` | `xiaomachi-llbot` | 3080 | `LLBOT_WS_PORT`（默认 3002） |
-| NapCat | `napcat` | `xiaomachi-napcat` | 6099 | 3001 |
+冷启动/重启 QQ 容器可能再次要求扫码；不要承诺持久卷能免除任何平台登录要求。watchdog 对“等扫码”先通知而不是重复重启，避免二维码不断变化。只有人工完成登录后才能通过在线检查。
 
-切换流程（登录态各自独立，互不影响）：
+### LLBot 与 NapCat
 
-```bash
-# infra/wsl/.env 里改 QQ_PLATFORM=<napcat|llbot|snowluma>，然后
-systemctl restart xiaomachi-stack.service   # stop.sh 会停掉另外两个 stack
-# 首次登录：open-snowluma-webui.bat（密码自动复制到剪贴板，初始账号 admin）
-```
+使用对应 WebUI 扫码或按平台支持的登录方式设置。LLBot 初始化由 `bootstrap_llbot_runtime.py` 写入自己的卷；NapCat OneBot 默认配置由初始化脚本生成。镜像/签名构建辅助脚本只在选用该平台时需要，见 `build_llbot_from_source.sh --help`；不要同时启动多个平台占用账号或端口。
 
-SnowLuma 镜像来自上游维护的 `SnowLuma.Docker.Framework`（Docker Hub
-`motricseven7/snowluma`，compose 里按 digest 固定 v1.14.15）。首次登录需要
-在 WebUI 里改密码并接入 QQ；`SNOWLUMA_ACCEPT_EULA=1` 与
-`SNOWLUMA_ACCEPT_PRIVACY=1` 表示运营者已阅读并接受发行包内的协议。
-重启 stack 会让 SnowLuma 重新生成一次性初始密码，因此首次登录期间先不要让它
-反复重启（watchdog 在这段时间保持停止）。
+## 4. 常用入口与返回值
 
-首次登录后 SnowLuma 会为该账号自动生成 OneBot v11 默认配置（HTTP 3000 /
-WS 3001，绑定 127.0.0.1），并填入随机 `accessToken`。本栈的 bot 走
-`NAPCAT_WS_URL=ws://127.0.0.1:3001` 且**不带令牌**（与 NapCat 路径一致，
-`app/adapters/napcat_ws.py` 只在传入令牌时才发 `Authorization` 头），因此要把
-两个 `accessToken` 清空：WebUI→连接配置里删掉，或
+| 入口 | 行为 |
+|---|---|
+| `start-xiaomachi-wsl.bat` | 首次安装，之后启动当前 release 的运行栈 |
+| `rebuild-xiaomachi-wsl.bat` | 从当前工作区发布并重建群/私应用 |
+| `status-xiaomachi-wsl.bat` | 读取实际运行实例状态 |
+| `stop-xiaomachi-wsl.bat` | 先停看护和已启用计算，再停应用/QQ 栈 |
 
-```bash
-# WebUI 登录后会返回 Bearer token，用它调用配置接口（保存即热重载，无需重启）
-curl -sS -X POST -H "Authorization: Bearer <webui-token>" \
-  -H 'Content-Type: application/json' \
-  --data-binary @onebot_config.json \
-  http://127.0.0.1:5099/api/config/<uin>
-```
-
-清空后 `ws-default` 会显示 `1 个客户端`（即 xiaomachi bot 已连接）。
-
-#### SnowLuma 的冷启动限制（实测 2026-09-11）
-
-PC 开机（或 `wsl --shutdown`）后的自恢复链路里，WSL、Docker、两个容器、
-SnowLuma 本体（含 hook 自动挂载）都会自动起来，**但 QQ 不会自动登录**：
-
-- QQ 客户端默认停在"手机QQ扫码登录"页，需要人工扫码；
-- 即使登录时勾选了"自动登录"，也没有效果：容器停止时 QQ 客户端是
-  **崩溃退出**的（`/app/.config/QQ/crash_files/tomb_*.txt` 里 `signal: 5
-  (SIGTRAP)`），登录态来不及落盘，下次启动回到扫码页；
-- 上游 SnowLuma 没有免扫码的环境变量（只有 EULA/PRIVACY/DEV_MODE/
-  UPDATE_CHECK/WEBUI_BOOTSTRAP_PASSWORD/TRUST_PROXY），`qq --help` 也没有
-  自动登录开关；
-- LLBot 自带会话文件（`qq-session-*.json`），容器/守护进程重启后能自动重登；
-  NapCat 类似。若"开机零人工"是硬要求，这是选择平台时的关键差异。
-
-因此开机后需要：双击 `open-snowluma-desktop.bat`（noVNC 直达 QQ 桌面并自动
-填入 VNC 密码）→ 点"刷新" → 手机扫码。watchdog 在离线时会弹 Windows 通知提醒。
-
-#### 开机流程（当前约定：每次开机人工扫一次码）
-
-1. Windows 登录 → 计划任务 `Xiaomachi WSL Runtime` 自动拉起 WSL 与整套 stack
-   （mihomo、SnowLuma、bot 容器都在其中）；
-2. SnowLuma 会自己起来、自动挂 hook，但 QQ 客户端停在扫码页；
-3. watchdog 探测到"WebUI 正常但 OneBot 未监听"时**不会重启容器**（重启只会换掉
-   二维码），而是弹一次 Windows 通知：`SnowLuma is running but the QQ account is
-   not logged in. Double-click open-snowluma-desktop.bat ...`；
-4. 双击 `open-snowluma-desktop.bat` → 点"刷新" → 手机扫码；OneBot 起来后 bot
-   自动连上（`ws-default` 显示 1 个客户端），无需其它操作；
-5. 上线后**不会补答离线期间积压的消息**：`GROUP_MESSAGE_MAX_AGE_SECONDS=300`
-   之外的旧消息只归档、不回复（日志 `group_message_stale_archived`）。
-
-#### 回复长度与拆分的边界（2026-09-11 调整）
-
-`configs/persona.yaml` 只描述**风格和人格**，不再出现任何"几条消息 / 多少字 /
-用不用 Markdown"的格式约束；拆条与长度策略全部在系统层：
-
-- 默认尽量短：`app/core/chat_style.py` 的 `Reply length` 两条规则要求"一条短消息
-  为默认形态，只有问题确实需要长回答（教程 / 分析 / 详细说明）才展开"；
-- 拆条由 `.env` 的 `GROUP_REPLY_SPLIT_*` 控制：`GROUP_REPLY_SPLIT_MAX_CHARS=64`
-  之内的回答**原样单条发出**；超过时才在句号/逗号处切成最多
-  `GROUP_REPLY_SPLIT_MAX_MESSAGES=3` 条（只拆不丢字，不切句中）；
-- 回复里的换行会被合并成同一句，不再因为换行变成多条消息。
-
-需要切回 LLBot 时，先在 `infra/wsl/.env` 改为 `QQ_PLATFORM=llbot`，再重启
-`xiaomachi-stack.service`；不要让两个 QQ 平台同时运行。
-
-### LLBot 1001 掉线与签名组件（历史备选平台记录）
-
-以下是 2026-09 对 LLBot 8.1.10 的排障记录，不代表上游今天的最新版本。该版本内置的
-`@lucky-lillia/sign-proxy-loader`（20260813 构建）**没有导出 `setMachineGuid`**。QQ
-1001 掉线后 LLBot 会重新生成 `machine_guid.bin`，但签名层无法切换设备指纹，日志会打印
-`sign-proxy 未导出 setMachineGuid (老版 .node), GUID 切换不会生效`。该 sign-proxy 由上游
-私有仓库构建、未发布到 npm，仓库内无法自行升级；等上游新版 release 后换回官方 digest。
-
-由于 8.1.10 早于会话过期修复（PR #856），仓库保留了**上游 main 的源码构建**作为 LLBot 备选镜像，
-用仓库自带脚本重建（脚本会解析 commit、走代理下载、构建并校验产物）：
-
-```bash
-# 在 WSL 内（需要走代理，否则 GitHub 直连只有几十 KB/s）
-LLBOT_IMAGE_TAG=xiaomachi-llbot:main-<commit> \
-  bash infra/wsl/scripts/build_llbot_from_source.sh main
-```
-
-校验项包括：`/app/llbot/webui/index.html`、`llbot.js`（`node --check` 通过且含
-`session-expired` 修复）、以及 `sign-proxy.*-musl.node`。任一项缺失即构建失败，
-镜像不会带病上线。
-
-**不要直接用上游的 `docker/Dockerfile.local`**：它把 `yarn build-webui` 放在
-`yarn build` 之前，而主 bundle 的 vite 构建会先清空 `dist/`，把刚生成的
-`dist/webui` 删掉，结果镜像里没有 `/app/llbot/webui/index.html`，WebUI 直接
-HTTP 500（`open-llbot-webui.bat` 会因此报错打不开）。上游自己的 publish
-workflow 是先 `yarn build` 再 `yarn build-webui`，顺序才对；
-`infra/wsl/Dockerfile.llbot-source` 采用正确顺序并带断言。
-
-当时对比 v8.1.10 与所用 main 提交，运行时代码差异集中于会话鉴权/登录恢复修复（`direct.ts`、
-`direct-lib/client.ts`、`direct-lib/login.ts`、`base.ts`、`emailNotification.ts`、
-`milky/adapter.ts`）。镜像只存在于本地 Docker daemon，启用 LLBot 前应确认它仍存在；
-若将来改用上游官方镜像，先验证实际 release 与 digest，再修改 `docker-compose.llbot.yml`。
-
-1001 掉线在历史日志中多次标注为“异地登录顶号”（同一 QQ 号在别处登录）。恢复顺序是：
-先退出其它登录端，再打开 LLBot WebUI（`open-llbot-webui.bat`）扫码。
-
-watchdog 侧的策略：检测到“等扫码”状态（最近 15 分钟内出现 `login-qrcode.png`）时**不再重启
-容器**——重启无法完成扫码，只会重复一次失败登录；此时只通知一次。其余 recovery 重启按
-120s → 240s → 480s 退避，上限 15 分钟，避免短时间内反复重登触发 QQ 风控。
-
-## 运行态保护
-
-不要删除当前运行平台的数据卷及以下本机配置/运行文件：
-
-- `.env`
-- `configs/groups.local.yaml`
-- `xiaomachi-bot-data`、SnowLuma/LLBot/NapCat 的登录态 Docker 卷
-- `/opt/xiaomachi/shared/runtime/logs` 与 watchdog 状态
-- `/opt/xiaomachi/shared/mihomo`（如启用本机代理）
-
-首次迁移前工作区里的 `infra/wsl/runtime/` 可能仍保存旧登录态；不要把它当作当前
-生产数据目录，也不要在确认卷迁移完成前删除。可重建的缓存与登录态、数据库要区别处理。
-
-## Memory V3 发布与回滚
-
-Memory V3 是生产启用的历史查询路径（生产 `.env` 中 `MEMORY_RAW_V3_ENABLED=true`，
-运行时日志 `route=raw_v3`）；`.env.example` 已按生产模板全部开启，代码默认值保持
-安全关闭。V3 运行仍要求 `MEMORY_ORCHESTRATION_V2_ENABLED=true`，但该开关只是 V2
-兼容开关，不是 V3 回滚开关。发布前使用 SQLite backup API 创建并验证
-`integrity_check=ok` 的备份，再按下方 V3 流程完成准备、评测、激活。
-
-常规代码发布从源仓库根目录运行安装脚本。它会选择当前 `QQ_PLATFORM` 对应的
-Compose 文件，构建应用镜像，并只重建 `xiaomachi` 与 `xiaomachi-private` 两个
-应用容器，保留 QQ 接入容器：
-
-```bash
-bash infra/wsl/scripts/install_linux_runtime.sh
-bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh
-```
-
-操作前后记录当前 QQ 接入容器的 container ID 与 `StartedAt`，确认它没有被重建。
-向量通道异常时可临时设置 `MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS，
-但这属于功能降级，不是完整 V3 向量运行状态；普通代码回滚不恢复数据库，
-也不得删除 QQ 登录态。
-
-### CUDA 向量加速
-
-`xiaomachi` 镜像使用 CUDA 12.8、cuDNN 与 `fastembed-gpu`。GPU 设备是可选的：
-基础 Compose 不再挂载 GPU，`ENABLE_GPU=1` 时才通过 `docker-compose.gpu.yml`
-向 bot 服务挂载 `nvidia.com/gpu=all` CDI 设备；无 NVIDIA 机器无需任何改动即可运行
-（嵌入 `MEMORY_EMBEDDING_DEVICE=auto` 自动回退 CPU）。
-设置 `MEMORY_EMBEDDING_DEVICE=auto` 后优先使用 NVIDIA GPU，并在 CUDA 推理异常时
-回退 CPU；QQ 接入容器不申请 GPU。主机需安装 NVIDIA Container Toolkit，并确保
-`nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` 已生成设备规范。
-可用 `docker run --rm --device nvidia.com/gpu=all ...` 验证透传。
-确认模型已经缓存后设置 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`，可保证离线重启不会
-等待模型站点超时（首次部署请保持 `false` 以便联网下载模型）。嵌入模型缓存位于持久卷
-`/workspace/data/models`，镜像重建不会丢失。
-
-### 按群记忆策略与日常维护（Memory V3）
-
-记忆系统按群开关，配置在 `configs/groups.yaml`：
-
-- `memory_enabled: false`（默认）：该群**不使用任何记忆**，回复只取最近
-  `recent_context_limit`（默认 100）条消息作为上下文；后台不生成、不检索、不入队。
-- `memory_enabled: true`：启用完整分层记忆（episode 摘要、结构化事实、用户画像、
-  记忆工具、语义排序）。真实群号在 `configs/groups.local.yaml`（gitignored）中配置。
-
-日常维护命令（容器内，先备份）：
-
-```bash
-# 事实向量回填（幂等、可断点）
-python -m scripts.backfill_memory_item_semantic_vectors --database /workspace/data/bot.db --batch-size 100
-# 历史噪音清理（plan -> 备份 -> run；可恢复）
-python -m scripts.cleanup_memory_noise plan --database /workspace/data/bot.db
-python -m scripts.cleanup_memory_noise run --database /workspace/data/bot.db
-# 全系统一致性审计（只读、只输出计数，不调用外部模型）
-python -m scripts.maintain_memory_integrity audit --database /workspace/data/bot.db
-# 确定性修复：必须显式 --apply，执行前自动创建 SQLite online backup
-python -m scripts.maintain_memory_integrity repair --apply \
-  --database /workspace/data/bot.db \
-  --backup-dir /workspace/data/backups
-# 关闭记忆的群：删除全部记忆派生数据（原始消息保留）
-python -m scripts.purge_group_memory --database /workspace/data/bot.db --group-id <GROUP_ID> --dry-run
-```
-
-正式安装会启用 `xiaomachi-memory-audit.timer`，每天上海时间 04:15–04:20
-运行一次只读审计，并在开机错过计划时间时补跑。定时任务绝不执行
-`repair --apply`，也不调用外部模型。最新报告与按行历史分别保存在：
-
-- `/opt/xiaomachi/shared/runtime/logs/memory-integrity-audit.latest.json`
-- `/opt/xiaomachi/shared/runtime/logs/memory-integrity-audit.jsonl`
-
-关键一致性指标非零时，`xiaomachi-memory-audit.service` 以退出码 2 失败并向
-journal 写入 `memory_integrity_audit_alert`；缺少语义向量、缺少投影文档、重复
-候选和旧式非结构化记录仍作为观察指标，不触发告警。查看最近结果：
-
-`failed_episode_jobs` 记录仍在等待恢复的当前 episode；
-`failed_episode_jobs_overdue_24h` 超过一天时触发审计告警。群聊后台会按间隔、
-限速自动恢复匹配当前处理版本的失败 episode，并保留累计失败次数和错误码；
-日常审计本身仍然只读。持续失败时先检查上游接口与错误码，不要直接把失败任务
-标成完成。历史重放生成的“正在做”事实仍按原消息时间计算有效期。
-日常运行 `status-xiaomachi-wsl.bat` 或 `status.sh` 时，组件诊断中的
-`memory_episode_backlog` 会列出 `queued/running/failed/overdue` 数量；恢复中的
-积压显示 `WARN`，不会把仍在线的 QQ 网关误判为离线。
-
-```bash
-systemctl status xiaomachi-memory-audit.timer --no-pager
-journalctl -u xiaomachi-memory-audit.service -n 20 --no-pager
-```
-
-一致性修复仅处理可机械证明的状态：过期 active 记忆、倒置摘要时间、无来源旧
-`window` 摘要、legacy compaction 积压、非 active 记忆残留向量/FTS/检索文档，
-以及 active 记忆缺失的 FTS 行。它不会判断聊天内容真假，也不会自动改写人物画像。
-修复后应再次运行 `audit`，要求上述可修复计数归零，并执行数据库
-`PRAGMA integrity_check`。
-
-发布只重建两个小町应用容器，不重启当前 QQ 接入容器。
-
-## 验收
+状态返回 0 表示通过；75 表示 QQ 暂时离线但仍在恢复；其他非零需查看错误。等待登录不是模型故障。日常检查不调用模型，深检查至多发起一次受限文本请求：
 
 ```bash
 bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh
-# 按需执行一次真实文本模型与人格文件契约检查：
 bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh --deep
 ```
 
-正常在线时应看到当前 QQ 平台运行、OneBot `online=true`、群聊/私聊心跳、向量预热、数据库和后台任务均通过。默认检查不消耗模型 token；`--deep` 才发起一次受限请求。若 QQ 本身已离线，先完成对应平台登录，再重复状态检查。
+深检查可能收费，只检查受限模型/人格文件契约，不替你执行空间/绘图真实写入。
 
-### Memory V3 prepare, evaluate, activate, and rollback
-
-V3 rollout is deliberately split into separate fail-closed phases. Preparing a
-generation never changes the active vector generation:
-
-Production may additionally enable the adaptive context profile:
-
-```dotenv
-MEMORY_ADAPTIVE_CONTEXT_ENABLED=true
-MEMORY_ADAPTIVE_CONTEXT_BUDGET_CHARS=48000
-MEMORY_RECENT_PROTECTED_MIN_TOKENS=1200
-MEMORY_HISTORY_PROTECTED_MIN_TOKENS=2400
-MEMORY_RECENT_PROTECTED_MIN_MESSAGES=1
-MEMORY_HISTORY_PROTECTED_MIN_MESSAGES=1
-MEMORY_ADAPTIVE_MAX_RECENT_MESSAGES=60
-MEMORY_ADAPTIVE_MAX_HISTORY_MESSAGES=300
-```
-
-This profile dynamically shares the effective input-token budget between recent
-and historical context. `60/300` are emergency row caps in this example, not fixed quotas and
-not targets to fill. Strong direct, lexical, or multi-channel evidence uses a
-compact history expansion (up to 150 candidates); weak evidence or a failed
-channel may expand up to 300. Disable only
-`MEMORY_ADAPTIVE_CONTEXT_ENABLED` and recreate both application containers to restore the legacy
-60/150 packer without changing the active V3 generation or restarting the QQ bridge.
+安装后在 WSL 使用稳定入口：
 
 ```bash
-python -m scripts.backfill_memory_v3_raw \
-  --phase prepare \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --output /workspace/data/backups/memory-v3-prepared.json
+/usr/local/bin/xiaomachi-wsl-entry start
+/usr/local/bin/xiaomachi-wsl-entry status
+/usr/local/bin/xiaomachi-wsl-entry stop
 ```
 
-Build the real snapshot dataset and review every frozen evidence source. The
-generated review sidecar starts with `approved=false`; do not activate until a
-human reviewer has approved every case. The review bundle contains private chat
-content: keep it under `/workspace/data/backups`, never commit or upload it.
+不要把工作区中尚未部署的 start/status 脚本当成现役发布。
+
+## 5. 开机恢复与监督
+
+Windows 登录后保持 WSL 活跃需要登录级任务。在 Windows PowerShell 安装：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File infra/wsl/scripts/install_windows_runtime_task.ps1
+```
+
+任务通过隐藏锚点启动/维持 systemd，不需要一直保留空白命令窗口。显式 stop 会撤销运行标记，避免锚点立即重启。QQ 平台登录仍可能需要人工操作。
+
+关键服务是 `xiaomachi-stack.service`、`xiaomachi-watchdog.service`、定期 `xiaomachi-memory-audit.timer`，以及按需启用的 `xiaomachi-sandbox.service` / `xiaomachi-mihomo.service`。
 
 ```bash
-python -m scripts.build_memory_eval_dataset \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --output /workspace/data/backups/memory-v3-cases.jsonl \
-  --review-output /workspace/data/backups/memory-v3-review.json
-
-python -m scripts.export_memory_eval_review_bundle \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
-  --output /workspace/data/backups/memory-v3-review-bundle.json
+systemctl status xiaomachi-stack xiaomachi-watchdog --no-pager
+journalctl -u xiaomachi-stack -n 80 --no-pager
+journalctl -u xiaomachi-watchdog -n 80 --no-pager
+docker logs --tail 80 xiaomachi-bot
+docker logs --tail 80 xiaomachi-private
 ```
 
-After the review sidecar is approved, run the evaluator once without a quality
-sidecar to freeze retrieval results and generate a retrieval-bound quality
-template. This command is expected to exit with the missing-quality gate:
+日志可能包含私有资料或请求错误细节，分享前需脱敏。查看服务 active 还不够，应同时确认 OneBot、当前实例心跳和实际消息回执。
+
+## 6. 更新与回滚
+
+修改人格 YAML、代码、`.env` 或本地策略后，从源项目 Windows 目录执行：
+
+```powershell
+.\rebuild-xiaomachi-wsl.bat
+```
+
+无需先停止。安装脚本复制运行白名单（app/configs/infra/scripts/依赖文件等），先构建新镜像，然后仅重建两个应用，保留现役 QQ 接入容器和数据卷。成功后检查 readiness。**未提交源码也会一起发布**，这不是从 GitHub 拉取最新版的命令。
+
+Linux 等价入口为 `bash infra/wsl/scripts/install_linux_runtime.sh`；更新 Compose 服务 `xiaomachi` 与 `xiaomachi-private`，不重启当前 QQ 接入容器。
+
+构建/激活失败会尝试恢复之前的 release 和镜像；保留最近一个发布目录及回滚镜像。脚本不是数据库回滚工具，不会撤销已经执行的 QQ 行为。恢复失败时检查 current、容器 image ID 和健康后再操作，不重复执行未知状态的外部动作。
+
+只执行 start/stop 不会同步源码变化。修改生产 `shared/.env` 后容器须重新创建，单纯重启进程不会更新创建时的环境。正常维护优先修改源目录私有配置并 rebuild。
+
+切换 QQ 平台需要在 `.env` 修改 `QQ_PLATFORM` 后受控停止/启动并更新部署配置，准备新平台登录；不要在持续业务中反复试多个平台。
+
+## 7. 数据与备份
+
+| 路径/卷 | 内容 |
+|---|---|
+| `/opt/xiaomachi/current` | 现役发布软链接 |
+| `/opt/xiaomachi/releases/` | 运行源码和配置发布目录 |
+| `/opt/xiaomachi/shared/.env`、`shared/configs/` | 私有共享环境、群配置 |
+| `/opt/xiaomachi/shared/runtime/` | 看护日志、锁与运行标记 |
+| `xiaomachi-bot-data` → `/workspace/data` | SQLite、聊天归档、记忆人格、图像、模型、会话与任务 |
+| 平台专属卷 | QQ/WebUI/客户端登录状态 |
+| `wsl_sandbox_data`（启用时） | 计算侧车持久运行数据 |
+
+生产数据不用 Windows bind mount。曾经的 `infra/wsl/runtime/` 迁移目录不是现役数据库；只有确认卷迁移与备份后才清理旧文件。
+
+创建一致 SQLite 备份（容器中执行）：
 
 ```bash
-python -m scripts.run_memory_recall_eval \
+docker exec xiaomachi-bot python -m scripts.backup_memory_v2 \
   --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
-  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
-  --review /workspace/data/backups/memory-v3-review.json \
-  --quality-template-output /workspace/data/backups/memory-v3-quality.json \
-  --results-output /workspace/data/backups/memory-v3-results.jsonl \
-  --report-output /workspace/data/backups/memory-v3-gate-draft.json \
-  --benchmark-output /workspace/data/backups/memory-v3-benchmark-draft.json \
-  --warmup 20 --benchmark-runs 250
+  --backup-dir /workspace/data/backups --tag manual
 ```
 
-Fill the template only from a controlled GPT answer replay and at least 20 real
-index-visibility samples. Then rerun the V3 evaluator against the prepared,
-non-active generation. Its passing report is bound to the manifest, dataset,
-retrieval fingerprint, exact quality-sidecar digest, and `vector_generation`:
+验证输出 `integrity_check=ok`，保存生成的 manifest 与备份；真实数据不要上传 GitHub。其他账号卷另行备份。记忆索引的 prepare/activate/rollback 见 [MEMORY](../../docs/MEMORY.md)，代码升级不等于索引激活。
+
+## 8. GPU 与模型缓存
+
+基础镜像包含 CUDA/cuDNN 和 fastembed-gpu，但 GPU 设备是可选。无 NVIDIA 设置 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`，用 CPU；启用需 Windows NVIDIA 驱动、WSL GPU 支持和 NVIDIA Container Toolkit/CDI。
 
 ```bash
-python -m scripts.run_memory_v3_quality_replay \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
-  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
-  --review /workspace/data/backups/memory-v3-review.json \
-  --quality-output /workspace/data/backups/memory-v3-quality.json \
-  --private-replay-output /workspace/data/backups/memory-v3-quality-private.json \
-  --visibility-output /workspace/data/backups/memory-v3-quality-visibility.json \
-  --visibility-samples 20
+nvidia-smi
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 ```
 
-After that controlled replay completes, run the final evaluator:
+确认透传后启用 `ENABLE_GPU=1` 并 rebuild；GPU overlay 只给群应用，不给 QQ 客户端。`auto` 遇 CUDA 推理错误可回退 CPU。首次模型下载需联网，缓存放持久 `/workspace/data/models`；缓存完才使用 `MEMORY_EMBEDDING_LOCAL_FILES_ONLY=true`。
+
+GPU overlay 文件为 `docker-compose.gpu.yml`，挂载 CDI 设备 `nvidia.com/gpu=all`。向量通道故障可暂设 `MEMORY_EMBEDDING_PROVIDER=disabled` 保留 FTS，这属于降级，不代表完整向量检索正常。
+
+## 9. 可选代理
+
+上游可直连就留空 `XIAOMACHI_HTTP_PROXY`、`XIAOMACHI_HTTPS_PROXY`。QQ/OneBot 与应用模型代理分离；安装器通过 `runtime_egress.py` 判断是否启用 Mihomo，默认不要求代理服务。
+
+需要代理时，使用提供的 `install_mihomo.sh`、`sync_mihomo_from_clash_verge.ps1` 和 `render_mihomo_config.py` 准备本机配置，再验证 `xiaomachi-mihomo.service` 与实际上游可达性。代理订阅/节点/Token 都是私有数据；不要复制到公开示例。
+
+Docker 下载依赖使用 `DOCKER_HTTP_PROXY` / `DOCKER_HTTPS_PROXY`，应用运行用 `XIAOMACHI_*`。host 网络下 `127.0.0.1` 指向 WSL 主机；Windows 本地代理并不自动成为 WSL 的同一端口。改变出口后需重新创建应用并核对模型请求。
+
+## 10. 可选隔离计算
+
+默认关闭。先配置固定的 localhost endpoint 和私有 Token。应用 `.env` 与 root 可读的 `/opt/xiaomachi/shared/sandbox.env` 使用相同 `XIAOMACHI_SANDBOX_TOKEN`，不得输出或放进提示词。
+
+本机 endpoint 为 `http://127.0.0.1:8217`，在私有 social 覆盖设置 `compute.endpoint`。
+
+在现役发布目录构建：
 
 ```bash
-python -m scripts.run_memory_recall_eval \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
-  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
-  --review /workspace/data/backups/memory-v3-review.json \
-  --quality-sidecar /workspace/data/backups/memory-v3-quality.json \
-  --quality-private-replay /workspace/data/backups/memory-v3-quality-private.json \
-  --quality-visibility-artifact /workspace/data/backups/memory-v3-quality-visibility.json \
-  --results-output /workspace/data/backups/memory-v3-results.jsonl \
-  --report-output /workspace/data/backups/memory-v3-gate.json \
-  --benchmark-output /workspace/data/backups/memory-v3-benchmark.json \
-  --warmup 20 --benchmark-runs 320
+cd /opt/xiaomachi/current
+docker compose --env-file /opt/xiaomachi/shared/sandbox.env \
+  -f infra/wsl/docker-compose.sandbox.yml --profile sandbox-build --profile sandbox \
+  build sandbox-base xiaomachi-sandbox
+docker image inspect xiaomachi-sandbox-base:py312 --format '{{.Id}}'
 ```
 
-Activation requires both the original prepared report and a passing gate
-report. It performs final live catch-up and a locked manifest check before the
-generation CAS. Immediately after this command succeeds, set
-`MEMORY_RAW_V3_ENABLED=true` in `infra/wsl/.env` (and
-`MEMORY_ADAPTIVE_CONTEXT_ENABLED=true` when releasing the adaptive profile), then recreate
-only the two application containers; never recreate the current QQ bridge. Production retrieval resolves the active
-generation per query, so it does not keep reading the deactivated legacy table
-between the CAS and this bounded restart:
+计算代码 `app/agent/python_sandbox.py` 固定执行基础镜像内容 ID。新机器自行构建得到不同 ID 时，维护者须核对基础镜像后同步该常量，再构建 gateway 和应用；不应绕过固定镜像校验。
 
 ```bash
-python -m scripts.backfill_memory_v3_raw \
-  --phase activate \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
-  --gate-report /workspace/data/backups/memory-v3-gate.json \
-  --dataset /workspace/data/backups/memory-v3-cases.jsonl \
-  --quality-sidecar /workspace/data/backups/memory-v3-quality.json \
-  --quality-private-replay /workspace/data/backups/memory-v3-quality-private.json \
-  --quality-visibility-artifact /workspace/data/backups/memory-v3-quality-visibility.json \
-  --results /workspace/data/backups/memory-v3-results.jsonl \
-  --benchmark-report /workspace/data/backups/memory-v3-benchmark.json \
-  --output /workspace/data/backups/memory-v3-activated.json
+install -m 0644 infra/wsl/systemd/xiaomachi-sandbox.service \
+  /etc/systemd/system/xiaomachi-sandbox.service
+systemctl daemon-reload
+systemctl enable --now xiaomachi-sandbox
 ```
 
-Emergency rollback preserves all raw messages and vector tables and switches
-only the active vector generation back to the legacy generation recorded by
-prepare. After rollback succeeds, set `MEMORY_RAW_V3_ENABLED=false` and
-recreate only the two application containers:
+再在私有 social 配置开启 compute 并 rebuild。侧车 service 使用预建镜像，start/stop/status 会覆盖已启用侧车。认证失败、镜像缺失或执行不可用应返回 unavailable，不用宿主 Python 替代。
 
-```bash
-python -m scripts.backfill_memory_v3_raw \
-  --phase rollback \
-  --database /workspace/data/bot.db \
-  --manifest /workspace/data/backups/bot-memory-v3.manifest.json \
-  --prepared-report /workspace/data/backups/memory-v3-prepared.json \
-  --output /workspace/data/backups/memory-v3-rollback.json
-```
+## 11. 常见问题
 
-### Layered memory and memory tools
+| 现象 | 核查顺序 |
+|---|---|
+| @ 没回复 | QQ 是否登录/OneBot连接；群enabled/speak；来源年龄/撤回；回合超时与发送回执 |
+| 私聊不能执行空间动作 | 是否真实主人；social表面/好友许可；原帖读取；工具与QQ拒绝原因 |
+| 图片没看见 | 视觉开关、真实下载像素、引用来源和图片数量/字节预算 |
+| 搜索只有链接 | SEARCH_PROVIDER是否支持正文桥接；模型是否实际调用open/find；总预算是否已用完 |
+| 记忆为空/旧日期 | 群memory_enabled；后台索引状态；V3活动代际；来源日期与上海当前日期 |
+| 人格没变化 | 编辑的是实际YAML还是说明快照；是否rebuild；当前群选择及.live覆盖 |
+| 启动一直等QQ | 先完成扫码，读取平台日志，不反复删除登录卷 |
+| GPU不可用 | 驱动/CDI/模型缓存；CPU回退；不要删除数据库换取“修复” |
 
-`MEMORY_LAYERED_MEMORY_ENABLED=true` adds episode summaries, structured
-`memory_items`, and user profile facts to the V3 evidence packet while keeping
-the vector channel raw-message-only. `MEMORY_MEMORY_TOOLS_ENABLED=true`
-exposes `memory_search` / `memory_read` / `memory_write` to the model through
-Responses function calling; writes are source-bound to the current group and
-conversation. Code defaults are `false`; the public `.env.example` enables both,
-so deployments must check their own `.env` rather than assume either state.
+模型/API限制、网页反爬、桥接动作不支持或QQ拒绝均可能导致工具失败。错误结果不代表动作成功；未知回执不要再次提交同一个动作。
 
-To fill summaries and facts for history that predates episode derivation, run
-the bounded, resumable backfill (inside the `xiaomachi` container or against a
-backup copy):
+## 12. 空间清理
 
-```bash
-python -m scripts.backfill_structured_memory plan --database /workspace/data/bot.db
-python -m scripts.backfill_structured_memory run \
-  --database /workspace/data/bot.db --run-key layered-20260806 --finalize
-python -m scripts.backfill_structured_memory status \
-  --database /workspace/data/bot.db --run-key layered-20260806
-```
+用 `docker system df`、`docker ps -a`、当前 `readlink -f /opt/xiaomachi/current` 和目录统计确认消费方，再清理过期 release、历史镜像、闲置构建缓存和已结束测试临时数据。不得一键删除现役数据卷或计算基础镜像。
+
+测试临时产物在源码 `data/test-work/`，使用 `scripts/clean_test_tmp.ps1` 预览后按需清理。必要验收报告保留在私有工程 data 中，根目录不再创建测试缓存目录。
+
+WSL 内删除文件后，Windows VHD 可能不立即缩小。压缩需要先核对发行版/VHD路径、停止服务、trim、退出WSL，再使用 Windows 支持的虚拟磁盘压缩操作并恢复启动/状态验证。不要在容器写数据库时对挂载中的 VHD 操作。

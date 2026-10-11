@@ -5,6 +5,19 @@ import pytest
 from app.config import AppSettings, load_runtime_config
 
 
+def test_model_first_output_budget_is_independent_and_configurable(monkeypatch):
+    monkeypatch.delenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", raising=False)
+    connection = dict(NAPCAT_WS_URL="ws://synthetic.invalid/ws", LLM_BASE_URL="https://synthetic.invalid/v1",
+                      LLM_API_KEY="synthetic")
+    settings = AppSettings(_env_file=None, **connection)
+    assert settings.agent_model_first_output_timeout_seconds == 90
+    monkeypatch.setenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", "75")
+    assert AppSettings(_env_file=None, **connection).agent_model_first_output_timeout_seconds == 75
+    monkeypatch.setenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError):
+        AppSettings(_env_file=None, **connection)
+
+
 def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
@@ -126,11 +139,11 @@ def test_app_settings_exposes_search_and_context_defaults(tmp_path, monkeypatch)
     assert settings.context_recent_limit == 60
     assert settings.context_summary_limit == 3
     assert settings.context_history_limit == 8
-    assert settings.llm_reasoning_effort == "low"
-    assert settings.memory_compaction_reasoning_effort == "low"
-    assert settings.memory_episode_topic_judge_reasoning_effort == "low"
-    assert settings.memory_episode_post_segment_reasoning_effort == "low"
-    assert settings.proactive_judge_reasoning_effort == "low"
+    assert settings.llm_reasoning_effort == "medium"
+    assert settings.memory_compaction_reasoning_effort == "medium"
+    assert settings.memory_episode_topic_judge_reasoning_effort == "medium"
+    assert settings.memory_episode_post_segment_reasoning_effort == "medium"
+    assert settings.proactive_judge_reasoning_effort == "medium"
     assert settings.memory_compaction_max_output_tokens == 4096
     assert settings.llm_model == "gpt-5.4-mini"
     assert settings.llm_fallback_model == "gpt-5.4"
@@ -175,6 +188,17 @@ def test_app_settings_exposes_private_chat_whitelist(tmp_path, monkeypatch) -> N
     settings = AppSettings(config_dir=tmp_path / "configs", data_dir=tmp_path / "data", _env_file=None)
 
     assert settings.private_chat_whitelist == {987654321, 10002, 20002}
+
+
+def test_private_chat_all_friends_is_explicit_opt_in(monkeypatch) -> None:
+    required = {"NAPCAT_WS_URL": "ws://127.0.0.1:3001", "LLM_BASE_URL": "https://example.invalid/v1",
+        "LLM_API_KEY": "synthetic", "BOT_QQ": "900000099", "OWNER_QQ": "900000101"}
+    for key, value in required.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("PRIVATE_CHAT_ALL_FRIENDS", raising=False)
+    assert AppSettings(_env_file=None).private_chat_all_friends is False
+    monkeypatch.setenv("PRIVATE_CHAT_ALL_FRIENDS", "true")
+    assert AppSettings(_env_file=None).private_chat_all_friends is True
 
 
 def test_app_settings_reads_llm_fallback_model(tmp_path, monkeypatch) -> None:

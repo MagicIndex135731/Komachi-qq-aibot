@@ -8,7 +8,7 @@ import httpx
 import pytest
 from PIL import Image
 
-from app.providers.llm_client import LlmClient, LlmFunctionCall
+from app.providers.llm_client import LlmClient, LlmFunctionCall, ResponsesProviderError
 from app.core.message_content import ImageAttachment
 
 
@@ -110,6 +110,145 @@ MEMORY_TOOLS = [
 ]
 
 
+def _sse_events(*events: dict) -> str:
+    return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_responses_returns_final_answer_instead_of_commentary(streaming) -> None:
+    output = [
+        {"type": "message", "phase": "commentary", "content": [{"type": "output_text", "text": "正在查。"}]},
+        {"type": "message", "phase": "final_answer", "content": [{"type": "output_text", "text": "查到了，这是结果。"}]},
+    ]
+    payload = {"id": "synthetic_phase", "output": output}
+    events = []
+    for index, item in enumerate(output):
+        events.extend([
+            {"type": "response.output_item.added", "output_index": index, "item": item},
+            {"type": "response.output_text.delta", "output_index": index, "delta": item["content"][0]["text"]},
+            {"type": "response.output_text.done", "output_index": index, "text": item["content"][0]["text"]},
+        ])
+    events.append({"type": "response.completed", "response": payload})
+    transport = httpx.MockTransport(lambda request: (
+        httpx.Response(200, text=_sse_events(*events), headers={"content-type": "text/event-stream"})
+        if streaming else httpx.Response(200, json=payload)
+    ))
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4",
+                       responses_model="gpt-5.4", responses_only=True, http_client=httpx.Client(transport=transport))
+    assert client.generate_text(["Target message: synthetic question"]) == "查到了，这是结果。"
+
+
+def test_responses_sse_completed_output_works_without_deltas_or_phase() -> None:
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4")
+    result = client._extract_responses_result_from_sse(_sse_events({
+        "type": "response.completed", "response": {"id": "synthetic_complete", "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "完整正文"}]},
+        ]},
+    }), model="gpt-5.4")
+    assert result.text == "完整正文"
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "error", "code": "server_error", "message": "private provider detail"},
+    {"type": "response.failed", "response": {"error": {"code": "server_error", "message": "private provider detail"}}},
+    {"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}},
+])
+def test_responses_terminal_failure_discards_partial_text_and_tools(event) -> None:
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4")
+    body = _responses_tool_stream_body(response_id="synthetic_error", text="partial", function_calls=[
+        {"type": "function_call", "call_id": "synthetic_call", "name": "memory_search", "arguments": "{}"},
+    ]) + _sse_events(event)
+    with pytest.raises(ResponsesProviderError) as captured:
+        client._extract_responses_result_from_sse(body, model="gpt-5.4")
+    assert "private provider detail" not in str(captured.value)
+    assert captured.value.event == event["type"]
+
+
+def test_responses_search_failure_recovers_with_memory_tools_and_stays_degraded(caplog) -> None:
+    requests = []
+    calls = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            body = _sse_events({"type": "error", "code": "server_error", "message": "private provider detail"})
+        elif len(requests) == 2:
+            body = _responses_tool_stream_body(response_id="synthetic_memory", text=None, function_calls=[
+                {"type": "function_call", "call_id": "synthetic_call", "name": "memory_search", "arguments": '{"query":"合成问题"}'},
+            ])
+        else:
+            body = _responses_stream_body(response_id="synthetic_final", text="目前无法联网核实，可以先聊已有信息。")
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4",
+                       responses_model="gpt-5.4", responses_only=True, builtin_web_search=True,
+                       http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with caplog.at_level(logging.WARNING):
+        text = client.generate_text_with_tools(
+            ["System persona: keep persona", "Target message: synthetic question"], tools=MEMORY_TOOLS,
+            tool_executor=lambda name, arguments: calls.append((name, arguments)) or "synthetic result",
+            allow_web_search=True, force_web_search=True,
+        )
+    assert text == "目前无法联网核实，可以先聊已有信息。"
+    assert len(requests) == 3
+    assert requests[0]["tool_choice"] == {"type": "web_search"}
+    for payload in requests[1:]:
+        assert payload["tools"] == MEMORY_TOOLS
+        assert payload.get("tool_choice") != {"type": "web_search"}
+        assert "keep persona" in payload["instructions"]
+        assert "Web search failed" in payload["instructions"]
+    assert calls == [("memory_search", {"query": "合成问题"})]
+    assert "responses_provider_error" in caplog.text
+    assert "responses_web_search_degraded" in caplog.text
+    assert "responses_missing_output" not in caplog.text
+    assert "private provider detail" not in caplog.text
+
+
+def test_responses_persistent_provider_errors_keep_three_attempt_budget(caplog) -> None:
+    requests = []
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, text=_sse_events({"type": "error", "code": "server_error"}),
+                              headers={"content-type": "text/event-stream"})
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4",
+                       responses_model="gpt-5.4", responses_only=True, builtin_web_search=True,
+                       http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with caplog.at_level(logging.WARNING), pytest.raises(ResponsesProviderError):
+        client.generate_text(["Target message: synthetic question"], allow_web_search=True)
+    assert len(requests) == 3
+    assert "responses_missing_output" not in caplog.text
+
+
+def test_responses_nonretryable_stream_error_is_not_repeated() -> None:
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, text=_sse_events({"type": "error", "code": "invalid_request_error"}),
+                              headers={"content-type": "text/event-stream"})
+    client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4",
+                       responses_model="gpt-5.4", responses_only=True,
+                       http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(ResponsesProviderError):
+        client.generate_text(["Target message: synthetic question"])
+    assert len(requests) == 1
+
+
+def test_responses_stream_returns_at_completed_without_waiting_for_eof() -> None:
+    class LingeringStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield _responses_stream_body(response_id="synthetic_done", text="最终答复").encode()
+            raise AssertionError("must not read past the completed event")
+
+    client = LlmClient(
+        base_url="https://api.example.test/v1", api_key="test-key", model="gpt-5.4",
+        responses_model="gpt-5.4", responses_only=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, stream=LingeringStream(), headers={"content-type": "text/event-stream"},
+        ))),
+    )
+    assert client.generate_text(["Target message: synthetic question"]) == "最终答复"
+
+
 def test_responses_sse_extracts_function_calls() -> None:
     client = LlmClient(
         base_url="https://api.example.test/v1",
@@ -185,10 +324,10 @@ def test_generate_text_with_tools_executes_and_returns_final_text() -> None:
 
     def executor(name, arguments):
         executed.append((name, arguments))
-        return "阿渣喜欢喝冰美式"
+        return "小甲喜欢喝冰美式"
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣喜欢喝什么？"],
+        ["Target message: 小甲喜欢喝什么？"],
         tools=MEMORY_TOOLS,
         tool_executor=executor,
         max_tool_rounds=2,
@@ -205,7 +344,7 @@ def test_generate_text_with_tools_executes_and_returns_final_text() -> None:
         {
             "type": "function_call_output",
             "call_id": "call_1",
-            "output": "阿渣喜欢喝冰美式",
+            "output": "小甲喜欢喝冰美式",
         }
     ]
 
@@ -419,9 +558,9 @@ def test_generate_text_with_tools_replays_reasoning_items_before_function_items(
     )
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣喜欢喝什么？"],
+        ["Target message: 小甲喜欢喝什么？"],
         tools=MEMORY_TOOLS,
-        tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+        tool_executor=lambda _name, _args: "小甲喜欢冰美式",
     )
 
     assert text == "最终回答"
@@ -483,7 +622,7 @@ def test_generate_text_with_tools_keeps_parallel_call_block_contiguous() -> None
         return f"hit for {arguments['query']}"
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣最近怎么样？"],
+        ["Target message: 小甲最近怎么样？"],
         tools=MEMORY_TOOLS,
         tool_executor=executor,
     )
@@ -558,9 +697,9 @@ def test_generate_text_with_tools_degrades_to_plain_when_tool_round_is_rejected(
 
     with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
         text = client.generate_text_with_tools(
-            ["Target message: 阿渣喜欢喝什么？"],
+            ["Target message: 小甲喜欢喝什么？"],
             tools=MEMORY_TOOLS,
-            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+            tool_executor=lambda _name, _args: "小甲喜欢冰美式",
             max_tool_rounds=2,
         )
 
@@ -625,9 +764,9 @@ def test_generate_text_with_tools_degrades_when_fallback_model_round_is_rejected
 
     with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
         text = client.generate_text_with_tools(
-            ["Target message: 阿渣喜欢喝什么？"],
+            ["Target message: 小甲喜欢喝什么？"],
             tools=MEMORY_TOOLS,
-            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+            tool_executor=lambda _name, _args: "小甲喜欢冰美式",
         )
 
     assert text == "降级后的回答"
@@ -1800,7 +1939,7 @@ def test_llm_client_uses_responses_stream_model_for_text_when_configured() -> No
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "reasoning": {"effort": "low"},
+        "reasoning": {"effort": "medium"},
         "instructions": (
             "System persona: You are Mira.\n\n"
             "Safety rules: Stay safe.\n\n"
@@ -1973,6 +2112,33 @@ def test_llm_client_uses_primary_responses_model_for_image_generation() -> None:
     assert len(recorded) == 1
     assert recorded[0].model == "gpt-6.1-sol"
     assert recorded[0].endpoint == "responses"
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_standard_responses_image_model_is_explicit_and_references_survive(tmp_path, edit) -> None:
+    captured = {}
+    def handler(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=_responses_image_stream_body(response_id="image25", image_b64="aW1hZ2U="),
+                              headers={"content-type": "text/event-stream"})
+    client = LlmClient(base_url="https://provider.example.test/v1", api_key="test-key", model="gpt-6.1-sol",
+                       responses_model="gpt-6.1-sol", image_responses_model="gpt-6.1-sol",
+                       image_generation_model="gpt-image-2.5-flare", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    source = tmp_path / "reference.png"
+    source.write_bytes(b"real-test-reference")
+    options = {"prompt": "draw a flower", "model": "gpt-image-2.5-flare", "size": "1024x1024", "quality": "high"}
+    if edit:
+        result = client.edit_image(**options, images=[ImageAttachment(url="", local_path=str(source), reference_subject="flower")])
+    else:
+        result = client.generate_image(**options)
+    payload = captured["payload"]
+    assert payload["model"] == "gpt-6.1-sol"
+    assert payload["tools"] == [{"type": "image_generation", "model": "gpt-image-2.5-flare", "size": "1024x1024", "quality": "high"}]
+    images = [part for part in payload["input"][0]["content"] if part["type"] == "input_image"]
+    assert bool(images) is edit
+    if edit:
+        assert base64.b64decode(images[0]["image_url"].split(",", 1)[1]) == source.read_bytes()
+    assert result.artifacts[0].b64_json == "aW1hZ2U="
 
 
 def test_llm_client_uses_responses_image_tool_with_reference_image(tmp_path) -> None:
@@ -2807,7 +2973,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "reasoning": {"effort": "low"},
+        "reasoning": {"effort": "medium"},
         "input": [
             {
                 "role": "user",
@@ -2821,7 +2987,7 @@ def test_llm_client_does_not_send_previous_response_id_on_http_responses_endpoin
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "reasoning": {"effort": "low"},
+        "reasoning": {"effort": "medium"},
         "input": [
             {
                 "role": "user",
@@ -2874,7 +3040,7 @@ def test_llm_client_routes_images_to_responses_with_input_image_when_configured(
         "model": "gpt-5.4",
         "stream": True,
         "max_output_tokens": 8192,
-        "reasoning": {"effort": "low"},
+        "reasoning": {"effort": "medium"},
         "input": [
             {
                 "role": "user",
@@ -3573,3 +3739,49 @@ def test_llm_client_uses_granular_http_timeouts_when_no_client_provided() -> Non
     assert timeout.read == 90.0
     assert timeout.write == 90.0
     assert timeout.pool == 10.0
+@pytest.mark.parametrize("responses", [True, False])
+def test_request_guard_revocation_prevents_retry_and_model_fallback(responses, monkeypatch):
+    from app.providers.llm_client import LlmRequestAuthorityError
+    calls, checks = [], []
+    def guard():
+        checks.append(1)
+        if len(checks) > 1:
+            raise RuntimeError("revoked")
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(503)
+    monkeypatch.setattr(LlmClient, "_sleep_before_retry", lambda *args, **kwargs: None)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+        client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="synthetic-primary",
+            responses_model="synthetic-primary" if responses else None, fallback_model="synthetic-fallback",
+            http_client=http, request_guard=guard)
+        with pytest.raises(LlmRequestAuthorityError):
+            client.generate_text(["synthetic input"])
+    assert len(calls) == 1
+
+
+def test_request_guard_prevents_first_http_request():
+    from app.providers.llm_client import LlmRequestAuthorityError
+    def guard():
+        raise ValueError("source revoked")
+    with httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("authority must be checked before HTTP"))) as http:
+        client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="synthetic",
+            responses_model="synthetic", responses_only=True, http_client=http, request_guard=guard)
+        with pytest.raises(LlmRequestAuthorityError) as error:
+            client.generate_text(["synthetic input"])
+        assert isinstance(error.value.__cause__, ValueError)
+
+
+def test_single_request_budget_keeps_global_default_and_sends_once(monkeypatch):
+    calls = []
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(503)
+    monkeypatch.setattr(LlmClient, "_sleep_before_retry", lambda *args, **kwargs: None)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+        client = LlmClient(base_url="https://api.example.test/v1", api_key="test-key", model="synthetic",
+            responses_model="synthetic", responses_only=True, http_client=http, request_max_attempts=1)
+        with pytest.raises(ValueError, match="after retries"):
+            client.generate_text(["synthetic input"])
+    assert len(calls) == 1
+    assert LlmClient.REQUEST_MAX_ATTEMPTS == 3

@@ -1,0 +1,16 @@
+[Unit]
+Description=Xiaomachi isolated Python computation gateway
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/xiaomachi/current/infra/wsl
+ExecStart=/usr/bin/docker compose --env-file /opt/xiaomachi/shared/sandbox.env -f /opt/xiaomachi/current/infra/wsl/docker-compose.sandbox.yml --profile sandbox up -d --no-deps --no-build xiaomachi-sandbox
+ExecStop=/usr/bin/docker compose --env-file /opt/xiaomachi/shared/sandbox.env -f /opt/xiaomachi/current/infra/wsl/docker-compose.sandbox.yml --profile sandbox stop --timeout 15 xiaomachi-sandbox
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

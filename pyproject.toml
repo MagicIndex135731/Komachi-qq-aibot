@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "NapCat-based QQ AI bot with group memory, persona chat, private chat and image generation"
 requires-python = ">=3.12"
 dependencies = [
+  "deepseek-harness-sdk==0.1.5rc1",
+  "deepseek-harness-runtime-bin==0.1.5rc1",
   "ddgs>=9.14.2",
   "fastembed>=0.6.0,<0.7.0",
   "httpx>=0.28.0",
@@ -29,6 +31,7 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
+cache_dir = "data/test-work/pytest-cache"
 norecursedirs = [
   "data",
   ".git",
@@ -51,3 +54,6 @@ norecursedirs = [
 [tool.setuptools.packages.find]
 include = ["app*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"app.agent" = ["harness_plugins/*.mjs"]

@@ -35,3 +35,14 @@ def test_filter_removes_parenthesized_citations_and_empty_brackets() -> None:
     assert filtered == "第一条事实。 第二条事实。 第三条。"
     assert "(" not in filtered
     assert "（" not in filtered
+
+
+def test_filter_removes_url_only_line_with_label_but_keeps_answer() -> None:
+    reply = "套餐以当天页面为准。\n发我截图，我陪你核对。\n查到的门店页：https://example.com/shop"
+    assert filter_reply_urls(reply, allow_urls=False) == "套餐以当天页面为准。\n发我截图，我陪你核对。"
+    assert filter_reply_urls(reply, allow_urls=True) == reply
+
+
+def test_filter_keeps_source_labels_with_meaningful_text_and_plain_headings() -> None:
+    reply = "菜品：\n来源：门店说明 https://example.com/shop\n官网：https://example.com/shop"
+    assert filter_reply_urls(reply, allow_urls=False) == "菜品：\n来源：门店说明"

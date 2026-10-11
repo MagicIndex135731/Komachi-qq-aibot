@@ -23,6 +23,7 @@ from app.core.hybrid_memory_retriever import HybridRetrievalResult, MemoryScopeV
 from app.core.memory_fact_ranking import fact_intent_policy, temporal_recency_required
 from app.core.memory_orchestrator import MemoryContextResult
 from app.core.memory_query_resolver import (
+    MemoryQueryResolver,
     RecentMemoryMessage,
     ResolvedMemoryQuery,
     has_bound_member_subject,
@@ -88,6 +89,12 @@ class MemoryV2Request:
     impersonated_subject_id: int | None = None
     impersonated_subject_addressed: bool | None = None
     bot_user_id: int | None = None
+    # Explicit Agent tool constraints are applied after deterministic parsing;
+    # defaults preserve the ordinary reply pipeline and its quote contract.
+    force_memory_retrieval: bool = False
+    memory_subject_ids: tuple[str, ...] | None = None
+    memory_layer: str = ""
+    read_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,10 +189,43 @@ class MemoryV2ContextProvider:
                 }
             ),
         }
+        group_members = ()
         if self._member_loader is not None:
-            resolve_kwargs["group_members"] = tuple(self._member_loader(request.group_id))
+            group_members = tuple(self._member_loader(request.group_id))
+            resolve_kwargs["group_members"] = group_members
         resolve_started = perf_counter()
         resolved = self._resolver.resolve(request.query, **resolve_kwargs)
+        if request.memory_layer not in {"", "raw", "facts", "summaries", "all"}:
+            raise ValueError("unknown memory layer")
+        if request.memory_subject_ids is not None:
+            scoped_subjects = {
+                str(member.user_id) for member in group_members if member.in_scope
+            } | {
+                str(message.user_id) for message in request.recent_messages
+                if not message.is_bot and message.user_id is not None
+            }
+            excluded = {str(value) for value in resolve_kwargs["excluded_member_ids"]}
+            if (
+                not request.memory_subject_ids
+                or any(subject not in scoped_subjects or subject in excluded
+                       for subject in request.memory_subject_ids)
+            ):
+                raise MemoryScopeViolation("tool member scope mismatch")
+            resolved = replace(
+                resolved, subject_ids=request.memory_subject_ids,
+                speaker_ids=request.memory_subject_ids, mentioned_user_ids=None,
+                subject_binding="explicit", subject_decision_reason="explicit_tool_member",
+                subject_aliases_removed=(),
+            )
+        if request.force_memory_retrieval:
+            resolved = replace(
+                resolved, needs_history=True, quote_role="none",
+                time_range=(resolved.time_range or MemoryQueryResolver._parse_time_range(
+                    request.query, request.now or datetime.now().astimezone(), force_history=True,
+                )),
+                answer_mode=("general_history" if resolved.answer_mode == "mention"
+                             else resolved.answer_mode),
+            )
         fact_policy = fact_intent_policy(
             query=str(resolved.original_query or ""),
             answer_mode=resolved.answer_mode,
@@ -276,7 +316,8 @@ class MemoryV2ContextProvider:
         )
         segments = self._pin_required_segments(
             self._eligible_segments(
-                expanded_segments, resolved, target_message_id=request.target_message_id
+                expanded_segments, resolved, target_message_id=request.target_message_id,
+                strict_author_ids=request.memory_subject_ids,
             ),
             resolved,
         )
@@ -298,7 +339,8 @@ class MemoryV2ContextProvider:
             )
             segments = self._pin_required_segments(
                 self._eligible_segments(
-                    expanded_segments, resolved, target_message_id=request.target_message_id
+                    expanded_segments, resolved, target_message_id=request.target_message_id,
+                    strict_author_ids=request.memory_subject_ids,
                 ),
                 resolved,
             )
@@ -339,7 +381,11 @@ class MemoryV2ContextProvider:
         suppressed_retrospective_facts = loaded_fact_count - len(facts)
         derived_ms = (perf_counter() - derived_started) * 1000
         packing_started = perf_counter()
-        recent_messages = request.recent_messages
+        recent_messages = () if request.memory_layer else request.recent_messages
+        if request.memory_layer:
+            segments = segments if request.memory_layer in {"raw", "all"} else ()
+            facts = facts if request.memory_layer in {"facts", "all"} else ()
+            summaries = summaries if request.memory_layer in {"summaries", "all"} else ()
         if (
             resolved.answer_mode == "current_fact"
             and resolved.subject_ids
@@ -673,6 +719,7 @@ class MemoryV2ContextProvider:
         resolved: ResolvedMemoryQuery,
         *,
         target_message_id: str | None = None,
+        strict_author_ids: tuple[str, ...] | None = None,
     ) -> tuple[EvidenceSegment, ...]:
         """Revalidate every expanded raw source against the resolved plan."""
 
@@ -703,7 +750,10 @@ class MemoryV2ContextProvider:
                     and re.sub(r"[\s?？。！!]", "", message.content).endswith(normalized_query)
                 )
                 and (
-                    eligible(message, resolved)
+                    (eligible(message, resolved)
+                     and (strict_author_ids is None
+                          or message.source_msg_id not in hit_ids
+                          or str(message.user_id) in strict_author_ids))
                     or (
                         message.source_msg_id in contextual_ids
                         and eligible_context(message, resolved)

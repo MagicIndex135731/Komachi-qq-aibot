@@ -43,7 +43,7 @@ logger = logging.getLogger("audit_system_llm")
 GROUP_ID = 0
 BOT_QQ = 0
 REQUESTER_QQ = 0
-PERSONA_KEY = "azha"
+PERSONA_KEY = "member_alpha"
 
 
 class FakeSender(Sender):
@@ -95,7 +95,7 @@ SCENARIOS: list[dict[str, Any]] = [
         "id": "xiao_yuan_dislike_guardrail",
         "persona_key": PERSONA_KEY,
         "question": "你最讨厌什么动画",
-        "card": "逆蝶蝶",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
             "1. 不能把'排行低/评价一般'说成'讨厌'；只有记忆明确表示讨厌时才可列出。\n"
@@ -107,34 +107,34 @@ SCENARIOS: list[dict[str, Any]] = [
         "id": "requester_binding",
         "persona_key": PERSONA_KEY,
         "question": "如何评价我",
-        "card": "逆蝶蝶",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 回复评价的对象必须是提问者本人（群名片：逆蝶蝶），而不是阿渣自己或AI。\n"
-            "2. 评价内容应来自对提问者的记忆/印象，语气符合阿渣与逆蝶蝶的熟络互怼关系。\n"
+            "1. 回复评价的对象必须是提问者本人（群名片：小乙乙），而不是小甲自己或AI。\n"
+            "2. 评价内容应来自对提问者的记忆/印象，语气符合小甲与小乙乙的熟络互怼关系。\n"
             "3. 不能答非所问。"
         ),
     },
     {
         "id": "third_person_member_binding",
         "persona_key": PERSONA_KEY,
-        "question": "逆蝶蝶的动画喜好是什么",
-        "card": "逆蝶蝶",
+        "question": "小乙乙的动画喜好是什么",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 必须把'逆蝶蝶'绑定到群成员本人并从记忆中回答。\n"
-            "2. 回答应点名'逆蝶蝶'并包含至少一个具体作品/喜好；阿渣风格允许极短，不需要展开。\n"
-            "3. 不能把阿渣自己的喜好说成逆蝶蝶的。"
+            "1. 必须把'小乙乙'绑定到群成员本人并从记忆中回答。\n"
+            "2. 回答应点名'小乙乙'并包含至少一个具体作品/喜好；小甲风格允许极短，不需要展开。\n"
+            "3. 不能把小甲自己的喜好说成小乙乙的。"
         ),
     },
     {
-        "id": "azha_fact_retrieval",
+        "id": "member_alpha_fact_retrieval",
         "persona_key": PERSONA_KEY,
         "question": "你最近面了哪些企业",
-        "card": "阿渣",
+        "card": "小甲",
         "nickname": "喜泽满灰多",
         "criteria": (
-            "1. 这是阿渣本人被问自己的经历，应从共享记忆中检索出面试/求职相关事实。\n"
+            "1. 这是小甲本人被问自己的经历，应从共享记忆中检索出面试/求职相关事实。\n"
             "2. 回答应提到具体企业（如虾皮、联想等），至少有一个真实企业名。\n"
             "3. 不能凭空编造记忆里没有的企业。"
         ),
@@ -143,10 +143,10 @@ SCENARIOS: list[dict[str, Any]] = [
         "id": "style_fidelity",
         "persona_key": PERSONA_KEY,
         "question": "最近工作咋样",
-        "card": "逆蝶蝶",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 必须像阿渣：极短、口语、直接、可能带网络用语（nb/尿了/卧槽等）。\n"
+            "1. 必须像小甲：极短、口语、直接、可能带网络用语（nb/尿了/卧槽等）。\n"
             "2. 不能出现'主人''您好''请问''作为AI''亲'等客服或机器人腔。\n"
             "3. 不能长篇大论，通常不超过一两句。"
         ),
@@ -155,10 +155,10 @@ SCENARIOS: list[dict[str, Any]] = [
         "id": "burst_messages",
         "persona_key": PERSONA_KEY,
         "question": "周末有空吗，一起玩游戏？",
-        "card": "逆蝶蝶",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 阿渣约游戏时会短句连发（如'来了''上号''几点'分多条）。\n"
+            "1. 小甲约游戏时会短句连发（如'来了''上号''几点'分多条）。\n"
             "2. 输出应能被拆成多条短消息，或至少连续多个短句。\n"
             "3. 不能是一条长句。"
         ),
@@ -166,11 +166,11 @@ SCENARIOS: list[dict[str, Any]] = [
     {
         "id": "relationship_address",
         "persona_key": PERSONA_KEY,
-        "question": "你觉得加菲猫这人咋样",
-        "card": "逆蝶蝶",
+        "question": "你觉得小丁丁这人咋样",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
-            "1. 按阿渣与加菲猫的关系（球友、互怼）说话。\n"
+            "1. 按小甲与小丁丁的关系（球友、互怼）说话。\n"
             "2. 不能出现'主人''老公''亲爱的'等凭空发明的亲密称呼。\n"
             "3. 评价要具体，不能空泛。"
         ),
@@ -179,12 +179,12 @@ SCENARIOS: list[dict[str, Any]] = [
         "id": "switch_back_to_komachi",
         "persona_key": "default",
         "question": "你是谁",
-        "card": "逆蝶蝶",
+        "card": "小乙乙",
         "nickname": "不知道叫什么",
         "criteria": (
             "1. 这是切回默认人格（小町）后的回复，应恢复小町的傲娇/毒舌风格并自称小町。\n"
-            "2. 不能残留阿渣的口吻（如'上号''尿了'）。\n"
-            "3. 不能自称是阿渣或其他群成员。"
+            "2. 不能残留小甲的口吻（如'上号''尿了'）。\n"
+            "3. 不能自称是小甲或其他群成员。"
         ),
     },
 ]
@@ -318,7 +318,7 @@ def main() -> int:
     parser.add_argument("--bot-qq", type=int, required=True)
     parser.add_argument("--requester-qq", type=int, required=True)
     parser.add_argument("--persona-key", default=PERSONA_KEY)
-    parser.add_argument("--out", default="/workspace/data/personas/azha/eval/audit_llm.json")
+    parser.add_argument("--out", default="/workspace/data/personas/member_alpha/eval/audit_llm.json")
     parser.add_argument("--skip-generate", action="store_true")
     parser.add_argument("--judge-only", action="store_true")
     parser.add_argument("--only", default="", help="Run a single scenario id")

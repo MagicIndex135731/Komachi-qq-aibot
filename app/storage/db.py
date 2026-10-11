@@ -19,6 +19,11 @@ from sqlalchemy.orm import Session
 
 from app.core.time_utils import shanghai_now_naive
 from app.storage.models import Base
+from app.storage import group_agent as _group_agent_models
+from app.storage import social_agent as _social_agent_models
+from app.storage import autonomous_agent as _autonomous_agent_models
+from app.storage import agent_sessions as _agent_session_models
+from app.storage import agent_effects as _agent_effect_models
 from app.providers.embeddings import hashed_text_embedding
 
 
@@ -163,6 +168,10 @@ def _apply_schema_migrations(connection) -> None:
             text("SELECT name FROM sqlite_master WHERE type='table'")
         )
     }
+    if "agent_tool_effects" in table_names:
+        _add_missing_columns(connection, "agent_tool_effects", {
+            "reservation_attempts": "INTEGER NOT NULL DEFAULT 1", "wake_id": "VARCHAR(160) NOT NULL DEFAULT ''",
+        })
     if "dev_sessions" in table_names:
         _add_missing_columns(
             connection,
@@ -373,6 +382,20 @@ def _apply_schema_migrations(connection) -> None:
                 "ix_retrieval_document_messages_group_document "
                 "ON retrieval_document_messages (group_id, document_id)"
             )
+        )
+
+    if "group_agent_sessions" in table_names:
+        _add_missing_columns(
+            connection,
+            "group_agent_sessions",
+            {"working_note_source_message_ids": "JSON NOT NULL DEFAULT '[]'"},
+        )
+
+    if "social_action_records" in table_names:
+        _add_missing_columns(
+            connection,
+            "social_action_records",
+            {"dispatched_at": "DATETIME"},
         )
 
 

@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 import httpx
 
 import pytest
+from PIL import Image
 from sqlalchemy import text
 
 from app.core.group_image_generation import (
     GroupImageGenerationRequest,
     GroupImageGenerationService,
+    PrivateImageGenerationRequest,
+    PrivateImageGenerationService,
 )
+from app.adapters.outbound_guard import GroupDispatchScope, group_dispatch_scope
+from app.adapters.sender import Sender
 from app.core.message_content import ImageAttachment
 from app.providers.llm_client import ImageGenerationResult
 from app.storage.db import session_scope
-from app.storage.repositories import JobRepository
+from app.storage.repositories import GroupRepository, JobRepository, MessageRepository, UserRepository
 
 
 class FakeGroupImageSender:
@@ -813,6 +820,97 @@ async def test_group_image_service_downloads_url_artifacts_when_provider_returns
 
 
 @pytest.mark.asyncio
+async def test_group_image_service_decodes_large_data_url_artifacts_without_http_download(tmp_path) -> None:
+    sender = FakeGroupImageSender()
+    buffer = io.BytesIO()
+    Image.new("RGB", (256, 128), color=(55, 105, 190)).save(buffer, format="PNG", compress_level=0)
+    image_bytes = buffer.getvalue()
+    assert len(image_bytes) > 8192
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    image_url = "data:image/png;base64," + encoded
+    assert len(image_url) > 65536  # exceeds httpx's URL-length budget
+
+    class DataUrlImageLlm(UrlImageLlm):
+        def __init__(self) -> None:
+            super().__init__(image_url=image_url)
+            self.http_client.close()
+
+            def reject_download(request):
+                raise AssertionError("data URI was incorrectly sent to httpx")
+
+            self.http_client = httpx.Client(transport=httpx.MockTransport(reject_download))
+
+    service = GroupImageGenerationService(
+        llm_client=DataUrlImageLlm(),
+        sender=sender,
+        output_dir=tmp_path / "generated_images",
+        model="gpt-image-2",
+        size="1024x1024",
+        quality="low",
+        background="",
+        output_format="png",
+        max_slots=3,
+    )
+
+    result = await service.enqueue(make_request("draw-data-url-image-1"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert len(sender.image_calls) == 1
+    written = tmp_path / "generated_images" / Path(sender.image_calls[0]["image_file"]).name
+    assert written.read_bytes() == image_bytes
+    with Image.open(written) as actual:
+        actual.load()
+        assert actual.format == "PNG"
+        assert actual.size == (256, 128)
+    service.http_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_kind", [
+    "not_image", "not_base64", "malformed_base64", "empty", "bad_flag", "non_ascii",
+    "encoded_oversize", "decoded_oversize",
+])
+async def test_group_image_service_rejects_invalid_data_url_without_download_or_image_send(tmp_path, invalid_kind) -> None:
+    values = {
+        "not_image": "data:text/plain;base64,YWI=",
+        "not_base64": "data:image/png,abc",
+        "malformed_base64": "data:image/png;base64,YW!I=",
+        "empty": "data:image/png;base64,",
+        "bad_flag": "data:image/png;base64garbage,YWI=",
+        "non_ascii": "data:image/png;base64,%FF",
+    }
+    if invalid_kind == "encoded_oversize":
+        image_url = "data:image/png;base64," + "A" * (12 * 1024 * 1024 + 1)
+    elif invalid_kind == "decoded_oversize":
+        image_url = "data:image/png;base64," + base64.b64encode(b"x" * (8 * 1024 * 1024 + 1)).decode("ascii")
+    else:
+        image_url = values[invalid_kind]
+    requests = []
+
+    def reject_download(request):
+        requests.append(request)
+        raise AssertionError("data URI must never be downloaded")
+
+    llm = UrlImageLlm(image_url=image_url)
+    llm.http_client.close()
+    llm.http_client = httpx.Client(transport=httpx.MockTransport(reject_download))
+    sender = FakeGroupImageSender()
+    service = GroupImageGenerationService(llm_client=llm, sender=sender,
+        output_dir=tmp_path / "generated_images", model="test-image", failure_reply_text="invalid image result")
+
+    result = await service.enqueue(make_request("draw-invalid-data-url"))
+    await service.wait_for_idle()
+
+    assert result.accepted is True
+    assert requests == []
+    assert sender.image_calls == []
+    assert sender.text_calls == [{"group_id": 10001, "text": "[CQ:at,qq=20001] invalid image result"}]
+    assert not list(service.output_dir.glob("*"))
+    service.http_client.close()
+
+
+@pytest.mark.asyncio
 async def test_group_image_service_failure_releases_slot_and_notifies_group(tmp_path) -> None:
     sender = FakeGroupImageSender()
     llm = FailingImageLlm()
@@ -841,6 +939,7 @@ async def test_group_image_service_failure_releases_slot_and_notifies_group(tmp_
         }
     ]
     assert second.accepted is True
+    await service.wait_for_idle()
 
 
 @pytest.mark.asyncio
@@ -889,6 +988,7 @@ async def test_group_image_service_start_recovers_running_job_from_persistent_qu
         max_slots=3,
     )
 
+    persist_image_source(sqlite_engine, make_request("draw-recover-1"))
     with session_scope(sqlite_engine) as session:
         JobRepository(session).add_job(
             job_type=service.job_type,
@@ -940,3 +1040,170 @@ async def test_group_image_service_retries_transport_timeout_and_suggests_simple
     assert llm.calls[0]["max_attempts"] == 5
     assert llm.calls[0]["timeout_seconds"] is None
     assert "短" in sender.text_calls[-1]["text"]
+
+
+def persist_image_source(engine, request, *, raw_json=None) -> None:
+    with session_scope(engine) as session:
+        GroupRepository(session).upsert_group(group_id=request.group_id, group_name="synthetic", enabled=True, speak_enabled=True)
+        UserRepository(session).upsert_user(user_id=request.requester_user_id, nickname="synthetic", group_card="")
+        MessageRepository(session).add_group_message(
+            platform_msg_id=request.trigger_message_id, group_id=request.group_id,
+            user_id=request.requester_user_id, timestamp=datetime.now(UTC),
+            plain_text=request.prompt, raw_json=raw_json or {}, msg_type="text",
+            reply_to_msg_id=None, mentioned_bot=True,
+        )
+
+
+def persistent_image_service(engine, tmp_path, sender, *, llm=None):
+    return GroupImageGenerationService(
+        engine=engine, llm_client=llm or StaticImageLlm(image_b64=base64.b64encode(b"png").decode()),
+        sender=sender, output_dir=tmp_path / "images", model="test-image",
+    )
+
+
+class ImageReceiptGateway:
+    def __init__(self, missing_receipt_at=None):
+        self.calls = []
+        self.missing_receipt_at = missing_receipt_at
+
+    async def call_api(self, action, params):
+        self.calls.append((action, params))
+        data = {} if len(self.calls) == self.missing_receipt_at else {"message_id": f"image-receipt-{len(self.calls)}"}
+        return {"status": "ok", "retcode": 0, "data": data}
+
+
+@pytest.mark.asyncio
+async def test_image_jobs_outlive_turn_scope_and_keep_each_group(sqlite_engine, tmp_path):
+    gateway = ImageReceiptGateway()
+    service = persistent_image_service(sqlite_engine, tmp_path, Sender(gateway))
+    first = replace(make_request("independent-first"), group_id=900000001, requester_user_id=900000101)
+    second = replace(first, group_id=900000002, trigger_message_id="independent-second")
+    persist_image_source(sqlite_engine, first)
+    persist_image_source(sqlite_engine, second)
+    obsolete_turn = GroupDispatchScope(first.group_id, lambda: False, lambda: pytest.fail("old turn dispatched"))
+    with group_dispatch_scope(obsolete_turn):
+        assert (await service.enqueue(first)).accepted
+        assert (await service.enqueue(second)).accepted
+    await asyncio.wait_for(service.wait_for_idle(), 2)
+    assert [params["group_id"] for _, params in gateway.calls] == [first.group_id, first.group_id, second.group_id, second.group_id]
+    with session_scope(sqlite_engine) as session:
+        completed = JobRepository(session).list_jobs(job_type=service.job_type, statuses=["completed"])
+        assert len(completed) == 2
+        assert completed[0].payload_json["image_receipt_ids"] == ["image-receipt-1"]
+        assert completed[0].payload_json["notice_receipt_ids"] == ["image-receipt-2"]
+    assert not obsolete_turn.dispatched
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_receipt_at", [1, 2])
+async def test_unknown_image_or_notice_delivery_is_never_repeated(sqlite_engine, tmp_path, missing_receipt_at):
+    gateway = ImageReceiptGateway(missing_receipt_at)
+    service = persistent_image_service(sqlite_engine, tmp_path, Sender(gateway))
+    request = replace(make_request("unknown-image"), group_id=900000001, requester_user_id=900000101)
+    persist_image_source(sqlite_engine, request)
+    assert (await service.enqueue(request)).accepted
+    await asyncio.wait_for(service.wait_for_idle(), 2)
+    assert len(gateway.calls) == missing_receipt_at
+    with session_scope(sqlite_engine) as session:
+        failed = JobRepository(session).list_jobs(job_type=service.job_type, statuses=["failed"])
+        assert len(failed) == 1
+        assert failed[0].payload_json["delivery_state"] == "uncertain"
+    await service.start()
+    await asyncio.wait_for(service.wait_for_idle(), 2)
+    assert len(gateway.calls) == missing_receipt_at
+
+
+@pytest.mark.asyncio
+async def test_restart_does_not_repeat_dispatching_image_job(sqlite_engine, tmp_path):
+    sender = FakeGroupImageSender()
+    llm = ReferenceAwareImageLlm(image_b64=base64.b64encode(b"png").decode())
+    service = persistent_image_service(sqlite_engine, tmp_path, sender, llm=llm)
+    request = make_request("crash-during-image-dispatch")
+    payload = service._serialize_request(request)
+    payload["delivery_state"] = "dispatching"
+    with session_scope(sqlite_engine) as session:
+        JobRepository(session).add_job(job_type=service.job_type, payload_json=payload, run_at=datetime.now(UTC), status="running")
+    await service.start()
+    await service.wait_for_idle()
+    assert llm.generate_calls == []
+    assert sender.image_calls == sender.text_calls == []
+    with session_scope(sqlite_engine) as session:
+        job = JobRepository(session).list_jobs(job_type=service.job_type, statuses=["failed"])[0]
+        assert job.payload_json["delivery_state"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_image_request_sources_must_match_group_author_and_live_source(sqlite_engine, tmp_path):
+    service = persistent_image_service(sqlite_engine, tmp_path, FakeGroupImageSender())
+    request = replace(make_request("source-scope"), group_id=900000001, requester_user_id=900000101)
+    assert (await service.enqueue(request)).reason == "source_unusable"
+    persist_image_source(sqlite_engine, request)
+    assert (await service.enqueue(replace(request, group_id=900000002))).reason == "source_unusable"
+    assert (await service.enqueue(replace(request, requester_user_id=900000102))).reason == "source_unusable"
+    with session_scope(sqlite_engine) as session:
+        source = MessageRepository(session).get_by_platform_msg_id(request.trigger_message_id)
+        source.raw_json = {"delivery_state": "deleted"}
+    assert (await service.enqueue(request)).reason == "source_unusable"
+
+
+@pytest.mark.asyncio
+async def test_recall_while_image_generates_prevents_all_qq_writes(sqlite_engine, tmp_path):
+    sender = FakeGroupImageSender()
+    llm = BlockingImageLlm()
+    service = persistent_image_service(sqlite_engine, tmp_path, sender, llm=llm)
+    request = make_request("recall-while-generating")
+    persist_image_source(sqlite_engine, request)
+    assert (await service.enqueue(request)).accepted
+    try:
+        for _ in range(200):
+            if llm.started.is_set():
+                break
+            await asyncio.sleep(.005)
+        assert llm.started.is_set()
+        with session_scope(sqlite_engine) as session:
+            source = MessageRepository(session).get_by_platform_msg_id(request.trigger_message_id)
+            source.raw_json = {"delivery_state": "deleted"}
+    finally:
+        llm.release.set()
+    await asyncio.wait_for(service.wait_for_idle(), 2)
+    assert sender.image_calls == sender.text_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stop_during_generation_revokes_late_image_and_notice(sqlite_engine, tmp_path):
+    sender = FakeGroupImageSender()
+    llm = BlockingImageLlm()
+    service = persistent_image_service(sqlite_engine, tmp_path, sender, llm=llm)
+    request = make_request("stop-while-generating")
+    persist_image_source(sqlite_engine, request)
+    assert (await service.enqueue(request)).accepted
+    try:
+        for _ in range(200):
+            if llm.started.is_set():
+                break
+            await asyncio.sleep(.005)
+        assert llm.started.is_set()
+        await asyncio.wait_for(service.stop(), 1)
+        assert (await service.enqueue(request)).reason == "service_stopping"
+    finally:
+        llm.release.set()
+    await asyncio.sleep(.03)
+    assert sender.image_calls == sender.text_calls == []
+
+
+@pytest.mark.asyncio
+async def test_image_services_reject_other_surface_requests(tmp_path):
+    kwargs = dict(llm_client=StaticImageLlm(image_b64=base64.b64encode(b"png").decode()), sender=FakeGroupImageSender(), output_dir=tmp_path, model="test-image")
+    group_service = GroupImageGenerationService(**kwargs)
+    private_service = PrivateImageGenerationService(**kwargs)
+    private_request = PrivateImageGenerationRequest(user_id=900000101, trigger_message_id="private-source", prompt="test")
+    with pytest.raises(ValueError, match="chat surface"):
+        await group_service.enqueue(private_request)
+    with pytest.raises(ValueError, match="chat surface"):
+        await private_service.enqueue(make_request("group-source"))
+    group_payload = group_service._serialize_request(make_request("group-source"))
+    private_payload = private_service._serialize_request(private_request)
+    with pytest.raises(ValueError, match="private"):
+        group_service._deserialize_request({**group_payload, **private_payload})
+    with pytest.raises(ValueError, match="group"):
+        private_service._deserialize_request({**private_payload, **group_payload})

@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 sys.path.insert(0, "/workspace")
 
 from app.config import AppSettings
-from app.providers.llm_client import LlmClient
+from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort
 
 
 def load_episodes(con: sqlite3.Connection, group_id: int, days: int | None) -> list[dict]:
@@ -179,7 +179,7 @@ def main() -> None:
         image_responses_model=settings.llm_model,
         builtin_web_search=False,
         web_search_context_size="low",
-        reasoning_effort="low",
+        reasoning_effort=default_auxiliary_reasoning_effort(settings.llm_model),
         max_output_tokens=2048,
         usage_recorder=None,
         tool_event_recorder=None,

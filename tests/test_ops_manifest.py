@@ -44,7 +44,7 @@ def test_root_readme_routes_wsl_operations_to_authoritative_docs() -> None:
         assert launcher in readme
     assert "[WSL/Docker 部署与运维](infra/wsl/README.md)" in readme
     assert "[工程架构与运行原理](docs/ARCHITECTURE.md)" in readme
-    assert "[`infra/wsl/.env.example`](infra/wsl/.env.example)" in readme
+    assert "(infra/wsl/.env.example)" in readme
     assert "start_xiaomachi.ps1" not in readme
     assert "NAPCAT_SHELL_DIR" not in readme
     assert "QQ_EXE_PATH" not in readme

@@ -993,14 +993,41 @@ class MessageRepository:
             .where(Message.group_id == group_id)
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        recent_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
-                continue
-            recent_messages.append(message)
-            if len(recent_messages) >= limit:
+        return self._recent_message_pages(stmt, limit=limit)
+
+    def _recent_message_pages(self, stmt, *, limit: int, skip_unconfirmed: bool = False,
+                              skip_qq_blocked: bool = False, by_id: bool = False) -> list[Message]:
+        # ORM scalars() eagerly materializes the entire result before its first
+        # yield. A Python break after 24 rows therefore decodes years of JSON
+        # on every dispatch guard. Keyset pages bound both SQL rows and ORM
+        # materialization while filling past reserved/unconfirmed outbound rows.
+        if limit <= 0:
+            return []
+        page_size = min(limit, 128)
+        selected = []
+        cursor = None
+        while len(selected) < limit:
+            page_stmt = stmt.limit(page_size)
+            if cursor is not None:
+                timestamp, identifier = cursor
+                page_stmt = page_stmt.where(Message.id < identifier if by_id else
+                    or_(Message.timestamp < timestamp,
+                        and_(Message.timestamp == timestamp, Message.id < identifier)))
+            page = list(self.session.scalars(page_stmt))
+            if not page:
                 break
-        return list(reversed(recent_messages))
+            for message in page:
+                if (self._is_reserved_outbound(message)
+                        or skip_unconfirmed and self._is_unconfirmed_outbound(message)
+                        or skip_qq_blocked and self.is_qq_blocked_outbound(message)):
+                    continue
+                selected.append(message)
+                if len(selected) >= limit:
+                    break
+            cursor = (page[-1].timestamp, page[-1].id)
+            if len(page) < page_size:
+                break
+        return list(reversed(selected))
 
     def list_recent_group_messages_for_summarization(self, *, group_id: int, limit: int) -> list[Message]:
         stmt = (
@@ -1008,14 +1035,7 @@ class MessageRepository:
             .where(Message.group_id == group_id)
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        recent_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
-                continue
-            recent_messages.append(message)
-            if len(recent_messages) >= limit:
-                break
-        return list(reversed(recent_messages))
+        return self._recent_message_pages(stmt, limit=limit, skip_unconfirmed=True)
 
     def list_group_messages_chronological(
         self,
@@ -1120,14 +1140,7 @@ class MessageRepository:
             .where(Message.group_id == group_id, Message.user_id != bot_user_id)
             .order_by(Message.id.desc())
         )
-        rows: list[Message] = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
-                continue
-            rows.append(message)
-            if len(rows) >= max(1, limit):
-                break
-        return list(reversed(rows))
+        return self._recent_message_pages(stmt, limit=max(1, limit), skip_unconfirmed=True, by_id=True)
 
     def list_group_messages_by_id_range(
         self,
@@ -1159,14 +1172,7 @@ class MessageRepository:
             .where(Message.group_id == group_id, Message.user_id == user_id)
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        recent_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self._is_unconfirmed_outbound(message):
-                continue
-            recent_messages.append(message)
-            if len(recent_messages) >= limit:
-                break
-        return list(reversed(recent_messages))
+        return self._recent_message_pages(stmt, limit=limit, skip_unconfirmed=True)
 
     def list_recent_group_messages_for_user_since(
         self,
@@ -1186,14 +1192,7 @@ class MessageRepository:
             )
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        recent_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
-                continue
-            recent_messages.append(message)
-            if len(recent_messages) >= limit:
-                break
-        return list(reversed(recent_messages))
+        return self._recent_message_pages(stmt, limit=limit)
 
     def list_recent_private_messages_for_user_since(
         self,
@@ -1212,14 +1211,7 @@ class MessageRepository:
             )
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        recent_messages = []
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message):
-                continue
-            recent_messages.append(message)
-            if len(recent_messages) >= limit:
-                break
-        return list(reversed(recent_messages))
+        return self._recent_message_pages(stmt, limit=limit)
 
     def list_group_messages_matching_terms(
         self,
@@ -1311,20 +1303,25 @@ class MessageRepository:
             stmt = stmt.limit(int(limit))
         return list(self.session.scalars(stmt))
 
-    def last_bot_reply_at(self, *, group_id: int, bot_user_id: int) -> datetime | None:
+    def last_bot_reply_at(self, *, group_id: int, bot_user_id: int,
+                          exclude_owner_user_id: int | None = None) -> datetime | None:
         stmt = (
             select(Message)
             .where(Message.group_id == group_id, Message.user_id == bot_user_id)
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
-        timestamp = None
-        for message in self.session.scalars(stmt):
-            if self._is_reserved_outbound(message) or self.is_qq_blocked_outbound(message):
-                continue
-            timestamp = message.timestamp
-            break
-        if timestamp is None:
+        if exclude_owner_user_id is not None:
+            from app.storage.agent_effects import AgentToolEffect
+            owner_effects=select(AgentToolEffect.action_id).where(
+                AgentToolEffect.account_id==bot_user_id,AgentToolEffect.scope.startswith('owner:'))
+            owner_sources=select(Message.platform_msg_id).where(Message.group_id==group_id,
+                Message.user_id==exclude_owner_user_id)
+            stmt=stmt.where(func.coalesce(func.json_extract(Message.raw_json,'$.social_action_id'),'').not_in(owner_effects),
+                func.coalesce(Message.reply_to_msg_id,'').not_in(owner_sources))
+        rows = self._recent_message_pages(stmt, limit=1, skip_qq_blocked=True)
+        if not rows:
             return None
+        timestamp = rows[0].timestamp
         if timestamp.tzinfo is None:
             return timestamp.replace(tzinfo=ASIA_SHANGHAI).astimezone(UTC)
         return timestamp
@@ -5022,6 +5019,10 @@ class RetrievalDocumentRepository:
         ][:resolved_limit]
 
     def _sync_fts(self, document: RetrievalDocument) -> None:
+        # Canonical document/provenance constraints must propagate. SQLAlchemy
+        # 2.1 also autoflushes Core statements, so keep that flush outside the
+        # optional FTS error boundary rather than swallowing its IntegrityError.
+        self.session.flush()
         try:
             self.session.execute(
                 text(

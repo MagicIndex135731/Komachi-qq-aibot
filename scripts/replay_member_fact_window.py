@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from app.config import AppSettings
 from app.core.member_memory_backfill import MemberFactRefreshService
+from app.main import build_usage_recorder
 from app.providers.semantic_embeddings import build_embedding_provider
 from app.storage.db import build_engine, session_scope
 from app.storage.models import MemoryItem, Message
@@ -235,6 +236,7 @@ def main() -> int:
     service = MemberFactRefreshService(
         engine=engine,
         settings=settings,
+        usage_recorder=build_usage_recorder(engine),
         group_ids={int(args.group_id)},
         bot_qq=int(settings.bot_qq),
         member_allowlist={int(args.user_id)},

@@ -5,6 +5,8 @@ from html import unescape
 from math import ceil
 from pathlib import Path
 import re
+import time
+import uuid
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
@@ -19,6 +21,17 @@ class WebSearchResult:
     snippet: str
     source: str
     date: str
+    ref_id: str = ""
+
+
+@dataclass(slots=True)
+class WebSearchReport:
+    results: list[WebSearchResult]
+    content: str
+
+
+class WebSearchProviderError(RuntimeError):
+    """Safe error categories; never retain upstream credentials or payloads."""
 
 
 @dataclass(slots=True)
@@ -138,6 +151,8 @@ class WebSearchClient:
         ddgs_factory: Callable[..., Any] | None = None,
         region: str = "wt-wt",
         backend: str = "auto",
+        model: str = "",
+        reasoning_effort: str = "medium",
     ) -> None:
         self.provider = provider.strip().lower()
         self.base_url = base_url.rstrip("/")
@@ -147,10 +162,38 @@ class WebSearchClient:
         self.ddgs_factory = ddgs_factory
         self.region = region
         self.backend = backend
+        self.model = (model or "").strip()
+        if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("invalid web search reasoning effort")
+        self.reasoning_effort = reasoning_effort
+
+    @property
+    def supports_page_tools(self) -> bool:
+        return self.provider in {"wyzlab", "wyzlab_alpha"}
+
+    def search_report(self, query: str, max_results: int = 8) -> WebSearchReport:
+        if not 1 <= max_results <= 20:
+            raise ValueError("search result limit must be between 1 and 20")
+        if not self.supports_page_tools:
+            return WebSearchReport(self.search(query, max_results=max_results), "")
+        return self._alpha_report({"search_query": [{"q": query}]},
+            instruction=f"搜索公开资料，最多收集{max_results}条相关来源：{query}", max_results=max_results)
+
+    def open_page(self, url: str, *, lineno: int = 0) -> WebSearchReport:
+        if not self.supports_page_tools:
+            raise WebSearchProviderError("page_tools_unavailable")
+        return self._alpha_report({"open": [{"ref_id": url, "lineno": lineno}]}, instruction="读取公开网页正文", max_results=20)
+
+    def find_page(self, url: str, *, pattern: str) -> WebSearchReport:
+        if not self.supports_page_tools:
+            raise WebSearchProviderError("page_tools_unavailable")
+        return self._alpha_report({"find": [{"ref_id": url, "pattern": pattern}]}, instruction="查找公开网页中的内容", max_results=20)
 
     def search(self, query: str, max_results: int = 3) -> list[WebSearchResult]:
         if self.provider == "ddgs":
             return self._search_ddgs(query=query, max_results=max_results)
+        if self.provider in {"wyzlab", "wyzlab_alpha"}:
+            return self._search_wyzlab_alpha(query=query, max_results=max_results)
         return self._search_tavily(query=query, max_results=max_results)
 
     def image_search(self, query: str, max_results: int = 3) -> list[ImageAttachment]:
@@ -227,6 +270,80 @@ class WebSearchClient:
                 )
             )
         return results
+
+    def _search_wyzlab_alpha(self, *, query: str, max_results: int) -> list[WebSearchResult]:
+        return self.search_report(query, max_results=max_results).results
+
+    def _alpha_report(self, commands: dict[str, Any], *, instruction: str, max_results: int) -> WebSearchReport:
+        """The bridge's plaintext output is independent of encrypted_output."""
+        base = self.base_url.rstrip("/")
+        if not base.endswith("/alpha/search"):
+            base = f"{base}/alpha/search" if base.endswith("/v1") else f"{base}/v1/alpha/search"
+        payload = {
+            "id": f"xiaomachi-search-{uuid.uuid4().hex}",
+            "model": self.model or "gpt-6.1-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": instruction}],
+            }],
+            "commands": {**commands, "response_length": "long"},
+            "settings": {"allowed_callers": ["direct"], "external_web_access": True},
+            "reasoning": {"effort": self.reasoning_effort},
+            "max_output_tokens": 10000,
+        }
+        # Stream with a byte cap before JSON parsing. No retries; the turn
+        # runner retains its slot if a cancelled HTTP worker is still alive.
+        with self.http_client.stream(
+            "POST", base,
+            headers={
+                "Accept": "application/json",
+                "Originator": "Codex Desktop",
+                "User-Agent": "axonhub/1.0",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            json=payload,
+            timeout=self.timeout_seconds,
+        ) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body.extend(chunk)
+                if len(body) > 2 * 1024 * 1024:
+                    raise WebSearchProviderError("web_response_too_large")
+        import json
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeError) as exc:
+            raise WebSearchProviderError("web_response_invalid_json") from exc
+        if not isinstance(data, dict) or data.get("error") or not isinstance(data.get("output", ""), str):
+            raise WebSearchProviderError("web_response_invalid")
+        content = data.get("output", "").strip()
+        if content.startswith("Internal Error"):
+            raise WebSearchProviderError("web_page_unavailable")
+        if "search_query" not in commands and not content:
+            raise WebSearchProviderError("web_page_empty")
+        raw_results = data.get("results") or []
+        if not isinstance(raw_results, list):
+            raise WebSearchProviderError("web_results_invalid")
+        results: list[WebSearchResult] = []
+        for item in raw_results:
+            if not isinstance(item, dict) or item.get("type") not in {None, "text_result"}:
+                continue
+            results.append(
+                WebSearchResult(
+                    title=str(item.get("title", "")).strip(),
+                    snippet=str(item.get("snippet", "")).strip(),
+                    source=str(item.get("url", "")).strip(),
+                    date=str(item.get("date", "")).strip(),
+                    ref_id=str(item.get("ref_id", "")).strip(),
+                )
+            )
+            if len(results) == max_results:
+                break
+        # Transport is capped above; tools apply tighter context budgets.
+        return WebSearchReport(results, content)
 
     def _search_ddgs(self, *, query: str, max_results: int) -> list[WebSearchResult]:
         factory = self.ddgs_factory

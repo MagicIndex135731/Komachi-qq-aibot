@@ -29,6 +29,11 @@ from app.providers.image_adapter import (
 logger = logging.getLogger(__name__)
 
 
+def default_auxiliary_reasoning_effort(model: str) -> str:
+    """Sol 6.1 auxiliary jobs use low; retain other models' existing defaults."""
+    return "low" if model.strip().lower() == "gpt-6.1-sol" else "medium"
+
+
 INSTRUCTION_PREFIXES = (
     "System persona:",
     "Safety rules:",
@@ -38,6 +43,24 @@ INSTRUCTION_PREFIXES = (
 PROXY_CHAT_IMAGE_STRING_HOSTS = {"api.codexzh.com"}
 TRANSIENT_RESPONSES_403_HOSTS = {"api.xbai.top"}
 USE_CLIENT_DEFAULT_TIMEOUT = object()
+WEB_SEARCH_FAILURE_INSTRUCTION = (
+    "Web search failed for this turn. Do not claim to have searched or verified current information. "
+    "If the request requires current facts, briefly explain that live lookup is unavailable; "
+    "answer only what can be established without it."
+)
+
+
+class ResponsesProviderError(ValueError):
+    """A terminal provider failure, without retaining private upstream details."""
+
+    def __init__(self, *, event: str, code: str) -> None:
+        self.event = event
+        self.code = code
+        super().__init__(f"Responses provider failure: event={event} code={code}")
+
+    @property
+    def retryable(self) -> bool:
+        return self.code in {"server_error", "internal_server_error", "rate_limit_exceeded", "rate_limited", "overloaded_error"}
 
 
 @dataclass(slots=True)
@@ -64,6 +87,7 @@ class ResponsesStreamResult:
     usage: LlmUsage | None
     function_calls: tuple[LlmFunctionCall, ...] = ()
     reasoning_items: tuple[dict[str, Any], ...] = ()
+    web_search_degraded: bool = False
 
 
 @dataclass(slots=True)
@@ -71,6 +95,10 @@ class ResponsesImageResult:
     result: ImageGenerationResult
     response_id: str | None
     usage: LlmUsage | None
+
+
+class LlmRequestAuthorityError(RuntimeError):
+    """A caller's authority check rejected an HTTP request; never retry it."""
 
 
 class LlmClient:
@@ -91,20 +119,27 @@ class LlmClient:
         responses_model: str | None = None,
         responses_only: bool = False,
         image_responses_model: str | None = None,
+        image_generation_model: str | None = None,
         compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
         image_edits_endpoint: str = "/images/edits",
         builtin_web_search: bool = False,
         web_search_context_size: str = "high",
         web_search_model: str | None = None,
-        reasoning_effort: str = "low",
+        reasoning_effort: str = "medium",
         max_output_tokens: int = 8192,
         temperature: float | None = None,
         timeout_seconds: float = 30.0,
         http_client: httpx.Client | None = None,
         usage_recorder=None,
         tool_event_recorder: Callable[[dict[str, Any]], None] | None = None,
+        request_guard: Callable[[], None] | None = None,
+        request_max_attempts: int | None = None,
     ) -> None:
+        if request_max_attempts is not None and (
+            type(request_max_attempts) is not int or not 1 <= request_max_attempts <= 10
+        ):
+            raise ValueError("request_max_attempts must be an integer between 1 and 10")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -113,6 +148,7 @@ class LlmClient:
         self.responses_model = (responses_model or "").strip()
         self.responses_only = bool(responses_only)
         self.image_responses_model = (image_responses_model or "").strip()
+        self.image_generation_model = (image_generation_model or "").strip()
         self.compat_model = (compat_model or model).strip() or model
         self.image_generations_endpoint = self._normalize_endpoint(
             image_generations_endpoint,
@@ -147,8 +183,17 @@ class LlmClient:
         )
         self.usage_recorder = usage_recorder
         self.tool_event_recorder = tool_event_recorder
+        self.request_guard = request_guard
+        self.request_max_attempts = request_max_attempts or type(self).REQUEST_MAX_ATTEMPTS
         self._conversation_response_ids: dict[str, str] = {}
         self._base_host = (urlparse(self.base_url).hostname or "").lower()
+
+    def _require_request_authority(self) -> None:
+        if self.request_guard is not None:
+            try:
+                self.request_guard()
+            except Exception as exc:
+                raise LlmRequestAuthorityError("LLM request authority revoked") from exc
 
     def _normalize_endpoint(self, endpoint: str, *, default: str) -> str:
         normalized = (endpoint or "").strip()
@@ -330,6 +375,8 @@ class LlmClient:
                 if content.get("type") == "input_image":
                     content["detail"] = "high"
         image_tool: dict[str, Any] = {"type": "image_generation"}
+        if self.image_generation_model:
+            image_tool["model"] = self.image_generation_model
         normalized_size = str(size or "").strip()
         if normalized_size and normalized_size != "auto":
             image_tool["size"] = normalized_size
@@ -452,6 +499,7 @@ class LlmClient:
 
     def _download_input_image(self, *, image_url: str, file_id: str | None) -> httpx.Response | None:
         for attempt in range(1, self.IMAGE_DOWNLOAD_MAX_ATTEMPTS + 1):
+            self._require_request_authority()
             try:
                 response = self.http_client.get(image_url)
                 response.raise_for_status()
@@ -672,24 +720,68 @@ class LlmClient:
         return multipart_images
 
     def _extract_responses_text(self, payload: dict[str, Any]) -> str | None:
-        output_text = payload.get("output_text")
-        if isinstance(output_text, str):
-            return output_text
+        items = [item for item in (payload.get("output") or []) if isinstance(item, dict)]
+        final_items = [item for item in items if item.get("phase") == "final_answer"]
+        if final_items:
+            return "".join(self._responses_item_text(item) or "" for item in final_items) or None
+        # Some relays expose progress commentary as a separate message. It is
+        # never a completed user-facing answer, including in JSON responses.
+        if not any(item.get("phase") == "commentary" for item in items):
+            output_text = payload.get("output_text")
+            if isinstance(output_text, str) and output_text:
+                return output_text
+        return "".join(
+            self._responses_item_text(item) or ""
+            for item in items if item.get("phase") != "commentary"
+        ) or None
 
-        for output_item in payload.get("output", []):
-            if not isinstance(output_item, dict):
-                continue
-            if output_item.get("type") == "reasoning":
-                continue
-            for content_item in output_item.get("content", []):
-                if not isinstance(content_item, dict):
-                    continue
-                if content_item.get("type") in {"reasoning_text", "summary_text"}:
-                    continue
-                text = content_item.get("text")
-                if isinstance(text, str):
-                    return text
-        return None
+    @staticmethod
+    def _responses_item_text(item: dict[str, Any]) -> str | None:
+        if item.get("type") == "reasoning":
+            return None
+        return "".join(
+            part["text"] for part in (item.get("content") or [])
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            and part.get("type") not in {"reasoning_text", "summary_text"}
+        ) or None
+
+    @staticmethod
+    def _responses_terminal_error(payload: dict[str, Any]) -> ResponsesProviderError | None:
+        event = payload.get("type")
+        response = payload.get("response")
+        response = response if isinstance(response, dict) else payload
+        if event not in {"error", "response.failed", "response.incomplete"}:
+            if response.get("status") in {"failed", "incomplete"}:
+                event = f"response.{response['status']}"
+            elif not event and isinstance(payload.get("error"), dict):
+                event = "error"
+            else:
+                return None
+        error = response.get("error") or payload.get("error")
+        details = response.get("incomplete_details")
+        code = error.get("code") if isinstance(error, dict) else payload.get("code")
+        if not code and isinstance(details, dict):
+            code = details.get("reason")
+        # Log only a bounded identifier; provider messages may contain prompts
+        # or account details and must not enter the reply or container logs.
+        code = code if isinstance(code, str) and len(code) <= 64 and code.replace("_", "").isalnum() else "unknown"
+        return ResponsesProviderError(event=event, code=code)
+
+    @staticmethod
+    def _degrade_responses_web_search_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        degraded = dict(payload)
+        tools = [tool for tool in (payload.get("tools") or []) if tool.get("type") != "web_search"]
+        if tools:
+            degraded["tools"] = tools
+        else:
+            degraded.pop("tools", None)
+        choice = degraded.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "web_search":
+            degraded.pop("tool_choice", None)
+        instructions = str(degraded.get("instructions") or "")
+        if WEB_SEARCH_FAILURE_INSTRUCTION not in instructions:
+            degraded["instructions"] = f"{instructions}\n\n{WEB_SEARCH_FAILURE_INSTRUCTION}".strip()
+        return degraded
 
     def _extract_chat_completions_text(self, payload: dict[str, Any]) -> str | None:
         for choice in payload.get("choices", []):
@@ -935,8 +1027,11 @@ class LlmClient:
         *,
         model: str,
     ) -> ResponsesStreamResult:
-        pieces: list[str] = []
-        fallback_done_text: str | None = None
+        pieces: dict[Any, list[str]] = {}
+        done_texts: dict[Any, str] = {}
+        phases: dict[Any, str] = {}
+        item_keys: dict[str, Any] = {}
+        completed_text: str | None = None
         response_id: str | None = None
         usage_payload: dict[str, Any] | None = None
         function_calls: list[LlmFunctionCall] = []
@@ -989,17 +1084,32 @@ class LlmClient:
 
             payload_type = payload.get("type")
             self._log_responses_tool_event(payload, response_id=response_id)
+            error = self._responses_terminal_error(payload)
+            if error is not None:
+                raise error
+            item = payload.get("item")
+            if isinstance(item, dict):
+                key = payload.get("output_index", item.get("id", 0))
+                if isinstance(item.get("id"), str):
+                    item_keys[item["id"]] = key
+                if isinstance(item.get("phase"), str):
+                    phases[key] = item["phase"]
+                item_text = self._responses_item_text(item)
+                if item_text:
+                    done_texts[key] = item_text
+            key = payload.get("output_index", item_keys.get(payload.get("item_id"), 0))
             if payload_type == "response.output_text.delta":
                 delta = payload.get("delta")
                 if isinstance(delta, str) and delta:
-                    pieces.append(delta)
+                    pieces.setdefault(key, []).append(delta)
                     continue
-            if payload_type == "response.output_text.done" and fallback_done_text is None:
+            if payload_type == "response.output_text.done":
                 done_text = payload.get("text")
                 if isinstance(done_text, str) and done_text:
-                    fallback_done_text = done_text
+                    done_texts[key] = done_text
                     continue
             if payload_type == "response.completed" and isinstance(response, dict):
+                completed_text = self._extract_responses_text(response)
                 usage = response.get("usage")
                 if isinstance(usage, dict):
                     usage_payload = usage
@@ -1028,7 +1138,12 @@ class LlmClient:
                     }
                 )
 
-        extracted_text = "".join(pieces) if pieces else fallback_done_text
+        keys = list(dict.fromkeys([*pieces, *done_texts]))
+        final_keys = [key for key in keys if phases.get(key) == "final_answer"]
+        answer_keys = final_keys or [key for key in keys if phases.get(key) != "commentary"]
+        extracted_text = completed_text or "".join(
+            done_texts.get(key) or "".join(pieces.get(key, [])) for key in answer_keys
+        ) or None
         usage = self._extract_responses_usage({"usage": usage_payload}, model=model) if usage_payload else None
         return ResponsesStreamResult(
             text=extracted_text,
@@ -1299,9 +1414,10 @@ class LlmClient:
         max_attempts: int | None = None,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
-        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+        attempt_limit = max(1, int(max_attempts or self.request_max_attempts))
 
         for attempt in range(1, attempt_limit + 1):
+            self._require_request_authority()
             try:
                 response = self.http_client.post(
                     f"{self.base_url}/chat/completions",
@@ -1356,7 +1472,8 @@ class LlmClient:
     def _request_anthropic_messages_json(self, *, messages_payload: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
 
-        for attempt in range(1, self.REQUEST_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.request_max_attempts + 1):
+            self._require_request_authority()
             try:
                 response = self.http_client.post(
                     f"{self.base_url}/messages",
@@ -1372,12 +1489,12 @@ class LlmClient:
             except httpx.TimeoutException as exc:
                 last_error = exc
                 logger.warning("anthropic_messages_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
             except httpx.TransportError as exc:
                 last_error = exc
                 logger.warning("anthropic_messages_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
@@ -1385,12 +1502,12 @@ class LlmClient:
                     raise
                 last_error = exc
                 logger.warning("anthropic_messages_status_retry attempt=%s status=%s", attempt, status_code)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
             except ValueError as exc:
                 last_error = exc
                 logger.warning("anthropic_messages_invalid_json attempt=%s", attempt)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
 
         if last_error is None:
             raise ValueError("anthropic messages request failed without a captured exception")
@@ -1403,24 +1520,23 @@ class LlmClient:
         model: str,
     ) -> ResponsesStreamResult:
         last_error: Exception | None = None
+        request_payload = responses_payload
+        web_search_degraded = False
 
-        for attempt in range(1, self.REQUEST_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.request_max_attempts + 1):
             try:
-                response = self.http_client.post(
-                    f"{self.base_url}/responses",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json=responses_payload,
+                response, response_text = self._read_responses_text_response(
+                    payload=request_payload,
                 )
-                response.raise_for_status()
             except httpx.TimeoutException as exc:
                 last_error = exc
                 logger.warning("responses_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
             except httpx.TransportError as exc:
                 last_error = exc
                 logger.warning("responses_transport_retry attempt=%s reason=%s", attempt, type(exc).__name__)
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
@@ -1428,40 +1544,54 @@ class LlmClient:
                     self._log_responses_rejection(exc=exc, model=model)
                     raise
                 last_error = exc
-                instructions_chars, input_chars = self._responses_payload_text_sizes(responses_payload)
+                instructions_chars, input_chars = self._responses_payload_text_sizes(request_payload)
                 logger.warning(
                     "responses_status_retry attempt=%s max_attempts=%s status=%s "
                     "instructions_chars=%s input_chars=%s model=%s endpoint=/responses",
                     attempt,
-                    self.REQUEST_MAX_ATTEMPTS,
+                    self.request_max_attempts,
                     status_code,
                     instructions_chars,
                     input_chars,
                     model,
                 )
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
 
             content_type = response.headers.get("content-type", "")
-            if "text/event-stream" in content_type:
-                sse_result = self._extract_responses_result_from_sse(
-                    response.text,
-                    model=model,
-                )
-                if sse_result.text is not None or sse_result.function_calls:
-                    return sse_result
-                last_error = ValueError("model response did not include output text")
-                logger.warning(
-                    "responses_missing_output attempt=%s sse=True",
-                    attempt,
-                )
-                # The failed attempt already consumed the upstream time;
-                # retry immediately instead of sleeping again. The 3-attempt
-                # budget is unchanged.
-                continue
-
             try:
-                response_data = response.json()
+                if "text/event-stream" in content_type:
+                    result = self._extract_responses_result_from_sse(response_text, model=model)
+                else:
+                    response_data = json.loads(response_text)
+                    if not isinstance(response_data, dict):
+                        raise ValueError("Responses JSON must be an object")
+                    error = self._responses_terminal_error(response_data)
+                    if error is not None:
+                        raise error
+                    # Use the same output parser for JSON-only relays so
+                    # function calls and reasoning continuations stay intact.
+                    result = self._extract_responses_result_from_sse(
+                        "data: " + json.dumps({"type": "response.completed", "response": response_data}),
+                        model=model,
+                    )
+            except ResponsesProviderError as exc:
+                last_error = exc
+                logger.warning(
+                    "responses_provider_error attempt=%s max_attempts=%s event=%s code=%s model=%s",
+                    attempt, self.request_max_attempts, exc.event, exc.code, model,
+                )
+                if not exc.retryable:
+                    raise
+                if not web_search_degraded and any(
+                    tool.get("type") == "web_search" for tool in (request_payload.get("tools") or [])
+                ) and attempt < self.request_max_attempts:
+                    request_payload = self._degrade_responses_web_search_payload(request_payload)
+                    web_search_degraded = True
+                    logger.warning("responses_web_search_degraded attempt=%s model=%s", attempt, model)
+                # A terminal event already consumed the provider's work. Use
+                # the existing retry budget, with no outer retry multiplication.
+                continue
             except ValueError as exc:
                 last_error = exc
                 logger.warning(
@@ -1469,41 +1599,57 @@ class LlmClient:
                     attempt,
                     response.status_code,
                     content_type,
-                    response.text[:200],
+                    response_text[:200],
                 )
-                self._sleep_before_retry(attempt=attempt, max_attempts=self.REQUEST_MAX_ATTEMPTS)
+                self._sleep_before_retry(attempt=attempt, max_attempts=self.request_max_attempts)
                 continue
 
-            text = self._extract_responses_text(response_data)
-            if text is None:
+            if result.text is None and not result.function_calls:
                 last_error = ValueError("model response did not include output text")
                 logger.warning(
-                    "responses_missing_output attempt=%s sse=False",
-                    attempt,
+                    "responses_missing_output attempt=%s sse=%s", attempt,
+                    "text/event-stream" in content_type,
                 )
                 # Retry immediately; see the SSE branch above.
                 continue
-            usage = self._extract_responses_usage(response_data, model=model)
-            response_id = response_data.get("id") if isinstance(response_data, dict) else None
-            reasoning_items: list[dict[str, Any]] = []
-            seen_reasoning_keys: set[str] = set()
-            if isinstance(response_data, dict):
-                for output_item in response_data.get("output") or ():
-                    self._append_reasoning_item(
-                        reasoning_items,
-                        seen_reasoning_keys,
-                        output_item,
-                    )
-            return ResponsesStreamResult(
-                text=text,
-                response_id=response_id,
-                usage=usage,
-                reasoning_items=tuple(reasoning_items),
-            )
+            result.web_search_degraded = web_search_degraded
+            return result
 
         if last_error is None:
             raise ValueError("responses request failed without a captured exception")
+        if isinstance(last_error, ResponsesProviderError):
+            raise last_error
         raise ValueError("responses request failed after retries") from last_error
+
+    def _read_responses_text_response(self, *, payload: dict[str, Any]) -> tuple[httpx.Response, str]:
+        request_kwargs = {"headers": {"Authorization": f"Bearer {self.api_key}"}, "json": payload}
+        self._require_request_authority()
+        if not hasattr(self.http_client, "stream"):
+            response = self.http_client.post(f"{self.base_url}/responses", **request_kwargs)
+            response.raise_for_status()
+            return response, response.text
+        with self.http_client.stream("POST", f"{self.base_url}/responses", **request_kwargs) as response:
+            if response.is_error:
+                response.read()
+            response.raise_for_status()
+            if "text/event-stream" not in response.headers.get("content-type", ""):
+                response.read()
+                return response, response.text
+            lines = []
+            for line in response.iter_lines():
+                lines.append(line)
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and (
+                    event.get("type") == "response.completed"
+                    or self._responses_terminal_error(event) is not None
+                ):
+                    break
+            return response, "\n".join(lines)
 
     def _request_responses_image_result(
         self,
@@ -1532,6 +1678,7 @@ class LlmClient:
                 # bytes when a proxy closes the final chunk early.  The real
                 # client therefore streams and can still parse a complete
                 # image event that arrived before the truncated terminator.
+                self._require_request_authority()
                 if hasattr(self.http_client, "stream"):
                     with self.http_client.stream(
                         "POST",
@@ -1624,7 +1771,7 @@ class LlmClient:
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
-        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+        attempt_limit = max(1, int(max_attempts or self.request_max_attempts))
 
         for attempt in range(1, attempt_limit + 1):
             try:
@@ -1634,6 +1781,7 @@ class LlmClient:
                 }
                 if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
                     request_kwargs["timeout"] = timeout_seconds
+                self._require_request_authority()
                 response = self.http_client.post(
                     f"{self.base_url}{self.image_generations_endpoint}",
                     **request_kwargs,
@@ -1684,7 +1832,7 @@ class LlmClient:
         timeout_seconds: float | None | object = USE_CLIENT_DEFAULT_TIMEOUT,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
-        attempt_limit = max(1, int(max_attempts or self.REQUEST_MAX_ATTEMPTS))
+        attempt_limit = max(1, int(max_attempts or self.request_max_attempts))
 
         for attempt in range(1, attempt_limit + 1):
             try:
@@ -1695,6 +1843,7 @@ class LlmClient:
                 }
                 if timeout_seconds is not USE_CLIENT_DEFAULT_TIMEOUT:
                     request_kwargs["timeout"] = timeout_seconds
+                self._require_request_authority()
                 response = self.http_client.post(
                     f"{self.base_url}{self.image_edits_endpoint}",
                     **request_kwargs,
@@ -1866,6 +2015,8 @@ class LlmClient:
                     chat_payload=chat_payload,
                     max_attempts=1 if fallback_model else None,
                 )
+            except LlmRequestAuthorityError:
+                raise
             except Exception as exc:
                 if not fallback_model:
                     raise
@@ -1929,31 +2080,35 @@ class LlmClient:
         output_tokens = (
             self.max_output_tokens if max_output_tokens is None else max(1, int(max_output_tokens))
         )
+        search_degraded = False
 
         def generate_without_tools() -> str:
             return self.generate_text(
                 prompt_lines,
                 conversation_key=conversation_key,
-                force_web_search=force_web_search,
-                allow_web_search=allow_web_search,
+                force_web_search=force_web_search and not search_degraded,
+                allow_web_search=False if search_degraded else allow_web_search,
                 temperature=temperature,
             )
 
         def request_with_tools(*, model: str) -> ResponsesStreamResult:
+            payload = self._build_responses_payload(
+                model=model,
+                instructions=instructions,
+                input_lines=input_lines,
+                images=None,
+                previous_response_id=None,
+                force_web_search=force_web_search and not search_degraded,
+                allow_web_search=False if search_degraded else allow_web_search,
+                max_output_tokens=output_tokens,
+                tools=tools,
+                extra_input_items=extra_input_items,
+                temperature=temperature,
+            )
+            if search_degraded:
+                payload = self._degrade_responses_web_search_payload(payload)
             return self._request_responses_stream_result(
-                responses_payload=self._build_responses_payload(
-                    model=model,
-                    instructions=instructions,
-                    input_lines=input_lines,
-                    images=None,
-                    previous_response_id=None,
-                    force_web_search=force_web_search,
-                    allow_web_search=allow_web_search,
-                    max_output_tokens=output_tokens,
-                    tools=tools,
-                    extra_input_items=extra_input_items,
-                    temperature=temperature,
-                ),
+                responses_payload=payload,
                 model=model,
             )
 
@@ -1983,6 +2138,10 @@ class LlmClient:
         for round_index in range(effective_rounds + 1):
             try:
                 responses_result = request_with_tools(model=request_model)
+            except ResponsesProviderError:
+                # This request has already exhausted its bounded recovery (or
+                # is non-retryable). Do not multiply it via model/plain fallback.
+                raise
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
                 logger.warning(
@@ -2004,6 +2163,8 @@ class LlmClient:
                     )
                     try:
                         responses_result = request_with_tools(model=fallback_model)
+                    except ResponsesProviderError:
+                        raise
                     except httpx.HTTPStatusError as status_exc:
                         status_code = (
                             status_exc.response.status_code
@@ -2020,6 +2181,7 @@ class LlmClient:
                         if self.responses_only:
                             raise
                     else:
+                        search_degraded = search_degraded or responses_result.web_search_degraded
                         self._remember_response_id(
                             conversation_key=conversation_key,
                             response_id=responses_result.response_id,
@@ -2037,6 +2199,7 @@ class LlmClient:
                 )
                 return generate_without_tools()
             else:
+                search_degraded = search_degraded or responses_result.web_search_degraded
                 self._remember_response_id(
                     conversation_key=conversation_key,
                     response_id=responses_result.response_id,
@@ -2175,6 +2338,8 @@ class LlmClient:
                     responses_payload=responses_payload,
                     model=responses_model,
                 )
+            except ResponsesProviderError:
+                raise
             except ValueError as exc:
                 fallback_model = "" if images and self.vision_model else self._distinct_responses_fallback_model(
                     primary_model=responses_model
@@ -2201,6 +2366,8 @@ class LlmClient:
                             responses_payload=fallback_payload,
                             model=fallback_model,
                         )
+                    except ResponsesProviderError:
+                        raise
                     except ValueError:
                         if self.responses_only:
                             raise

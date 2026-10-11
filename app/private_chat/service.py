@@ -1,11 +1,10 @@
 """Private chat service: daily persona chat and private drawings only.
 
 The owner used to be able to drive Codex project work over QQ through
-``app.dev_control``.  That channel was removed on 2026-09-11 (see
-``.trellis/tasks/08-11-memory-test-platform/research/39-private-chat-only-scope.md``),
+``app.dev_control``.  That channel was removed on 2026-09-11,
 so this service keeps only the chat surface:
 
-* daily persona chat for the owner and the ``PRIVATE_CHAT_QQS`` allow list,
+* daily persona chat for the owner, the fixed allow list and optionally all QQ friends,
 * private image generation plus its follow-up/quote windows,
 * outbound reply de-duplication and the rolling session summary.
 
@@ -14,6 +13,8 @@ through the existing repositories; no schema migration was made.
 """
 
 from __future__ import annotations
+
+from app.private_chat.access import PrivateChatAccess
 
 import asyncio
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ from app.core.quoted_message import (
     quoted_message_line_for_prompt,
     quoted_pronoun_referent_note,
 )
-from app.core.router import (
+from app.core.image_request_policy import (
     AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
     AUTO_WEB_REFERENCE_QUERY_PATTERN,
     GROUP_IMAGE_NEGATIVE_PATTERNS,
@@ -169,6 +170,7 @@ class PrivateChatService:
         owner_qq: int,
         bot_qq: int | None = None,
         private_chat_qqs: set[int] | None = None,
+        access_policy: PrivateChatAccess | None = None,
         data_dir: Path,
         private_image_followup_window_seconds: float = 1.2,
         web_search_client=None,
@@ -196,6 +198,7 @@ class PrivateChatService:
         self.owner_qq = owner_qq
         self.bot_qq = bot_qq
         self.private_chat_qqs = {qq for qq in (private_chat_qqs or set()) if qq != owner_qq}
+        self.access_policy = access_policy or PrivateChatAccess(owner_qq=owner_qq, allowlist=self.private_chat_qqs)
         self.data_dir = data_dir.resolve()
         self.private_image_followup_window_seconds = max(
             0.0,
@@ -244,16 +247,24 @@ class PrivateChatService:
         ] = {}
         self._private_image_turn_overrides: dict[int, list] = {}
         self._private_draw_context_reset_users: set[int] = set()
+        self.agent_handler = None
 
     async def start(self) -> None:
         await self.private_image_service.start()
+        if self.agent_handler is not None:
+            await self.agent_handler.start()
 
     async def stop(self) -> None:
+        if self.agent_handler is not None:
+            await self.agent_handler.stop()
         self._cancel_pending_private_image_turns_for_user(None, preserve_for_next_turn=False)
         await self.private_image_service.stop()
 
     async def handle_private_message(self, event: PrivateMessageEvent) -> bool:
         """Answer one direct message; return ``False`` when the sender is unknown."""
+
+        if not await self.access_policy.authorize(event.user_id):
+            return False
 
         if getattr(event, "reply_to_msg_id", None) is not None or bool(
             list(getattr(event, "images", []) or [])
@@ -274,8 +285,6 @@ class PrivateChatService:
         )
 
         is_owner = event.user_id == self.owner_qq
-        if not is_owner and event.user_id not in self.private_chat_qqs:
-            return False
         private_scope = (
             PRIVATE_SCOPE_OWNER_DAILY if is_owner else PRIVATE_SCOPE_ALLOWLIST_DAILY
         )
@@ -297,12 +306,18 @@ class PrivateChatService:
                 user_id=event.user_id,
             )
             if command_reply is not None:
+                if self.agent_handler is not None and self._normalize_private_command_text(event.plain_text) in SESSION_NEW_COMMANDS:
+                    await self.agent_handler.reset_user(event.user_id)
                 await self._send_private_text(
                     user_id=event.user_id,
                     text=command_reply,
                     context=f"private_session_command:{event.platform_msg_id}",
                 )
                 return True
+
+        if self.agent_handler is not None:
+            await self.agent_handler.handle(event, private_scope=private_scope)
+            return True
 
         if await self._schedule_private_image_followup_if_needed(
             event,
@@ -332,12 +347,18 @@ class PrivateChatService:
         user_id: int,
         text: str,
         context: str,
+        receipt_callback=None,
+        before_dispatch=None,
     ) -> tuple[bool, str | None]:
         if not self._reserve_private_outbound_reply(user_id=user_id, reply_text=text, context=context):
             logger.info("private_reply_dedup_skip context=%s user_id=%s", context, user_id)
             return True, None
         try:
-            await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
+            if before_dispatch is not None:
+                before_dispatch()
+            receipts = await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
+            if receipt_callback is not None:
+                receipt_callback(receipts)
             self._mark_private_outbound_reply_sent(user_id=user_id, reply_text=text, context=context)
             return True, None
         except QQMessageDeliveryUncertainError as exc:
@@ -365,7 +386,9 @@ class PrivateChatService:
         user_id: int,
         text: str,
         context: str,
-    ) -> None:
+        receipt_callback=None,
+        before_dispatch=None,
+    ) -> tuple[bool, str | None]:
         """Send one chat reply, split into a short burst when configured.
 
         The private surface uses the same delivery shape as the group chat: one
@@ -379,13 +402,18 @@ class PrivateChatService:
         # Same window as the group delivery path, from the shared helper.
         delay_min, delay_max = burst_delays(burst, segment_count=len(segments))
         for index, segment in enumerate(segments):
-            await self._deliver_private_text(
+            delivered, failure = await self._deliver_private_text(
                 user_id=user_id,
                 text=segment,
                 context=context if index == 0 else f"{context}-b{index}",
+                receipt_callback=receipt_callback,
+                before_dispatch=before_dispatch,
             )
+            if not delivered and receipt_callback is not None:
+                return False, failure
             if index < len(segments) - 1 and delay_max > 0:
                 await asyncio.sleep(random.uniform(delay_min, delay_max))
+        return True, None
 
     async def _fetch_private_quoted_message_payload(self, *, reply_to_msg_id: str | None) -> dict | None:
         if not reply_to_msg_id:
@@ -745,20 +773,18 @@ class PrivateChatService:
                     image_count=len(target_images or []),
                     quoted_raw_payload=quoted_raw_payload,
                 )
-                reply_text = self._normalize_private_reply(
-                    self.llm_client.generate_text(
-                        prompt_lines,
-                        images=target_images,
-                        conversation_key=conversation_key,
-                        **self._private_generation_search_kwargs(web_context),
-                    )
+                reply_text = self.llm_client.generate_text(
+                    prompt_lines,
+                    images=target_images,
+                    conversation_key=conversation_key,
+                    **self._private_generation_search_kwargs(web_context),
                 )
                 if not reply_text:
                     raise ValueError("empty private chat reply")
-                reply_text = filter_reply_urls(
+                reply_text = self._normalize_private_reply(filter_reply_urls(
                     reply_text,
                     allow_urls=explicitly_requests_urls(request_text),
-                )
+                ))
 
             if private_image_request is None:
                 with session_scope(self.engine) as session:
@@ -1151,7 +1177,7 @@ class PrivateChatService:
                 grounding_notes=grounding_notes,
             )
 
-        search_result_limit = 5 if reference_search_request or external_lookup_search_request else 3
+        search_result_limit = 8 if reference_search_request or external_lookup_search_request else 6
         try:
             search_hits = self.web_search_client.search(parsed_search.query, max_results=search_result_limit)
         except Exception:

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.message_content import ImageAttachment, extract_images_from_message, extract_reply_to_msg_id
+from app.core.forward_content import extract_forward_ids
 
 
 @dataclass(slots=True)
@@ -43,6 +44,8 @@ def _flatten_message(message: list[dict[str, Any]] | str) -> str:
     for item in message:
         if item.get("type") == "text":
             parts.append(item.get("data", {}).get("text", ""))
+        elif extract_forward_ids([item]):
+            parts.append("[合并转发消息]")
     return "".join(parts).strip()
 
 

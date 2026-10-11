@@ -2,6 +2,8 @@ import asyncio
 
 import pytest
 
+from app.adapters.outbound_guard import GroupDispatchRevokedError, GroupDispatchScope, group_dispatch_scope
+
 from app.adapters.sender import (
     OutboundMessage,
     OutboundPrivateMessage,
@@ -93,11 +95,13 @@ def test_extract_avatar_file_accepts_common_shapes() -> None:
         _extract_avatar_file({"data": {}})
 
 
-def test_sender_uses_send_group_msg_for_image_segment() -> None:
+def test_sender_uses_send_group_msg_for_image_segment(tmp_path) -> None:
     gateway = FakeGateway()
     sender = Sender(gateway)
+    image_file = tmp_path / "生成图 image.png"
+    image_file.write_bytes(b"isolated image fixture")
 
-    asyncio.run(sender.send_group_image(group_id=10001, image_file="D:/tmp/generated.png"))
+    asyncio.run(sender.send_group_image(group_id=10001, image_file=str(image_file)))
 
     assert gateway.calls == [
         (
@@ -107,7 +111,7 @@ def test_sender_uses_send_group_msg_for_image_segment() -> None:
                 "message": [
                     {
                         "type": "image",
-                        "data": {"file": "file:///D:/tmp/generated.png"},
+                        "data": {"file": "base64://aXNvbGF0ZWQgaW1hZ2UgZml4dHVyZQ=="},
                     }
                 ],
             },
@@ -115,11 +119,13 @@ def test_sender_uses_send_group_msg_for_image_segment() -> None:
     ]
 
 
-def test_sender_uses_send_private_msg_for_image_segment() -> None:
+def test_sender_uses_send_private_msg_for_image_segment(tmp_path) -> None:
     gateway = FakeGateway()
     sender = Sender(gateway)
+    image_file = tmp_path / "生成图 image.png"
+    image_file.write_bytes(b"isolated image fixture")
 
-    asyncio.run(sender.send_private_image(user_id=10001, image_file="D:/tmp/generated.png"))
+    asyncio.run(sender.send_private_image(user_id=10001, image_file=str(image_file)))
 
     assert gateway.calls == [
         (
@@ -129,7 +135,7 @@ def test_sender_uses_send_private_msg_for_image_segment() -> None:
                 "message": [
                     {
                         "type": "image",
-                        "data": {"file": "file:///D:/tmp/generated.png"},
+                        "data": {"file": "base64://aXNvbGF0ZWQgaW1hZ2UgZml4dHVyZQ=="},
                     }
                 ],
             },
@@ -147,15 +153,35 @@ class FailingGateway:
         }
 
 
-def test_sender_raises_when_gateway_reports_failed_status() -> None:
+def test_sender_raises_when_gateway_reports_failed_status(tmp_path) -> None:
     sender = Sender(FailingGateway())
+    image_file = tmp_path / "synthetic.png"
+    image_file.write_bytes(b"isolated image fixture")
 
     with pytest.raises(RuntimeError) as exc_info:
-        asyncio.run(sender.send_group_image(group_id=10001, image_file="D:/tmp/generated.png"))
+        asyncio.run(sender.send_group_image(group_id=10001, image_file=str(image_file)))
 
     assert not isinstance(exc_info.value, QQMessageDeliveryUncertainError)
     assert "retcode=1200" in str(exc_info.value)
     assert "rich media transfer failed" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("surface", ["group", "private", "media"])
+@pytest.mark.parametrize("size", [0, Sender.MAX_IMAGE_BYTES + 1])
+def test_image_byte_budget_rejects_before_gateway_dispatch(tmp_path, surface, size) -> None:
+    image_file = tmp_path / "synthetic.png"
+    with image_file.open("wb") as stream:
+        stream.truncate(size)
+    gateway = FakeGateway()
+    sender = Sender(gateway)
+    with pytest.raises(ValueError, match="send budget"):
+        if surface == "group":
+            asyncio.run(sender.send_group_image(group_id=10001, image_file=str(image_file)))
+        elif surface == "private":
+            asyncio.run(sender.send_private_image(user_id=10001, image_file=str(image_file)))
+        else:
+            asyncio.run(sender.send_group_media(group_id=10001, text="test", image_files=(str(image_file),)))
+    assert gateway.calls == []
 
 
 class RetryableFailOnceGateway:
@@ -300,3 +326,46 @@ def test_sender_treats_wait_for_self_echo_timeout_as_uncertain_without_retry() -
     assert gateway.calls == [
         ("send_group_msg", {"group_id": 10001, "message": long_text.strip()}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_dispatch_checks_group_epoch_and_records_real_receipt() -> None:
+    gateway = ProfileGateway({"send_group_msg": {"status": "ok", "data": {"message_id": 123}}})
+    dispatched = []
+    scope = GroupDispatchScope(10001, lambda: True, lambda: dispatched.append(True))
+    with group_dispatch_scope(scope):
+        receipts = await Sender(gateway).send_group_text(OutboundMessage(10001, "hello"))
+        with pytest.raises(ValueError, match="escaped"):
+            await Sender(gateway).send_group_text(OutboundMessage(10002, "wrong group"))
+    assert receipts == ("123",)
+    assert scope.receipts == ["123"]
+    assert dispatched == [True]
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stopped_agent_never_dispatches_text_or_image() -> None:
+    gateway = FakeGateway()
+    scope = GroupDispatchScope(10001, lambda: False, lambda: pytest.fail("dispatch after stop"))
+    with group_dispatch_scope(scope):
+        with pytest.raises(GroupDispatchRevokedError):
+            await Sender(gateway).send_group_text(OutboundMessage(10001, "late answer"))
+        with pytest.raises(GroupDispatchRevokedError):
+            await Sender(gateway).send_group_image(group_id=10001, image_file="synthetic.png")
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_qq_dispatch_is_unknown_and_never_retried() -> None:
+    class CancelledGateway(FakeGateway):
+        async def call_api(self, action, params):
+            self.calls.append((action, params))
+            raise asyncio.CancelledError
+
+    gateway = CancelledGateway()
+    scope = GroupDispatchScope(10001, lambda: True, lambda: None)
+    with group_dispatch_scope(scope):
+        with pytest.raises(QQMessageDeliveryUncertainError):
+            await Sender(gateway).send_group_text(OutboundMessage(10001, "hello"))
+    assert scope.dispatched and scope.uncertain
+    assert len(gateway.calls) == 1

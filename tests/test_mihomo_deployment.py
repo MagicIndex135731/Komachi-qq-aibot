@@ -100,8 +100,11 @@ def test_mihomo_service_is_local_only_and_precedes_stack() -> None:
     assert "Remove-Item -LiteralPath $rendered" in sync
     assert "xiaomachi-mihomo.service" in release_installer
     assert 'mihomo -t -d "${shared_dir}/mihomo"' in release_installer
-    assert "Wants=network-online.target xiaomachi-mihomo.service" in stack
-    assert "After=network-online.target docker.service xiaomachi-mihomo.service" in stack
+    assert "Wants=network-online.target\n" in stack
+    assert "After=network-online.target docker.service\n" in stack
+    assert "runtime_egress.py" in release_installer
+    assert 'if [[ "${mihomo_required}" == true ]]' in release_installer
+    assert "systemctl disable --now xiaomachi-mihomo.service" in release_installer
     assert 'xiaomachi_proxy}' in start
     assert "systemctl is-active --quiet xiaomachi-mihomo.service" in start
     assert "Mihomo provider proxy probe:" in status

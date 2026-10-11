@@ -101,13 +101,13 @@ def test_short_quoted_anchor_adds_bounded_local_scene_fragments() -> None:
 
 def test_active_persona_name_is_not_topic_evidence() -> None:
     query = build_style_retrieval_query(
-        current_text="阿渣最近在看哪些动画",
-        subject_terms=["阿渣", "渣哥"],
+        current_text="小甲最近在看哪些动画",
+        subject_terms=["小甲", "渣哥"],
     )
 
-    assert "阿渣" not in query.semantic_text
+    assert "小甲" not in query.semantic_text
     assert "最近在看哪些动画" in query.semantic_text
-    assert not (query.lexical_units & {"阿渣", "渣最"})
+    assert not (query.lexical_units & {"小甲", "渣最"})
 
 
 def test_short_followup_takes_only_two_messages_inside_time_boundary() -> None:
@@ -281,11 +281,11 @@ def test_semantic_empty_short_or_weak_scene_stays_empty() -> None:
 
 
 def test_near_duplicate_of_current_question_is_excluded() -> None:
-    query = build_style_retrieval_query(current_text="阿渣最近在看哪些动画")
+    query = build_style_retrieval_query(current_text="小甲最近在看哪些动画")
     echoed_question = _document(
         "echo",
         situation="刚才在聊游戏",
-        reply="阿渣最近在看什么动画",
+        reply="小甲最近在看什么动画",
     )
     topical_response = _document(
         "response",

@@ -86,9 +86,9 @@ def test_format_example_pairs_uses_canonical_situation_without_context_after() -
     entries = [
         {
             "text": "来了",
-            "reply_target": "加菲猫: 上号",
-            "context_before": [{"speaker": "加菲猫", "text": "上号"}],
-            "context_after": [{"speaker": "逆蝶蝶", "text": "人呢"}],
+            "reply_target": "小丁丁: 上号",
+            "context_before": [{"speaker": "小丁丁", "text": "上号"}],
+            "context_after": [{"speaker": "小乙乙", "text": "人呢"}],
         }
     ]
     rendered = format_example_pairs(entries)
@@ -243,8 +243,8 @@ def test_split_burst_reply_strips_a_dangling_separator() -> None:
 
 def test_scrub_banned_address_terms_replaces_honorifics() -> None:
     assert scrub_banned_address_terms(
-        "主人，阿渣啊。大人您稍等", ("主人", "大人", "您")
-    ) == "你，阿渣啊。你稍等"
+        "主人，小甲啊。大人您稍等", ("主人", "大人", "您")
+    ) == "你，小甲啊。你稍等"
 
 
 def test_retrieve_relevant_examples_ranks_by_topic_overlap() -> None:

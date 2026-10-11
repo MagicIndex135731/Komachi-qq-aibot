@@ -787,7 +787,9 @@ def test_stop_terminates_the_keepalive_process_group_before_state_cleanup() -> N
 
 
 def test_memory_v3_runbook_includes_all_final_gate_and_activation_artifacts() -> None:
-    readme = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
+    runbook = (REPO_ROOT / "infra/wsl/README.md").read_text(encoding="utf-8")
+    assert "../../docs/MEMORY.md" in runbook
+    readme = (REPO_ROOT / "docs/MEMORY.md").read_text(encoding="utf-8")
 
     assert "python -m scripts.run_memory_v3_quality_replay" in readme
     assert "--quality-output /workspace/data/backups/memory-v3-quality.json" in readme

@@ -795,8 +795,9 @@ def test_create_all_is_safe_for_two_concurrent_fresh_database_entry_points(
     check.dispose()
 
 
+@pytest.mark.parametrize("fts_available", [True, False])
 def test_episode_membership_and_documents_reject_cross_group_links(
-    sqlite_engine,
+    sqlite_engine, fts_available,
 ) -> None:
     with session_scope(sqlite_engine) as session:
         first = _seed_group_message(
@@ -866,6 +867,8 @@ def test_episode_membership_and_documents_reject_cross_group_links(
             == []
         )
         documents = RetrievalDocumentRepository(session)
+        if not fts_available:
+            session.execute(text("DROP TABLE IF EXISTS retrieval_documents_fts"))
         with pytest.raises(IntegrityError):
             documents.upsert_document(
                 scope_type="group",
@@ -885,6 +888,36 @@ def test_episode_membership_and_documents_reject_cross_group_links(
             session.flush()
         session.rollback()
         session.rollback()
+
+
+@pytest.mark.parametrize("fts_available", [True, False])
+def test_document_and_provenance_persist_when_optional_fts_is_unavailable(
+    sqlite_engine, fts_available,
+) -> None:
+    with session_scope(sqlite_engine) as session:
+        message = _seed_group_message(
+            session, group_id=10001, user_id=20001, platform_msg_id="fts-write-source",
+        )
+        if not fts_available:
+            session.execute(text("DROP TABLE IF EXISTS retrieval_documents_fts"))
+        document = RetrievalDocumentRepository(session).upsert_document(
+            scope_type="group", scope_id="10001", group_id=10001, episode_id=None,
+            document_kind="message", source_table="messages", source_id=str(message.id),
+            start_at=message.timestamp, end_at=message.timestamp,
+            content="synthetic canonical provenance", metadata_json={},
+            content_hash="fts-write-content", source_message_ids=[message.id],
+        )
+        document_id, message_id = document.id, message.id
+
+    with session_scope(sqlite_engine) as session:
+        documents = RetrievalDocumentRepository(session)
+        assert documents.list_source_message_ids(
+            document_id=document_id, group_id=10001,
+        ) == [message_id]
+        hits = documents.search_group_documents_fts(
+            group_id=10001, query="canonical provenance", limit=10,
+        )
+        assert [row.id for row in hits] == [document_id]
 
 
 def test_one_message_has_one_episode_and_group_has_one_open_episode(

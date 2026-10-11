@@ -237,7 +237,7 @@ def _build_eval_clients(
 
     Auxiliary calls (judge, citation repair) default to low effort;
     final answers use the configured answer profile. The rewrite provider
-    already constructs its own low-effort client from settings.
+    already constructs its own medium-effort client from settings.
     """
 
     def make(model: str, effort: str) -> LlmClient:

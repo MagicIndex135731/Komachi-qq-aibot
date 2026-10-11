@@ -8,7 +8,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import yaml
 from zoneinfo import ZoneInfo
@@ -21,13 +21,37 @@ from app.core.message_mentions import (
 from app.core.memory_clarification_threads import resolve_clarification_threads
 from app.core.memory_context_packer import EvidenceMessage
 from app.core.worker_status import write_worker_status
-from app.providers.llm_client import LlmClient
+from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort, LlmUsage
 from app.storage.db import session_scope
 from app.storage.models import MemberFactRefreshState, MemoryItem
 from app.storage.repositories import MemoryRepository, MessageRepository
 
 
 logger = logging.getLogger(__name__)
+
+
+def _member_fact_usage_recorder(
+    recorder: Callable[[LlmUsage], None] | None,
+    *,
+    stage: str,
+) -> Callable[[LlmUsage], None] | None:
+    if recorder is None:
+        return None
+
+    def record(usage: LlmUsage) -> None:
+        recorder(usage)
+        logger.info(
+            "member_fact_llm_usage stage=%s model=%s endpoint=%s "
+            "input_tokens=%s cached_input_tokens=%s output_tokens=%s",
+            stage,
+            usage.model,
+            usage.endpoint,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+        )
+
+    return record
 
 
 _TEMPORAL_PROCESS_EVALUATION = re.compile(
@@ -114,6 +138,7 @@ def extract_facts_from_lines(
     context_lines: list[str] | None = None,
     source_records: Sequence[Mapping[str, object]] | None = None,
     context_records: Sequence[Mapping[str, object]] | None = None,
+    usage_recorder: Callable[[LlmUsage], None] | None = None,
 ) -> list[dict]:
     slices = build_slices(
         lines,
@@ -132,7 +157,8 @@ def extract_facts_from_lines(
         responses_model=settings.llm_model,
         max_output_tokens=8000,
         timeout_seconds=300.0,
-        reasoning_effort="low",
+        reasoning_effort=default_auxiliary_reasoning_effort(settings.llm_model),
+        usage_recorder=_member_fact_usage_recorder(usage_recorder, stage="extract"),
     )
     facts: list[dict] = []
     for index, lines_slice in enumerate(slices):
@@ -357,7 +383,12 @@ def _member_fact_canonical_key(
     return "member-fact|" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def review_facts(settings, facts: list[dict]) -> list[dict]:
+def review_facts(
+    settings,
+    facts: list[dict],
+    *,
+    usage_recorder: Callable[[LlmUsage], None] | None = None,
+) -> list[dict]:
     """Second-pass semantic review; drop joke/irony/misread facts."""
 
     if not facts:
@@ -386,7 +417,8 @@ def review_facts(settings, facts: list[dict]) -> list[dict]:
         responses_model=settings.llm_model,
         max_output_tokens=4000,
         timeout_seconds=300.0,
-        reasoning_effort="low",
+        reasoning_effort=default_auxiliary_reasoning_effort(settings.llm_model),
+        usage_recorder=_member_fact_usage_recorder(usage_recorder, stage="review"),
     )
     generated = client.generate_text([prompt])
     if not str(generated or "").strip():
@@ -512,6 +544,7 @@ class MemberFactRefreshService:
         threshold: int = 50,
         cooldown_seconds: float = 86400.0,
         min_member_messages: int = 300,
+        usage_recorder: Callable[[LlmUsage], None] | None = None,
     ) -> None:
         self.engine = engine
         self.settings = settings
@@ -529,6 +562,7 @@ class MemberFactRefreshService:
         self.threshold = max(10, int(threshold))
         self.cooldown_seconds = max(3600.0, float(cooldown_seconds))
         self.min_member_messages = max(50, int(min_member_messages))
+        self.usage_recorder = usage_recorder
 
     async def run(self) -> None:
         while True:
@@ -621,8 +655,9 @@ class MemberFactRefreshService:
             [str(row.plain_text) for row in eligible],
             source_records=self._fact_prompt_records(eligible, role="target"),
             context_records=self._fact_prompt_records(context_rows, role="context"),
+            usage_recorder=self.usage_recorder,
         )
-        facts = review_facts(self.settings, facts)
+        facts = review_facts(self.settings, facts, usage_recorder=self.usage_recorder)
         facts.extend(
             self._clarification_facts_for_targets(
                 group_id=group_id,
@@ -727,8 +762,9 @@ class MemberFactRefreshService:
             [str(row.plain_text) for row in new_lines],
             source_records=self._fact_prompt_records(new_lines, role="target"),
             context_records=self._fact_prompt_records(context_rows, role="context"),
+            usage_recorder=self.usage_recorder,
         )
-        facts = review_facts(self.settings, facts)
+        facts = review_facts(self.settings, facts, usage_recorder=self.usage_recorder)
         facts.extend(
             self._clarification_facts_for_targets(
                 group_id=group_id,

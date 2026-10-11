@@ -20,6 +20,30 @@ ReasoningEffort = Literal["", "minimal", "low", "medium", "high", "xhigh", "max"
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    group_agent_enabled: bool = Field(default=True, alias="GROUP_AGENT_ENABLED")
+    agent_runtime: Literal["harness", "legacy"] = Field(default="harness", alias="AGENT_RUNTIME")
+    agent_max_external_writes: int = Field(default=2, ge=1, le=8, alias="AGENT_MAX_EXTERNAL_WRITES")
+    group_agent_batch_quiet_seconds: float = Field(default=1.5, ge=0, le=30, alias="GROUP_AGENT_BATCH_QUIET_SECONDS")
+    group_agent_batch_max_seconds: float = Field(default=5.0, gt=0, le=60, alias="GROUP_AGENT_BATCH_MAX_SECONDS")
+    group_agent_batch_max_messages: int = Field(default=20, ge=1, le=100, alias="GROUP_AGENT_BATCH_MAX_MESSAGES")
+    group_agent_max_concurrent_turns: int = Field(default=2, ge=1, le=8, alias="GROUP_AGENT_MAX_CONCURRENT_TURNS")
+    group_agent_turn_timeout_seconds: float = Field(default=180, ge=1, le=900, alias="GROUP_AGENT_TURN_TIMEOUT_SECONDS")
+    agent_background_turn_timeout_seconds: float = Field(default=900, ge=1, le=900, alias="AGENT_BACKGROUND_TURN_TIMEOUT_SECONDS")
+    agent_model_request_timeout_seconds: float = Field(default=120, ge=1, le=300, alias="AGENT_MODEL_REQUEST_TIMEOUT_SECONDS")
+    agent_model_first_output_timeout_seconds: float = Field(default=90, ge=1, le=120, alias="AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS")
+    agent_model_progress_timeout_seconds: float = Field(default=45, ge=1, le=120, alias="AGENT_MODEL_PROGRESS_TIMEOUT_SECONDS")
+    group_agent_decision_timeout_seconds: float = Field(default=45, ge=1, le=180, alias="GROUP_AGENT_DECISION_TIMEOUT_SECONDS")
+    group_agent_decision_max_output_tokens: int = Field(default=768, ge=256, le=2048, alias="GROUP_AGENT_DECISION_MAX_OUTPUT_TOKENS")
+    group_agent_decision_reasoning_effort: ReasoningEffort = Field(default="low", alias="GROUP_AGENT_DECISION_REASONING_EFFORT")
+    group_agent_max_pending_per_group: int = Field(default=2000, ge=20, le=20000, alias="GROUP_AGENT_MAX_PENDING_PER_GROUP")
+    group_agent_max_message_age_seconds: float = Field(default=300, ge=10, le=3600, alias="GROUP_AGENT_MAX_MESSAGE_AGE_SECONDS")
+
+    social_agent_enabled: bool = Field(default=False, alias="SOCIAL_AGENT_ENABLED")
+    social_agent_poll_seconds: float = Field(default=15, ge=5, le=300, alias="SOCIAL_AGENT_POLL_SECONDS")
+    social_agent_decision_timeout_seconds: float = Field(default=60, ge=15, le=180, alias="SOCIAL_AGENT_DECISION_TIMEOUT_SECONDS")
+    social_agent_max_output_tokens: int = Field(default=1024, ge=256, le=2048, alias="SOCIAL_AGENT_MAX_OUTPUT_TOKENS")
+    autonomous_sandbox_token: str = Field(default="", alias="XIAOMACHI_SANDBOX_TOKEN")
+
     napcat_ws_url: str = Field(alias="NAPCAT_WS_URL")
     llm_base_url: str = Field(alias="LLM_BASE_URL")
     llm_api_key: str = Field(alias="LLM_API_KEY")
@@ -36,7 +60,7 @@ class AppSettings(BaseSettings):
     )
     llm_web_search_model: str = Field(default="", alias="LLM_WEB_SEARCH_MODEL")
     llm_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="LLM_REASONING_EFFORT",
     )
     llm_timeout_seconds: float = Field(
@@ -55,6 +79,9 @@ class AppSettings(BaseSettings):
         alias="GROUP_IMAGE_TRANSPORT",
     )
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
+    # Standard Responses separates the mainline model from image_generation.model.
+    # Empty preserves the existing relay-specific image-model-as-outer contract.
+    group_image_responses_model: str = Field(default="", alias="GROUP_IMAGE_RESPONSES_MODEL")
     group_image_generations_endpoint: str = Field(
         default="/images/generations",
         alias="GROUP_IMAGE_GENERATIONS_ENDPOINT",
@@ -68,10 +95,15 @@ class AppSettings(BaseSettings):
     bot_qq: int = Field(alias="BOT_QQ")
     owner_qq: int = Field(alias="OWNER_QQ")
     private_chat_qqs: str = Field(default="", alias="PRIVATE_CHAT_QQS")
+    private_chat_all_friends: bool = Field(default=False, alias="PRIVATE_CHAT_ALL_FRIENDS")
     search_provider: str = Field(default="tavily", alias="SEARCH_PROVIDER")
     search_base_url: str = Field(default="https://api.tavily.com/search", alias="SEARCH_BASE_URL")
     search_api_key: str = Field(default="", alias="SEARCH_API_KEY")
     search_timeout_seconds: float = Field(default=8.0, alias="SEARCH_TIMEOUT_SECONDS")
+    agent_web_search_timeout_seconds: float = Field(default=45.0, ge=5, le=90, alias="AGENT_WEB_SEARCH_TIMEOUT_SECONDS")
+    agent_web_search_results: int = Field(default=8, ge=1, le=20, alias="AGENT_WEB_SEARCH_RESULTS")
+    web_search_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = Field(
+        default="medium", alias="WEB_SEARCH_REASONING_EFFORT")
     search_region: str = Field(default="wt-wt", alias="SEARCH_REGION")
     search_backend: str = Field(default="auto", alias="SEARCH_BACKEND")
     context_recent_limit: int = Field(default=60, alias="CONTEXT_RECENT_LIMIT")
@@ -119,7 +151,7 @@ class AppSettings(BaseSettings):
     memory_compaction_retry_limit: int = Field(default=3, alias="MEMORY_COMPACTION_RETRY_LIMIT")
     memory_compaction_backfill_windows: int = Field(default=24, alias="MEMORY_COMPACTION_BACKFILL_WINDOWS")
     memory_compaction_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="MEMORY_COMPACTION_REASONING_EFFORT",
     )
     memory_compaction_max_output_tokens: int = Field(
@@ -178,7 +210,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_EPISODE_TOPIC_JUDGE_INTERVAL",
     )
     memory_episode_topic_judge_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="MEMORY_EPISODE_TOPIC_JUDGE_REASONING_EFFORT",
     )
     memory_episode_topic_judge_max_output_tokens: int = Field(
@@ -198,7 +230,7 @@ class AppSettings(BaseSettings):
         alias="MEMORY_EPISODE_POST_SEGMENT_MIN_MESSAGES",
     )
     memory_episode_post_segment_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="MEMORY_EPISODE_POST_SEGMENT_REASONING_EFFORT",
     )
     memory_episode_post_segment_max_output_tokens: int = Field(
@@ -289,7 +321,7 @@ class AppSettings(BaseSettings):
         alias="PROACTIVE_JUDGE_MODEL",
     )
     proactive_judge_reasoning_effort: ReasoningEffort = Field(
-        default="low",
+        default="medium",
         alias="PROACTIVE_JUDGE_REASONING_EFFORT",
     )
     proactive_judge_max_output_tokens: int = Field(
@@ -449,6 +481,7 @@ class RuntimeConfig:
     group_policy: dict[str, Any]
     safety: dict[str, Any]
     personas: dict[str, dict[str, Any]] = field(default_factory=dict)
+    social_policy: dict[str, Any] = field(default_factory=dict)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -507,12 +540,18 @@ def load_runtime_config(settings: AppSettings) -> RuntimeConfig:
         if isinstance(local_policy, dict):
             group_policy = _deep_merge_mapping(group_policy, local_policy)
     safety = _read_yaml(settings.config_dir / "safety.yaml")
+    social_path = settings.config_dir / "social.yaml"
+    social_policy = _read_yaml(social_path) if social_path.exists() else {}
+    social_local_path = settings.config_dir / "social.local.yaml"
+    if social_local_path.exists():
+        social_policy = _deep_merge_mapping(social_policy, _read_yaml(social_local_path))
     return RuntimeConfig(
         settings=settings,
         persona=persona,
         group_policy=group_policy,
         safety=safety,
         personas=personas,
+        social_policy=social_policy,
     )
 
 

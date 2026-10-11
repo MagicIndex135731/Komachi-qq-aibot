@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -41,6 +42,19 @@ def _personas() -> dict[str, dict]:
             "source_user_id": 123456789,
         },
     }
+
+
+def _add_fact_source(session, source_id, content, *, group_id=10001, user_id=222, state=""):
+    from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
+
+    GroupRepository(session).upsert_group(group_id=group_id, group_name="test", enabled=True, speak_enabled=True)
+    UserRepository(session).upsert_user(user_id=user_id, nickname="test", group_card="")
+    return MessageRepository(session).add_group_message(
+        platform_msg_id=source_id, group_id=group_id, user_id=user_id,
+        timestamp=datetime(2026, 9, 19, 12, tzinfo=UTC), plain_text=content,
+        raw_json={"delivery_state": state} if state else {}, msg_type="text",
+        reply_to_msg_id=None, mentioned_bot=False,
+    )
 
 
 def test_parse_switch_command_accepts_half_and_full_width_colon() -> None:
@@ -285,7 +299,7 @@ def test_router_sanitizes_impersonation_context_lines(sqlite_engine) -> None:
 
     scrubbed = router._sanitize_impersonation_lines(
         [
-            "阿渣（小町扮演）: 主人，来了",
+            "小甲（小町扮演）: 主人，来了",
             "测试小町: 大人您稍等",
             "路人: 谁是你的主人",
             "测试君: 大人您稍等",
@@ -366,6 +380,7 @@ def test_router_appends_relevant_facts_from_shared_memory(sqlite_engine) -> None
     }
     router.persona_manager.set_persona_key(10001, "test_self")
     with session_scope(sqlite_engine) as session:
+        _add_fact_source(session, "router-fact-source", "主玩英雄联盟手游")
         MemoryRepository(session).upsert_canonical_memory(
             scope_type="group",
             scope_id="10001",
@@ -378,7 +393,7 @@ def test_router_appends_relevant_facts_from_shared_memory(sqlite_engine) -> None
             content="主玩英雄联盟手游",
             importance=3,
             confidence=0.8,
-            source_msg_ids=[],
+            source_msg_ids=["router-fact-source"],
         )
 
     text = router._with_relevant_facts(
@@ -412,6 +427,7 @@ def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
             ("游戏", "主玩英雄联盟手游"),
             ("工作", "在快手实习"),
         ):
+            _add_fact_source(session, fact, fact)
             repo.upsert_canonical_memory(
                 scope_type="group",
                 scope_id="10001",
@@ -424,7 +440,7 @@ def test_persona_manager_retrieves_facts_from_memory(sqlite_engine) -> None:
                 content=fact,
                 importance=3,
                 confidence=0.8,
-                source_msg_ids=[],
+                source_msg_ids=[fact],
             )
 
     picked = manager.retrieve_facts(10001, ["你最擅长什么英雄"], limit=2)
@@ -465,6 +481,7 @@ def test_persona_manager_selects_dynamic_fact_kinds_by_intent_and_validity(
             ("preference", "preference", "喜欢爵士乐", None),
             ("relationship", "relationship", "和甲是同学", None),
         ):
+            _add_fact_source(session, key, content)
             repo.upsert_canonical_memory(
                 scope_type="group",
                 scope_id="10001",
@@ -481,6 +498,7 @@ def test_persona_manager_selects_dynamic_fact_kinds_by_intent_and_validity(
                 valid_from=now - timedelta(days=2),
                 valid_until=valid_until,
             )
+        _add_fact_source(session, "anime-abbreviation", "刚看完一集 RW0")
         repo.upsert_canonical_memory(
             scope_type="group",
             scope_id="10001",
@@ -520,6 +538,31 @@ def test_persona_manager_selects_dynamic_fact_kinds_by_intent_and_validity(
     assert [item["fact"] for item in current_anime] == ["刚看完一集 RW0"]
 
 
+@pytest.mark.parametrize("change", ["reserved", "blocked", "uncertain", "deleted", "missing", "cross_group", "no_sources"])
+def test_persona_facts_revalidate_all_current_group_provenance(sqlite_engine, change):
+    from app.storage.db import session_scope
+    from app.storage.repositories import MemoryRepository
+
+    personas = {"default": {"name": "test bot"}, "actor": {"name": "test member", "source_user_id": 222}}
+    manager = PersonaManager(engine=sqlite_engine, personas=personas, default_persona=personas["default"])
+    manager.set_persona_key(10001, "actor")
+    with session_scope(sqlite_engine) as session:
+        _add_fact_source(session, "valid-fact-source", "喜欢爵士乐")
+        if change not in {"missing", "no_sources"}:
+            _add_fact_source(session, "bad-fact-source", "喜欢被撤回的音乐", group_id=20001 if change == "cross_group" else 10001, state=change if change != "cross_group" else "")
+        for marker, sources in (
+            ("喜欢爵士乐", ["valid-fact-source"]),
+            ("喜欢被撤回的音乐", [] if change == "no_sources" else ["valid-fact-source", "bad-fact-source"]),
+        ):
+            MemoryRepository(session).upsert_canonical_memory(
+                scope_type="group", scope_id="10001", subject_type="user", subject_id="222",
+                memory_kind="preference", canonical_key=marker, predicate="likes", object_text=marker,
+                content=marker, importance=3, confidence=0.9, source_msg_ids=sources,
+            )
+    picked = manager.retrieve_facts(10001, ["你喜欢什么音乐"], limit=5)
+    assert [item["fact"] for item in picked] == ["喜欢爵士乐"]
+
+
 def test_live_persona_refreshes_relationship_labels(sqlite_engine) -> None:
     from app.storage.db import session_scope
     from app.storage.repositories import UserRepository
@@ -555,6 +598,112 @@ def test_live_persona_refreshes_relationship_labels(sqlite_engine) -> None:
 
     assert live["relationships"][0]["member"] == "路人卡"
     assert live["relationships"][1]["member"] == "球友甲"
+
+
+def test_member_alias_cache_is_independent_for_each_group(sqlite_engine):
+    from datetime import UTC, datetime
+    from app.storage.db import session_scope
+    from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
+    with session_scope(sqlite_engine) as session:
+        UserRepository(session).upsert_user(user_id=777, nickname="common", group_card="")
+        for group, card in ((100, "group-a-card"), (200, "group-b-card")):
+            GroupRepository(session).upsert_group(group_id=group, group_name="test", enabled=True, speak_enabled=True)
+            MessageRepository(session).add_group_message(platform_msg_id=f"alias-{group}", group_id=group, user_id=777, timestamp=datetime.now(UTC), plain_text="hello", raw_json={"sender": {"card": card}}, msg_type="text", reply_to_msg_id=None, mentioned_bot=False)
+    manager = PersonaManager(engine=sqlite_engine, personas={}, default_persona={})
+    assert manager.member_label_for_user(777, 100) == "group-a-card"
+    assert manager.member_label_for_user(777, 200) == "group-b-card"
+    assert manager.member_label_for_user(777, 100) == "group-a-card"
+
+
+def test_style_bank_does_not_keep_a_recalled_local_source(sqlite_engine):
+    from datetime import UTC, datetime
+    from app.storage.db import session_scope
+    from app.storage.repositories import GroupRepository, MessageRepository, PersonaStyleExampleRepository, UserRepository
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(group_id=100, group_name="test", enabled=True, speak_enabled=True)
+        UserRepository(session).upsert_user(user_id=777, nickname="test", group_card="")
+        MessageRepository(session).add_group_message(platform_msg_id="style-source", group_id=100, user_id=777, timestamp=datetime.now(UTC), plain_text="old-style", raw_json={}, msg_type="text", reply_to_msg_id=None, mentioned_bot=False)
+        PersonaStyleExampleRepository(session).insert_many([{"group_id": 100, "user_id": 777, "msg_id": "style-source", "text": "old-style", "context_before": [], "reply_target": None}])
+    personas = {"member": {"source_user_id": 777, "source_group_id": 100}}
+    manager = PersonaManager(engine=sqlite_engine, personas=personas, default_persona={})
+    manager.load_style_banks()
+    assert manager.style_bank(100, persona_key="member")
+    with session_scope(sqlite_engine) as session:
+        MessageRepository(session).mark_group_message_deleted(group_id=100, platform_msg_id="style-source")
+    assert manager.style_bank(100, persona_key="member") == []
+
+
+@pytest.mark.parametrize("situation_kind", ["quoted", "adjacent"])
+@pytest.mark.parametrize("state", ["reserved", "blocked", "uncertain", "deleted", "outbound", "serialized_outbound"])
+def test_style_bank_revalidates_live_situation_sources(sqlite_engine, situation_kind, state):
+    from app.core.persona_live_sync import _build_examples
+    from app.core.persona_style_retrieval import build_style_document, build_style_retrieval_query
+    from app.storage.db import session_scope
+    from app.storage.repositories import MessageRepository, PersonaStyleExampleRepository
+
+    rows = [
+        {"id": 1, "platform_msg_id": "situation-source", "group_id": 10001, "user_id": 111,
+         "timestamp": datetime(2026, 9, 19, 12, tzinfo=UTC), "plain_text": "游戏更新怎么延期了",
+         "msg_type": "text", "reply_to_msg_id": None, "raw_json": {}},
+        {"id": 2, "platform_msg_id": "style-response", "group_id": 10001, "user_id": 222,
+         "timestamp": datetime(2026, 9, 19, 12, 1, tzinfo=UTC), "plain_text": "游戏延期只能继续等",
+         "msg_type": "text", "reply_to_msg_id": "situation-source" if situation_kind == "quoted" else None,
+         "raw_json": {}},
+    ]
+    with session_scope(sqlite_engine) as session:
+        for row in rows:
+            source = _add_fact_source(session, row["platform_msg_id"], row["plain_text"], user_id=row["user_id"])
+            source.reply_to_msg_id = row["reply_to_msg_id"]
+        PersonaStyleExampleRepository(session).insert_many(_build_examples(
+            rows, user_id=222, group_id=10001, bot_qqs={900001}, bot_text_names={"test bot"},
+        ))
+    personas = {"member": {"source_user_id": 222, "source_group_id": 10001}}
+    manager = PersonaManager(engine=sqlite_engine, personas=personas, default_persona={})
+    manager.load_style_banks()
+    before = build_style_document(manager.style_bank(10001, persona_key="member")[0])
+    assert before.situation == "游戏更新怎么延期了"
+    with session_scope(sqlite_engine) as session:
+        source = MessageRepository(session).get_by_platform_msg_id("situation-source")
+        source.raw_json = (
+            '{"direction":"outbound"}' if state == "serialized_outbound"
+            else {"direction": "outbound"} if state == "outbound"
+            else {"delivery_state": state}
+        )
+    after = build_style_document(manager.style_bank(10001, persona_key="member")[0])
+    assert after.situation == ""
+    assert before.document_hash != after.document_hash
+
+    class FakeEmbedding:
+        identity = type("Identity", (), {"provider": "test", "model": "fake", "version": "v1", "dimensions": 2})()
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    manager.embedding_provider = FakeEmbedding()
+    manager._example_vectors[manager._example_cache_key(222, 10001)] = (
+        {before.msg_id: before}, {before.msg_id: [1.0, 0.0]},
+    )
+    assert manager.retrieve_examples(
+        10001, build_style_retrieval_query(current_text="游戏更新怎么延期了"), persona_key="member",
+    ) == []
+
+
+def test_style_bank_drops_legacy_unverifiable_adjacent_situation(sqlite_engine):
+    from app.storage.db import session_scope
+    from app.storage.repositories import PersonaStyleExampleRepository
+
+    with session_scope(sqlite_engine) as session:
+        _add_fact_source(session, "live-style", "游戏延期只能继续等")
+        PersonaStyleExampleRepository(session).insert_many([
+            {"group_id": 10001, "user_id": 222, "msg_id": "live-style", "text": "游戏延期只能继续等",
+             "context_before": [{"speaker": "unknown", "text": "unverifiable live situation"}], "reply_target": None},
+            {"group_id": 10001, "user_id": 222, "msg_id": "imported-style", "text": "imported response",
+             "context_before": [{"speaker": "unknown", "text": "compatible imported situation"}], "reply_target": None},
+        ])
+    manager = PersonaManager(engine=sqlite_engine, personas={"member": {"source_user_id": 222, "source_group_id": 10001}}, default_persona={})
+    manager.load_style_banks()
+    bank = {entry["msg_id"]: entry for entry in manager.style_bank(10001, persona_key="member")}
+    assert bank["live-style"]["context_before"] == []
+    assert bank["imported-style"]["context_before"][0]["text"] == "compatible imported situation"
 
 
 def test_example_vectors_persist_across_manager_instances(sqlite_engine) -> None:

@@ -1,212 +1,119 @@
-# 小町 QQ AI Bot
+# 小町 Komachi QQ AI Bot
 
-小町是一个面向 QQ 群聊的 AI 机器人。她能以稳定的人格参与群聊，理解文字与图片，按需联网检索，并通过分层记忆持续认识群成员和群内发生的事情。
+小町是一个长期运行的 QQ 角色 Agent：在授权群里观察聊天、理解图片、检索历史，决定接话还是保持安静，也能通过消息接受绘图、联网查询和主人委派的行动。
 
-项目目前以 **Windows 11 + WSL2 + Docker** 为主要运行环境，示例配置使用 SnowLuma 接入 QQ；LLBot 和 NapCat 是可切换的备选平台。文本模型支持 OpenAI 兼容的 Responses 或 Chat Completions 接口；NVIDIA GPU 为可选项。
+当前工程使用 **Python 3.12 + DeepSeek Harness SDK 0.1.5rc1**，支持 **Windows + WSL2 + Docker**。群聊与私聊分别运行，QQ 通过 SnowLuma、LLBot 或 NapCat 的 OneBot 11 接入。文本、搜索和绘图服务由部署者自行配置。
 
-> 这是一个仍在持续开发的个人项目。部署前请确认你了解 QQ 机器人、模型 API 和本地数据保存带来的风险。
+## 能做什么
 
-## 核心能力
+| 能力 | 当前实现 |
+|---|---|
+| 群聊与私聊 | 按群授权、直接 @ 和引用回复、好友准入、独立进程与持久发送记录 |
+| 自主参与 | 每群观察与批处理、模型自主选择回复/等待/沉默、持久目标与到期唤醒 |
+| 长期记忆 | 原始消息、话题片段、摘要、事实与人物资料；全文/向量/时间混合检索并展开来源 |
+| 人格与模仿 | 默认角色、风格变体、来源约束的成员人格、动态事实和表达样本更新 |
+| 图片与转发 | 群/私聊看图、引用图片、生成/编辑图片；群内合并转发按页展开并读取节点图片 |
+| 联网资料 | 搜索、网页正文、分页和关键词查找；支持读取 GitHub 页面与指定源码文件 |
+| QQ 行动 | 授权后发布文字/图片空间、读取好友动态并评论、修改允许的个人资料 |
+| 隔离计算 | 可选 Docker Python 计算侧车，限制资源、网络、输入和产物 |
 
-- **自然参与群聊**：支持被 @、被回复、被提及时答话，也能按群策略主动插话。
-- **长期记忆**：保存群聊事件、事实、人物画像和关系，并结合近期对话与长期记忆回答问题。
-- **图片理解**：读取消息中引用或最近出现的图片，同时保留图片发送者等上下文信息。
-- **联网与多模态工具**：支持模型内置联网检索、图片生成与图片编辑。
-- **按群独立配置**：分别控制监听、发言、主动回复、归档、记忆和图片能力。
-- **可运维运行栈**：提供启动、停止、状态检查、会话看护、故障恢复和数据持久化能力。
+**功能存在不代表新安装全部启用。** 群、好友、社交、计算和写入权限由本地配置控制；公开模板默认关闭主动空间与计算。工具是否可用还取决于 QQ 桥接、模型接口和授权。
 
-想了解一条消息如何经过 QQ 接入、上下文组装、记忆检索、模型调用和消息投递，请阅读[工程架构与运行原理](docs/ARCHITECTURE.md)。
+## 为什么这样设计
 
-## 运行要求
+- **带来源的长期记忆**：回答可追溯到实际消息；撤回、失效、跨群或未知发送结果不能冒充可靠事实。
+- **模型决定行为，代码约束范围**：Harness 负责模型与工具循环；权限、预算、冷却和提交前复验由业务层执行。
+- **人格持续生效**：表达风格与事实资料分开，近期旧回复不会被当成必须照抄的台词。
+- **能恢复的后台运行**：消息 inbox、目标、工具效果和回执持久化；systemd、watchdog 和 Windows 计划任务负责进程与连接恢复。
+- **独立控制成本**：直接互动、主动群聊、空间发布/评论分预算；无任务或无合格机会时等待，模型也可以沉默。
 
-- Windows 11
-- 已启用 systemd 的 WSL2 Ubuntu
-- WSL 内可用的 Docker Engine 与 Docker Compose
-- 一个 QQ 机器人账号
-- 一个 OpenAI 兼容模型接口（推荐使用 Responses API）
-- 可选：NVIDIA GPU、Windows 驱动和 NVIDIA Container Toolkit
+## 开始使用
 
-当前唯一受支持的生产运行栈位于 [`infra/wsl`](infra/wsl/README.md)。其他操作系统或部署方式可以自行适配，但不在现有脚本的保证范围内。
+需要一个 QQ 机器人账号、可用的模型 API、启用 systemd 的 WSL2 Ubuntu，以及 WSL 内的 Docker Engine/Compose。NVIDIA GPU 可选，用于本地向量推理。
 
-## 快速开始
-
-### 1. 克隆项目
-
-在 Windows PowerShell 中执行：
+在 Windows PowerShell 中：
 
 ```powershell
 git clone https://github.com/MagicIndex135731/Komachi-qq-aibot.git
 cd Komachi-qq-aibot
+Copy-Item infra/wsl/.env.example infra/wsl/.env
+Copy-Item configs/groups.yaml configs/groups.local.yaml
 ```
 
-### 2. 初始化 WSL 环境
+在私有 `infra/wsl/.env` 中填写 `BOT_QQ`、`OWNER_QQ`、`LLM_BASE_URL`、`LLM_API_KEY`、实际可用的 `LLM_MODEL`；选择 `QQ_PLATFORM`。首次安装保持 `MEMORY_RAW_V3_ENABLED=false`，完成索引准备与验收后再激活 V3。
 
-在 WSL 中进入项目目录并执行：
+在 `configs/groups.local.yaml` 中替换示例群号，按需要设置 `enabled`、`speak`、`archive`、`memory_enabled` 和 `image_generation`。真实账号和策略不要写进公开模板。
+
+在 WSL 项目目录执行初始化，然后从 Windows 启动：
 
 ```bash
 bash infra/wsl/scripts/bootstrap_wsl.sh
 ```
 
-脚本会创建本地运行目录、`infra/wsl/.env` 和看护程序所需的 Python 环境。完整的初始化和运行栈说明见 [WSL/Docker 部署文档](infra/wsl/README.md#初始化)。
-
-### 3. 填写必要配置
-
-编辑 `infra/wsl/.env`，至少确认以下内容：
-
-```dotenv
-BOT_QQ=机器人QQ号
-OWNER_QQ=管理员QQ号
-QQ_PLATFORM=snowluma
-
-LLM_BASE_URL=https://你的模型接口地址
-LLM_API_KEY=你的API密钥
-LLM_MODEL=gpt-6.1-sol
-LLM_TEXT_ENDPOINT=responses
-```
-
-不要把 `.env`、API 密钥、QQ 密码、WebUI Token 或验证码链接提交到 Git。
-
-模型名称只是示例，必须与你的接口实际提供的模型一致。新安装尚未准备 Memory V3 索引时，先在本地 `.env` 把 `MEMORY_RAW_V3_ENABLED` 设为 `false`；完成 [V3 准备、评测与激活](infra/wsl/README.md#memory-v3-prepare-evaluate-activate-and-rollback) 后再启用。`.env.example` 中的 `true` 是已完成激活的运行配置示例，不是跳过初始化的许可。
-
-然后在 Windows PowerShell 中从 `configs/groups.yaml` 复制一份本地群配置：
-
 ```powershell
-Copy-Item configs/groups.yaml configs/groups.local.yaml
+.\start-xiaomachi-wsl.bat
 ```
 
-将 `configs/groups.local.yaml` 中的占位群号替换为真实群号，并按需启用 `enabled`、`speak`、`memory_enabled` 等选项。这个本地文件不会进入 Git。
+通过对应平台的管理页完成 QQ 登录和 OneBot 配置。SnowLuma 使用 `open-snowluma-webui.bat` 和 `open-snowluma-desktop.bat`；冷启动可能需要重新扫码。详细步骤见 [部署运维指南](infra/wsl/README.md)。
 
-### 4. 启动并登录 QQ
+## 平时怎样使用
 
-在资源管理器中双击：
+在允许发言的群里 @ 小町提问，或引用相关消息/图片：
 
 ```text
-start-xiaomachi-wsl.bat
+@小町 昨天群里讨论的活动最终怎么定的？给出对应来源。
+@小町 看看这份合并转发，概括几个人分别说了什么。
+@小町 根据这张图画一个冬日版本。
+@小町 联网查找 requests 的文档，再打开指定源码解释 patch 函数。
 ```
 
-启动窗口会显示构建、QQ 平台、OneBot、小町容器、可选 CUDA 预热和网关就绪进度。窗口正常自动关闭时，小町已经可以接收消息；启动失败时窗口会保留错误信息。
+主人可以通过真实群聊/私聊消息委派已启用的工具，例如“评论某位好友的最新空间”。昵称解析可能有歧义，必要时明确目标。普通聊天文字、转发署名和引用内容不能取得主人权限。
 
-使用示例中的 SnowLuma 时，双击 `open-snowluma-webui.bat` 打开管理页面，首次设置密码并配置 OneBot；需要 QQ 扫码时使用 `open-snowluma-desktop.bat`。首次登录与冷启动限制见 [SnowLuma 操作说明](infra/wsl/README.md#qq-平台选择与-snowluma)。若改用 LLBot 或 NapCat，应打开对应平台的 WebUI；它们的登录态互不共用。
+主动群聊受群间隔约束并由 Agent 自己判断是否开口。空间巡检采用随机间隔与夜间静默；推荐策略是每日主动发布最多 1 条、每个好友每日最多评论 1 条，具体值见 [配置参考](docs/CONFIGURATION.md)。主人指令不计入自主行动冷却/次数，仍受授权、单回合资源和平台限制。
 
-### 5. 检查状态
+## 启动、停止与更新
 
-双击 `status-xiaomachi-wsl.bat`。正常状态应包括：
+| Windows 入口 | 作用 |
+|---|---|
+| `start-xiaomachi-wsl.bat` | 首次安装，之后启动已部署版本 |
+| `rebuild-xiaomachi-wsl.bat` | 把当前工作区代码/配置发布为新版本并重建群私应用 |
+| `status-xiaomachi-wsl.bat` | 检查 QQ/OneBot、应用、记忆人格和已启用计算服务 |
+| `stop-xiaomachi-wsl.bat` | 停止运行栈、计算侧车和看护服务 |
+| `open-llbot-webui.bat` / `open-napcat-webui.bat` | 打开备选 QQ 平台管理页 |
 
-- QQ 平台容器健康；
-- OneBot 已连接；
-- 群聊与私聊进程、心跳和消息网关已就绪；
-- 至少存在一个允许发言的本地群策略；
-- 向量预热、数据库、记忆/人格文件与后台任务状态正常。
+修改人格 YAML、配置或代码后使用 **rebuild**；start 不会更新已有镜像。rebuild 会部署未提交的源码改动，并保留持久数据与 QQ 接入容器。日常状态检查不调用模型；`status.sh --deep` 会发起一次受限真实请求。
 
-日常状态检查不调用模型。需要验证当前模型接口与人格更新字段、临时文件写入链路时，在 WSL 中运行 `bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh --deep`：它至多发起一次受输出预算限制的真实请求，不会修改生产人格文件；搜索和生图只检查配置，不执行付费生成。详见 [状态检查说明](infra/wsl/README.md#操作命令)。
+## 工程构成与文档
 
-如果状态检查未通过，请先查看[常见问题](#常见问题)和 [WSL/Docker 验收说明](infra/wsl/README.md#验收)。
-
-## 日常操作
-
-| 入口 | 用途 |
-| --- | --- |
-| `start-xiaomachi-wsl.bat` | 显示启动和预热进度，全部就绪后自动关闭窗口 |
-| `rebuild-xiaomachi-wsl.bat` | 将当前工作区代码、配置与人格发布为新的 Linux 运行版本；只重建应用容器 |
-| `stop-xiaomachi-wsl.bat` | 停止小町、QQ 接入和后台看护服务 |
-| `status-xiaomachi-wsl.bat` | 零模型 token 检查 systemd、QQ/OneBot、应用、数据库与后台任务 |
-| `open-snowluma-webui.bat` / `open-snowluma-desktop.bat` | 打开当前示例平台的管理页 / QQ 扫码桌面 |
-| `open-llbot-webui.bat` | 使用 LLBot 备选平台时打开管理页面 |
-| `open-napcat-webui.bat` | 使用 NapCat 备用接入时打开其管理页面 |
-
-后台运行由 WSL systemd 和 Windows 登录级计划任务共同维持，不需要保留一个空白 CMD 窗口。启动入口、服务关系和日志位置见 [WSL/Docker 启动链路](infra/wsl/README.md#启动链路)。
-
-## 配置指南
-
-### 群与人格
-
-| 文件 | 用途 | 是否应提交 |
-| --- | --- | --- |
-| `configs/groups.yaml` | 群策略模板和安全默认值 | 是 |
-| `configs/groups.local.yaml` | 真实群号及本机群策略 | 否 |
-| `configs/persona.yaml` | 小町的人格、口吻和行为风格 | 是 |
-| `configs/safety.yaml` | 内容和操作安全限制 | 是 |
-| `infra/wsl/.env` | 密钥、账号和运行参数 | 否 |
-
-一个群只有同时设置 `enabled: true` 和 `speak: true` 才允许小町发言。`memory_enabled: true` 会为该群启用完整记忆；关闭时只使用近期上下文，不生成或检索长期记忆。
-
-群主可 @ 小町发送 `切换人格为:粘人小町` 或 `切换人格为:嘴臭小町`，在当前进程中按群切换小町说话风格；重启后会回到粘人小町。全角冒号也可用。
-
-群策略的字段示例见 [`configs/groups.yaml`](configs/groups.yaml)，运行时的数据边界见[架构文档：配置与数据边界](docs/ARCHITECTURE.md#9-配置与数据边界)。
-
-### 记忆系统
-
-Memory V3 将原始消息、话题片段、结构化事实、人物画像和关系记忆分层保存，并使用关键词、时间、语义向量和来源证据进行混合检索。记忆按群隔离，写入和召回都保留来源约束。
-
-- [Memory V3 构成与原理](docs/ARCHITECTURE.md#6-memory-v3-的构成与原理)
-- [Memory V3 发布与回滚](docs/ARCHITECTURE.md#7-memory-v3-发布与回滚)
-- [按群记忆策略与日常维护](infra/wsl/README.md#按群记忆策略与日常维护memory-v3)
-
-### GPU 加速
-
-GPU 只用于小町本地向量模型，不分配给 QQ 接入容器。没有 NVIDIA GPU 时保持：
-
-```dotenv
-ENABLE_GPU=0
-MEMORY_EMBEDDING_DEVICE=auto
+```text
+app/agent/       Harness、群观察、工具、目标与自主社交
+app/core/        记忆、人格、图片、上下文和消息投递
+app/adapters/    OneBot、QQ 空间、转发及账户动作
+app/providers/   文本模型、网页搜索、向量与图片服务
+app/storage/     SQLite 模型、仓储、账本与迁移
+app/runtime/     依赖装配和运行组件
+configs/        可公开的配置模板与角色定义
+infra/wsl/      Docker、systemd、部署与状态脚本
+scripts/        回填、评估、审计与维护工具
+tests/          使用合成 ID 的隔离测试
 ```
 
-满足 NVIDIA Container Toolkit 和 CDI 设备条件后可以设置 `ENABLE_GPU=1`。首次启用、模型缓存和故障回退步骤见 [CUDA 向量加速](infra/wsl/README.md#cuda-向量加速)。
+- [工程架构与运行原理](docs/ARCHITECTURE.md)
+- [配置、权限与工具](docs/CONFIGURATION.md)
+- [记忆、人格与索引发布](docs/MEMORY.md)
+- [WSL/Docker 部署与运维](infra/wsl/README.md)
+- [开发与测试](docs/DEVELOPMENT.md)
+- [数据保护与安全发布](docs/SECURITY.md)
+- [环境配置模板](infra/wsl/.env.example)
 
-### 上游代理
+## 适用边界
 
-小町可以通过 WSL 内独立的 Mihomo 实例访问模型接口，而 QQ、OneBot 和 Windows 系统代理保持互不影响。代理不是运行必需项；只有上游接口确实需要时才配置。
+这是一套自行部署的机器人工程。模型可能误解消息，QQ 桥接可能断线或拒绝动作，明确 @ 也不能保证任何情况下都成功。搜索不会自动读完整 GitHub 仓库，图片、动态和历史检索只覆盖已取得且获授权的资料。私聊不提供宿主文件、Shell 或远程项目控制。
 
-详见 [WSL 内置 Mihomo 上游代理](infra/wsl/README.md#wsl-内置-mihomo-上游代理)。
+聊天数据保存在本地持久卷，但选中的消息、记忆片段和图片会提交给你配置的模型服务。API、绘图和部分记忆/人格更新可能产生费用；启用主动功能前先配置许可与预算。
 
-## 数据与安全
+## 参考与致谢
 
-以下内容包含登录态、聊天数据或运行状态，请勿提交、公开或随意删除：
+本项目参考了 [fumingyang2004/Tulpa](https://github.com/fumingyang2004/Tulpa) 关于持续群聊、Agent 工具协作、人格与资料授权边界的设计思路。感谢 Tulpa 作者与贡献者公开分享实现和文档，为小町的重构提供了重要参考。
 
-- `infra/wsl/.env`
-- `configs/groups.local.yaml`
-- SnowLuma / LLBot / NapCat 的独立 Docker 登录态卷；
-- `xiaomachi-bot-data` 卷中的 SQLite 数据库、聊天归档、模型缓存与日志；
-- `/opt/xiaomachi/shared/` 中的本机配置、运行文件与备份。
-
-更新代码或重建镜像前应先备份数据库和登录态。更完整的数据边界、备份和发布要求见 [WSL/Docker 运行态保护](infra/wsl/README.md#运行态保护)和[工程架构](docs/ARCHITECTURE.md#9-配置与数据边界)。
-
-## 常见问题
-
-### 启动窗口一直不关闭
-
-启动脚本会等待 QQ 平台、OneBot、小町心跳、消息网关和可选 CUDA 预热全部完成。窗口长期停留通常表示某项就绪检查失败，请保留窗口中的错误信息并运行 `status-xiaomachi-wsl.bat`。
-
-### 小町在线但群里不回复
-
-检查该群是否已经写入 `configs/groups.local.yaml`，并确认同时启用了 `enabled` 和 `speak`。修改本地群策略后需要按部署文档重新安装或发布运行版本，不能只修改工作区文件。
-
-### QQ 接入平台要求重新登录
-
-打开当前平台对应的 WebUI 或 SnowLuma QQ 桌面完成登录，然后重新运行状态检查。SnowLuma 冷启动可能需要重新扫码；不要删除平台数据卷，否则会丢失已保存的登录态。
-
-### 模型请求失败或很慢
-
-先区分上游接口耗时、本机网络代理、模型工具调用和本地记忆检索。相关日志、代理拓扑和排查入口见 [WSL/Docker 运行文档](infra/wsl/README.md)。
-
-## 深入了解
-
-- [工程架构与运行原理](docs/ARCHITECTURE.md)：消息处理、模型工具、Memory V3、进程拓扑和数据边界。
-- [WSL/Docker 部署与运维](infra/wsl/README.md)：安装、启动、代理、GPU、健康检查、发布和回滚。
-- [`configs/groups.yaml`](configs/groups.yaml)：群策略完整示例。
-- [`infra/wsl/.env.example`](infra/wsl/.env.example)：运行参数模板。
-
-## 开发
-
-项目要求 Python 3.12。创建开发环境后安装依赖：
-
-```bash
-python -m pip install -e ".[dev]"
-pytest
-```
-
-提交修改前请至少运行受影响测试，并检查 Docker Compose 配置和文档链接。公开的模块职责与运行边界见 [工程架构文档](docs/ARCHITECTURE.md)；本地开发工作流可能另有不随 GitHub 仓库分发的内部规范。
-
-## License
-
-本项目使用 [MIT License](LICENSE)。
+同时感谢 DeepSeek Harness、OneBot、SnowLuma、LLBot、NapCat、FastEmbed 与 sqlite-vec 等项目。小町自主代码采用 [MIT License](LICENSE)；第三方运行时、客户端、模型和服务遵循各自许可。

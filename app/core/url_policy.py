@@ -25,6 +25,8 @@ _BARE_DOMAIN = re.compile(
     r"(?:com|cn|net|org|io|ai|app|dev|gov|edu|me|tv|cc|co|xyz)"
     r"(?:/[^\s<>\[\]{}，。；：！？、（）]*)?"
 )
+_LINK_LINE_LABEL = re.compile(r"^\s*([^:：\n。！？!?，,;；|]{1,32}[:：])")
+_EMPTY_LINK_LABEL = re.compile(r"^[^:：\n。！？!?，,;；|]{1,32}[:：]\s*$")
 
 
 def explicitly_requests_urls(text: str) -> bool:
@@ -51,6 +53,15 @@ def filter_reply_urls(text: str, *, allow_urls: bool) -> str:
     filtered = _SCHEME_URL.sub("", filtered)
     filtered = _BARE_DOMAIN.sub("", filtered)
     filtered = re.sub(r"(?:\(\s*\)|（\s*）|\[\s*\]|【\s*】)", "", filtered)
+    # Remove only standalone labels whose link was removed. Keep ordinary
+    # headings and source lines that still contain descriptive answer text.
+    link_labels = set()
+    for line in original.splitlines():
+        label = _LINK_LINE_LABEL.match(line)
+        if label and (_SCHEME_URL.search(line) or _BARE_DOMAIN.search(line)):
+            link_labels.add(label.group(1).strip())
+    filtered = "\n".join(line.rstrip() for line in filtered.splitlines()
+        if not (_EMPTY_LINK_LABEL.fullmatch(line.strip()) and line.strip() in link_labels))
     filtered = re.sub(r"[ \t]+([,.;:!?，。；：！？])", r"\1", filtered)
     filtered = re.sub(r"[ \t]{2,}", " ", filtered)
     filtered = re.sub(r"\n[ \t]+", "\n", filtered)

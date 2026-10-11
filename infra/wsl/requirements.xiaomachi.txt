@@ -1,4 +1,6 @@
 ddgs>=9.14.2
+deepseek-harness-sdk==0.1.5rc1
+deepseek-harness-runtime-bin==0.1.5rc1
 fastembed>=0.6.0,<0.7.0
 httpx>=0.28.0
 pydantic>=2.8.0

@@ -1,47 +1,68 @@
 param(
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Legacy,
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = "Stop"
-
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$tmpRoot = Join-Path $repoRoot ".test-tmp"
-
-if (-not (Test-Path -LiteralPath $tmpRoot)) {
-    Write-Host "No .test-tmp directory under $repoRoot; nothing to clean."
-    exit 0
-}
-
-$resolved = (Resolve-Path -LiteralPath $tmpRoot).Path
-if ((Split-Path -Parent $resolved) -ne $repoRoot) {
-    throw "Refusing to clean unexpected path: $resolved"
-}
-
-$items = @(Get-ChildItem -LiteralPath $resolved -Force)
-if ($items.Count -eq 0) {
-    Write-Host ".test-tmp is already empty."
-    exit 0
-}
-
-$bytes = ($items |
-    ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue } |
-    Measure-Object -Property Length -Sum).Sum
-$sizeMb = [math]::Round(([double]$bytes) / 1MB, 1)
-
-if (-not $Force) {
-    Write-Host ("Would remove {0} entries ({1} MB) under {2}." -f $items.Count, $sizeMb, $resolved)
-    Write-Host "Re-run with -Force to delete them."
-    exit 0
-}
-
-$failed = 0
-foreach ($item in $items) {
-    try {
-        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-    } catch {
-        $failed++
-        Write-Warning ("Could not remove {0}: {1}" -f $item.Name, $_.Exception.Message)
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$workRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "data/test-work"))
+$targets = @()
+foreach ($parent in @((Join-Path $repoRoot "data"), $workRoot)) {
+    if ((Test-Path -LiteralPath $parent) -and
+        ((Get-Item -LiteralPath $parent -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing linked test workspace: $parent"
     }
 }
-
-Write-Host ("Removed {0} of {1} entries ({2} MB)." -f ($items.Count - $failed), $items.Count, $sizeMb)
+if (Test-Path -LiteralPath $workRoot) {
+    $targets += @(Get-ChildItem -LiteralPath $workRoot -Force)
+}
+if ($Legacy) {
+    $targets += @(Get-ChildItem -LiteralPath $repoRoot -Force | Where-Object {
+        $_.PSIsContainer -and $_.Name -match '^(\.test-tmp.*|\.pytest.*|\.tmp_pytest.*|\.codex_tmp.*|dbg_service_.*|\.artifacts)$'
+    })
+}
+$rows = @()
+foreach ($target in $targets) {
+    $path = (Resolve-Path -LiteralPath $target.FullName).Path
+    $parent = Split-Path -Parent $path
+    if (($parent -ne $workRoot -and (-not $Legacy -or $parent -ne $repoRoot)) -or
+        ($target.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing unexpected cleanup target: $path"
+    }
+    $bytes = if ($target.PSIsContainer) {
+        (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+    } else { $target.Length }
+    $row = [ordered]@{ path = $path; bytes = [long]$bytes; status = "preview" }
+    if ($Force) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            $row.status = "removed"
+        } catch {
+            $row.status = "failed"
+            $row.error = $_.Exception.Message
+            Write-Warning "Could not remove $path"
+        }
+    }
+    $rows += [pscustomobject]$row
+}
+$report = [ordered]@{
+    recorded_at = [DateTimeOffset]::Now.ToString("o")
+    applied = [bool]$Force
+    legacy = [bool]$Legacy
+    entries = $rows
+    bytes = [long](($rows | Measure-Object -Property bytes -Sum).Sum)
+    failures = @($rows | Where-Object status -eq "failed").Count
+}
+if ($ReportPath) {
+    $absoluteReport = [IO.Path]::GetFullPath($ReportPath)
+    if (-not $absoluteReport.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup report must be inside the repository"
+    }
+    $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $absoluteReport -Encoding utf8
+}
+Write-Host ("{0}: {1} entries, {2:N1} MiB, {3} failures." -f
+    $(if ($Force) { "Cleanup" } else { "Preview" }), $rows.Count, ($report.bytes / 1MB), $report.failures)
+if (-not $Force) { Write-Host "Re-run with -Force to delete; -Legacy also includes old root test folders." }
+if ($report.failures) { exit 1 }

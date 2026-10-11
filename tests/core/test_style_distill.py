@@ -182,6 +182,6 @@ def test_compute_relationship_map_tracks_replies_and_mentions() -> None:
     assert len(relationships) == 1
     member = relationships[0]
     assert member["member"] == "路人甲"
-    assert member["azha_replied_to"] == 1
-    assert member["replies_to_azha"] == 1
+    assert member["member_alpha_replied_to"] == 1
+    assert member["replies_to_member_alpha"] == 1
     assert member["mention_examples"] == ["老哥我在"]

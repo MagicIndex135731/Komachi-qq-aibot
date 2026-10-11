@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
+import pytest
+
 from app.config import AppSettings
 from app.core.persona_live_sync import write_live_profile
 from app.core.worker_status import write_worker_status
@@ -21,10 +23,11 @@ def _settings(tmp_path: Path) -> AppSettings:
     )
 
 
-def test_live_persona_probe_validates_model_and_temp_file(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("model, effort", [("gpt-6.1-sol", "low"), ("synthetic-other-model", "medium")])
+def test_live_persona_probe_validates_model_and_temp_file(tmp_path, monkeypatch, model, effort) -> None:
     class FakeClient:
         def __init__(self, **kwargs):
-            assert kwargs["reasoning_effort"] == "low"
+            assert kwargs["reasoning_effort"] == effort
             assert kwargs["max_output_tokens"] <= 1200
             self.http_client = self
 
@@ -42,7 +45,7 @@ def test_live_persona_probe_validates_model_and_temp_file(tmp_path, monkeypatch)
             pass
 
     monkeypatch.setattr(status_components, "LlmClient", FakeClient)
-    assert status_components.check_live_persona(_settings(tmp_path))
+    assert status_components.check_live_persona(_settings(tmp_path).model_copy(update={"llm_model": model}))
     assert list(tmp_path.rglob("*.live.yaml")) == []
 
 

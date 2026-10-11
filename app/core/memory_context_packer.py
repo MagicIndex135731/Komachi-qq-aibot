@@ -164,6 +164,7 @@ class MemoryFact:
     group_id: int | None = None
     memory_kind: str = ""
     observed_at: datetime | None = None
+    memory_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +173,7 @@ class MemorySummary:
     source_msg_ids: tuple[str, ...]
     relevant: bool = False
     group_id: int | None = None
+    summary_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

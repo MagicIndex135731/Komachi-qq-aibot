@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +16,7 @@ import yaml
 from sqlalchemy import text
 
 from app.core.persona_switch import DEFAULT_PERSONA_KEY
+from app.core.memory_source_guard import is_usable_memory_source
 from app.core.message_mentions import (
     bot_text_mention_names,
     collect_bot_display_names,
@@ -26,11 +31,28 @@ from app.storage.repositories import (
     MessageRepository,
     PersonaStyleExampleRepository,
     PersonaStyleSyncStateRepository,
+    UsageRepository,
 )
 
 
 logger = logging.getLogger(__name__)
-PERSONA_REFRESH_REASONING_EFFORT = "low"
+PERSONA_REFRESH_TIMEOUT_SECONDS = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class _PersonaTranscriptSource:
+    message_id: str
+    user_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PersonaTranscriptPacket:
+    text: str = ""
+    sources: tuple[_PersonaTranscriptSource, ...] = ()
+
+
+class PersonaRefreshSourcesRevokedError(ValueError):
+    """The observed live sources no longer authorize a persona update."""
 
 
 _LIVE_PROFILE_REQUIRED_TYPES: dict[str, type] = {
@@ -55,6 +77,10 @@ _LIVE_PROFILE_OPTIONAL_TYPES: dict[str, type] = {
     "live_refresh": bool,
     "source_group_id": int,
     "source_user_id": int,
+    # Existing persona.yaml profiles use this runtime label to distinguish a
+    # Komachi variant from a member impersonation.  Live refresh must preserve
+    # the field when the model echoes the current profile.
+    "komachi_variant": bool,
 }
 _LIVE_PROFILE_FIELD_ALIASES = {
     "speaking_habits": "speech_habits",
@@ -195,6 +221,28 @@ class PersonaLiveSyncService:
         self.interval_seconds = max(30.0, float(interval_seconds))
         self.refresh_threshold = max(1, int(refresh_threshold))
         self.refresh_cooldown_seconds = max(3600.0, float(refresh_cooldown_seconds))
+        self._profile_locks: dict[tuple[str, int, int], threading.RLock] = {}
+        self._profile_locks_guard = threading.Lock()
+
+    def _profile_lock(self, persona_key: str, user_id: int, group_id: int):
+        with self._profile_locks_guard:
+            return self._profile_locks.setdefault((persona_key, user_id, group_id), threading.RLock())
+
+    @contextmanager
+    def _profile_execution(self, persona_key: str, user_id: int, group_id: int, execution_guard):
+        lock = self._profile_lock(persona_key, user_id, group_id)
+        deadline = time.monotonic() + 200.0
+        while not lock.acquire(timeout=0.1):
+            if execution_guard is not None:
+                execution_guard()
+            if time.monotonic() >= deadline:
+                raise RuntimeError("persona_profile_execution_busy")
+        try:
+            if execution_guard is not None:
+                execution_guard()
+            yield
+        finally:
+            lock.release()
 
     async def run(self) -> None:
         while True:
@@ -230,7 +278,13 @@ class PersonaLiveSyncService:
             self._sync_examples(persona_key, user_id, group_id)
             self._maybe_refresh_profile(persona_key, user_id, group_id)
 
-    def _sync_examples(self, persona_key: str, user_id: int, group_id: int) -> int:
+    def _sync_examples(self, persona_key: str, user_id: int, group_id: int, *, execution_guard=None) -> int:
+        with self._profile_execution(persona_key, user_id, group_id, execution_guard):
+            return self._sync_examples_locked(persona_key, user_id, group_id, execution_guard=execution_guard)
+
+    def _sync_examples_locked(self, persona_key: str, user_id: int, group_id: int, *, execution_guard=None) -> int:
+        if execution_guard is not None:
+            execution_guard()
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
@@ -279,6 +333,7 @@ class PersonaLiveSyncService:
             examples = _build_examples(
                 rows,
                 user_id=user_id,
+                group_id=group_id,
                 bot_qqs=self.bot_qqs,
                 bot_text_names=self.bot_text_names,
                 quoted_rows=quoted_rows,
@@ -291,6 +346,7 @@ class PersonaLiveSyncService:
                 1
                 for row in new_rows
                 if int(row.get("user_id") or 0) == user_id
+                and is_usable_memory_source(row, group_id=group_id)
                 and str(row.get("plain_text") or "").strip()
                 and str(row.get("msg_type") or "text") == "text"
                 and not message_mentions_bot(
@@ -306,6 +362,9 @@ class PersonaLiveSyncService:
                 last_msg_id=str(last_id),
                 new_count=new_target_count,
             )
+            session.flush()
+            if execution_guard is not None:
+                execution_guard()
         if inserted or updated or trimmed:
             logger.info(
                 "persona_live_bank_sync persona_key=%s user_id=%s inserted=%s updated=%s trimmed=%s",
@@ -374,7 +433,13 @@ class PersonaLiveSyncService:
             member_display_names=member_display,
         )
 
-    def _maybe_refresh_profile(self, persona_key: str, user_id: int, group_id: int) -> None:
+    def _maybe_refresh_profile(self, persona_key: str, user_id: int, group_id: int, *, execution_guard=None) -> None:
+        with self._profile_execution(persona_key, user_id, group_id, execution_guard):
+            self._maybe_refresh_profile_locked(persona_key, user_id, group_id, execution_guard=execution_guard)
+
+    def _maybe_refresh_profile_locked(self, persona_key: str, user_id: int, group_id: int, *, execution_guard=None) -> None:
+        if execution_guard is not None:
+            execution_guard()
         with session_scope(self.engine) as session:
             state_repo = PersonaStyleSyncStateRepository(session)
             state = state_repo.get(group_id=group_id, user_id=user_id)
@@ -426,7 +491,16 @@ class PersonaLiveSyncService:
                 examples=examples,
                 user_id=user_id,
                 group_id=group_id,
+                execution_guard=execution_guard,
             )
+        except PersonaRefreshSourcesRevokedError:
+            logger.info(
+                "persona_live_refresh_skipped persona_key=%s user_id=%s "
+                "reason=source_became_unavailable",
+                persona_key,
+                user_id,
+            )
+            return
         except Exception:
             logger.exception(
                 "persona_live_refresh_failed persona_key=%s user_id=%s",
@@ -435,6 +509,8 @@ class PersonaLiveSyncService:
             )
             return
         with session_scope(self.engine) as session:
+            if execution_guard is not None:
+                execution_guard()
             state_repo = PersonaStyleSyncStateRepository(session)
             state_repo.mark_refreshed(
                 group_id=group_id,
@@ -456,14 +532,17 @@ class PersonaLiveSyncService:
         examples: list,
         user_id: int,
         group_id: int,
+        execution_guard=None,
     ) -> Path:
-        from app.providers.llm_client import LlmClient
+        from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort, LlmRequestAuthorityError
 
-        transcript = self._window_transcript_block(
+        packet = self._window_transcript_packet(
             user_id=user_id,
             group_id=group_id,
             examples=examples,
         )
+        if not packet.text.strip():
+            raise ValueError("persona_refresh_no_eligible_sources")
         prompt = (
             "你是人设维护助手。下面是群成员最近一段时间的真实对话记录"
             "（按时间顺序 + 发言者）。"
@@ -477,20 +556,48 @@ class PersonaLiveSyncService:
             "不要删除仍成立的条目，不要新增语料里没有的事实。\n"
             "只输出一个 ```yaml 代码块。\n"
             f"当前画像：\n{yaml.safe_dump(current_profile, allow_unicode=True, sort_keys=False)}\n"
-            f"最新对话记录：\n{transcript}"
+            f"最新对话记录：\n{packet.text}"
         )
+        def require_request_valid():
+            if execution_guard is not None:
+                execution_guard()
+            with session_scope(self.engine) as session:
+                self._validate_refresh_sources(session, packet=packet, user_id=user_id, group_id=group_id)
+
+        def record_refresh_usage(usage):
+            with session_scope(self.engine) as session:
+                UsageRepository(session).add_usage(
+                    timestamp=usage.timestamp, model=usage.model,
+                    endpoint="persona_refresh_" + usage.endpoint,
+                    input_tokens=usage.input_tokens, cached_input_tokens=usage.cached_input_tokens,
+                    output_tokens=usage.output_tokens,
+                )
+
         client = LlmClient(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
             model=self.settings.llm_model,
-            fallback_model=self.settings.llm_fallback_model,
+            fallback_model="",
             responses_only=True,
             responses_model=self.settings.llm_model,
             max_output_tokens=16000,
-            timeout_seconds=180.0,
-            reasoning_effort=PERSONA_REFRESH_REASONING_EFFORT,
+            timeout_seconds=PERSONA_REFRESH_TIMEOUT_SECONDS,
+            reasoning_effort=default_auxiliary_reasoning_effort(self.settings.llm_model),
+            request_max_attempts=1,
+            request_guard=require_request_valid,
+            usage_recorder=record_refresh_usage,
         )
-        generated = client.generate_text([prompt])
+        try:
+            # Check here as well as at the real HTTP boundary: injected test
+            # clients and future wrappers cannot bypass source authority.
+            require_request_valid()
+            generated = client.generate_text([prompt])
+        except LlmRequestAuthorityError as exc:
+            if isinstance(exc.__cause__, PersonaRefreshSourcesRevokedError):
+                raise exc.__cause__
+            raise
+        finally:
+            client.http_client.close()
         profile = _normalize_live_profile_contract(
             parse_persona_yaml(generated),
             fallback_profile=current_profile,
@@ -508,16 +615,56 @@ class PersonaLiveSyncService:
         for rel in profile.get("relationships") or []:
             if isinstance(rel, dict) and not rel.get("member_user_id"):
                 rel["member_user_id"] = id_by_name.get(str(rel.get("member") or ""))
-        live_path = write_live_profile(
-            data_dir=self.settings.data_dir,
-            persona_key=persona_key,
-            profile=profile,
-        )
-        merged = _merge_profile(current_profile, profile)
-        self.personas[persona_key] = merged
-        if hasattr(self.manager, "personas"):
-            self.manager.personas[persona_key] = merged
+        with session_scope(self.engine) as session:
+            # The model call holds no database lock. Only the final source
+            # check and atomic profile replacement share this short write
+            # fence, so a recall cannot race between validation and publish.
+            if self.engine.dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            self._validate_refresh_sources(
+                session, packet=packet, user_id=user_id, group_id=group_id,
+            )
+            if execution_guard is not None:
+                execution_guard()
+            live_path = write_live_profile(
+                data_dir=self.settings.data_dir,
+                persona_key=persona_key,
+                profile=profile,
+            )
+            merged = _merge_profile(current_profile, profile)
+            self.personas[persona_key] = merged
+            if hasattr(self.manager, "personas"):
+                self.manager.personas[persona_key] = merged
         return live_path
+
+    def _validate_refresh_sources(self, session, *, packet, user_id: int, group_id: int) -> None:
+        expected = {source.message_id: source.user_id for source in packet.sources}
+        sources = MessageRepository(session).get_group_messages_by_platform_msg_ids(
+            group_id=group_id, platform_msg_ids=list(expected),
+        )
+        def outbound(source):
+            raw = source.raw_json
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    return True
+            return isinstance(raw, dict) and raw.get("direction") == "outbound"
+        if (
+            not expected
+            or user_id not in expected.values()
+            or set(sources) != set(expected)
+            or any(
+                author_id <= 0
+                or author_id in self.bot_qqs
+                or not is_usable_memory_source(
+                    sources[message_id], group_id=group_id, author_id=author_id,
+                )
+                or outbound(sources[message_id])
+                for message_id, author_id in expected.items()
+            )
+        ):
+            raise PersonaRefreshSourcesRevokedError("persona_refresh_sources_unavailable")
 
     def _window_transcript_block(
         self,
@@ -528,6 +675,21 @@ class PersonaLiveSyncService:
         context_radius: int = 3,
         max_lines: int = 2000,
     ) -> str:
+        """Compatibility renderer; refreshes use the source-bearing packet."""
+        return self._window_transcript_packet(
+            user_id=user_id, group_id=group_id, examples=examples,
+            context_radius=context_radius, max_lines=max_lines,
+        ).text
+
+    def _window_transcript_packet(
+        self,
+        *,
+        user_id: int,
+        group_id: int,
+        examples: list,
+        context_radius: int = 3,
+        max_lines: int = 2000,
+    ) -> _PersonaTranscriptPacket:
         """Render the refresh window as a chronological transcript with
         speaker labels. Image messages appear as a plain [图片] placeholder."""
 
@@ -541,7 +703,7 @@ class PersonaLiveSyncService:
             if timestamp is not None:
                 stamps.append(timestamp)
         if not stamps:
-            return ""
+            return _PersonaTranscriptPacket()
         from datetime import timedelta
 
         start = min(stamps)
@@ -565,7 +727,7 @@ class PersonaLiveSyncService:
         with session_scope(self.engine) as session:
             rows = session.execute(
                 text(
-                    "SELECT id, platform_msg_id, user_id, timestamp, plain_text, "
+                    "SELECT id, platform_msg_id, group_id, user_id, timestamp, plain_text, "
                     "msg_type, raw_json "
                     "FROM messages WHERE group_id = :group_id "
                     "AND timestamp BETWEEN :start AND :end ORDER BY id"
@@ -580,16 +742,25 @@ class PersonaLiveSyncService:
                     candidate = index + offset
                     if 0 <= candidate < len(rows):
                         kept_indexes.add(candidate)
-        selected = [rows[index] for index in sorted(kept_indexes)]
+        selected = [
+            rows[index] for index in sorted(kept_indexes)
+            if is_usable_memory_source(rows[index], group_id=group_id)
+        ]
         if len(selected) > int(max_lines):
             step = len(selected) / int(max_lines)
             selected = [
                 selected[int(position * step)] for position in range(int(max_lines))
             ]
         lines: list[str] = []
+        sources: list[_PersonaTranscriptSource] = []
         for row in selected:
             row_user_id = int(row.get("user_id") or 0)
-            if row_user_id in self.bot_qqs:
+            if row_user_id <= 0 or row_user_id in self.bot_qqs:
+                continue
+            raw = row.get("raw_json")
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if isinstance(raw, dict) and raw.get("direction") == "outbound":
                 continue
             speaker = _speaker_label(row.get("raw_json")) or str(row_user_id)
             timestamp = str(row.get("timestamp") or "")[:16]
@@ -598,7 +769,12 @@ class PersonaLiveSyncService:
                 lines.append(f"[{timestamp}] {speaker}: [图片]")
             elif plain:
                 lines.append(f"[{timestamp}] {speaker}: {plain}")
-        return "\n".join(lines)
+            else:
+                continue
+            sources.append(_PersonaTranscriptSource(str(row["platform_msg_id"]), row_user_id))
+        if not any(source.user_id == target_user_id for source in sources):
+            return _PersonaTranscriptPacket()
+        return _PersonaTranscriptPacket("\n".join(lines), tuple(sources))
 
 def _build_examples(
     rows: list,
@@ -606,15 +782,27 @@ def _build_examples(
     user_id: int,
     bot_qqs: set[int],
     bot_text_names: set[str],
+    group_id: int | None = None,
     quoted_rows: dict[str, dict] | None = None,
 ) -> list[dict]:
-    new_rows = [dict(row) for row in rows]
+    # Keep only author identities from revoked rows: a human replying to the
+    # bot remains generated-content-dependent even when that bot row is no
+    # longer eligible to provide its text as a style sample.
+    source_authors = {
+        str(row.get("platform_msg_id")): int(row.get("user_id") or 0)
+        for row in [*rows, *(quoted_rows or {}).values()]
+    }
+    new_rows = [
+        dict(row) for row in rows
+        if is_usable_memory_source(row, group_id=group_id)
+    ]
     by_id = {str(row.get("platform_msg_id")): row for row in new_rows if row.get("plain_text")}
     by_id.update(
         {
             str(msg_id): dict(row)
             for msg_id, row in (quoted_rows or {}).items()
             if str(row.get("plain_text") or "").strip()
+            and is_usable_memory_source(row, group_id=group_id)
         }
     )
     ordered = [row for row in new_rows if str(row.get("plain_text") or "").strip()]
@@ -630,7 +818,7 @@ def _build_examples(
             # Human-to-AI turns must never become style samples.
             continue
         quoted_for_style = by_id.get(str(row.get("reply_to_msg_id") or ""))
-        if quoted_for_style is not None and int(quoted_for_style.get("user_id") or 0) in bot_qqs:
+        if source_authors.get(str(row.get("reply_to_msg_id") or "")) in bot_qqs:
             # A reply to the bot is conditioned on generated content, so it is
             # not independent evidence of how this member talks with humans.
             continue
@@ -645,7 +833,12 @@ def _build_examples(
                 continue
             label = _speaker_label(other.get("raw_json")) or str(other.get("user_id"))
             context_before.append(
-                {"speaker": label, "text": str(other.get("plain_text") or "").strip()}
+                {
+                    "speaker": label,
+                    "text": str(other.get("plain_text") or "").strip(),
+                    "source_msg_id": str(other.get("platform_msg_id") or ""),
+                    "user_id": int(other.get("user_id") or 0),
+                }
             )
         context_after = []
         for other in ordered[index + 1 : index + 1 + 2]:

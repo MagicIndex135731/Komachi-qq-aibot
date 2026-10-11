@@ -1,0 +1,8 @@
+# This Dockerfile-specific whitelist leaves the production bot context unchanged.
+**
+!__init__.py
+!agent/
+agent/**
+!agent/__init__.py
+!agent/python_sandbox.py
+!agent/sandbox_gateway.py

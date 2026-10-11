@@ -42,6 +42,46 @@ def test_web_search_client_maps_tavily_results() -> None:
     assert results[0].date == "2026-05-01"
 
 
+def test_web_search_client_maps_wyzlab_alpha_results_without_store() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        import json
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "encrypted_output": "opaque desktop payload",
+            "results": [{
+                "type": "text_result",
+                "title": "Jev 是什么？",
+                "snippet": "Jev 是面向软件的决策模型。",
+                "url": "https://www.jev.guide/zh/learn/what-is-jev",
+                "date": "2026-09-19",
+            }],
+        })
+
+    client = WebSearchClient(
+        provider="wyzlab_alpha",
+        base_url="https://shell.wyzlab.ai/v1",
+        api_key="search-key",
+        model="gpt-6.1-sol",
+        timeout_seconds=8.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    results = client.search("JEV 是什么", max_results=3)
+
+    assert captured["url"] == "https://shell.wyzlab.ai/v1/alpha/search"
+    assert "store" not in captured["payload"]
+    assert captured["payload"]["commands"]["search_query"] == [{"q": "JEV 是什么"}]
+    assert results == [WebSearchResult(
+        title="Jev 是什么？",
+        snippet="Jev 是面向软件的决策模型。",
+        source="https://www.jev.guide/zh/learn/what-is-jev",
+        date="2026-09-19",
+    )]
+
+
 def test_web_search_client_returns_empty_results_when_api_key_is_blank() -> None:
     client = WebSearchClient(
         provider="tavily",

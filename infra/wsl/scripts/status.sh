@@ -411,6 +411,32 @@ if [[ "${private_ok}" != true ]]; then
 fi
 
 echo "Component diagnostics:"
+if systemctl is-enabled --quiet xiaomachi-sandbox.service; then
+  systemctl is-active --quiet xiaomachi-sandbox.service || {
+    echo "xiaomachi-sandbox.service is not active."
+    exit 1
+  }
+  echo "Isolated computation gateway probe:"
+  if ! docker exec -i "${bot_container_name}" python - <<'PY'
+import json
+import os
+from urllib.request import Request, ProxyHandler, build_opener
+
+token = os.environ.get("XIAOMACHI_SANDBOX_TOKEN", "")
+if not token:
+    raise SystemExit("Sandbox token is missing")
+request = Request("http://127.0.0.1:8217/health", headers={"Authorization": "Bearer " + token})
+with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+    result = json.load(response)
+print(json.dumps({"status": result.get("status"), "available": result.get("available")}))
+if result.get("status") != "ok" or result.get("available") is not True:
+    raise SystemExit(1)
+PY
+  then
+    echo "Xiaomachi computation gateway is unavailable."
+    exit 1
+  fi
+fi
 component_args=()
 if [[ "${deep_probe}" == true ]]; then
   component_args+=(--deep)

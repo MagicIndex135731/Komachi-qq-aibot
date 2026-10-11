@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from zlib import crc32
 
+from app.core.time_utils import ASIA_SHANGHAI
+
 
 @dataclass(slots=True)
 class PolicyInput:
@@ -92,7 +94,8 @@ class ReplyPolicy:
         if policy_input.quiet_hours is None:
             return False
         start, end = policy_input.quiet_hours
-        current = policy_input.now.timetz().replace(tzinfo=None)
+        now = policy_input.now
+        current = (now.astimezone(ASIA_SHANGHAI) if now.tzinfo is not None else now).timetz().replace(tzinfo=None)
         if start <= end:
             return start <= current <= end
         return current >= start or current <= end

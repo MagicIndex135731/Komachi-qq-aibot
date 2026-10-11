@@ -1,5 +1,8 @@
 from importlib import metadata
+import json
 from pathlib import Path
+import tomllib
+from urllib.parse import unquote, urlparse
 
 import pytest
 
@@ -55,6 +58,11 @@ def test_editable_install_metadata_exists() -> None:
 
     assert metadata.version("qq-ai-bot") == "0.1.0"
     assert package_metadata["Name"] == "qq-ai-bot"
-    assert package_metadata["Summary"] == "NapCat-based QQ AI bot with image generation and private admin repo control"
-    assert Path(distribution.locate_file("pyproject.toml")).resolve() == ROOT / "pyproject.toml"
-    assert Path(distribution.locate_file("app/main.py")).resolve() == ROOT / "app" / "main.py"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert package_metadata["Summary"] == project["description"]
+    direct_url = json.loads(distribution.read_text("direct_url.json"))
+    assert direct_url["dir_info"]["editable"] is True
+    installed_path = unquote(urlparse(direct_url["url"]).path)
+    if installed_path.startswith("/") and len(installed_path) > 2 and installed_path[2] == ":":
+        installed_path = installed_path[1:]
+    assert Path(installed_path).resolve() == ROOT

@@ -6,6 +6,9 @@ WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${WSL_DIR}"
 
 compose_exit=0
+if systemctl is-active --quiet xiaomachi-sandbox.service; then
+  systemctl stop xiaomachi-sandbox.service || compose_exit=$?
+fi
 # Each stack tears down every service it defines, so ``down`` also removes the
 # xiaomachi-private chat container alongside the group bot and the QQ platform.
 docker compose -f docker-compose.yml down --remove-orphans || compose_exit=$?

@@ -12,6 +12,11 @@ from sqlalchemy import bindparam, text
 from app.adapters.napcat_ws import NapCatGateway
 from app.adapters.onebot_models import parse_group_message_event, resolve_message_type
 from app.adapters.sender import Sender
+from app.agent.contracts import GroupAgentOptions
+from app.agent.observation import GroupObservationService
+from app.agent.participation import GroupParticipationPlanner
+from app.agent.runtime import GroupAgentRuntime
+from app.providers.llm_client import LlmClient
 from app.config import AppSettings, load_runtime_config
 from app.core.time_utils import ASIA_SHANGHAI
 from app.core.context_builder import ContextBuilder
@@ -29,6 +34,7 @@ from app.main import (
     build_llm_client,
     build_memory_runtime,
     build_proactive_judge_client,
+    build_usage_recorder,
     build_web_search_client,
     create_runtime_banner,
     should_enable_memory_in_group,
@@ -37,6 +43,7 @@ from app.main import (
 )
 from app.providers.semantic_embeddings import EmbeddingProvider
 from app.runtime_heartbeat import RuntimeHeartbeat
+from app.runtime.social import build_social_agent
 from app.storage.db import build_engine, create_all, session_scope
 from app.storage.repositories import MessageRepository, RetrievalDocumentRepository
 
@@ -250,6 +257,7 @@ async def _replay_startup_window_mentions(
     settings: AppSettings,
     runtime,
     watermark_message_id: int,
+    agent: GroupAgentRuntime | None = None,
 ) -> None:
     """补处理启动窗口内被回填为历史、但实际是 @小町 的提问。"""
     enabled_group_ids = tuple(
@@ -310,7 +318,10 @@ async def _replay_startup_window_mentions(
             event.platform_msg_id,
         )
         try:
-            await router._handle_persisted_group_message(event)
+            if agent is not None:
+                await agent.observe(event)
+            else:
+                await router._handle_persisted_group_message(event)
         except Exception:
             logging.exception(
                 "startup_window_replay_failed group_id=%s msg_id=%s",
@@ -373,6 +384,10 @@ async def _handle_group_recall_payload(payload: dict, *, engine) -> bool:
 
 
 async def run() -> None:
+    # Also covers the legacy app.main alias, which invokes run() directly.
+    # QQ media URLs can carry access tokens in their query string.
+    for library in ("httpx", "httpcore"):
+        logging.getLogger(library).setLevel(logging.WARNING)
     settings = AppSettings()
     runtime = load_runtime_config(settings)
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "group.heartbeat.json")
@@ -381,8 +396,16 @@ async def run() -> None:
     group_image_service = None
     memory_compaction_service = None
     persona_sync_task = None
+    persona_task_worker = None
     member_fact_refresh_task = None
     persona_prewarm_task = None
+    group_agent = None
+    participation_planner = None
+    social_agent = None
+    social_planner = None
+    group_image_started = False
+    owner_action_worker = None
+    owner_notice_worker = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
         logging.info("startup_step build_engine done")
@@ -397,7 +420,7 @@ async def run() -> None:
         )
         sender = Sender(gateway)
         llm_client = build_llm_client(settings=settings, engine=engine)
-        proactive_judge_client = build_proactive_judge_client(
+        proactive_judge_client = None if settings.group_agent_enabled else build_proactive_judge_client(
             settings=settings,
             llm_client=llm_client,
             engine=engine,
@@ -442,8 +465,6 @@ async def run() -> None:
         persistent_group_engine = engine if hasattr(engine, "connect") else None
         if hasattr(group_image_service, "engine") and getattr(group_image_service, "engine", None) is None:
             group_image_service.engine = persistent_group_engine
-        if hasattr(group_image_service, "start") and getattr(group_image_service, "engine", None) is not None:
-            await group_image_service.start()
         if memory_compaction_service is not None:
             await memory_compaction_service.start()
         persona_manager = PersonaManager(
@@ -473,6 +494,12 @@ async def run() -> None:
             manager=persona_manager,
         )
         persona_sync_task = asyncio.create_task(persona_sync_service.run())
+        from app.agent.service_tools import PersonaTaskService, PersonaTaskWorker
+        persona_task_worker = PersonaTaskWorker(
+            PersonaTaskService(engine, account_id=settings.bot_qq), persona_sync_service,
+            permission_check=lambda: getattr(runtime, "social_policy", {}).get("services", {}).get("persona_task_execution") is True,
+        )
+        await persona_task_worker.start()
         memory_group_ids = {
             int(group_id)
             for group_id in runtime.group_policy.get("groups", {})
@@ -484,6 +511,7 @@ async def run() -> None:
         member_fact_refresh_service = MemberFactRefreshService(
             engine=engine,
             settings=settings,
+            usage_recorder=build_usage_recorder(engine),
             group_ids=memory_group_ids,
             bot_qq=settings.bot_qq,
             bot_name=str(runtime.persona.get("name", settings.bot_qq)),
@@ -514,6 +542,84 @@ async def run() -> None:
             persona_manager=persona_manager,
             persona_switch_service=persona_switch_service,
         )
+        if hasattr(group_image_service, "group_source_validator"):
+            observation = GroupObservationService(router)
+            group_image_service.group_source_validator = lambda request: (
+                gateway.websocket is not None and observation.image_job_allowed(request)
+            )
+        enabled_group_ids = tuple(int(group_id) for group_id in runtime.group_policy.get("groups", {})
+                                  if should_ingest_group_message(group_id=int(group_id), group_policy=runtime.group_policy))
+        if settings.group_agent_enabled and enabled_group_ids:
+            decision_client = build_proactive_judge_client(
+                settings=settings.model_copy(update={
+                    "proactive_model_judge_enabled": True,
+                    "proactive_judge_max_output_tokens": settings.group_agent_decision_max_output_tokens,
+                    "proactive_judge_reasoning_effort": settings.group_agent_decision_reasoning_effort,
+                    "llm_timeout_seconds": min(settings.llm_timeout_seconds, settings.group_agent_decision_timeout_seconds),
+                }),
+                llm_client=llm_client, engine=engine,
+            ) or llm_client
+            if isinstance(decision_client, LlmClient):
+                decision_client.vision_model = (settings.llm_vision_model or "").strip()
+            participation_planner = GroupParticipationPlanner(
+                router=router, decision_client=decision_client,
+                max_workers=settings.group_agent_max_concurrent_turns,
+            )
+            group_agent = GroupAgentRuntime(
+                engine=engine, bot_qq=settings.bot_qq,
+                bot_name=str(runtime.persona.get("name", settings.bot_qq)),
+                decide=participation_planner.decide, execute=participation_planner.execute,
+                options=GroupAgentOptions(
+                    quiet_seconds=settings.group_agent_batch_quiet_seconds,
+                    max_batch_wait_seconds=settings.group_agent_batch_max_seconds,
+                    max_batch_messages=settings.group_agent_batch_max_messages,
+                    max_pending_per_group=settings.group_agent_max_pending_per_group,
+                    max_message_age_seconds=settings.group_agent_max_message_age_seconds,
+                    max_active_groups=max(1, len(enabled_group_ids)),
+                    model_concurrency=settings.group_agent_max_concurrent_turns,
+                    decision_timeout_seconds=settings.group_agent_decision_timeout_seconds,
+                    execution_timeout_seconds=settings.group_agent_turn_timeout_seconds,
+                ),
+            )
+            await group_agent.start()
+        if settings.social_agent_enabled or (settings.agent_runtime == "harness" and settings.group_agent_enabled):
+            social_agent, social_planner = build_social_agent(
+                router=router, sender=sender, gateway=gateway, llm_client=llm_client,
+            )
+        if social_agent is not None:
+            if participation_planner is not None and hasattr(social_planner.executor, "execute_group_turn"):
+                participation_planner.autonomous_executor = social_planner.executor
+            await social_agent.start()
+        if (participation_planner is not None and settings.agent_runtime == "harness"
+                and participation_planner.autonomous_executor is None):
+            from app.agent.autonomous_social import AutonomousSocialExecutor
+            from app.adapters.qzone import QzoneAdapter
+            from app.adapters.account_profile import AccountProfileAdapter
+            participation_planner.autonomous_executor = AutonomousSocialExecutor(
+                router=router, sender=sender, qzone_adapter=QzoneAdapter(gateway), decision_client=llm_client,
+                image_service=group_image_service, profile_adapter=AccountProfileAdapter(gateway,
+                    account_id=settings.bot_qq, allowed_group_ids=tuple(enabled_group_ids),
+                    media_roots=((settings.data_dir / "autonomous_artifacts").resolve(),)))
+            participation_planner.owns_autonomous_executor = True
+
+        if settings.agent_runtime == 'harness':
+            executor = getattr(social_planner, 'executor', None) if social_planner is not None else None
+            executor = executor or getattr(participation_planner, 'autonomous_executor', None)
+            if executor is not None and hasattr(executor, 'execute_owner_action'):
+                from app.agent.owner_actions import OwnerActionService, OwnerActionWorker, OwnerNoticeWorker
+                owner_service = OwnerActionService(engine, runtime=runtime)
+                owner_action_worker = OwnerActionWorker(owner_service, executor, connected=lambda: gateway.websocket is not None)
+                owner_notice_worker = OwnerNoticeWorker(owner_service, sender, surface='group', connected=lambda: gateway.websocket is not None)
+                await owner_action_worker.start()
+                await owner_notice_worker.start()
+
+        def set_agents_connected(connected: bool) -> None:
+            if group_agent is not None:
+                group_agent.set_connected(connected)
+            if social_agent is not None:
+                social_agent.set_connected(connected)
+
+        gateway.on_connection_change = set_agents_connected
 
         async def handle_payload(payload: dict) -> None:
             if await _handle_group_recall_payload(payload, engine=engine):
@@ -555,9 +661,23 @@ async def run() -> None:
                 bot_qq=settings.bot_qq,
                 bot_name=str(runtime.persona.get("name", settings.bot_qq)),
             )
-            await router.handle_group_message(event)
+            if group_agent is not None:
+                router.ingest_live_group_message(event)
+                await group_agent.observe(event)
+            else:
+                await router.handle_group_message(event)
 
         async def backfill_group_history_on_connect() -> None:
+            nonlocal group_image_started
+            set_agents_connected(True)
+            if (
+                not group_image_started
+                and hasattr(group_image_service, "start")
+                and getattr(group_image_service, "engine", None) is not None
+            ):
+                # Recovered drawings may send only after policy and OneBot are ready.
+                await group_image_service.start()
+                group_image_started = True
             _write_group_ready_marker(log_dir=settings.log_dir, state="connected")
             try:
                 watermark_message_id = _max_message_id(engine)
@@ -573,6 +693,7 @@ async def run() -> None:
                     settings=settings,
                     runtime=runtime,
                     watermark_message_id=watermark_message_id,
+                    agent=group_agent,
                 )
             except Exception:
                 logging.exception("startup_backfill_failed; continuing to accept messages")
@@ -582,12 +703,32 @@ async def run() -> None:
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
+        if owner_action_worker is not None:
+            await owner_action_worker.stop()
+        if owner_notice_worker is not None:
+            await owner_notice_worker.stop()
+        if persona_task_worker is not None:
+            await persona_task_worker.stop()
+        if social_agent is not None:
+            await social_agent.stop()
+        if social_planner is not None:
+            if hasattr(social_planner, "aclose"):
+                await social_planner.aclose()
+            else:
+                social_planner.close()
+        if group_agent is not None:
+            await group_agent.stop()
+        if participation_planner is not None:
+            participation_planner.close()
         if member_fact_refresh_task is not None:
             member_fact_refresh_task.cancel()
         if persona_prewarm_task is not None:
             persona_prewarm_task.cancel()
         if persona_sync_task is not None:
             persona_sync_task.cancel()
+        service_tasks = [task for task in (member_fact_refresh_task, persona_prewarm_task, persona_sync_task) if task is not None]
+        if service_tasks:
+            await asyncio.gather(*service_tasks, return_exceptions=True)
         if group_image_service is not None and hasattr(group_image_service, "stop") and getattr(group_image_service, "engine", None) is not None:
             await group_image_service.stop()
         if memory_compaction_service is not None:

@@ -127,11 +127,15 @@ done
 # Persistent runtime state lives in Docker named volumes on the Linux ext4
 # filesystem.  The migration script is a no-op in an installed Linux release.
 docker volume inspect xiaomachi-bot-data >/dev/null 2>&1 || docker volume create xiaomachi-bot-data >/dev/null
-docker volume inspect xiaomachi-llbot-data >/dev/null 2>&1 || docker volume create xiaomachi-llbot-data >/dev/null
+if [[ "${platform}" == "llbot" ]]; then
+  docker volume inspect xiaomachi-llbot-data >/dev/null 2>&1 || docker volume create xiaomachi-llbot-data >/dev/null
+fi
 bash "${SCRIPT_DIR}/migrate_runtime_to_linux_volumes.sh"
-# This is a cache check on normal starts. Dependency installation only runs when
-# the Dockerfile or requirements file changed, or when the local image is absent.
-docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi
+# Installation/rebuild prepares the image. Normal startup must survive removal
+# of old dependency images and build caches without compiling a new release.
+if ! docker image inspect xiaomachi-bot:local >/dev/null 2>&1; then
+  docker compose -f "${compose_file}" ${gpu_flag} build xiaomachi
+fi
 bash "${SCRIPT_DIR}/migrate_xiaomachi_data_volume.sh" "${compose_file}"
 if [[ "${platform}" == "llbot" ]]; then
   docker run --rm \
@@ -153,6 +157,9 @@ docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
 # server broadcasts every event to every connected client, so both processes
 # share the same WebSocket.
 docker compose -f "${compose_file}" up -d --no-deps xiaomachi-private
+if systemctl is-enabled --quiet xiaomachi-sandbox.service; then
+  systemctl start xiaomachi-sandbox.service
+fi
 if bash "${SCRIPT_DIR}/status.sh"; then
   :
 else

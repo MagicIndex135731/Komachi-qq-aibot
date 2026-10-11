@@ -42,21 +42,21 @@ def _settings(tmp_path) -> AppSettings:
 
 
 PARAPHRASE_VARIANTS = (
-    "阿渣喜欢喝什么？",
-    "阿渣平时爱喝啥来着？",
-    "阿渣的饮品偏好是啥？",
-    "喝什么，阿渣喜欢？",
-    "阿渣上次说他喜欢喝什么来着？",
+    "小甲喜欢喝什么？",
+    "小甲平时爱喝啥来着？",
+    "小甲的饮品偏好是啥？",
+    "喝什么，小甲喜欢？",
+    "小甲上次说他喜欢喝什么来着？",
     "20001喜欢喝什么？",
 )
 
 OPINION_VARIANTS = (
-    "阿渣觉得八仙怎么样？",
-    "阿渣感觉八仙如何？",
-    "阿渣认为八仙咋样？",
-    "阿渣怎么看八仙？",
-    "阿渣对八仙什么看法？",
-    "阿渣如何评价八仙？",
+    "小甲觉得八仙怎么样？",
+    "小甲感觉八仙如何？",
+    "小甲认为八仙咋样？",
+    "小甲怎么看八仙？",
+    "小甲对八仙什么看法？",
+    "小甲如何评价八仙？",
 )
 
 FIRST_PERSON_VARIANTS = (
@@ -102,7 +102,7 @@ def seeded(sqlite_engine) -> dict:
                 speak_enabled=True,
             )
         users = UserRepository(session)
-        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=20001, nickname="Member-A", group_card="小甲")
         users.upsert_user(user_id=99, nickname="Questioner", group_card="提问者")
         messages = MessageRepository(session)
         fact_source = messages.add_group_message(
@@ -110,8 +110,8 @@ def seeded(sqlite_engine) -> dict:
             group_id=100,
             user_id=20001,
             timestamp=observed_at,
-            plain_text="阿渣喜欢喝冰美式。",
-            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            plain_text="小甲喜欢喝冰美式。",
+            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -179,7 +179,7 @@ def seeded(sqlite_engine) -> dict:
             group_id=200,
             user_id=99,
             timestamp=observed_at,
-            plain_text="阿渣喜欢喝什么？",
+            plain_text="小甲喜欢喝什么？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -193,7 +193,7 @@ def seeded(sqlite_engine) -> dict:
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="para-fact-source",
@@ -205,7 +205,7 @@ def seeded(sqlite_engine) -> dict:
             subject_type="user",
             subject_id="20001",
             memory_kind="profile",
-            content="阿渣是咖啡爱好者",
+            content="小甲是咖啡爱好者",
             importance=3,
             confidence=0.8,
             source_msg_id="para-fact-source",
@@ -272,7 +272,7 @@ def test_paraphrase_matrix_recalls_same_source_for_all_variants(
         fact_sources = {
             source_id
             for fact in packed.facts
-            if "阿渣喜欢喝冰美式" in fact.text
+            if "小甲喜欢喝冰美式" in fact.text
             for source_id in fact.source_msg_ids
         }
         if subject_ids == ():
@@ -311,7 +311,7 @@ def test_opinion_variants_bind_member_and_recall_same_source(
         fact_sources = {
             source_id
             for fact in trace.result.packed_context.facts
-            if "阿渣喜欢喝冰美式" in fact.text
+            if "小甲喜欢喝冰美式" in fact.text
             for source_id in fact.source_msg_ids
         }
         assert fact_sources == {seeded["fact_source"]}, variant

@@ -6,15 +6,15 @@ Two-stage pipeline:
   2. validation against held-out samples and a revised profile
 
 Usage:
-  python scripts/distill_azha_persona.py \
-    --stream data/personas/azha/group_stream.jsonl \
-    --corpus data/personas/azha/corpus.jsonl \
+  python scripts/distill_member_alpha_persona.py \
+    --stream data/personas/member_alpha/group_stream.jsonl \
+    --corpus data/personas/member_alpha/corpus.jsonl \
     --user-id <MEMBER_QQ> \
     --target-name <DISPLAY_NAME> --group-card <GROUP_CARD>
 
 Outputs are local-only persona artifacts (private-chat derived style):
-  configs/personas/azha.yaml
-  data/personas/azha/samples.jsonl
+  configs/personas/member_alpha.yaml
+  data/personas/member_alpha/samples.jsonl
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ from app.core.style_distill import (
 )
 
 
+from app.providers.llm_client import default_auxiliary_reasoning_effort
+
+
 def _complete_responses_nonstream(
     *,
     base_url: str,
@@ -46,7 +49,7 @@ def _complete_responses_nonstream(
     model: str,
     prompt_lines: list[str],
     max_output_tokens: int = 30000,
-    reasoning_effort: str = "low",
+    reasoning_effort: str | None = None,
     timeout_seconds: float = 120.0,
 ) -> str:
     """Call the Responses API without streaming to avoid truncated long outputs."""
@@ -56,7 +59,7 @@ def _complete_responses_nonstream(
         "stream": False,
         "input": "\n\n".join(prompt_lines),
         "max_output_tokens": max_output_tokens,
-        "reasoning": {"effort": reasoning_effort},
+        "reasoning": {"effort": reasoning_effort or default_auxiliary_reasoning_effort(model)},
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     with httpx.Client(timeout=timeout_seconds) as client:
@@ -126,9 +129,9 @@ def main() -> int:
     parser.add_argument("--group-card", default="")
     parser.add_argument("--source-group-id", type=int, default=0)
     parser.add_argument("--exclude-user-ids", default="")
-    parser.add_argument("--output", default="configs/personas/azha.yaml")
-    parser.add_argument("--samples", default="data/personas/azha/samples.jsonl")
-    parser.add_argument("--stage1-draft", default="data/personas/azha/stage1_draft.yaml")
+    parser.add_argument("--output", default="configs/personas/member_alpha.yaml")
+    parser.add_argument("--samples", default="data/personas/member_alpha/samples.jsonl")
+    parser.add_argument("--stage1-draft", default="data/personas/member_alpha/stage1_draft.yaml")
     parser.add_argument("--reuse-stage1", action="store_true")
     parser.add_argument("--skip-refine", action="store_true")
     parser.add_argument("--max-samples", type=int, default=700)

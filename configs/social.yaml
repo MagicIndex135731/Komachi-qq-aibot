@@ -1,0 +1,61 @@
+# Enable SOCIAL_AGENT_ENABLED and the individual surfaces explicitly.
+# Real IDs belong in the ignored social.local.yaml overlay.
+enabled: false
+# 群记忆写入与人格刷新服务可用；作用域、真实来源和刷新阈值仍独立校验。
+services:
+  memory_write: true
+  persona_refresh: true
+  persona_task_execution: true
+groups: {}
+# Per-group permission example (put real IDs in social.local.yaml):
+# autonomous_tools: true; allow_images: true; identity_tools: [card]
+# max_steps: 8; max_model_calls_daily: 60; max_image_calls_daily: 2
+compute:
+  enabled: false
+  endpoint: "http://127.0.0.1:8217"
+# Operator-owned MCP manifests, with fixed url/tools/parameters/scopes/effect.
+# Never give the model a tool to change this permission list.
+mcp: []
+profile:
+  enabled: false
+  autonomous_tools: true
+  allow_images: true
+  identity_tools: [nickname, avatar]
+  interval_seconds: 7200
+  cooldown_seconds: 86400
+  max_daily: 1
+  max_steps: 8
+  max_model_calls_daily: 60
+  max_image_calls_daily: 2
+  topics: ["小町自己的名字、形象和原创绘画兴趣"]
+qzone:
+  patrol:
+    enabled: true
+    interval_seconds: [5400, 10800]
+    morning_delay_seconds: [1800, 5400]
+    shared_cooldown_seconds: 3600
+  publish:
+    enabled: false
+    autonomous_tools: true
+    allow_images: true
+    interval_seconds: 7200
+    cooldown_seconds: 64800
+    max_daily: 1
+    persona: default
+    visibility: 4
+    topics: ["季节与日常小发现", "音乐与虚构故事"]
+    quiet_hours: ["23:00", "08:00"]
+  comment:
+    enabled: false
+    autonomous_tools: true
+    interval_seconds: 7200
+    cooldown_seconds: 3600
+    max_daily: 3
+    # Natural day in Asia/Shanghai, independently for each current friend.
+    max_daily_per_friend: 1
+    # Set all_friends: true in social.local.yaml to follow current QQ friendships.
+    all_friends: false
+    friend_ids: []
+    max_post_age_seconds: 86400
+    persona: default
+    quiet_hours: ["23:00", "08:00"]

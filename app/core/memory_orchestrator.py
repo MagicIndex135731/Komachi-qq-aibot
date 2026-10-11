@@ -80,7 +80,7 @@ class MemoryOrchestrator:
 
         if self.shadow_mode:
             selected = self._legacy_or_recent(request)
-            if self.shadow_enqueue is not None:
+            if self.shadow_enqueue is not None and not getattr(request, "read_only", False):
                 try:
                     self.shadow_enqueue(self._build_shadow_job_request(request))
                 except Exception as exc:

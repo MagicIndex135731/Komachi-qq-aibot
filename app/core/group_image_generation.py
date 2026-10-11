@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 from collections import deque
 from collections.abc import Callable
+from contextvars import Context, ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 from uuid import uuid4
 
 import httpx
 from sqlalchemy.engine import Engine
 
-from app.adapters.sender import OutboundMessage, OutboundPrivateMessage
+from app.adapters.sender import (
+    OutboundMessage, OutboundPrivateMessage, QQMessageDeliveryUncertainError,
+)
+from app.adapters.outbound_guard import GroupDispatchScope, current_group_dispatch, group_dispatch_scope
+from app.runtime.blocking import AgentModelBusyError, BoundedBlockingRunner
 from app.core.message_content import ImageAttachment
 from app.providers.image_adapter import coerce_image_artifact
 from app.storage.db import session_scope
-from app.storage.repositories import JobRepository
+from app.storage.repositories import JobRepository, MessageRepository
+from app.storage.models import Job, Message
+from app.core.memory_source_guard import is_usable_memory_source
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,8 @@ LANDSCAPE_IMAGE_SIZE = "1536x1024"
 PORTRAIT_IMAGE_SIZE = "1024x1536"
 LANDSCAPE_IMAGE_SIZE_KEYWORDS = ("横图", "横版")
 PORTRAIT_IMAGE_SIZE_KEYWORDS = ("竖图", "竖版")
+
+_image_job_id: ContextVar[int | None] = ContextVar("qq_image_job_id", default=None)
 
 
 @dataclass(slots=True)
@@ -49,6 +59,8 @@ class PrivateImageGenerationRequest:
     reference_images: list[ImageAttachment] = field(default_factory=list)
     web_search_query: str | None = None
     dev_task_id: int | None = None
+    agent_source_message_id: str | None = None
+    agent_reference_source_ids: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -56,6 +68,7 @@ class GroupImageGenerationEnqueueResult:
     accepted: bool
     queue_position: int | None = None
     reason: str = ""
+    job_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -64,6 +77,7 @@ class ImageJobResult:
     notice_text: str
     image_path: Path | None = None
     failure_reason: str = ""
+    delivery_state: str = "sent"
 
 
 @dataclass(slots=True)
@@ -120,14 +134,31 @@ class GroupImageGenerationService:
         self._worker_task: asyncio.Task | None = None
         self._idle_event = asyncio.Event()
         self._idle_event.set()
+        self._stopping = False
+        self._generation_runner = BoundedBlockingRunner(max_workers=1)
+        self.group_source_validator: Callable[[GroupImageGenerationRequest], bool] | None = None
 
     async def start(self) -> None:
+        self._stopping = False
         if self.engine is None:
+            async with self._lock:
+                if self._queue:
+                    self._idle_event.clear()
+                    self._ensure_worker_locked()
             return
         recovered_active_jobs = 0
         with session_scope(self.engine) as session:
             jobs = JobRepository(session)
-            jobs.requeue_running_jobs(job_type=self.job_type)
+            for job in jobs.list_jobs(job_type=self.job_type, statuses=["running"]):
+                payload = dict(job.payload_json or {})
+                if payload.get("delivery_state") in {"dispatching", "uncertain"}:
+                    payload["delivery_state"] = "uncertain"
+                    jobs.mark_job_status(job_id=job.id, status="failed", payload_json=payload)
+                elif payload.get("delivery_state") == "sent":
+                    jobs.mark_job_status(job_id=job.id, status="completed", payload_json=payload)
+                else:
+                    job.run_at = datetime.now(UTC)
+                    jobs.mark_job_status(job_id=job.id, status="queued")
             recovered_active_jobs = jobs.count_active_jobs(job_type=self.job_type)
         if recovered_active_jobs <= 0:
             return
@@ -136,11 +167,23 @@ class GroupImageGenerationService:
             self._ensure_worker_locked()
 
     async def stop(self) -> None:
+        self._stopping = True
         worker_task = self._worker_task
-        if worker_task is not None and worker_task.done():
+        if worker_task is not None:
+            if not worker_task.done():
+                worker_task.cancel()
             await asyncio.gather(worker_task, return_exceptions=True)
 
     async def enqueue(self, request: GroupImageGenerationRequest) -> GroupImageGenerationEnqueueResult:
+        expected_type = PrivateImageGenerationRequest if isinstance(self, PrivateImageGenerationService) else GroupImageGenerationRequest
+        if not isinstance(request, expected_type):
+            raise ValueError("image request does not belong to this chat surface")
+        if self._stopping:
+            return GroupImageGenerationEnqueueResult(accepted=False, reason="service_stopping")
+        if isinstance(request, GroupImageGenerationRequest) and not self._group_source_usable(request):
+            return GroupImageGenerationEnqueueResult(accepted=False, reason="source_unusable")
+        if isinstance(request, PrivateImageGenerationRequest) and not self._agent_private_source_usable(request):
+            return GroupImageGenerationEnqueueResult(accepted=False, reason="source_unusable")
         if self.engine is None:
             return await self._enqueue_in_memory(request)
         async with self._lock:
@@ -148,17 +191,19 @@ class GroupImageGenerationService:
             if occupied_slots >= self.max_slots:
                 return GroupImageGenerationEnqueueResult(accepted=False, reason="queue_full")
             with session_scope(self.engine) as session:
-                JobRepository(session).add_job(
+                queued_job = JobRepository(session).add_job(
                     job_type=self.job_type,
                     payload_json=self._serialize_request(request),
                     run_at=datetime.now(UTC),
                     status="queued",
                 )
+                queued_job_id = queued_job.id
             self._idle_event.clear()
             self._ensure_worker_locked()
             return GroupImageGenerationEnqueueResult(
                 accepted=True,
                 queue_position=occupied_slots + 1,
+                job_id=queued_job_id,
             )
 
     async def _enqueue_in_memory(self, request: GroupImageGenerationRequest) -> GroupImageGenerationEnqueueResult:
@@ -182,7 +227,41 @@ class GroupImageGenerationService:
 
     def _ensure_worker_locked(self) -> None:
         if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker_loop())
+            # Accepted image jobs outlive the short conversational turn. They
+            # must not inherit its dispatch fence, working note or group scope.
+            self._worker_task = asyncio.create_task(self._worker_loop(), context=Context())
+
+    def _group_source_usable(self, request: GroupImageGenerationRequest) -> bool:
+        if self._stopping:
+            return False
+        if self.engine is not None:
+            with session_scope(self.engine) as session:
+                source = MessageRepository(session).get_by_platform_msg_id(request.trigger_message_id)
+                if not is_usable_memory_source(source, group_id=request.group_id, author_id=request.requester_user_id):
+                    return False
+                if (source.raw_json or {}).get("direction") == "outbound":
+                    return False
+        return self.group_source_validator is None or bool(self.group_source_validator(request))
+
+    def _update_delivery_state(self, state: str, *, receipt_stage: str | None = None) -> None:
+        job_id = _image_job_id.get()
+        if self.engine is None or job_id is None:
+            return
+        with session_scope(self.engine) as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                raise RuntimeError("image job lost its persistent delivery record")
+            payload = dict(job.payload_json or {})
+            payload["delivery_state"] = state
+            if receipt_stage is not None and "group_id" in payload:
+                scope = current_group_dispatch(int(payload["group_id"]))
+                if scope is not None:
+                    prior = set(payload.get("image_receipt_ids", [])) if receipt_stage == "notice" else set()
+                    payload[f"{receipt_stage}_receipt_ids"] = [
+                        receipt for receipt in dict.fromkeys(scope.receipts) if receipt not in prior
+                    ][-20:]
+            job.payload_json = payload
+            session.add(job)
 
     async def _worker_loop(self) -> None:
         if self.engine is None:
@@ -228,26 +307,39 @@ class GroupImageGenerationService:
                             self._idle_event.set()
                         return
                     self._running += 1
-                request = self._deserialize_request(claimed_job.payload_json)
+                job_token = _image_job_id.set(claimed_job.id)
                 try:
-                    result = await self._process_request(request)
-                except Exception as exc:
-                    logger.exception(
-                        "group_image_worker_request_failed job_type=%s job_id=%s",
-                        self.job_type,
-                        claimed_job.id,
-                    )
-                    result = ImageJobResult(
-                        success=False,
-                        notice_text=self._failure_reply_for_exception(exc),
-                        failure_reason=str(exc),
-                    )
-                self._mark_persisted_job_result(job_id=claimed_job.id, request=request, result=result)
-                await self._handle_job_result(request=request, result=result)
-                async with self._lock:
-                    self._running = max(0, self._running - 1)
-                    if self._running == 0 and self._active_persisted_job_count() == 0:
-                        self._idle_event.set()
+                    try:
+                        request = self._deserialize_request(claimed_job.payload_json)
+                        result = await self._process_request(request)
+                    except asyncio.CancelledError:
+                        self._settle_cancelled_job(claimed_job.id)
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            "group_image_worker_request_failed job_type=%s job_id=%s",
+                            self.job_type,
+                            claimed_job.id,
+                        )
+                        result = ImageJobResult(
+                            success=False,
+                            notice_text=self._failure_reply_for_exception(exc),
+                            failure_reason=str(exc),
+                            delivery_state="failed",
+                        )
+                        request = None
+                    self._mark_persisted_job_result(job_id=claimed_job.id, result=result)
+                    if request is not None:
+                        try:
+                            await self._handle_job_result(request=request, result=result)
+                        except Exception:
+                            logger.exception("image_job_result_callback_failed job_id=%s", claimed_job.id)
+                finally:
+                    _image_job_id.reset(job_token)
+                    async with self._lock:
+                        self._running = max(0, self._running - 1)
+                        if self._running == 0 and self._active_persisted_job_count() == 0:
+                            self._idle_event.set()
         finally:
             async with self._lock:
                 if self._running == 0 and self._active_persisted_job_count() == 0:
@@ -268,16 +360,36 @@ class GroupImageGenerationService:
                 now=datetime.now(UTC),
             )
 
-    def _mark_persisted_job_result(self, *, job_id: int, request, result: ImageJobResult) -> None:
+    def _settle_cancelled_job(self, job_id: int) -> None:
         if self.engine is None:
             return
-        payload = self._serialize_request(request)
-        payload["last_notice_text"] = result.notice_text
-        if result.image_path is not None:
-            payload["image_path"] = str(result.image_path)
-        if result.failure_reason:
-            payload["failure_reason"] = result.failure_reason
         with session_scope(self.engine) as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            payload = dict(job.payload_json or {})
+            state = payload.get("delivery_state")
+            if state in {"dispatching", "uncertain"}:
+                payload["delivery_state"] = "uncertain"
+                JobRepository(session).mark_job_status(job_id=job_id, status="failed", payload_json=payload)
+            elif state == "sent":
+                JobRepository(session).mark_job_status(job_id=job_id, status="completed", payload_json=payload)
+            # Generation has no QQ side effect. Leave it recoverable as running.
+
+    def _mark_persisted_job_result(self, *, job_id: int, result: ImageJobResult) -> None:
+        if self.engine is None:
+            return
+        with session_scope(self.engine) as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                raise RuntimeError("image job lost its persistent result record")
+            payload = dict(job.payload_json or {})
+            payload["last_notice_text"] = result.notice_text
+            payload["delivery_state"] = result.delivery_state
+            if result.image_path is not None:
+                payload["image_path"] = str(result.image_path)
+            if result.failure_reason:
+                payload["failure_reason"] = result.failure_reason
             JobRepository(session).mark_job_status(
                 job_id=job_id,
                 status="completed" if result.success else "failed",
@@ -285,9 +397,29 @@ class GroupImageGenerationService:
             )
 
     async def _process_request(self, request: GroupImageGenerationRequest) -> ImageJobResult:
+        if not self._group_source_usable(request):
+            return ImageJobResult(False, "", failure_reason="source_unusable", delivery_state="blocked")
+        scope = GroupDispatchScope(
+            group_id=request.group_id,
+            can_send=lambda: self._group_source_usable(request),
+            on_dispatch=lambda: self._update_delivery_state("dispatching"),
+        )
+        with group_dispatch_scope(scope):
+            return await self._process_group_request(request)
+
+    async def _process_group_request(self, request: GroupImageGenerationRequest) -> ImageJobResult:
         try:
-            image_path = await asyncio.to_thread(self._generate_and_store_image, request)
+            image_path = await self._generation_runner.run(self._generate_and_store_image, request)
+            if not self._group_source_usable(request):
+                return ImageJobResult(False, "", image_path, "source_unusable", "blocked")
+            self._update_delivery_state("dispatching")
             await self.sender.send_group_image(group_id=request.group_id, image_file=str(image_path))
+            self._update_delivery_state("sent", receipt_stage="image")
+        except AgentModelBusyError:
+            return ImageJobResult(False, "", failure_reason="generation_capacity_unavailable", delivery_state="failed")
+        except QQMessageDeliveryUncertainError as exc:
+            self._update_delivery_state("uncertain")
+            return ImageJobResult(False, "", failure_reason=str(exc), delivery_state="uncertain")
         except Exception as exc:
             logger.exception(
                 "group_image_generation_failed group_id=%s msg_id=%s",
@@ -295,20 +427,23 @@ class GroupImageGenerationService:
                 request.trigger_message_id,
             )
             failure_text = self._failure_reply_for_exception(exc)
-            await self._send_group_notice(
+            notice_state = await self._send_group_notice(
                 request=request,
                 text=failure_text,
                 log_event="group_image_failure_notice_failed",
             )
-            return ImageJobResult(success=False, notice_text=failure_text, failure_reason=str(exc))
+            return ImageJobResult(False, failure_text, failure_reason=str(exc), delivery_state=notice_state)
 
         success_text = "图好了"
-        await self._send_group_notice(
+        notice_state = await self._send_group_notice(
             request=request,
             text=success_text,
             log_event="group_image_success_notice_failed",
         )
-        return ImageJobResult(success=True, notice_text=success_text, image_path=image_path)
+        return ImageJobResult(
+            success=notice_state != "uncertain", notice_text=success_text,
+            image_path=image_path, delivery_state="uncertain" if notice_state == "uncertain" else "sent",
+        )
 
     async def _handle_job_result(self, *, request, result: ImageJobResult) -> None:
         del request
@@ -320,8 +455,11 @@ class GroupImageGenerationService:
         request: GroupImageGenerationRequest,
         text: str,
         log_event: str,
-    ) -> None:
+    ) -> str:
+        if not self._group_source_usable(request):
+            return "blocked"
         try:
+            self._update_delivery_state("dispatching")
             await self.sender.send_group_text(
                 OutboundMessage(
                     group_id=request.group_id,
@@ -331,6 +469,11 @@ class GroupImageGenerationService:
                     ),
                 )
             )
+            self._update_delivery_state("sent", receipt_stage="notice")
+            return "sent"
+        except QQMessageDeliveryUncertainError:
+            self._update_delivery_state("uncertain")
+            return "uncertain"
         except Exception:
             logger.exception(
                 "%s group_id=%s msg_id=%s requester_user_id=%s",
@@ -339,6 +482,7 @@ class GroupImageGenerationService:
                 request.trigger_message_id,
                 request.requester_user_id,
             )
+            return "failed"
 
     def _generate_and_store_image(self, request: GroupImageGenerationRequest) -> Path:
         reference_images = self._resolve_reference_images(request)
@@ -522,6 +666,11 @@ class GroupImageGenerationService:
 
             url_value = str(artifact.url or "").strip()
             if url_value:
+                if url_value.lower().startswith("data:"):
+                    # Some image providers honor ``response_format=url`` by
+                    # returning a data URI. Passing that multi-megabyte URI
+                    # to httpx raises ``URL too long``; decode it locally.
+                    return self._decode_data_image_url(url_value), self._preferred_suffix(item=item, url=url_value)
                 response = self.http_client.get(url_value)
                 response.raise_for_status()
                 return response.content, self._preferred_suffix(item=item, url=url_value)
@@ -535,6 +684,30 @@ class GroupImageGenerationService:
         normalized += "=" * (-len(normalized) % 4)
         return base64.b64decode(normalized)
 
+    def _decode_data_image_url(self, value: str) -> bytes:
+        header, separator, encoded = value.partition(",")
+        if not separator or header.lower() not in {
+            "data:image/png;base64", "data:image/jpeg;base64",
+            "data:image/webp;base64", "data:image/gif;base64",
+        }:
+            raise ValueError("image generation response included an unsupported data URL")
+        # Reject oversized inline results before decoding; decoded bytes also
+        # remain inside the 8 MiB media budget used by the current adapters.
+        if len(encoded) > 12 * 1024 * 1024:
+            raise ValueError("image generation response exceeded its size budget")
+        try:
+            raw = unquote_to_bytes(encoded).decode("ascii")
+            normalized = "".join(raw.split())
+            if not normalized:
+                raise ValueError("empty data URL")
+            normalized += "=" * (-len(normalized) % 4)
+            contents = base64.b64decode(normalized, validate=True)
+        except (UnicodeError, ValueError, binascii.Error):
+            raise ValueError("image generation response included invalid data URL encoding") from None
+        if len(contents) > 8 * 1024 * 1024:
+            raise ValueError("image generation response exceeded its size budget")
+        return contents
+
     def _preferred_suffix(self, *, item: Any, url: str | None = None) -> str:
         if self.output_format:
             return self.output_format
@@ -542,6 +715,8 @@ class GroupImageGenerationService:
         if artifact is not None and artifact.output_format:
             return artifact.output_format
         if url:
+            if url.lower().startswith("data:image/"):
+                return url.split(";", 1)[0].split("/", 1)[1].lower()
             suffix = Path(urlparse(url).path).suffix
             if suffix:
                 return suffix.lstrip(".")
@@ -580,9 +755,14 @@ class GroupImageGenerationService:
             payload["user_id"] = request.user_id
         if hasattr(request, "dev_task_id"):
             payload["dev_task_id"] = request.dev_task_id
+        if isinstance(request, PrivateImageGenerationRequest) and request.agent_source_message_id:
+            payload["agent_source_message_id"] = request.agent_source_message_id
+            payload["agent_reference_source_ids"] = list(request.agent_reference_source_ids)
         return payload
 
     def _deserialize_request(self, payload: dict[str, Any]) -> GroupImageGenerationRequest:
+        if "user_id" in payload:
+            raise ValueError("private image request cannot enter a group worker")
         return GroupImageGenerationRequest(
             group_id=int(payload["group_id"]),
             trigger_message_id=str(payload.get("trigger_message_id", "")).strip(),
@@ -631,10 +811,61 @@ class PrivateImageGenerationService(GroupImageGenerationService):
         super().__init__(job_type="private_image_generation", **kwargs)
         self.task_result_callback = task_result_callback
 
+    def _agent_private_source_usable(self, request) -> bool:
+        permission = getattr(self, "agent_user_allowed", None)
+        if permission is not None and not permission(request.user_id):
+            return False
+        source_id = request.agent_source_message_id
+        if not source_id:
+            return True
+
+        if self.engine is None:
+            return False
+        with session_scope(self.engine) as session:
+            row = MessageRepository(session).get_by_platform_msg_id(source_id)
+            if not bool(row is not None and row.group_id is None
+                and is_usable_memory_source(row, author_id=request.user_id)
+                and isinstance(row.raw_json, dict) and row.raw_json.get("direction") != "outbound"):
+                return False
+            refs = request.agent_reference_source_ids
+            if not isinstance(refs, tuple) or len(refs) > 24 or any(type(value) is not int or value <= 0 for value in refs):
+                return False
+            for reference_id in refs:
+                reference = session.get(Message, reference_id)
+                if reference is None or reference.group_id is not None or not is_usable_memory_source(reference, author_id=request.user_id):
+                    return False
+            return True
+
+    def _record_private_receipts(self, stage, receipts):
+        job_id = _image_job_id.get()
+        if self.engine is None or job_id is None:
+            return
+        with session_scope(self.engine) as session:
+            row = session.get(Job, job_id)
+            if row and row.job_type == self.job_type:
+                payload = dict(row.payload_json)
+                payload[f"{stage}_receipt_ids"] = list(receipts)
+                row.payload_json = payload
+
     async def _process_request(self, request: PrivateImageGenerationRequest) -> ImageJobResult:
+        if self._stopping or not self._agent_private_source_usable(request):
+            return ImageJobResult(False, "", failure_reason="service_stopping" if self._stopping else "source_unavailable", delivery_state="blocked")
+        image_path = None
         try:
-            image_path = await asyncio.to_thread(self._generate_and_store_image, request)
-            await self.sender.send_private_image(user_id=request.user_id, image_file=str(image_path))
+            image_path = await self._generation_runner.run(self._generate_and_store_image, request)
+            if self._stopping or not self._agent_private_source_usable(request):
+                return ImageJobResult(False, "", image_path, "service_stopping" if self._stopping else "source_unavailable", "blocked")
+            self._update_delivery_state("dispatching")
+            receipt = await self.sender.send_private_image(user_id=request.user_id, image_file=str(image_path))
+            if request.agent_source_message_id and (not isinstance(receipt, str) or not receipt):
+                raise QQMessageDeliveryUncertainError("private_image_receipt_missing")
+            self._record_private_receipts("image", (receipt,) if isinstance(receipt, str) and receipt else ())
+            self._update_delivery_state("sent")
+        except AgentModelBusyError:
+            return ImageJobResult(False, "", failure_reason="generation_capacity_unavailable", delivery_state="failed")
+        except QQMessageDeliveryUncertainError as exc:
+            self._update_delivery_state("uncertain")
+            return ImageJobResult(False, "", image_path=image_path, failure_reason=str(exc), delivery_state="uncertain")
         except Exception as exc:
             logger.exception(
                 "private_image_generation_failed user_id=%s msg_id=%s",
@@ -642,20 +873,23 @@ class PrivateImageGenerationService(GroupImageGenerationService):
                 request.trigger_message_id,
             )
             failure_text = self._failure_reply_for_exception(exc)
-            await self._send_private_notice(
+            notice_state = await self._send_private_notice(
                 request=request,
                 text=failure_text,
                 log_event="private_image_failure_notice_failed",
             )
-            return ImageJobResult(success=False, notice_text=failure_text, failure_reason=str(exc))
+            return ImageJobResult(False, failure_text, failure_reason=str(exc), delivery_state=notice_state)
 
         success_text = "图好了"
-        await self._send_private_notice(
+        notice_state = await self._send_private_notice(
             request=request,
             text=success_text,
             log_event="private_image_success_notice_failed",
         )
-        return ImageJobResult(success=True, notice_text=success_text, image_path=image_path)
+        return ImageJobResult(
+            success=notice_state != "uncertain", notice_text=success_text,
+            image_path=image_path, delivery_state="uncertain" if notice_state == "uncertain" else "sent",
+        )
 
     async def _handle_job_result(self, *, request, result: ImageJobResult) -> None:
         if self.task_result_callback is None:
@@ -671,9 +905,21 @@ class PrivateImageGenerationService(GroupImageGenerationService):
         request: PrivateImageGenerationRequest,
         text: str,
         log_event: str,
-    ) -> None:
+    ) -> str:
+        if self._stopping or not self._agent_private_source_usable(request):
+            return "blocked"
         try:
-            await self.sender.send_private_text(OutboundPrivateMessage(user_id=request.user_id, text=text))
+            self._update_delivery_state("dispatching")
+            receipts = await self.sender.send_private_text(OutboundPrivateMessage(user_id=request.user_id, text=text))
+            valid_receipts = tuple(value for value in receipts if isinstance(value, str) and value) if isinstance(receipts, (list, tuple)) else ()
+            if request.agent_source_message_id and not valid_receipts:
+                raise QQMessageDeliveryUncertainError("private_image_notice_receipt_missing")
+            self._record_private_receipts("notice", valid_receipts)
+            self._update_delivery_state("sent")
+            return "sent"
+        except QQMessageDeliveryUncertainError:
+            self._update_delivery_state("uncertain")
+            return "uncertain"
         except Exception:
             logger.exception(
                 "%s user_id=%s msg_id=%s",
@@ -681,8 +927,11 @@ class PrivateImageGenerationService(GroupImageGenerationService):
                 request.user_id,
                 request.trigger_message_id,
             )
+            return "failed"
 
     def _deserialize_request(self, payload: dict[str, Any]) -> PrivateImageGenerationRequest:
+        if "group_id" in payload:
+            raise ValueError("group image request cannot enter a private worker")
         return PrivateImageGenerationRequest(
             user_id=int(payload["user_id"]),
             trigger_message_id=str(payload.get("trigger_message_id", "")).strip(),
@@ -694,5 +943,7 @@ class PrivateImageGenerationService(GroupImageGenerationService):
             ],
             web_search_query=self._optional_payload_text(payload.get("web_search_query")),
             dev_task_id=int(payload["dev_task_id"]) if payload.get("dev_task_id") else None,
+            agent_source_message_id=self._optional_payload_text(payload.get("agent_source_message_id")),
+            agent_reference_source_ids=tuple(payload.get("agent_reference_source_ids", ())),
         )
 

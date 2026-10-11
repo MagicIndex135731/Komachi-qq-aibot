@@ -24,7 +24,7 @@ from app.core.style_distill import (
     parse_persona_yaml,
     select_examples,
 )
-from app.providers.llm_client import LlmClient
+from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort
 
 
 def _speaker_label(raw_json: str | None, user_id: int) -> str:
@@ -187,7 +187,7 @@ def main() -> int:
             responses_model=settings.llm_model,
             max_output_tokens=12000,
             timeout_seconds=300.0,
-            reasoning_effort="low",
+            reasoning_effort=default_auxiliary_reasoning_effort(settings.llm_model),
         )
         prompt = build_profile_prompt(
             samples=samples[:160],

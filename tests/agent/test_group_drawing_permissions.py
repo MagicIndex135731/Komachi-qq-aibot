@@ -1,0 +1,90 @@
+"""Ordinary group drawing through the installed Harness and synthetic providers."""
+from __future__ import annotations
+
+import pytest
+
+from app.adapters.onebot_models import parse_group_message_event
+from app.agent.contracts import AgentBatch, AgentDecision
+from app.agent.owner_actions import restrict_directed_tools
+from app.agent.tool_agent import AgentTool, ToolOutcome
+from test_autonomous_social import (BOT, FRIEND, GROUP, OTHER_GROUP, NOW,
+    InteractiveIngressGuard, composed, writes)
+from test_harness_runtime import model_client, responses_sse
+from test_image_tools import saved_reference
+from test_mature_composition import latest
+
+
+async def unused(args):
+    return ToolOutcome({})
+
+
+@pytest.mark.parametrize("group_images", [False, True])
+def test_filter_allows_only_explicit_group_drawing(group_images):
+    names = {"generate_image": "image", "generate_private_image": "image",
+        "execute_python": "compute", "set_group_card": "write", "memory_write": "write",
+        "send_group": "write", "send_private": "write", "read_context": "read",
+        "unknown_image": "image", "unknown_write": "write"}
+    tools = [AgentTool(name, name, {}, unused, effect) for name, effect in names.items()]
+    expected = {"send_group", "send_private", "read_context"}
+    if group_images:
+        expected.add("generate_image")
+    assert {tool.name for tool in restrict_directed_tools(tools, owner=False,
+        allow_group_images=group_images)} == expected
+    assert restrict_directed_tools(tools, owner=True, allow_group_images=group_images) == tools
+    assert "generate_image" not in {tool.name for tool in restrict_directed_tools(tools, owner=False)}
+    forged = AgentTool("generate_image", "forged write", {}, unused, "write")
+    assert restrict_directed_tools([forged], owner=False, allow_group_images=True) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author", [FRIEND, FRIEND + 1])
+@pytest.mark.parametrize("operation", ["generate", "edit", "foreign", "disabled"])
+async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, operation):
+    generated = []
+    reference = []
+    enabled = operation != "disabled"
+
+    def script(body, number):
+        tools = {tool["name"] for tool in body["tools"]}
+        assert ("generate_image" in tools) is enabled
+        assert not tools.intersection({"generate_private_image", "execute_python", "memory_write", "set_group_card"})
+        if number == 1 and enabled:
+            assert "本群所有成员可要求绘图" in str(body)
+            return responses_sse(name="generate_image", arguments={"prompt": "合成猫",
+                "reference_artifact_ids": reference, "reference_subjects": ["合成参考"] * len(reference)}, number=number)
+        if number == 2 and enabled:
+            output = latest(body, "generate_image")
+            if operation == "foreign":
+                assert output["status"] != "ok"
+            else:
+                assert output["status"] == "ok" and output["data"]["ready"]
+                generated.append(output["data"]["artifact_id"])
+        if number == (2 if enabled else 1):
+            return responses_sse(name="send_group", arguments={"text": "合成回复",
+                "artifact_ids": generated}, call_id="send", number=number)
+        return responses_sse(number=number)
+
+    client, requests, _ = model_client(script)
+    async with composed(sqlite_engine, tmp_path, client, runtime="harness",
+        options={"allow_images": enabled, "max_steps": 5}) as fixture:
+        await fixture.agent.stop()
+        if operation in {"edit", "foreign"}:
+            reference.append(saved_reference(fixture, sqlite_engine,
+                group=OTHER_GROUP if operation == "foreign" else GROUP))
+        payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
+            "message_id": "synthetic-drawing-source", "user_id": author, "time": NOW.timestamp(),
+            "sender": {"nickname": "synthetic member"}, "message": [
+                {"type": "at", "data": {"qq": str(BOT)}},
+                {"type": "text", "data": {"text": "画一只猫"}}]}
+        event = parse_group_message_event(payload, bot_qq=BOT, bot_name="小町")
+        fixture.router.ingest_live_group_message(event)
+        batch = AgentBatch(GROUP, (event,), "synthetic-drawing-turn")
+        result = await fixture.executor.execute_group_turn(event, batch,
+            AgentDecision("reply", event.platform_msg_id, "direct_trigger"),
+            InteractiveIngressGuard(batch.turn_id))
+        assert result.status == "sent" and len(writes(fixture)) == 1
+        assert len(fixture.image_client.calls) == (operation == "generate")
+        assert len(fixture.image_client.edit_calls) == (operation == "edit")
+        if operation == "edit":
+            assert fixture.image_client.edit_calls[0]["images"]
+        assert len(requests) == (3 if enabled else 2)

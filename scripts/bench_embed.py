@@ -9,7 +9,7 @@ from fastembed import TextEmbedding
 
 
 TEXTS = [
-    "阿渣喜欢什么动画",
+    "小甲喜欢什么动画",
     "昨天我在群里说了什么",
     "帮我总结一下今天的群聊",
     "大蛇丸是哪个球队的粉丝",

@@ -23,6 +23,7 @@ from app.storage.models import (
     MemoryItem,
     Message,
     User,
+    UsageRecord,
 )
 
 
@@ -58,7 +59,8 @@ def test_build_slices_overlaps_boundaries() -> None:
     assert "四四四四四四四四" in slices[-1]
 
 
-def test_fact_extraction_and_review_use_low_reasoning(monkeypatch) -> None:
+@pytest.mark.parametrize("model, effort", [("test", "medium"), ("gpt-6.1-sol", "low")])
+def test_fact_extraction_and_review_use_model_reasoning(monkeypatch, model, effort) -> None:
     efforts: list[str] = []
 
     class FakeClient:
@@ -74,14 +76,83 @@ def test_fact_extraction_and_review_use_low_reasoning(monkeypatch) -> None:
     settings = SimpleNamespace(
         llm_base_url="http://example.invalid",
         llm_api_key="test",
-        llm_model="test",
+        llm_model=model,
         llm_fallback_model="test",
     )
 
     assert extract_facts_from_lines(settings, ["今天在学日语"]) == []
     candidates = [{"fact": "在学日语", "evidence": "今天在学日语"}]
     assert review_facts(settings, candidates) == candidates
-    assert efforts == ["low", "low"]
+    assert efforts == [effort, effort]
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_member_fact_requests_persist_usage(
+    fact_refresh_database, monkeypatch: pytest.MonkeyPatch, caplog, replay: bool,
+) -> None:
+    from app.main import build_usage_recorder
+
+    caplog.set_level("INFO", logger=member_memory_backfill.__name__)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.recorder = kwargs["usage_recorder"]
+
+        def generate_text(self, messages):
+            self.recorder(
+                SimpleNamespace(
+                    timestamp=datetime.now(UTC),
+                    model="test-model",
+                    endpoint="responses",
+                    input_tokens=101,
+                    cached_input_tokens=11,
+                    output_tokens=23,
+                )
+            )
+            if "候选：" in messages[0]:
+                return '{"drop": []}'
+            return (
+                '{"facts":[{"kind":"preference","category":"生活",'
+                '"fact":"该成员喜欢火锅","evidence":"我喜欢火锅"}]}'
+            )
+
+    monkeypatch.setattr(member_memory_backfill, "LlmClient", FakeClient)
+    message_id = _seed_member_message(
+        fact_refresh_database,
+        platform_msg_id="usage-source",
+        plain_text="我喜欢火锅",
+    )
+    service = MemberFactRefreshService(
+        engine=fact_refresh_database,
+        settings=SimpleNamespace(
+            llm_base_url="http://example.invalid",
+            llm_api_key="test",
+            llm_model="test-model",
+            llm_fallback_model="",
+        ),
+        group_ids={900000001},
+        bot_qq=900000999,
+        usage_recorder=build_usage_recorder(fact_refresh_database),
+    )
+    monkeypatch.setattr(service, "_refresh_bot_names", lambda: None)
+    if replay:
+        service.replay_member_window(
+            group_id=900000001,
+            user_id=900000101,
+            start_message_id=message_id,
+            dry_run=False,
+        )
+    else:
+        service._refresh_member(900000001, 900000101)
+    with session_scope(fact_refresh_database) as session:
+        rows = session.query(UsageRecord).all()
+        assert len(rows) == 2
+        assert [
+            (r.model, r.endpoint, r.input_tokens, r.cached_input_tokens, r.output_tokens)
+            for r in rows
+        ] == [("test-model", "responses", 101, 11, 23)] * 2
+    assert "member_fact_llm_usage stage=extract" in caplog.text
+    assert "member_fact_llm_usage stage=review" in caplog.text
 
 
 def test_fact_extraction_reclassifies_current_process_ranking_as_decision(
@@ -579,7 +650,7 @@ def test_refresh_failure_keeps_watermark_and_retries_same_messages(
         "extract_facts_from_lines",
         lambda _settings, lines, **_kwargs: attempts.append(list(lines)) or [],
     )
-    monkeypatch.setattr(member_memory_backfill, "review_facts", lambda _settings, facts: facts)
+    monkeypatch.setattr(member_memory_backfill, "review_facts", lambda _settings, facts, **_kwargs: facts)
     monkeypatch.setattr(member_memory_backfill, "upsert_member_facts", lambda *_args, **_kwargs: 0)
     service._refresh_member(900000001, 900000101)
 
@@ -742,7 +813,7 @@ def test_bounded_replay_apply_is_idempotent_and_preserves_watermark(
     monkeypatch.setattr(
         member_memory_backfill,
         "review_facts",
-        lambda _settings, facts: facts,
+        lambda _settings, facts, **_kwargs: facts,
     )
 
     for _ in range(2):

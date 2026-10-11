@@ -18,7 +18,15 @@ from app.adapters.sender import (
     QQMessageBlockedError,
     QQMessageDeliveryUncertainError,
 )
+from app.runtime.blocking import run_blocking
+from app.agent.reply_context import agent_reply_context, current_agent_reply
 from app.config import AppSettings, RuntimeConfig
+from app.core.group_reply_delivery import GroupReplyDeliveryMixin
+from app.core.delivery_contract import (
+    QQ_BLOCKED_REPLY_NOTICE,
+    QQ_BLOCKED_CONTEXT_NOTE,
+    DELIVERY_UNCERTAIN_CONTEXT_NOTE,
+)
 from app.core.bbot_bridge import build_bbot_outbound_message, resolve_bbot_command
 from app.core.memory_compaction import (
     _ADDRESSING_RULE_MARKERS,
@@ -59,6 +67,17 @@ from app.core.image_turn_resolver import (
     is_image_reference_followup,
     resolve_images_for_turn,
 )
+from app.core.image_request_policy import (
+    GROUP_IMAGE_REQUEST_FLAGS,
+    GROUP_IMAGE_REQUEST_PATTERNS,
+    GROUP_IMAGE_NEGATIVE_PATTERNS,
+    GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS,
+    GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS,
+    GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS,
+    LOOKUP_NORMALIZER,
+    AUTO_WEB_REFERENCE_QUERY_PATTERN,
+    AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN,
+)
 from app.core.legacy_memory_context import (
     GroupMemoryContextRequest,
     LegacyMemoryContext,
@@ -83,6 +102,7 @@ from app.core.memory_engine import (
 )
 from app.core.memory_compaction import canonical_key
 from app.core.memory_tool_executor import MemoryToolExecutor
+from app.core.memory_source_guard import is_usable_memory_source
 from app.core.memory_tools import memory_tool_schemas
 from app.core.member_identity import (
     group_member_identities_from_messages,
@@ -109,7 +129,7 @@ from app.core.proactive_judge import (
     build_proactive_judge_prompt,
     judge_proactive_interjection,
 )
-from app.core.reply_policy import PolicyInput, ReplyPolicy
+from app.core.reply_policy import PolicyInput, ReplyDecision, ReplyPolicy
 from app.core.search_policy import (
     build_forced_search_query,
     build_current_datetime_facts,
@@ -130,7 +150,11 @@ from app.core.search_policy import (
 )
 from app.core.style_distill import BANNED_ADDRESS_TERMS
 from app.core.summarizer import summarize_recursive, summarize_window
-from app.core.url_policy import explicitly_requests_urls, filter_reply_urls, url_reply_policy_instruction
+from app.core.url_policy import (
+    explicitly_requests_urls,
+    filter_reply_urls,
+    url_reply_policy_instruction,
+)
 from app.core.web_grounding import build_grounding_notes
 from app.jobs.summary_jobs import format_summary_source_lines, should_schedule_window_summary
 from app.providers.web_search import WebSearchClient
@@ -150,9 +174,7 @@ logger = logging.getLogger(__name__)
 ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 PROACTIVE_RESERVATION_TTL_SECONDS = 300
-_PROACTIVE_CANDIDATE_REASONS = frozenset(
-    {"proactive_candidate", "proactive_local_candidate"}
-)
+_PROACTIVE_CANDIDATE_REASONS = frozenset({"proactive_candidate", "proactive_local_candidate"})
 
 MEMORY_TOOL_EFFICIENCY_INSTRUCTION = (
     "If the injected memory context is already enough to answer, do not call "
@@ -197,9 +219,7 @@ IMPERSONATION_CONTAMINANT_MARKERS = (
 )
 
 
-_PACKED_LINE_SPEAKER_PATTERN = re.compile(
-    r"^\[[^\]]*\]\s*([^(\[]+?)\s*\(uin:"
-)
+_PACKED_LINE_SPEAKER_PATTERN = re.compile(r"^\[[^\]]*\]\s*([^(\[]+?)\s*\(uin:")
 
 
 def _scrub_impersonation_reply(
@@ -249,96 +269,7 @@ REQUESTER_IDENTITY_INSTRUCTION = (
 )
 
 
-QQ_BLOCKED_REPLY_NOTICE = "刚刚的回复可能包含敏感信息，被 QQ 拦截了，无法发送。"
-QQ_BLOCKED_CONTEXT_NOTE = (
-    "[系统投递状态：以上回复未在 QQ 群中送达；连续发送后仍被 QQ 拦截，可能包含敏感信息。"
-    "后续回答不得复述其中的敏感细节，只能概括说明上一条回复可能包含敏感信息、无法详细发送。]"
-)
-DELIVERY_UNCERTAIN_CONTEXT_NOTE = (
-    "[系统投递状态：上一条回复的发送结果未得到确认；系统不会自动重发，以避免重复消息。]"
-)
-GROUP_IMAGE_REQUEST_FLAGS = re.IGNORECASE | re.DOTALL
-GROUP_IMAGE_REQUEST_PATTERNS = (
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:一张|张)?(?:图片|图像|图)[\s,，。.!?？；;:：]*(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?画(?:个|一张|张)?(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?来张(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?出图(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
-    re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?生成(?:一张)?(?:图片|图像|图)?(?P<prompt>.+)$", GROUP_IMAGE_REQUEST_FLAGS),
-)
-GROUP_IMAGE_NEGATIVE_PATTERNS = (
-    re.compile(r"会画图吗|能画图吗|会不会画图", re.IGNORECASE),
-    re.compile(r"为什么.*出图", re.IGNORECASE),
-    re.compile(r"谁画的", re.IGNORECASE),
-    re.compile(r"识图", re.IGNORECASE),
-)
 GROUP_IMAGE_REFERENCE_PROMPT_PREFIX = re.compile(r"^(?:请|麻烦|拜托)?(?:帮我)?", re.IGNORECASE)
-GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS = (
-    "改成",
-    "换成",
-    "变成",
-    "做成",
-    "转成",
-    "替换成",
-    "替换为",
-)
-GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS = (
-    "模仿",
-    "参考",
-    "参照",
-    "仿照",
-    "照着",
-    "按照",
-    "按这张",
-    "按这个",
-    "按这两张",
-    "根据这张",
-    "根据这个",
-    "根据这两张",
-    "根据之前生成的图",
-    "根据前面生成的图",
-    "基于这张",
-    "基于这个",
-    "基于这两张",
-    "基于前面生成的图",
-    "同样动作",
-    "同款动作",
-    "同样画风",
-    "同款画风",
-    "同样构图",
-    "同款构图",
-    "在这张图基础上",
-    "在这个图基础上",
-    "在这两张图基础上",
-    "在之前生成的图基础上",
-    "在前面生成的图基础上",
-    "这张图基础上",
-    "这个图基础上",
-    "这两张图基础上",
-    "前图基础上",
-    "前面那张图基础上",
-)
-GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS = (
-    "图片",
-    "图",
-    "画",
-    "画一张",
-    "来一张",
-    "来张",
-    "出图",
-    "生成",
-    "做一张",
-    "整一张",
-    "搞一张",
-    "弄一张",
-)
-LOOKUP_NORMALIZER = re.compile(r"[\s\u3000`~!@#$%^&*()_+\-=\[\]{}\\|;:'\",<.>/?，。！？：；、“”‘’（）《》【】]")
-
-
-AUTO_WEB_REFERENCE_QUERY_PATTERN = re.compile(
-    r"(?:先)?(?:去)?(?:网上|上网|联网)?(?:找|搜一下|搜索一下|搜索|搜)(?P<query>.+?)(?:的人设图|人设图|设定图|参考图|的图片|图片|的照片|照片|的图像|图像)",
-    re.IGNORECASE,
-)
-AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN = re.compile(r"^(?:然后|再|并且|并|再去|接着|随后)+")
 
 
 @dataclass(slots=True)
@@ -359,7 +290,7 @@ class PreparedGroupReply:
 
 
 @dataclass(slots=True)
-class InboundRouter:
+class InboundRouter(GroupReplyDeliveryMixin):
     engine: object
     runtime: RuntimeConfig
     sender: object
@@ -374,7 +305,9 @@ class InboundRouter:
     memory_orchestrator: MemoryOrchestrator | None = None
     persona_manager: PersonaManager | None = None
     persona_switch_service: PersonaSwitchService | None = None
-    pending_group_image_turns: dict[tuple[int, int], tuple[datetime, list[ImageAttachment]]] = field(default_factory=dict)
+    pending_group_image_turns: dict[tuple[int, int], tuple[datetime, list[ImageAttachment]]] = (
+        field(default_factory=dict)
+    )
     _last_proactive_at: dict[int, datetime] = field(default_factory=dict)
     _proactive_inflight: dict[int, datetime] = field(default_factory=dict)
     _proactive_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -427,6 +360,9 @@ class InboundRouter:
         memory_orchestrator=None,
     ):
         settings = AppSettings.model_construct(
+            # Historical business-service unit fixtures use the explicit
+            # rollback adapter; mature-runtime acceptance overrides this.
+            agent_runtime="legacy",
             napcat_ws_url="ws://127.0.0.1:3001",
             llm_base_url="https://api.example.test/v1",
             llm_api_key="test-key",
@@ -443,7 +379,7 @@ class InboundRouter:
             context_summary_limit=3,
             context_history_limit=8,
             config_dir=Path("configs"),
-            data_dir=Path("data"),
+            data_dir=Path(sqlite_engine.url.database).resolve().parent / "runtime-data",
         )
         runtime = RuntimeConfig(
             settings=settings,
@@ -458,22 +394,22 @@ class InboundRouter:
                     "enabled": False,
                     "archive": False,
                     "speak": False,
-                "proactive_reply": True,
-                "proactive_interval_seconds": "180-480",
-                "memory_enabled": False,
-                "recent_context_limit": 100,
-            },
-            "groups": {
-                "10001": {
-                    "enabled": True,
-                    "archive": True,
-                    "speak": True,
                     "proactive_reply": True,
                     "proactive_interval_seconds": "180-480",
-                    "memory_enabled": True,
-                    "recent_context_limit": 120,
-                }
-            },
+                    "memory_enabled": False,
+                    "recent_context_limit": 100,
+                },
+                "groups": {
+                    "10001": {
+                        "enabled": True,
+                        "archive": True,
+                        "speak": True,
+                        "proactive_reply": True,
+                        "proactive_interval_seconds": "180-480",
+                        "memory_enabled": True,
+                        "recent_context_limit": 120,
+                    }
+                },
             },
             safety={
                 "deny_prompt_leak": True,
@@ -532,11 +468,17 @@ class InboundRouter:
 
         enabled = bool(configured.get("enabled", defaults.get("enabled", False)))
         speak_enabled = bool(configured.get("speak", defaults.get("speak", False)))
-        proactive_enabled = bool(configured.get("proactive_reply", defaults.get("proactive_reply", True)))
-        proactive_interval = self._parse_interval_range(
-            configured.get("proactive_interval_seconds", defaults.get("proactive_interval_seconds", "180-480"))
+        proactive_enabled = bool(
+            configured.get("proactive_reply", defaults.get("proactive_reply", True))
         )
-        quiet_hours = self._parse_quiet_hours(configured.get("quiet_hours", defaults.get("quiet_hours")))
+        proactive_interval = self._parse_interval_range(
+            configured.get(
+                "proactive_interval_seconds", defaults.get("proactive_interval_seconds", "180-480")
+            )
+        )
+        quiet_hours = self._parse_quiet_hours(
+            configured.get("quiet_hours", defaults.get("quiet_hours"))
+        )
         if not enabled:
             speak_enabled = False
 
@@ -545,13 +487,14 @@ class InboundRouter:
             "Keep replies short in group chat.",
             "Only use web search when the service has marked the turn as eligible.",
         ]
-        return enabled, speak_enabled, proactive_enabled, proactive_interval, quiet_hours, group_policy_lines
-
-    def _outbound_platform_msg_id(self, inbound_platform_msg_id: str) -> str:
-        return f"bot-reply-{inbound_platform_msg_id}"
-
-    def _blocked_notice_platform_msg_id(self, inbound_platform_msg_id: str) -> str:
-        return f"bot-reply-notice-{inbound_platform_msg_id}"
+        return (
+            enabled,
+            speak_enabled,
+            proactive_enabled,
+            proactive_interval,
+            quiet_hours,
+            group_policy_lines,
+        )
 
     def _should_hold_group_image_for_followup(self, event) -> bool:
         return not event.plain_text.strip() and len(event.images) == 1
@@ -712,14 +655,15 @@ class InboundRouter:
         with self._proactive_lock:
             self._proactive_inflight.pop(group_id, None)
 
-    def _build_local_generation_failure_reply(self, *, target_images: list[ImageAttachment] | None) -> str:
+    def _build_local_generation_failure_reply(
+        self, *, target_images: list[ImageAttachment] | None
+    ) -> str:
         if target_images:
             return "我这边刚想回你的时候卡了一下，图还没顾上看，你再叫我一次。"
         return "我这边刚刚卡了一下，结果没拿到。你再叫我一次，我马上接上。"
 
     def _build_vision_unavailable_reply(self) -> str:
         return "我这边这路模型现在还看不了图，得换支持识图的模型才行。"
-
 
     def ingest_historical_group_message(self, event) -> bool:
         persisted = self._persist_inbound_message(event, cache_images=False)
@@ -748,129 +692,6 @@ class InboundRouter:
         self._ingest_bbot_listener_cache(event)
         return True
 
-    async def _send_prebuilt_reply(
-        self,
-        event,
-        reply_text: str,
-        *,
-        allow_chunking: bool = False,
-        platform_msg_id: str | None = None,
-    ) -> None:
-        reply_text = filter_reply_urls(
-            reply_text,
-            allow_urls=explicitly_requests_urls(event.plain_text),
-        )
-        reserved = self._reserve_outbound_reply(
-            event, reply_text, platform_msg_id=platform_msg_id
-        )
-        if not reserved:
-            return
-
-        try:
-            await self.sender.send_group_text(
-                OutboundMessage(group_id=event.group_id, text=reply_text, allow_chunking=allow_chunking)
-            )
-        except QQMessageDeliveryUncertainError as exc:
-            logger.warning(
-                "reply_delivery_uncertain group_id=%s msg_id=%s error_type=%s",
-                event.group_id,
-                event.platform_msg_id,
-                type(exc).__name__,
-            )
-            uncertain_reply_text = self._mark_outbound_reply_uncertain(
-                event, reply_text, platform_msg_id=platform_msg_id
-            )
-            self._archive_outbound_reply(
-                event, uncertain_reply_text, platform_msg_id=platform_msg_id
-            )
-            return
-        except QQMessageBlockedError as exc:
-            logger.warning(
-                "reply_qq_blocked group_id=%s msg_id=%s reason=%s",
-                event.group_id,
-                event.platform_msg_id,
-                str(exc),
-            )
-            blocked_reply_text = self._mark_outbound_reply_blocked(
-                event, reply_text, platform_msg_id=platform_msg_id
-            )
-            self._archive_outbound_reply(
-                event, blocked_reply_text, platform_msg_id=platform_msg_id
-            )
-            await self._send_qq_block_notice(event)
-            return
-        except Exception:
-            logger.exception(
-                "reply_send_failed group_id=%s msg_id=%s",
-                event.group_id,
-                event.platform_msg_id,
-            )
-            self._clear_outbound_reply_reservation(event, platform_msg_id=platform_msg_id)
-            raise
-        logger.info(
-            "reply_send_success group_id=%s msg_id=%s",
-            event.group_id,
-            event.platform_msg_id,
-        )
-
-        try:
-            self._mark_outbound_reply_sent(event, reply_text, platform_msg_id=platform_msg_id)
-        except Exception:
-            self._fallback_mark_outbound_reply_sent(
-                event, reply_text, platform_msg_id=platform_msg_id
-            )
-        self._archive_outbound_reply(
-            event, reply_text, platform_msg_id=platform_msg_id
-        )
-
-    def _reply_split_config(self) -> dict:
-        """Delivery shape for a chat reply, taken from settings not the persona.
-
-        The persona only describes style and personality; how a long answer is
-        broken into QQ messages is a system-level policy.
-        """
-
-        return build_reply_split_config(self.runtime.settings)
-
-    async def _send_chat_reply(self, event, reply_text: str) -> None:
-        """Send an LLM chat reply, optionally as a short multi-message burst."""
-
-        active_persona = self._active_persona(event.group_id)
-        # Delivery shape comes from settings, not from the persona: the persona
-        # file only describes style and personality.
-        burst = self._reply_split_config()
-        allow_urls = explicitly_requests_urls(event.plain_text)
-        # A long Markdown citation can contain dots that the burst splitter
-        # treats as sentence boundaries. Remove unwanted links while the reply
-        # is still whole, before per-segment delivery applies its final guard.
-        reply_text = filter_reply_urls(
-            reply_text,
-            allow_urls=allow_urls,
-        )
-        if allow_urls and any(
-            marker in reply_text for marker in ("http://", "https://", "www.")
-        ):
-            # Explicitly requested URLs must remain intact rather than being
-            # split on the dots in their hostnames.
-            burst = {**burst, "enabled": False}
-        segments = split_burst_reply(reply_text, burst)
-        impersonating = self._impersonating(event.group_id)
-        base_id = self._outbound_platform_msg_id(event.platform_msg_id)
-        delay_min, delay_max = burst_delays(burst, segment_count=len(segments))
-        for index, segment in enumerate(segments):
-            if impersonating:
-                segment = scrub_banned_address_terms(
-                    segment, BANNED_ADDRESS_TERMS
-                )
-            platform_msg_id = base_id if index == 0 else f"{base_id}-b{index}"
-            await self._send_prebuilt_reply(
-                event,
-                segment,
-                platform_msg_id=platform_msg_id,
-            )
-            if index < len(segments) - 1 and delay_max > 0:
-                await asyncio.sleep(random.uniform(delay_min, delay_max))
-
     def _build_bot_names(self, persona_name: str) -> set[str]:
         # Trigger names stay with the bot's default identity (比企谷小町 /
         # 小町) no matter which persona is being impersonated. The impersonated
@@ -883,7 +704,11 @@ class InboundRouter:
 
         condensed = normalized.replace(" ", "")
         names = {normalized, condensed}
-        if condensed and any("\u4e00" <= char <= "\u9fff" for char in condensed) and len(condensed) >= 2:
+        if (
+            condensed
+            and any("\u4e00" <= char <= "\u9fff" for char in condensed)
+            and len(condensed) >= 2
+        ):
             names.add(condensed[-2:])
         names.add("小町")
         return {name for name in names if name}
@@ -894,15 +719,10 @@ class InboundRouter:
         return self.persona_manager.active_persona(group_id)
 
     def _impersonating(self, group_id: int) -> bool:
-        return self.persona_manager is not None and self.persona_manager.is_impersonating(
-            group_id
-        )
+        return self.persona_manager is not None and self.persona_manager.is_impersonating(group_id)
 
     def _persona_text_for(self, active_persona: dict, group_id: int) -> str:
-        if (
-            self._impersonating(group_id)
-            and self.persona_manager is not None
-        ):
+        if self._impersonating(group_id) and self.persona_manager is not None:
             active_persona = self.persona_manager.live_persona(group_id)
         text = render_persona(active_persona)
         if not self._impersonating(group_id):
@@ -910,7 +730,7 @@ class InboundRouter:
         name = str(active_persona.get("name") or "").strip()
         text += (
             f"\n你正在完整扮演群成员 {name}：你就是 TA 本人，不是 AI，也不是任何其他身份。"
-            "不要沿用任何属于 AI 或其他身份的设定与记忆，绝不称呼任何人为\"主人\"，不要自称机器人，也不要暴露 AI 身份。"
+            '不要沿用任何属于 AI 或其他身份的设定与记忆，绝不称呼任何人为"主人"，不要自称机器人，也不要暴露 AI 身份。'
             "禁止使用任何敬语称呼（主人、您、大人、老板、少爷、小姐等），直接叫名字或直接说事。"
             "你与其他群友的关系严格以下方 Relationship 规则为准；不确定的称呼用你最自然的方式，不要凭空发明亲密关系。"
             "你的回复必须极短，通常只有几个字到十几个字，像真人随手打字一样；除非对方明确要求详细解释，否则不要超过一两句。"
@@ -918,7 +738,7 @@ class InboundRouter:
         )
         text += (
             "\n当问题问的是其他群友（如'XX的动画喜好''XX这人咋样'）时，"
-            "必须先用 TA 当前的群名片点名（例如'逆蝶蝶喜欢……'），再给结论；"
+            "必须先用 TA 当前的群名片点名（例如'小乙乙喜欢……'），再给结论；"
             "绝对不要说成自己的喜好或经历，也不要不带名字直接回答。"
         )
         text += (
@@ -1012,11 +832,7 @@ class InboundRouter:
         else:
             bank = []
         if not bank:
-            bank = (
-                active_persona.get("example_bank")
-                or active_persona.get("example_lines")
-                or []
-            )
+            bank = active_persona.get("example_bank") or active_persona.get("example_lines") or []
         fallback_entries = [
             (
                 {"msg_id": f"fallback-{index}", "text": str(entry).strip()}
@@ -1094,9 +910,7 @@ class InboundRouter:
             labels.add(self.persona_manager.active_name(group_id))
         return {label for label in labels if label}
 
-    def _sanitize_impersonation_lines(
-        self, lines: list[str], *, group_id: int
-    ) -> list[str]:
+    def _sanitize_impersonation_lines(self, lines: list[str], *, group_id: int) -> list[str]:
         """Strip every factor that could pull the model out of character.
 
         In impersonation mode the injected context must not teach the model
@@ -1130,9 +944,7 @@ class InboundRouter:
             packed = replace(
                 packed,
                 text="\n".join(
-                    self._sanitize_impersonation_lines(
-                        packed.text.splitlines(), group_id=group_id
-                    )
+                    self._sanitize_impersonation_lines(packed.text.splitlines(), group_id=group_id)
                 ),
             )
         return packed
@@ -1201,9 +1013,7 @@ class InboundRouter:
             label = self._member_label_for_user(
                 user_id=user_id, users_by_id=users_by_id, group_id=group_id
             )
-        return (
-            f"{label}: {plain_text}"
-        )
+        return f"{label}: {plain_text}"
 
     def _flatten_raw_message_text(self, raw_payload: dict | None) -> str:
         return flatten_raw_message_text(raw_payload)
@@ -1222,7 +1032,9 @@ class InboundRouter:
             quoted_raw_payload=quoted_raw_payload,
         )
 
-    def _is_reply_to_bot(self, *, event, messages: MessageRepository, quoted_raw_payload: dict | None) -> bool:
+    def _is_reply_to_bot(
+        self, *, event, messages: MessageRepository, quoted_raw_payload: dict | None
+    ) -> bool:
         if event.reply_to_msg_id is None:
             return False
 
@@ -1248,7 +1060,11 @@ class InboundRouter:
             return event.plain_text
         if image_count == 1:
             return "[sent 1 image]" if event.images else "[asked about 1 image]"
-        return f"[sent {image_count} images]" if event.images else f"[asked about {image_count} images]"
+        return (
+            f"[sent {image_count} images]"
+            if event.images
+            else f"[asked about {image_count} images]"
+        )
 
     def _strip_group_image_prefix(self, text: str) -> str:
         persona_name = str(self.runtime.persona.get("name", "")).strip()
@@ -1274,7 +1090,9 @@ class InboundRouter:
 
     def _build_auto_web_reference_prompt(self, *, stripped_text: str, query: str) -> str:
         prompt = AUTO_WEB_REFERENCE_QUERY_PATTERN.sub("", stripped_text, count=1)
-        prompt = AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN.sub("", prompt).strip(" \t,，。.!?？；;:：")
+        prompt = AUTO_WEB_REFERENCE_LEADING_CONNECTOR_PATTERN.sub("", prompt).strip(
+            " \t,，。.!?？；;:："
+        )
         if not prompt:
             return f"参考搜索到的{query}人设图生成一张图"
         return f"参考搜索到的{query}人设图，{prompt}"
@@ -1282,6 +1100,7 @@ class InboundRouter:
     def _strip_group_image_request_prefix(self, text: str) -> str:
         stripped = GROUP_IMAGE_REFERENCE_PROMPT_PREFIX.sub("", text, count=1)
         return stripped.strip(" \t,，。.!！?？")
+
     def _build_image_attribution_lines(
         self,
         *,
@@ -1319,13 +1138,16 @@ class InboundRouter:
         if not normalized_text:
             return False
         has_transform_intent = any(
-            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS
+            self._normalize_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_INTENT_KEYWORDS
         )
         has_reference_context = any(
-            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS
+            self._normalize_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_CONTEXT_KEYWORDS
         )
         has_generation_intent = any(
-            self._normalize_lookup_text(keyword) in normalized_text for keyword in GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS
+            self._normalize_lookup_text(keyword) in normalized_text
+            for keyword in GROUP_IMAGE_REFERENCE_GENERATION_KEYWORDS
         )
         return has_transform_intent or (has_reference_context and has_generation_intent)
 
@@ -1338,14 +1160,18 @@ class InboundRouter:
     ) -> GroupImageGenerationRequest | None:
         if self.group_image_service is None:
             return None
-        if not self._group_policy_bool(group_id=event.group_id, key="image_generation", default=True):
+        if not self._group_policy_bool(
+            group_id=event.group_id, key="image_generation", default=True
+        ):
             return None
         stripped = self._strip_group_image_prefix(event.plain_text)
         if not stripped:
             return None
         if any(pattern.search(stripped) for pattern in GROUP_IMAGE_NEGATIVE_PATTERNS):
             return None
-        reference_images = list(resolved_image_turn.images) if resolved_image_turn is not None else []
+        reference_images = (
+            list(resolved_image_turn.images) if resolved_image_turn is not None else []
+        )
         auto_web_reference_query = self._extract_auto_web_reference_query(stripped_text=stripped)
         explicit_prompt: str | None = None
         for pattern in GROUP_IMAGE_REQUEST_PATTERNS:
@@ -1364,7 +1190,11 @@ class InboundRouter:
         implicitly_addressed_image_request = (
             event.reply_to_msg_id is not None
             and bool(reference_images)
-            and (auto_web_reference_query is not None or explicit_prompt is not None or reference_request)
+            and (
+                auto_web_reference_query is not None
+                or explicit_prompt is not None
+                or reference_request
+            )
         )
         if not addressed_turn and not implicitly_addressed_image_request:
             return None
@@ -1409,7 +1239,9 @@ class InboundRouter:
             return "行，我画"
         return f"收到了，排队第 {queue_position}"
 
-    async def _handle_group_image_request(self, event, request: GroupImageGenerationRequest) -> None:
+    async def _handle_group_image_request(
+        self, event, request: GroupImageGenerationRequest
+    ) -> None:
         if self.group_image_service is None:
             return
         try:
@@ -1448,11 +1280,25 @@ class InboundRouter:
         ) = self._group_runtime_policy(group_id=group_id)
         stored_group = groups.get_group(group_id)
         if stored_group is None:
-            return runtime_enabled, runtime_speak_enabled, proactive_enabled, proactive_interval, quiet_hours, group_policy_lines
+            return (
+                runtime_enabled,
+                runtime_speak_enabled,
+                proactive_enabled,
+                proactive_interval,
+                quiet_hours,
+                group_policy_lines,
+            )
 
         enabled = bool(stored_group.enabled)
         speak_enabled = bool(stored_group.speak_enabled) if enabled else False
-        return enabled, speak_enabled, proactive_enabled, proactive_interval, quiet_hours, group_policy_lines
+        return (
+            enabled,
+            speak_enabled,
+            proactive_enabled,
+            proactive_interval,
+            quiet_hours,
+            group_policy_lines,
+        )
 
     def _archive_inbound_message(self, event) -> None:
         if not self._group_policy_bool(group_id=event.group_id, key="archive", default=False):
@@ -1480,32 +1326,6 @@ class InboundRouter:
                 event.platform_msg_id,
             )
 
-    def _archive_outbound_reply(self, event, reply_text: str, *, platform_msg_id: str | None = None) -> None:
-        if not self._group_policy_bool(group_id=event.group_id, key="archive", default=False):
-            return
-        try:
-            append_group_message_archive(
-                history_dir=self.runtime.settings.data_dir / "history",
-                group_id=event.group_id,
-                timestamp=event.timestamp,
-                platform_msg_id=platform_msg_id or self._outbound_platform_msg_id(event.platform_msg_id),
-                user_id=self.runtime.settings.bot_qq,
-                nickname=str(self.runtime.persona.get("name", "Bot")),
-                group_card="",
-                plain_text=reply_text,
-                msg_type="text",
-                mentioned_bot=False,
-                reply_to_msg_id=event.platform_msg_id,
-                direction="outbound",
-                image_local_paths=[],
-            )
-        except Exception:
-            logger.exception(
-                "history_archive_outbound_failed group_id=%s msg_id=%s",
-                event.group_id,
-                event.platform_msg_id,
-            )
-
     def _persist_inbound_message(self, event, *, cache_images: bool) -> bool:
         with session_scope(self.engine) as session:
             groups = GroupRepository(session)
@@ -1521,11 +1341,16 @@ class InboundRouter:
                 )
                 return outbound_message is None
 
-            enabled, speak_enabled, _proactive_enabled, _proactive_interval, _quiet_hours, _group_policy_lines = (
-                self._resolve_group_policy(
-                    groups=groups,
-                    group_id=event.group_id,
-                )
+            (
+                enabled,
+                speak_enabled,
+                _proactive_enabled,
+                _proactive_interval,
+                _quiet_hours,
+                _group_policy_lines,
+            ) = self._resolve_group_policy(
+                groups=groups,
+                group_id=event.group_id,
             )
             group = groups.get_group(event.group_id)
             if group is None:
@@ -1538,7 +1363,9 @@ class InboundRouter:
             else:
                 group.group_name = str(event.group_id)
                 groups.session.add(group)
-            current_user = users.upsert_user(user_id=event.user_id, nickname=event.nickname, group_card=event.group_card)
+            current_user = users.upsert_user(
+                user_id=event.user_id, nickname=event.nickname, group_card=event.group_card
+            )
             current_users_by_id = {event.user_id: current_user}
             if event.images:
                 if cache_images:
@@ -1708,7 +1535,9 @@ class InboundRouter:
                     group_id=event.group_id,
                     limit=25,
                 )
-                window_users_by_id = users.get_users_by_ids([message.user_id for message in window_messages])
+                window_users_by_id = users.get_users_by_ids(
+                    [message.user_id for message in window_messages]
+                )
                 source_lines = format_summary_source_lines(
                     [
                         self._format_message_line(
@@ -1739,8 +1568,12 @@ class InboundRouter:
                         "daily:"
                         f"{self._normalize_timestamp(inbound_message.timestamp).astimezone(ASIA_SHANGHAI).date().isoformat()}"
                     )
-                    daily_day = self._normalize_timestamp(inbound_message.timestamp).astimezone(ASIA_SHANGHAI)
-                    day_start = daily_day.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+                    daily_day = self._normalize_timestamp(inbound_message.timestamp).astimezone(
+                        ASIA_SHANGHAI
+                    )
+                    day_start = daily_day.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ).replace(tzinfo=None)
                     existing_daily = summaries.list_group_summaries(
                         scope_id=str(event.group_id),
                         limit=1,
@@ -1760,10 +1593,15 @@ class InboundRouter:
                         ),
                         end_at=window_messages[-1].timestamp,
                         content=summarize_recursive(
-                            previous_summary=previous_daily.content if previous_daily is not None else "",
+                            previous_summary=(
+                                previous_daily.content if previous_daily is not None else ""
+                            ),
                             new_window_summary=window_summary.content,
                         ),
-                        source_count=(previous_daily.source_count if previous_daily is not None else 0) + len(source_lines),
+                        source_count=(
+                            previous_daily.source_count if previous_daily is not None else 0
+                        )
+                        + len(source_lines),
                         source_start_msg_id=(
                             previous_daily.source_start_msg_id
                             if previous_daily is not None
@@ -1773,7 +1611,11 @@ class InboundRouter:
                         source_summary_ids=list(
                             dict.fromkeys(
                                 [
-                                    *(previous_daily.source_summary_ids if previous_daily is not None else []),
+                                    *(
+                                        previous_daily.source_summary_ids
+                                        if previous_daily is not None
+                                        else []
+                                    ),
                                     window_summary.id,
                                 ]
                             )
@@ -1847,7 +1689,9 @@ class InboundRouter:
             )
             return True
 
-    def _prepare_group_reply(self, event, *, quoted_raw_payload: dict | None = None) -> PreparedGroupReply:
+    def _prepare_group_reply(
+        self, event, *, quoted_raw_payload: dict | None = None
+    ) -> PreparedGroupReply:
         with session_scope(self.engine) as session:
             groups = GroupRepository(session)
             users = UserRepository(session)
@@ -1884,8 +1728,7 @@ class InboundRouter:
                 default=False,
             )
             recent_blocked_output_present = any(
-                messages.is_qq_blocked_outbound(message)
-                for message in recent_messages
+                messages.is_qq_blocked_outbound(message) for message in recent_messages
             )
             users_by_id = users.get_users_by_ids(
                 [message.user_id for message in recent_messages]
@@ -1900,7 +1743,9 @@ class InboundRouter:
                 )
                 for message in recent_messages
             ]
-            recent_minute_threshold = self._normalize_timestamp(event.timestamp) - timedelta(minutes=1)
+            recent_minute_threshold = self._normalize_timestamp(event.timestamp) - timedelta(
+                minutes=1
+            )
             recent_minute_traffic = max(
                 1,
                 sum(
@@ -1910,7 +1755,9 @@ class InboundRouter:
                 ),
             )
             recent_bot_message_count = sum(
-                1 for message in recent_messages[-3:] if message.user_id == self.runtime.settings.bot_qq
+                1
+                for message in recent_messages[-3:]
+                if message.user_id == self.runtime.settings.bot_qq
             )
             bot_recently_participated = any(
                 message.user_id == self.runtime.settings.bot_qq for message in recent_messages[-10:]
@@ -1980,7 +1827,9 @@ class InboundRouter:
             time_sensitive = is_time_sensitive_request(event.plain_text)
             named_bot = address_decision.reason == "named_bot"
             addressed_turn = event.mentioned_bot or address_decision.is_addressed
-            addressed_without_at = address_decision.is_addressed and not event.mentioned_bot and not named_bot
+            addressed_without_at = (
+                address_decision.is_addressed and not event.mentioned_bot and not named_bot
+            )
             pending_group_images = self._consume_group_image_for_followup(
                 event,
                 addressed_turn=addressed_turn,
@@ -2047,6 +1896,32 @@ class InboundRouter:
                     event_id=event.platform_msg_id,
                 )
             )
+            agent_turn = current_agent_reply.get()
+            if agent_turn is not None:
+                # The controller already evaluated pacing and participation.
+                # Preserve the live group policy as the final authority.
+                admitted = speak_enabled and (
+                    addressed_turn
+                    or (
+                        proactive_enabled
+                        and not self.reply_policy._in_quiet_hours(
+                            PolicyInput(
+                                group_speak_enabled=speak_enabled,
+                                mentioned_bot=False,
+                                named_bot=False,
+                                same_thread_followup=False,
+                                recent_bot_reply_at=None,
+                                now=datetime.now(UTC),
+                                quiet_hours=quiet_hours,
+                                proactive_enabled=proactive_enabled,
+                                group_traffic_last_minute=0,
+                            )
+                        )
+                    )
+                )
+                decision = ReplyDecision(
+                    admitted, "agent_approved" if admitted else "agent_policy_revoked", 10
+                )
             logger.info(
                 "reply_decision group_id=%s msg_id=%s should_reply=%s reason=%s score=%s mentioned_bot=%s "
                 "addressed=%s time_sensitive=%s recent_messages=%s",
@@ -2068,30 +1943,23 @@ class InboundRouter:
                 decision.reason in _PROACTIVE_CANDIDATE_REASONS and time_sensitive
             )
             forced_search_request = addressed_turn and (
-                explicit_search_request or reference_search_request or external_lookup_search_request
+                explicit_search_request
+                or reference_search_request
+                or external_lookup_search_request
             )
             # A dedicated search model (LLM_WEB_SEARCH_MODEL) makes built-in
             # search more expensive: those turns leave the default chat model.
             # When one is configured, keep built-in search for turns that
             # actually need fresh information; without it, keep the original
             # "any addressed turn may search" behaviour.
-            scoped_builtin_search = bool(
-                (self.runtime.settings.llm_web_search_model or "").strip()
-            )
-            builtin_web_search_eligible = (
-                self.web_search_client is None
-                and (
-                    (
-                        addressed_turn
-                        and not is_search_verification_query(event.plain_text)
-                        and (
-                            not scoped_builtin_search
-                            or time_sensitive
-                            or forced_search_request
-                        )
-                    )
-                    or proactive_time_sensitive_turn
+            scoped_builtin_search = bool((self.runtime.settings.llm_web_search_model or "").strip())
+            builtin_web_search_eligible = self.web_search_client is None and (
+                (
+                    addressed_turn
+                    and not is_search_verification_query(event.plain_text)
+                    and (not scoped_builtin_search or time_sensitive or forced_search_request)
                 )
+                or proactive_time_sensitive_turn
             )
             if not decision.should_reply:
                 return PreparedGroupReply(False)
@@ -2278,22 +2146,21 @@ class InboundRouter:
                             member_names.setdefault(label.strip(), int(message.user_id))
                     member_names.setdefault(str(message.user_id), int(message.user_id))
                 member_names.setdefault(str(event.user_id), int(event.user_id))
-                member_names.setdefault(str(self.runtime.settings.bot_qq), int(self.runtime.settings.bot_qq))
+                member_names.setdefault(
+                    str(self.runtime.settings.bot_qq), int(self.runtime.settings.bot_qq)
+                )
                 memory_tool_executor = MemoryToolExecutor(
                     engine=self.engine,
                     group_id=event.group_id,
                     current_user_id=event.user_id,
                     now=self._normalize_timestamp(event.timestamp),
-                    recent_source_msg_ids=(
-                        message.platform_msg_id for message in recent_messages
-                    ),
+                    recent_source_msg_ids=(message.platform_msg_id for message in recent_messages),
                     member_names=member_names,
                     timeout_seconds=self.runtime.settings.memory_memory_tool_timeout_seconds,
                     max_results=self.runtime.settings.memory_memory_tool_max_results,
                 )
-            mentions_member = (
-                memory_tool_executor is not None
-                and self._query_mentions_member(event.plain_text, users_by_id)
+            mentions_member = memory_tool_executor is not None and self._query_mentions_member(
+                event.plain_text, users_by_id
             )
             impersonated_subject_id = None
             raw_subject_id = active_persona.get("source_user_id")
@@ -2322,11 +2189,7 @@ class InboundRouter:
                 impersonated_subject_addressed=(
                     bool(addressed_turn) if impersonated_subject_id is not None else None
                 ),
-                bot_user_id=(
-                    int(self.runtime.settings.bot_qq)
-                    if event.mentioned_bot
-                    else None
-                ),
+                bot_user_id=(int(self.runtime.settings.bot_qq) if event.mentioned_bot else None),
             )
             if memory_enabled:
                 memory_result = self.memory_orchestrator.build_context(memory_request)
@@ -2352,8 +2215,7 @@ class InboundRouter:
                 impersonating
                 and impersonated_subject_id is not None
                 and memory_result.resolved_subject_binding == "impersonated"
-                and memory_result.resolved_subject_ids
-                == (str(impersonated_subject_id),)
+                and memory_result.resolved_subject_ids == (str(impersonated_subject_id),)
             ):
                 persona_text = self._with_relevant_facts(
                     persona_text,
@@ -2372,7 +2234,10 @@ class InboundRouter:
                 if packed_memory_context is not None
                 else ""
             )
-            if packed_memory_context is not None and packed_memory_context.direct_current_source_ids:
+            if (
+                packed_memory_context is not None
+                and packed_memory_context.direct_current_source_ids
+            ):
                 # A directly matching, dated observation is already packed.
                 # Another broad search can surface older recollections and
                 # displace the stronger source during generation.
@@ -2473,8 +2338,7 @@ class InboundRouter:
                     self._bot_addressing_instruction(impersonating=impersonating),
                 ]
             packed_blocked_output_present = (
-                packed_memory_context is not None
-                and packed_memory_context.blocked_output_present
+                packed_memory_context is not None and packed_memory_context.blocked_output_present
             )
             if (
                 recent_blocked_output_present
@@ -2497,8 +2361,7 @@ class InboundRouter:
             if (
                 selected_image_turn is None
                 and group_image_resolved_turn is not None
-                and group_image_resolved_turn.source_kind
-                in {"current", "quoted", "quoted_remote"}
+                and group_image_resolved_turn.source_kind in {"current", "quoted", "quoted_remote"}
             ):
                 selected_image_turn = group_image_resolved_turn
             target_images = (
@@ -2523,7 +2386,9 @@ class InboundRouter:
                 )
             search_reference_time = self._normalize_timestamp(event.timestamp).astimezone()
             addressed_optional_search_eligible = (
-                addressed_turn and (time_sensitive or general_search_candidate) and not forced_search_request
+                addressed_turn
+                and (time_sensitive or general_search_candidate)
+                and not forced_search_request
             )
             search_priority_turn = bool(
                 forced_search_request
@@ -2532,7 +2397,11 @@ class InboundRouter:
             if (
                 self.web_search_client is not None
                 and not current_datetime_context_required
-                and (forced_search_request or addressed_optional_search_eligible or proactive_time_sensitive_turn)
+                and (
+                    forced_search_request
+                    or addressed_optional_search_eligible
+                    or proactive_time_sensitive_turn
+                )
             ):
                 if forced_search_request:
                     parsed_search = SearchDecision(
@@ -2544,9 +2413,11 @@ class InboundRouter:
                         (
                             "reference-topic-required"
                             if reference_search_request
-                            else "local-lookup-required"
-                            if external_lookup_search_request
-                            else "explicit-search-request"
+                            else (
+                                "local-lookup-required"
+                                if external_lookup_search_request
+                                else "explicit-search-request"
+                            )
                         ),
                     )
                 else:
@@ -2563,12 +2434,16 @@ class InboundRouter:
                         now=search_reference_time,
                     )
                     try:
-                        parsed_search = parse_search_decision(self.llm_client.generate_text(search_prompt))
+                        parsed_search = parse_search_decision(
+                            self.llm_client.generate_text(search_prompt)
+                        )
                         if parsed_search.should_search:
                             search_priority_turn = True
                             parsed_search = SearchDecision(
                                 True,
-                                normalize_relative_time_query(parsed_search.query, now=search_reference_time),
+                                normalize_relative_time_query(
+                                    parsed_search.query, now=search_reference_time
+                                ),
                                 parsed_search.reason,
                             )
                     except Exception:
@@ -2587,9 +2462,13 @@ class InboundRouter:
                     parsed_search.reason,
                 )
                 if parsed_search.should_search:
-                    search_result_limit = 5 if reference_search_request or external_lookup_search_request else 3
+                    search_result_limit = (
+                        8 if reference_search_request or external_lookup_search_request else 6
+                    )
                     try:
-                        search_hits = self.web_search_client.search(parsed_search.query, max_results=search_result_limit)
+                        search_hits = self.web_search_client.search(
+                            parsed_search.query, max_results=search_result_limit
+                        )
                     except Exception:
                         logger.exception(
                             "web_search_execute_failed group_id=%s msg_id=%s query=%s",
@@ -2630,13 +2509,13 @@ class InboundRouter:
                         len(page_reads),
                     )
                     web_pages = [
-                        f"{page.title} | {page.url} | {page.content}"
-                        for page in page_reads
+                        f"{page.title} | {page.url} | {page.content}" for page in page_reads
                     ]
                     recent_bot_replies = [
                         message.plain_text
                         for message in recent_messages
-                        if message.user_id == self.runtime.settings.bot_qq and message.plain_text.strip()
+                        if message.user_id == self.runtime.settings.bot_qq
+                        and message.plain_text.strip()
                     ]
                     grounding_notes = build_grounding_notes(
                         target_text=event.plain_text,
@@ -2664,7 +2543,29 @@ class InboundRouter:
                 *group_policy_lines,
                 url_reply_policy_instruction(event.plain_text),
             ]
-            quoted_message_line = self._quoted_message_line_for_prompt(quoted_raw_payload=quoted_raw_payload)
+            if agent_turn is not None:
+                group_policy_lines = [
+                    *group_policy_lines,
+                    "本次是群聊 Agent 已批准的一次参与。围绕当前新消息批次自然回应，避免重复和逐条点评。批次每条消息属于它实际的作者；工作笔记只表示临时话题观察，不能当作事实证据。",
+                    "参与原因（内部，回复不要复述）：" + agent_turn.decision.reason[:300],
+                    "本群临时工作笔记：" + agent_turn.batch.working_note[:2000],
+                    "新消息批次（观察数据）："
+                    + json.dumps(
+                        [
+                            {
+                                "source_msg_id": item.platform_msg_id,
+                                "author_id": str(item.user_id),
+                                "speaker": item.group_card or item.nickname,
+                                "text": item.plain_text[:1200],
+                            }
+                            for item in agent_turn.batch.events
+                        ],
+                        ensure_ascii=False,
+                    ),
+                ]
+            quoted_message_line = self._quoted_message_line_for_prompt(
+                quoted_raw_payload=quoted_raw_payload
+            )
             prompt_target_text = self._target_message_text_for_prompt(
                 event=event,
                 resolved_image_count=len(target_images),
@@ -2724,10 +2625,14 @@ class InboundRouter:
                     estimated_history_tokens = self.context_builder.estimate_prompt_tokens(
                         full_history_preamble + full_history_lines
                     )
-                    preamble_tokens = self.context_builder.estimate_prompt_tokens(full_history_preamble)
+                    preamble_tokens = self.context_builder.estimate_prompt_tokens(
+                        full_history_preamble
+                    )
                     history_budget = max(
                         0,
-                        max_input_tokens - (estimated_prompt_tokens - estimated_history_tokens) - preamble_tokens,
+                        max_input_tokens
+                        - (estimated_prompt_tokens - estimated_history_tokens)
+                        - preamble_tokens,
                     )
                     retained_history_lines = self.context_builder.take_latest_history_within_budget(
                         full_history_lines,
@@ -2827,8 +2732,7 @@ class InboundRouter:
                 force_web_search=forced_search_request and self.web_search_client is None,
                 allow_web_search=builtin_web_search_eligible,
                 use_memory_tools=(
-                    memory_tool_executor is not None
-                    and resolver_memory_tool_eligible
+                    memory_tool_executor is not None and resolver_memory_tool_eligible
                 ),
                 memory_tool_executor=memory_tool_executor,
                 memory_source_ids=(
@@ -2911,232 +2815,6 @@ class InboundRouter:
         )
         return resolver_positive or compatibility_positive
 
-    def _reserve_outbound_reply(
-        self,
-        event,
-        reply_text: str,
-        *,
-        platform_msg_id: str | None = None,
-    ) -> bool:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        with session_scope(self.engine) as session:
-            users = UserRepository(session)
-            messages = MessageRepository(session)
-
-            if messages.get_by_platform_msg_id(resolved_id) is not None:
-                return False
-
-            users.upsert_user(
-                user_id=self.runtime.settings.bot_qq,
-                nickname=str(self.runtime.persona.get("name", "Bot")),
-                group_card="",
-            )
-            messages.add_group_message(
-                platform_msg_id=resolved_id,
-                group_id=event.group_id,
-                user_id=self.runtime.settings.bot_qq,
-                timestamp=event.timestamp,
-                plain_text=reply_text,
-                raw_json={
-                    "direction": "outbound",
-                    "reply_to_msg_id": event.platform_msg_id,
-                    "delivery_state": "reserved",
-                },
-                msg_type="text",
-                reply_to_msg_id=event.platform_msg_id,
-                mentioned_bot=False,
-            )
-            return True
-
-    def _clear_outbound_reply_reservation(
-        self, event, *, platform_msg_id: str | None = None
-    ) -> None:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(resolved_id)
-            if outbound_message is None:
-                return
-            session.delete(outbound_message)
-
-    def _mark_outbound_reply_blocked(
-        self, event, reply_text: str, *, platform_msg_id: str | None = None
-    ) -> str:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        blocked_reply_text = f"{str(reply_text).strip()}\n\n{QQ_BLOCKED_CONTEXT_NOTE}"
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(resolved_id)
-            if outbound_message is None:
-                raise RuntimeError("blocked outbound reply reservation is missing")
-            outbound_message.plain_text = blocked_reply_text
-            outbound_message.raw_json = {
-                "direction": "outbound",
-                "reply_to_msg_id": event.platform_msg_id,
-                "delivery_state": "blocked",
-                "failure_kind": "qq_sensitive_content",
-                "delivery_reason": "wait_for_self_echo_timeout",
-                "delivery_attempts": 3,
-            }
-            session.add(outbound_message)
-        return blocked_reply_text
-
-    def _mark_outbound_reply_uncertain(
-        self, event, reply_text: str, *, platform_msg_id: str | None = None
-    ) -> str:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        uncertain_reply_text = f"{str(reply_text).strip()}\n\n{DELIVERY_UNCERTAIN_CONTEXT_NOTE}"
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(resolved_id)
-            if outbound_message is None:
-                raise RuntimeError("uncertain outbound reply reservation is missing")
-            outbound_message.plain_text = uncertain_reply_text
-            outbound_message.raw_json = {
-                "direction": "outbound",
-                "reply_to_msg_id": event.platform_msg_id,
-                "delivery_state": "uncertain",
-                "failure_kind": "delivery_result_unknown",
-                "delivery_reason": "gateway_ack_timeout",
-                "delivery_attempts": 1,
-            }
-            session.add(outbound_message)
-        return uncertain_reply_text
-
-    def _reserve_block_notice(self, event) -> bool:
-        with session_scope(self.engine) as session:
-            users = UserRepository(session)
-            messages = MessageRepository(session)
-            platform_msg_id = self._blocked_notice_platform_msg_id(event.platform_msg_id)
-            if messages.get_by_platform_msg_id(platform_msg_id) is not None:
-                return False
-            users.upsert_user(
-                user_id=self.runtime.settings.bot_qq,
-                nickname=str(self.runtime.persona.get("name", "Bot")),
-                group_card="",
-            )
-            messages.add_group_message(
-                platform_msg_id=platform_msg_id,
-                group_id=event.group_id,
-                user_id=self.runtime.settings.bot_qq,
-                timestamp=event.timestamp,
-                plain_text=QQ_BLOCKED_REPLY_NOTICE,
-                raw_json={
-                    "direction": "outbound",
-                    "reply_to_msg_id": event.platform_msg_id,
-                    "delivery_state": "reserved",
-                    "notice_kind": "qq_sensitive_content",
-                },
-                msg_type="text",
-                reply_to_msg_id=event.platform_msg_id,
-                mentioned_bot=False,
-            )
-            return True
-
-    async def _send_qq_block_notice(self, event) -> None:
-        if not self._reserve_block_notice(event):
-            return
-        platform_msg_id = self._blocked_notice_platform_msg_id(event.platform_msg_id)
-        try:
-            await self.sender.send_group_text(
-                OutboundMessage(group_id=event.group_id, text=QQ_BLOCKED_REPLY_NOTICE)
-            )
-        except Exception:
-            logger.exception(
-                "reply_qq_block_notice_failed group_id=%s msg_id=%s",
-                event.group_id,
-                event.platform_msg_id,
-            )
-            with session_scope(self.engine) as session:
-                messages = MessageRepository(session)
-                notice = messages.get_by_platform_msg_id(platform_msg_id)
-                if notice is not None:
-                    session.delete(notice)
-            return
-
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            notice = messages.get_by_platform_msg_id(platform_msg_id)
-            if notice is not None:
-                notice.raw_json = {
-                    "direction": "outbound",
-                    "reply_to_msg_id": event.platform_msg_id,
-                    "delivery_state": "sent",
-                    "notice_kind": "qq_sensitive_content",
-                }
-                session.add(notice)
-        self._archive_outbound_reply(
-            event,
-            QQ_BLOCKED_REPLY_NOTICE,
-            platform_msg_id=platform_msg_id,
-        )
-        self._enqueue_episode_message(
-            group_id=event.group_id,
-            platform_msg_id=platform_msg_id,
-            timestamp=event.timestamp,
-        )
-        logger.info(
-            "reply_qq_block_notice_success group_id=%s msg_id=%s",
-            event.group_id,
-            event.platform_msg_id,
-        )
-
-    def _mark_outbound_reply_sent(
-        self, event, reply_text: str, *, platform_msg_id: str | None = None
-    ) -> None:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(resolved_id)
-            if outbound_message is None:
-                return
-            outbound_message.plain_text = reply_text
-            outbound_message.raw_json = {
-                "direction": "outbound",
-                "reply_to_msg_id": event.platform_msg_id,
-                "delivery_state": "sent",
-            }
-            session.add(outbound_message)
-        self._enqueue_episode_message(
-            group_id=event.group_id,
-            platform_msg_id=resolved_id,
-            timestamp=event.timestamp,
-        )
-
-    def _fallback_mark_outbound_reply_sent(
-        self, event, reply_text: str, *, platform_msg_id: str | None = None
-    ) -> None:
-        resolved_id = platform_msg_id or self._outbound_platform_msg_id(
-            event.platform_msg_id
-        )
-        with session_scope(self.engine) as session:
-            messages = MessageRepository(session)
-            outbound_message = messages.get_by_platform_msg_id(resolved_id)
-            if outbound_message is None:
-                return
-            outbound_message.plain_text = reply_text
-            outbound_message.raw_json = {
-                "direction": "outbound",
-                "reply_to_msg_id": event.platform_msg_id,
-                "delivery_state": "sent",
-            }
-            session.add(outbound_message)
-        self._enqueue_episode_message(
-            group_id=event.group_id,
-            platform_msg_id=resolved_id,
-            timestamp=event.timestamp,
-        )
-
     def _enqueue_episode_message(
         self,
         *,
@@ -3155,9 +2833,7 @@ class InboundRouter:
         try:
             with session_scope(self.engine) as session:
                 messages = MessageRepository(session)
-                message = messages.get_by_platform_msg_id(
-                    platform_msg_id
-                )
+                message = messages.get_by_platform_msg_id(platform_msg_id)
                 if message is None or int(message.group_id or 0) != int(group_id):
                     return
                 message_id = int(message.id)
@@ -3194,16 +2870,19 @@ class InboundRouter:
 
     def _generate_group_reply_text(self, *, event, prepared_reply: PreparedGroupReply) -> str:
         conversation_key = f"group:{event.group_id}"
-        envelope_enabled = bool(
-            getattr(
-                self.runtime.settings,
-                "memory_decision_envelope_enabled",
-                False,
+        envelope_enabled = (
+            bool(
+                getattr(
+                    self.runtime.settings,
+                    "memory_decision_envelope_enabled",
+                    False,
+                )
             )
-        ) and bool(prepared_reply.memory_has_evidence) and not prepared_reply.target_images
-        force_web_search = (
-            prepared_reply.force_web_search
-            and bool(getattr(self.llm_client, "supports_forced_web_search", False))
+            and bool(prepared_reply.memory_has_evidence)
+            and not prepared_reply.target_images
+        )
+        force_web_search = prepared_reply.force_web_search and bool(
+            getattr(self.llm_client, "supports_forced_web_search", False)
         )
         generation_kwargs = {}
         if self._impersonating(event.group_id):
@@ -3332,9 +3011,7 @@ class InboundRouter:
                 tools=tools,
                 tool_executor=tool_executor,
                 conversation_key=(
-                    None
-                    if conversation_key is None
-                    else f"{conversation_key}:reanswer"
+                    None if conversation_key is None else f"{conversation_key}:reanswer"
                 ),
                 max_tool_rounds=max_tool_rounds,
                 **generation_kwargs,
@@ -3370,20 +3047,59 @@ class InboundRouter:
             return
         await self._handle_persisted_group_message(event)
 
-    async def _try_handle_persona_switch(self, event) -> bool:
-        """Handle an owner persona-switch command; returns True when consumed."""
+    def build_agent_observation(self, batch) -> dict:
+        from app.agent.observation import GroupObservationService
 
+        return GroupObservationService(self).build_agent_observation(batch)
+
+    async def handle_agent_turn(self, event, *, batch, decision, guard) -> None:
+        guard.require_valid()
+        # Revoked sources must not generate or send an action after planning.
+        with session_scope(self.engine) as session:
+            source = MessageRepository(session).get_by_platform_msg_id(event.platform_msg_id)
+            if (
+                source is None
+                or source.group_id != event.group_id
+                or not is_usable_memory_source(source)
+            ):
+                return
+        with agent_reply_context(batch, decision):
+            await self._handle_persisted_group_message(event)
+
+    def agent_dispatch_allowed(self, event, *, decision, continued_dispatch=False) -> bool:
+        from app.agent.observation import GroupObservationService
+
+        return GroupObservationService(self).dispatch_allowed(event, decision=decision,
+            continued_dispatch=continued_dispatch)
+
+    def persona_switch_target(self, event) -> str | None:
+        """Resolve only a live, same-group owner command addressed to the bot."""
         manager = self.persona_manager
         switch_service = self.persona_switch_service
         if manager is None or switch_service is None:
-            return False
+            return None
         if event.user_id != self.runtime.settings.owner_qq or not event.mentioned_bot:
-            return False
+            return None
         target_key = parse_switch_command(event.plain_text, manager.personas)
+        if target_key is None:
+            return None
+        with session_scope(self.engine) as session:
+            source = MessageRepository(session).get_by_platform_msg_id(event.platform_msg_id)
+            enabled, speak, *_ = self._resolve_group_policy(groups=GroupRepository(session), group_id=event.group_id)
+            if (not enabled or not speak
+                    or not is_usable_memory_source(source, group_id=event.group_id, author_id=event.user_id)
+                    or source.plain_text != event.plain_text or not source.mentioned_bot
+                    or isinstance(source.raw_json, dict) and source.raw_json.get("direction") == "outbound"):
+                return None
+        return target_key
+
+    async def _try_handle_persona_switch(self, event) -> bool:
+        """Handle an owner persona-switch command; returns True when consumed."""
+        target_key = self.persona_switch_target(event)
         if target_key is None:
             return False
         try:
-            confirmation = await switch_service.switch(
+            confirmation = await self.persona_switch_service.switch(
                 group_id=event.group_id,
                 target_key=target_key,
             )
@@ -3420,38 +3136,38 @@ class InboundRouter:
                 await self._send_prebuilt_reply(event, bbot_match.denied_reason)
                 return
             if bbot_match.command_text is not None:
-                rewritten_command = self._resolve_bbot_cached_command(event=event, command_text=bbot_match.command_text)
-                await self._send_prebuilt_reply(event, build_bbot_outbound_message(rewritten_command))
+                rewritten_command = self._resolve_bbot_cached_command(
+                    event=event, command_text=bbot_match.command_text
+                )
+                await self._send_prebuilt_reply(
+                    event, build_bbot_outbound_message(rewritten_command)
+                )
                 return
         if await self._try_handle_persona_switch(event):
             return
-        quoted_raw_payload = await self._fetch_quoted_message_payload(reply_to_msg_id=event.reply_to_msg_id)
-        prepared_reply = await asyncio.to_thread(
+        quoted_raw_payload = await self._fetch_quoted_message_payload(
+            reply_to_msg_id=event.reply_to_msg_id
+        )
+        prepared_reply = await run_blocking(
             self._prepare_group_reply,
             event,
             quoted_raw_payload=quoted_raw_payload,
         )
         if not prepared_reply.should_reply:
             return
-        proactive_cleanup_group = (
-            event.group_id if prepared_reply.proactive_turn else None
-        )
+        proactive_cleanup_group = event.group_id if prepared_reply.proactive_turn else None
         try:
             if prepared_reply.group_image_request is not None:
-                await self._handle_group_image_request(
-                    event, prepared_reply.group_image_request
-                )
+                await self._handle_group_image_request(event, prepared_reply.group_image_request)
                 return
             if prepared_reply.prebuilt_reply_text is not None:
-                await self._send_prebuilt_reply(
-                    event, prepared_reply.prebuilt_reply_text
-                )
+                await self._send_prebuilt_reply(event, prepared_reply.prebuilt_reply_text)
                 return
             if prepared_reply.prompt_lines is None:
                 return
 
             try:
-                reply_text = await asyncio.to_thread(
+                reply_text = await run_blocking(
                     self._generate_group_reply_text,
                     event=event,
                     prepared_reply=prepared_reply,
@@ -3536,7 +3252,9 @@ class InboundRouter:
         gateway = getattr(self.sender, "gateway", None)
         if gateway is None or not hasattr(gateway, "call_api"):
             return None
-        message_id: int | str = int(reply_to_msg_id) if reply_to_msg_id.isdigit() else reply_to_msg_id
+        message_id: int | str = (
+            int(reply_to_msg_id) if reply_to_msg_id.isdigit() else reply_to_msg_id
+        )
         try:
             response = await gateway.call_api("get_msg", {"message_id": message_id})
         except Exception:

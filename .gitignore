@@ -3,8 +3,14 @@
 __pycache__/
 .pytest_cache/
 .pytest-*/
-# 所有测试临时目录统一收在 .test-tmp/ 下（scripts/clean_test_tmp.ps1 可清理）
+# 测试临时目录统一收在 data/test-work/（scripts/clean_test_tmp.ps1 可清理）
 .test-tmp/
+.test-tmp*/
+.artifacts/
+.mypy_cache/
+.ruff_cache/
+# 运行数据、测试产物和发布证据整体不进入公开仓库。
+data/
 *.pyc
 *.egg-info/
 data/bot.db
@@ -26,7 +32,8 @@ data/models/
 data/backups/
 data/*.bundle
 data/filter-replacements.txt
-data/trellis-backup*/
+data/project-docs-history/
+data/project-tools/
 data/mention-*
 data/*.log
 data/napcat/
@@ -64,8 +71,9 @@ scripts/probe_*.py
 scripts/repair_zhuren_memory.py
 scripts/verify_rewrite_skip.py
 
-# Trellis 仅本地维护，永不推送到 GitHub（含历史 journal、任务、spec）
-.trellis/
+# 项目任务、内部开发合同与历史原文仅本地维护
+backlog/
+docs/project/
 
 # 本地 AI 工具目录与项目指令，仅本地维护，不推送 GitHub
 .agents/
@@ -73,11 +81,15 @@ scripts/verify_rewrite_skip.py
 AGENTS.md
 docs/superpowers/
 
-# 一次性调试探针脚本，仅本地使用
-infra/wsl/scripts/onebot_probe.py
-tests/test_onebot_probe.py
+# 一次性私有调试脚本；通用 OneBot 运行健康探针随源码发布。
 tests/test_probe_gpt_image2.py
 
 # Local bot runtime state
 *.qrcode.png
 qrcode.png
+configs/social.local.yaml
+*.local.yaml
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm

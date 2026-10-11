@@ -2409,8 +2409,10 @@ class MemoryQueryResolver:
         return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
-    def _parse_time_range(query: str, now: datetime) -> TimeRange | None:
-        if not _TEMPORAL_HISTORY_INTENT_PATTERN.search(query):
+    def _parse_time_range(
+        query: str, now: datetime, *, force_history: bool = False,
+    ) -> TimeRange | None:
+        if not force_history and not _TEMPORAL_HISTORY_INTENT_PATTERN.search(query):
             return None
         local_now = MemoryQueryResolver._as_shanghai_time(now)
         local_day = datetime(

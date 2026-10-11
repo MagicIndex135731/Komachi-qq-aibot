@@ -121,7 +121,7 @@ def test_historical_v3_failure_never_falls_back_to_unscoped_memory() -> None:
     )
 
     resolved = orchestrator.build_context(
-        Request(group_id=100, query="昨天阿渣说了什么劲爆发言")
+        Request(group_id=100, query="昨天小甲说了什么劲爆发言")
     )
 
     assert resolved.mode == "v3_safe_empty"

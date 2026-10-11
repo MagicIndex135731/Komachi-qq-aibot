@@ -12,6 +12,11 @@
 **/.venv*
 .venv-wsl
 .worktrees
+backlog
+docs/project
+.agents
+.codex
+AGENTS.md
 data
 infra/wsl/runtime
 release

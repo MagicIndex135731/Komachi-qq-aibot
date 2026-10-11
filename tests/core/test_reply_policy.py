@@ -115,12 +115,21 @@ def test_reply_policy_quiet_hours_blocks_proactive_candidate() -> None:
     policy = ReplyPolicy()
     decision = policy.decide(
         make_policy_input(
-            now=datetime(2026, 5, 8, 2, 0, tzinfo=UTC),
+            now=datetime(2026, 5, 7, 18, 0, tzinfo=UTC),
             quiet_hours=(datetime(2026, 5, 8, 1, 0, tzinfo=UTC).time(), datetime(2026, 5, 8, 8, 0, tzinfo=UTC).time()),
         )
     )
     assert decision.should_reply is False
     assert decision.reason == "quiet_hours"
+
+
+def test_reply_policy_quiet_hours_use_shanghai_clock_for_utc_events() -> None:
+    policy = ReplyPolicy()
+    decision = policy.decide(make_policy_input(
+        now=datetime(2026, 5, 8, 2, 0, tzinfo=UTC),
+        quiet_hours=(datetime(2026, 5, 8, 1).time(), datetime(2026, 5, 8, 8).time()),
+    ))
+    assert decision.should_reply  # UTC 02:00 is Shanghai 10:00.
 
 
 def test_reply_policy_cooldown_blocks_proactive_candidate() -> None:

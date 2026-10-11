@@ -1,8 +1,8 @@
 """Per-group persona switching: command parsing, state, and profile sync.
 
-The persona switch only changes which persona profile a group uses and the
-QQ-facing avatar/group-card presentation. It never touches knowledge, memory,
-or the safety layer.
+The persona switch only changes which persona profile a group uses.
+The QQ-facing avatar/group card stays unchanged. Facts remain in the shared
+group memory, while voice examples belong to the persona style bank.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from app.core.memory_fact_ranking import (
     select_temporal_current_facts,
     temporal_recency_required,
 )
+from app.core.memory_source_guard import is_usable_memory_source, memory_provenance_ids
 from app.storage.models import (
     MemoryItem,
     MemoryItemSemanticVector,
@@ -48,6 +49,7 @@ from app.storage.repositories import (
     GroupPersonaStateRepository,
     MemoryRepository,
     PersonaStyleExampleRepository,
+    MessageRepository,
 )
 
 
@@ -118,7 +120,7 @@ class PersonaManager:
         self._account_avatar_snapshot: str | None = None
         self._style_banks: dict[tuple[int, int], list[dict]] = {}
         self._member_aliases: dict[int | None, dict[int, str]] = {}
-        self._member_aliases_loaded_at: float = 0.0
+        self._member_aliases_loaded_at: dict[int | None, float] = {}
         self.embedding_provider = embedding_provider
         self._example_vectors: dict[
             tuple[int, int, str, str, str, int, str],
@@ -216,7 +218,39 @@ class PersonaManager:
             and source_group_id is not None
             and self._style_banks.get((user_id, source_group_id))
         ):
-            return list(self._style_banks[(user_id, source_group_id)])
+            bank = list(self._style_banks[(user_id, source_group_id)])
+            with session_scope(self.engine) as session:
+                messages = MessageRepository(session)
+                local_sources = messages.get_group_messages_by_platform_msg_ids(
+                    group_id=source_group_id,
+                    platform_msg_ids=[str(entry["msg_id"]) for entry in bank],
+                )
+                situation_ids = {
+                    str(item.get("source_msg_id"))
+                    for entry in bank
+                    for item in entry.get("context_before") or []
+                    if isinstance(item, dict) and item.get("source_msg_id")
+                }
+                situation_ids.update(
+                    str(source.reply_to_msg_id)
+                    for source in local_sources.values() if source.reply_to_msg_id
+                )
+                situation_sources = messages.get_group_messages_by_platform_msg_ids(
+                    group_id=source_group_id, platform_msg_ids=list(situation_ids),
+                )
+            # Imported/baked examples need not exist in the live ledger. For
+            # live examples, a recall must take effect before the next reply,
+            # even when the asynchronous sync watermark has already advanced.
+            eligible = []
+            for entry in bank:
+                source = local_sources.get(str(entry["msg_id"]))
+                if source is None:
+                    eligible.append(entry)
+                elif is_usable_memory_source(source, group_id=source_group_id, author_id=user_id):
+                    eligible.append(self._live_style_entry(
+                        entry, source, situation_sources, group_id=source_group_id,
+                    ))
+            return eligible
         return [
             {
                 "msg_id": f"baked-{index}",
@@ -230,6 +264,47 @@ class PersonaManager:
             for index, value in enumerate(persona.get("example_bank") or [])
             if str(value).strip()
         ]
+
+    @staticmethod
+    def _live_style_entry(entry, source, situation_sources, *, group_id: int) -> dict:
+        """Rebuild live situations from real sources; old free text is unproven."""
+        def is_outbound(row) -> bool:
+            raw = row.raw_json
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            return isinstance(raw, dict) and raw.get("direction") == "outbound"
+
+        result = dict(entry)
+        result["text"] = str(source.plain_text or "").strip()
+        result["context_before"] = []
+        for item in entry.get("context_before") or []:
+            if not isinstance(item, dict):
+                continue
+            author_id = _as_positive_int(item.get("user_id"))
+            context = situation_sources.get(str(item.get("source_msg_id") or ""))
+            if (
+                author_id is not None
+                and is_usable_memory_source(context, group_id=group_id, author_id=author_id)
+                and context.id < source.id
+                and not is_outbound(context)
+                and str(context.plain_text or "").strip()
+            ):
+                result["context_before"].append({
+                    "speaker": str(context.user_id),
+                    "text": str(context.plain_text).strip(),
+                    "source_msg_id": context.platform_msg_id,
+                    "user_id": int(context.user_id),
+                })
+        quoted = situation_sources.get(str(source.reply_to_msg_id or ""))
+        result["reply_target"] = (
+            f"{quoted.user_id}: {str(quoted.plain_text).strip()}"
+            if entry.get("reply_target")
+            and is_usable_memory_source(quoted, group_id=group_id)
+            and not is_outbound(quoted)
+            and str(quoted.plain_text or "").strip()
+            else None
+        )
+        return result
 
     def retrieve_examples(
         self,
@@ -320,7 +395,11 @@ class PersonaManager:
                 query_vector = self.embedding_provider.embed_query(query.semantic_text)
             except Exception:
                 logger.exception("persona_style_query_embedding_failed group_id=%s", group_id)
-        ranked_documents = list(documents_by_id.values()) if query_vector is not None else documents
+        allowed_hashes = {document.msg_id: document.document_hash for document in documents}
+        ranked_documents = (
+            [document for msg_id, document in documents_by_id.items() if allowed_hashes.get(msg_id) == document.document_hash]
+            if query_vector is not None else documents
+        )
         matches = rank_style_examples(
             query=query,
             documents=ranked_documents,
@@ -535,6 +614,21 @@ class PersonaManager:
                 )
                 if str(row.memory_kind or "") in allowed_kinds
             ]
+            provenance = {int(row.id): memory_provenance_ids(row) for row in rows}
+            sources = MessageRepository(session).get_group_messages_by_platform_msg_ids(
+                group_id=group_id,
+                platform_msg_ids=list(dict.fromkeys(
+                    source_id for source_ids in provenance.values() for source_id in source_ids
+                )),
+            )
+            rows = [
+                row for row in rows
+                if provenance[int(row.id)]
+                and all(
+                    is_usable_memory_source(sources.get(source_id), group_id=group_id)
+                    for source_id in provenance[int(row.id)]
+                )
+            ]
             vectors: dict[int, list[float]] = {}
             if rows and self.embedding_provider is not None:
                 row_ids = [row.id for row in rows]
@@ -652,8 +746,7 @@ class PersonaManager:
 
         group_id = int(group_id) if group_id is not None else None
         now = time.monotonic()
-        if now - self._member_aliases_loaded_at > max_age_seconds:
-            self._member_aliases_loaded_at = now
+        if group_id not in self._member_aliases_loaded_at or now - self._member_aliases_loaded_at[group_id] > max_age_seconds:
             grouped_aliases: dict[int | None, dict[int, str]] = {}
             with session_scope(self.engine) as session:
                 for user in session.query(User).all():
@@ -698,7 +791,8 @@ class PersonaManager:
                         **grouped_aliases.setdefault(None, {}),
                         **grouped_aliases.setdefault(group_id, {}),
                     }
-            self._member_aliases = grouped_aliases
+            self._member_aliases.update(grouped_aliases)
+            self._member_aliases_loaded_at[group_id] = now
         return self._member_aliases.get(group_id) or {}
 
     def live_persona(self, group_id: int) -> dict:
