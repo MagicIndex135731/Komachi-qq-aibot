@@ -10,7 +10,7 @@ from app.adapters.outbound_guard import current_group_dispatch
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.reply_policy import PolicyInput
 from app.core.search_policy import detect_address_intent
-from app.core.shared_content import extract_shared_links
+from app.agent.shared_links import build_share_access, share_context_text
 from app.core.time_utils import shanghai_aware
 from app.storage.db import session_scope
 from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
@@ -126,6 +126,11 @@ class GroupObservationService:
                 groups=GroupRepository(session), group_id=batch.group_id
             )
             events = [self._live_event(event, messages) for event in batch.events]
+            share_access = build_share_access(router, group_id=batch.group_id,
+                trigger_source_ids=tuple(messages.get_by_platform_msg_id(event.platform_msg_id).id
+                    for event in reversed(events) if event is not None),
+                bot_qq=router.runtime.settings.bot_qq)
+            share_ids = set(share_access.authorized_source_ids())
             # A quoted card may have fallen outside the 24 recent messages.
             # Only real ledger reply links grant access, bounded to eight rows.
             referenced = []
@@ -136,8 +141,7 @@ class GroupObservationService:
                 quoted = messages.get_by_platform_msg_id(event.reply_to_msg_id)
                 if not is_usable_memory_source(quoted, group_id=batch.group_id) or quoted.id in observed_ids:
                     continue
-                raw = quoted.raw_json
-                if isinstance(raw, dict) and extract_shared_links(raw.get('message', raw.get('raw_message', ''))):
+                if quoted.id in share_ids:
                     referenced.append(quoted)
                     observed_ids.add(quoted.id)
             visible = [*recent, *referenced]
@@ -173,7 +177,7 @@ class GroupObservationService:
                 "recent_lines": [
                     f"[{shanghai_aware(item.timestamp).isoformat(timespec='seconds')}] " + router._format_message_line(
                         user_id=item.user_id,
-                        plain_text=item.plain_text[:700],
+                        plain_text=share_context_text(item.raw_json, item.plain_text)[:700],
                         users_by_id=users_by_id,
                         group_id=batch.group_id,
                     )

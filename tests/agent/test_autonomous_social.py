@@ -506,7 +506,10 @@ async def test_harness_prepares_full_memory_and_persona_sources_and_rotates_chan
         first_id, prompt, names = captured[0]
         assert first_id != "old-native"
         assert "OLD_PERSONA_CONTEXT" not in "\n".join(prompt)
-        assert "新固定人格动态风格一寻址规则" in "\n".join(prompt)
+        # Persona guidance is a dynamic tail kept separate from the cached
+        # static persona prefix, so it can change without invalidating it.
+        assert "新固定人格" in "\n".join(prompt)
+        assert "动态风格一寻址规则" in "\n".join(prompt)
         assert "完整混合召回证据" in "\n".join(prompt)
         assert observation_json(prompt)["current_target"]["text"] == "当前请求必须可见"
         assert "memory_search" not in names and "memory_read" not in names

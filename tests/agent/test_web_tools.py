@@ -84,7 +84,7 @@ async def test_ref_collision_across_requests_and_budgets_are_explicit():
     assert a.data["sources"][0]["ref_id"] != b.data["sources"][0]["ref_id"]
     assert (await current["search_web"].handler({"query": "a", "max_results": 21})).status == "blocked"
     for _ in range(8):
-        await current["search_web"].handler({"query": "a"})
+        await current["search_web"].handler({"query": str(_)})
     assert len(client.calls) == 8
     assert (await current["search_web"].handler({"query": "a"})).data["error"] == "web_turn_budget_exhausted"
 
@@ -93,7 +93,7 @@ async def test_page_context_budget_and_next_line_use_visible_content():
     current = tools()
     total = 0
     for _ in range(8):
-        result = await current["open_web_page"].handler({"ref_id": "https://example.com/page"})
+        result = await current["open_web_page"].handler({"ref_id": "https://example.com/page", 'lineno': _ * 10})
         if result.status == "blocked":
             break
         total += len(__import__("json").dumps(result.data, ensure_ascii=False))
@@ -143,3 +143,95 @@ async def test_find_keeps_late_match_visible_and_legacy_feedback_fits():
     legacy = tools(agent_runtime="legacy")
     result = await legacy["open_web_page"].handler({"ref_id": "https://example.com/page"})
     assert len(__import__("json").dumps(result.data, ensure_ascii=False)) <= 8000
+
+
+@pytest.mark.parametrize('status', [429, 500, 502, 503, 504])
+async def test_search_retries_transient_http_once_and_counts_both_attempts(status):
+    class Temporary(Client):
+        attempts = 0
+        def search_report(self,*args,**kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                response=httpx.Response(status,request=httpx.Request('POST','https://bridge.example'))
+                raise httpx.HTTPStatusError('secret-containing error',request=response.request,response=response)
+            return super().search_report(*args,**kwargs)
+    c=Temporary();current=tools(c)
+    result=await current['search_web'].handler({'query':'public evidence'})
+    assert result.status=='ok' and c.attempts==2
+    for _ in range(6):await current['search_web'].handler({'query':str(_)})
+    assert (await current['search_web'].handler({'query':'new uncached request'})).status=='blocked'
+    assert c.attempts==8
+
+
+@pytest.mark.parametrize('status', [400,401,403,404,422,502])
+async def test_http_errors_are_safe_and_retries_are_bounded(status):
+    class Failed(Client):
+        attempts=0
+        def search_report(self,*args,**kwargs):
+            self.attempts+=1
+            response=httpx.Response(status,request=httpx.Request('POST','https://bridge.example?token=secret'))
+            raise httpx.HTTPStatusError('secret',request=response.request,response=response)
+    c=Failed();result=await tools(c)['search_web'].handler({'query':'a'})
+    assert result.status=='failed' and result.data['error']==f'web_http_{status}'
+    assert c.attempts==(2 if status==502 else 1)
+    assert 'secret' not in str(result.data)
+
+
+async def test_metadata_kind_is_visible_and_revocation_prevents_retry():
+    class Metadata(Client):
+        def open_page(self,*args,**kwargs):
+            r=super().open_page(*args,**kwargs);r.content_kind='bilibili_public_metadata';return r
+    assert (await tools(Metadata())['open_web_page'].handler({'ref_id':'https://example.com/page'})).data['content_kind']=='bilibili_public_metadata'
+    guard=Guard()
+    class Revoked(Client):
+        attempts=0
+        def search_report(self,*args,**kwargs):
+            self.attempts+=1;guard.valid=False
+            response=httpx.Response(502,request=httpx.Request('POST','https://bridge.example'))
+            raise httpx.HTTPStatusError('secret',request=response.request,response=response)
+    c=Revoked()
+    with pytest.raises(RuntimeError,match='source revoked'):await tools(c,guard)['search_web'].handler({'query':'a'})
+    assert c.attempts==1
+
+
+async def test_retry_backoff_stays_inside_total_timeout_and_call_budget():
+    class Temporary(Client):
+        attempts=0
+        def search_report(self,*args,**kwargs):
+            self.attempts+=1
+            response=httpx.Response(502,request=httpx.Request('POST','https://bridge.example'))
+            raise httpx.HTTPStatusError('secret',request=response.request,response=response)
+    c=Temporary()
+    result=await tools(c,agent_web_search_timeout_seconds=0.01)['search_web'].handler({'query':'a'})
+    assert result.data['error']=='web_timeout' and c.attempts==1
+    class AtLimit(Client):
+        attempts=0
+        def search_report(self,*args,**kwargs):
+            self.attempts+=1
+            if self.attempts==8:
+                response=httpx.Response(502,request=httpx.Request('POST','https://bridge.example'))
+                raise httpx.HTTPStatusError('secret',request=response.request,response=response)
+            return super().search_report(*args,**kwargs)
+    c=AtLimit();current=tools(c)
+    for _ in range(7):await current['search_web'].handler({'query':str(_)})
+    assert (await current['search_web'].handler({'query':'a'})).data['error']=='web_http_502'
+    assert c.attempts==8
+
+
+async def test_repeated_page_search_uses_compact_same_turn_receipt_and_rechecks_guard():
+    c=Client();guard=Guard();current=tools(c,guard)
+    first=await current['search_web'].handler({'query':'public evidence'})
+    again=await current['search_web'].handler({'query':'public evidence'})
+    assert again.status=='ok' and again.data['cached_in_turn'] is True
+    assert again.data['source_refs']==[x['ref_id'] for x in first.data['sources']] and not again.data['content']
+    assert len(c.calls)==1
+    ref=first.data['sources'][0]['ref_id']
+    page=await current['open_web_page'].handler({'ref_id':ref})
+    repeated=await current['open_web_page'].handler({'ref_id':'https://example.com/page'})
+    assert repeated.data['source_refs']==[x['ref_id'] for x in page.data['sources']] and repeated.data['cached_in_turn']
+    assert len(c.calls)==2 and repeated.data['next_line']==page.data['next_line']
+    guard.valid=False
+    with pytest.raises(RuntimeError):await current['open_web_page'].handler({'ref_id':ref})
+    other=tools(c)
+    await other['search_web'].handler({'query':'public evidence'})
+    assert len(c.calls)==3

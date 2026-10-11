@@ -455,9 +455,13 @@ def _read(context: ServiceToolContext, *, query, addressed, layer="", member=Non
             raise _MemoryReadError("source_unavailable")
         source_timestamps = {key: shanghai_aware(row.timestamp).isoformat(timespec="seconds")
                              for key, row in sources.items()}
+        # Only final packed recent evidence can replace a duplicate observation
+        # line. A historical fact's sources do not imply its raw text was shown.
+        recent_source_ids = [sources[message.source_msg_id].id for message in packed.recent_messages]
     return {
         "evidence": packed.text, "kind": "source_bound_memory_evidence", "mode": result.mode,
         "source_ids": list(source_ids), "source_message_ids": list(packed.source_msg_ids),
+        "recent_source_ids": recent_source_ids,
         "source_timestamps": source_timestamps,
         "memory_dependencies": dependencies,
         "estimated_tokens": packed.estimated_tokens,

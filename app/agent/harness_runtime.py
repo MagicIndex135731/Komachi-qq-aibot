@@ -31,10 +31,12 @@ from app.agent.harness_session_files import native_file_path
 from app.agent.model_observation import request_context_counts, usage_token_metrics
 from app.agent.model_stream import ModelStreamBudget
 from app.runtime.blocking import BoundedBlockingRunner
-from app.core.time_utils import conversation_time_prompt
+from app.core.time_utils import CONVERSATION_TIME_POLICY, conversation_time_context
 
 
 HARNESS_VERSION = "0.1.5rc1"
+CONTEXT_FORMAT_VERSION = 2
+_DYNAMIC_PERSONA_PREFIX = "Current persona guidance:\n"
 _PLUGIN = Path(__file__).with_name("harness_plugins") / "python_tools.mjs"
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,13 @@ class HarnessToolAgent:
         patch = home / ("turn-" + uuid4().hex + ".patch.json")
         bridge = _Bridge(self, by_name, guard, asyncio.get_running_loop(), resources,
                          invoke_tool or self.invoke_tool)
-        instructions, input_lines = self.decision_client._split_prompt_lines(prompt)
+        # Scoped live examples retain developer authority, but are not stored
+        # as the native session's fixed persona or conversation input. Replayed
+        # examples must not outlive their current canonical source checks.
+        bridge.dynamic_instructions = "\n".join(line for line in prompt
+            if line.startswith(_DYNAMIC_PERSONA_PREFIX))
+        fixed_prompt = [line for line in prompt if not line.startswith(_DYNAMIC_PERSONA_PREFIX)]
+        instructions, input_lines = self.decision_client._split_prompt_lines(fixed_prompt)
         bridge.instructions = "\n".join(instructions)
         self._active.add(bridge)
         bridge.start()
@@ -222,6 +230,7 @@ class _Bridge:
         self.model = client.responses_model or client.model
         self.vision_model = client.vision_model or self.model
         self.instructions = ""
+        self.dynamic_instructions = ""
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -428,19 +437,33 @@ class _Bridge:
         if client.temperature is not None:
             body["temperature"] = client.temperature
         base_instructions = body.get("instructions", "")
+        base_input = list(body.get("input", []))
         base_messages = list(body.get("messages", []))
         # Transport retry is independent of the Agent loop. Only model requests
         # before response bytes are committed may be retried, with a hard bound.
         with self.resources.hold() if self.resources else nullcontext():
             for attempt in range(3):
                 budget.check()
-                # Native session replay may contain yesterday's clock. Refresh at
-                # every upstream request, including a retry across midnight.
-                time_anchor = conversation_time_prompt(self.owner.clock())
+                # Keep the cacheable system/history prefix stable. The native
+                # session may contain yesterday's clock, so append a fresh
+                # application clock after replay on every request and retry.
+                # This transport-only item is not stored in the native session.
+                time_anchor = "Current time JSON:\n" + json.dumps(
+                    conversation_time_context(self.owner.clock()), ensure_ascii=False,
+                    separators=(",", ":"))
                 if self.protocol == "openai-responses":
-                    body["instructions"] = base_instructions + "\n" + time_anchor
+                    body["instructions"] = (base_instructions if CONVERSATION_TIME_POLICY in base_instructions
+                        else base_instructions + "\n" + CONVERSATION_TIME_POLICY)
+                    guidance = [{"role": "developer", "content": [{"type": "input_text",
+                        "text": self.dynamic_instructions}]}] if self.dynamic_instructions else []
+                    body["input"] = [*base_input, *guidance, {"role": "developer", "content": [
+                        {"type": "input_text", "text": time_anchor}]}]
                 else:
-                    body["messages"] = [{"role": "system", "content": time_anchor}, *base_messages]
+                    # Keep the existing Chat Completions role vocabulary for
+                    # providers without developer-role support.
+                    guidance = [{"role": "system", "content": self.dynamic_instructions}] if self.dynamic_instructions else []
+                    body["messages"] = [{"role": "system", "content": CONVERSATION_TIME_POLICY},
+                        *base_messages, *guidance, {"role": "user", "content": time_anchor}]
                 if self.owner.before_call and not self.owner.before_call("model"):
                     self.stop_reason = "model_daily_budget"
                     return handler.reply(429, {"error": {"message": "model_daily_budget"}})

@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from app.core.message_content import ImageAttachment
+from app.providers.shared_page_text import read_bilibili_text
 
 
 @dataclass(slots=True)
@@ -28,6 +29,7 @@ class WebSearchResult:
 class WebSearchReport:
     results: list[WebSearchResult]
     content: str
+    content_kind: str = 'web_page'
 
 
 class WebSearchProviderError(RuntimeError):
@@ -182,7 +184,18 @@ class WebSearchClient:
     def open_page(self, url: str, *, lineno: int = 0) -> WebSearchReport:
         if not self.supports_page_tools:
             raise WebSearchProviderError("page_tools_unavailable")
-        return self._alpha_report({"open": [{"ref_id": url, "lineno": lineno}]}, instruction="读取公开网页正文", max_results=20)
+        deadline = time.monotonic() + self.timeout_seconds
+        try:
+            return self._alpha_report({"open": [{"ref_id": url, "lineno": lineno}]}, instruction="读取公开网页正文", max_results=20)
+        except (httpx.HTTPError, WebSearchProviderError):
+            page = read_bilibili_text(url, client=self.http_client, deadline=deadline)
+            if page is None:
+                raise
+            body = '\n'.join(f'L{i}: {line}' for i, line in enumerate(page.lines) if i >= lineno)
+            content = (f'{page.title} ({page.url})\n'
+                f'citeturn0view0 Total lines: {len(page.lines)}\n{body}')
+            return WebSearchReport([WebSearchResult(page.title, page.lines[3], page.url, '', 'turn0view0')],
+                content, 'bilibili_public_metadata')
 
     def find_page(self, url: str, *, pattern: str) -> WebSearchReport:
         if not self.supports_page_tools:

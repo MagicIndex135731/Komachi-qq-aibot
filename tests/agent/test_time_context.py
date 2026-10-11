@@ -66,11 +66,18 @@ def test_every_model_request_refreshes_shanghai_day(bridge_factory, protocol):
         bridge.forward(ModelHandler(), request_body(protocol))
         clock[0] = datetime(2026, 10, 10, 16, 0, 0, tzinfo=UTC)
     def anchor(body):
-        value = body.get("instructions", "") if protocol == "openai-responses" else body["messages"][0]["content"]
+        value = body["input"][-1]["content"][0]["text"] if protocol == "openai-responses" else body["messages"][-1]["content"]
         return value
-    assert '"today": "2026-10-10"' in anchor(requests[0])
-    assert '"today": "2026-10-11"' in anchor(requests[1])
-    assert '"yesterday": "2026-10-10"' in anchor(requests[1])
+    assert '"today":"2026-10-10"' in anchor(requests[0])
+    assert '"today":"2026-10-11"' in anchor(requests[1])
+    assert '"yesterday":"2026-10-10"' in anchor(requests[1])
+    if protocol == "openai-responses":
+        assert requests[0]["instructions"] == requests[1]["instructions"]
+        assert requests[0]["input"][:-1] == requests[1]["input"][:-1]
+        assert requests[1]["input"][-1]["role"] == "developer"
+    else:
+        assert requests[0]["messages"][:-1] == requests[1]["messages"][:-1]
+        assert requests[1]["messages"][-1]["role"] == "user"
 
 
 @pytest.mark.parametrize("protocol", ["openai-responses", "openai-completions"])
@@ -88,11 +95,56 @@ def test_transport_retry_crossing_midnight_refreshes_once(bridge_factory, protoc
         body["instructions"] = "synthetic stable persona"
     bridge.forward(ModelHandler(), body)
     assert len(requests) == 2
-    anchors = [r["instructions"] if protocol == "openai-responses" else r["messages"][0]["content"] for r in requests]
-    assert '"today": "2026-10-10"' in anchors[0]
-    assert '"today": "2026-10-11"' in anchors[1]
+    anchors = [r["input"][-1]["content"][0]["text"] if protocol == "openai-responses" else r["messages"][-1]["content"] for r in requests]
+    assert '"today":"2026-10-10"' in anchors[0]
+    assert '"today":"2026-10-11"' in anchors[1]
     assert anchors[1].count("Current time JSON:") == 1
     if protocol == "openai-responses":
-        assert anchors[1].startswith("synthetic stable persona")
+        assert requests[1]["instructions"].startswith("synthetic stable persona")
+        assert requests[0]["instructions"] == requests[1]["instructions"]
+        assert requests[0]["input"][:-1] == requests[1]["input"][:-1]
     else:
-        assert len(requests[1]["messages"]) == 2
+        assert len(requests[1]["messages"]) == 3
+        assert requests[0]["messages"][:-1] == requests[1]["messages"][:-1]
+
+
+@pytest.mark.parametrize("protocol", ["openai-responses", "openai-completions"])
+def test_clock_does_not_split_or_rewrite_replayed_tool_pairs(bridge_factory, protocol):
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse() if protocol == "openai-responses" else chat_sse(), protocol=protocol)
+    body = request_body(protocol)
+    if protocol == "openai-responses":
+        body["input"].extend([
+            {"type": "function_call", "call_id": "synthetic-call", "name": "read_context", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "synthetic-call", "output": "synthetic closed result"}])
+        replay = list(body["input"])
+    else:
+        body["messages"].extend([
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "synthetic-call", "type": "function", "function": {"name": "read_context", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "synthetic-call", "content": "synthetic closed result"}])
+        replay = list(body["messages"])
+    bridge.forward(ModelHandler(), body)
+    if protocol == "openai-responses":
+        assert requests[0]["input"][:-1] == replay
+    else:
+        assert requests[0]["messages"][1:-1] == replay
+
+
+@pytest.mark.parametrize("protocol", ["openai-responses", "openai-completions"])
+def test_dynamic_persona_guidance_keeps_authority_after_replay(bridge_factory, protocol):
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse() if protocol == "openai-responses" else chat_sse(), protocol=protocol)
+    bridge.dynamic_instructions = "Current persona guidance:\nsynthetic live style"
+    body = request_body(protocol)
+    bridge.forward(ModelHandler(), body)
+    if protocol == "openai-responses":
+        guidance = requests[0]["input"][-2]
+        assert guidance["role"] == "developer"
+        assert guidance["content"][0]["text"] == bridge.dynamic_instructions
+        assert bridge.dynamic_instructions not in requests[0]["instructions"]
+    else:
+        guidance = requests[0]["messages"][-2]
+        assert guidance["role"] == "system"
+        assert guidance["content"] == bridge.dynamic_instructions
+    bridge.guard.allowed = False
+    with pytest.raises(RuntimeError):
+        bridge.forward(ModelHandler(), body)
+    assert len(requests) == 1

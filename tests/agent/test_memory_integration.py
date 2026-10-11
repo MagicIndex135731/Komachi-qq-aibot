@@ -128,6 +128,70 @@ async def test_initial_recall_uses_existing_v3_pipeline_and_registers_historical
     assert counts(context) == before
 
 
+def _install_recent_packet(context, monkeypatch, *, max_recent_messages=60):
+    """Supply scoped evidence, then exercise the real final safety/packing pass."""
+    from app.core.memory_context_packer import (
+        EvidenceMessage, EvidenceSegment, MemoryContextPacker, PackedMemoryContext,
+    )
+    from app.core.memory_orchestrator import MemoryContextResult
+
+    seed(context.router.engine, "早一点的近聊", "recent-earlier", timestamp=NOW-timedelta(seconds=1))
+    with session_scope(context.router.engine) as session:
+        rows = MessageRepository(session).get_group_messages_by_platform_msg_ids(
+            group_id=GROUP, platform_msg_ids=["historical-star", "recent-earlier", "recent-chat", "target-query"],
+        )
+        canonical_ids = {key: row.id for key, row in rows.items()}
+        evidence = {key: EvidenceMessage(key, "synthetic author", row.plain_text, row.timestamp,
+            group_id=GROUP, user_id=AUTHOR) for key, row in rows.items()}
+    packed = PackedMemoryContext("normal", 32000, 0, "",
+        recent_messages=(evidence["recent-earlier"], evidence["recent-chat"], evidence["target-query"]),
+        evidence_segments=(EvidenceSegment("synthetic-episode", 1, (evidence["historical-star"],)),))
+    monkeypatch.setattr(context.router.memory_orchestrator, "build_context",
+        lambda request: MemoryContextResult(GROUP, packed, (), 0, "synthetic"))
+    monkeypatch.setattr(context.router.memory_orchestrator.v2_provider, "_packer",
+        MemoryContextPacker(max_recent_messages=max_recent_messages))
+    return canonical_ids
+
+
+async def test_recent_source_ids_are_canonical_recent_rows_not_all_memory_sources(context, monkeypatch):
+    ids = _install_recent_packet(context, monkeypatch)
+    outcome = await build_agent_memory(context)
+    assert outcome.status == "ok"
+    assert outcome.data["recent_source_ids"] == [ids["recent-earlier"], ids["recent-chat"]]
+    assert ids["target-query"] not in outcome.data["recent_source_ids"]
+    assert ids["historical-star"] in outcome.data["source_ids"]
+    assert ids["historical-star"] not in outcome.data["recent_source_ids"]
+    assert "我以前喜欢星星" in outcome.data["evidence"]
+
+
+async def test_recent_source_ids_follow_final_packet_budget(context, monkeypatch):
+    ids = _install_recent_packet(context, monkeypatch, max_recent_messages=1)
+    outcome = await build_agent_memory(context)
+    assert outcome.status == "ok"
+    assert outcome.data["recent_source_ids"] == [ids["recent-chat"]]
+    assert ids["recent-earlier"] not in outcome.data["source_ids"]
+    assert "早一点的近聊" not in outcome.data["evidence"]
+    assert ids["historical-star"] in outcome.data["source_ids"]
+
+
+@pytest.mark.parametrize("rejection", ["revoked", "source_budget"])
+async def test_recent_source_ids_never_include_rejected_recent_rows(context, monkeypatch, rejection):
+    ids = _install_recent_packet(context, monkeypatch)
+    if rejection == "revoked":
+        with session_scope(context.router.engine) as session:
+            session.get(Message, ids["recent-chat"]).raw_json = {"delivery_state": "deleted"}
+    else:
+        context.observed_sources.update(seed(context.router.engine, f"scope seed {index}",
+            f"recent-budget-{index}") for index in range(199))
+        assert len(context.observed_sources) == 200
+    outcome = await build_agent_memory(context)
+    assert outcome.status == "ok"
+    assert outcome.data["recent_source_ids"] == ([ids["recent-earlier"]] if rejection == "revoked" else [])
+    assert ids["recent-chat"] not in outcome.data["source_ids"]
+    assert "今天的天气" not in outcome.data["evidence"]
+    assert set(outcome.data["recent_source_ids"]).issubset(context.observed_sources)
+
+
 def counts(context):
     with session_scope(context.router.engine) as session:
         return tuple(session.scalar(select(func.count()).select_from(model))

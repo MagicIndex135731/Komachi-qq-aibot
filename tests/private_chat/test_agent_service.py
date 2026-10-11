@@ -88,6 +88,34 @@ def event(message_id="native-private-one", *, user_id=OWNER, text="聊聊夜空"
             "user_id": user_id, "sender": {"nickname": "synthetic"}, "message": [{"type": "text", "data": {"text": text}}]}, datetime.now(UTC))
 
 
+async def test_native_private_history_bootstraps_once_and_restores_only_after_rotation(sqlite_engine, tmp_path):
+    service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,lambda body,n:sse(number=n))
+    def observation(body):
+        for item in reversed(body['input']):
+            content=item.get('content','')
+            if isinstance(content,list):content='\n'.join(block.get('text','') for block in content)
+            if 'Private observation JSON:\n' in content:
+                return json.loads(content.split('Private observation JSON:\n',1)[1])
+        raise AssertionError('private observation missing')
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('native-bootstrap-first',text='第一次普通聊天'))
+        first=observation(requests[-1]);assert first['previous_closed_context']==[]
+        await dispatcher.handle_private_message(event('native-bootstrap-second',text='第二次普通聊天'))
+        second=observation(requests[-1])
+        assert second['history_in_native_session'] and second['previous_closed_context']==[]
+        assert second['daily_session_summary']==''
+        scope=f'private:{OWNER}';state=agent.sessions.read(scope)
+        agent.sessions.save(scope,state['items'],{**state['checkpoint'],'context_format_version':0},
+            state['source_message_ids'],expected_revision=state['revision'])
+        await dispatcher.handle_private_message(event('native-bootstrap-third',text='第三次恢复聊天'))
+        third=observation(requests[-1])
+        assert not third['history_in_native_session']
+        assert [x['content'] for x in third['previous_closed_context'] if x['role']=='user']==['第一次普通聊天','第二次普通聊天']
+    finally:
+        await service.stop()
+
+
 async def test_current_friend_outside_fixed_list_can_chat_without_owner_tools(sqlite_engine, tmp_path):
     friend = 900000103
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
@@ -218,7 +246,7 @@ async def test_private_native_web_body_open_find_and_send_are_wired(sqlite_engin
         api_key="synthetic", timeout_seconds=45, http_client=httpx.Client(transport=httpx.MockTransport(web)))
     await service.start()
     try:
-        await dispatcher.handle_private_message(event(user_id=OTHER))
+        await dispatcher.handle_private_message(event(user_id=OTHER, text='联网搜索公开夜空资料并打开链接'))
         assert sender.texts == [(OTHER, "已核对公开正文")]
         assert len(web_calls) == 3 and len(requests) == 5
         assert "DETAILED_PUBLIC_EVIDENCE" in json.dumps(requests[1], ensure_ascii=False)

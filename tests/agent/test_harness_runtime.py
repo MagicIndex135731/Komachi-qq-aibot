@@ -228,7 +228,7 @@ def test_response_terminal_metrics_capture_usage_once_and_redact(bridge_factory,
     assert len(rows) == len(usages) == len(requests) == 1
     row = rows[0]
     assert row["terminal"] == terminal and row["model_call_index"] == row["attempt"] == 1
-    assert row["context_items"] == row["context_images"] == 1 and row["context_tools"] == 0
+    assert row["context_items"] == 2 and row["context_images"] == 1 and row["context_tools"] == 0
     assert row["input_tokens"] == 10 and row["output_tokens"] == 3 and row["cached_input_tokens"] == 8
     assert row["cache_token_ratio"] == 0.8 and row["usage_status"] == "reported"
     assert 0 <= row["headers_ms"] <= row["first_sse_byte_ms"] <= row["elapsed_ms"]
@@ -441,8 +441,8 @@ async def test_real_harness_controls_native_tool_results_and_multiple_writes(tmp
     assert result.status == "sent" and result.receipt_id == "4"
     assert [r["tool"] for r in result.trace if "tool" in r] == [row[0] for row in plan]
     assert len(requests) == 5 and len(usages) == 5
-    assert requests[1]["input"][-1]["type"] == "function_call_output"
-    assert json.loads(requests[1]["input"][-1]["output"])["data"]["value"] == "context"
+    assert requests[1]["input"][-2]["type"] == "function_call_output"
+    assert json.loads(requests[1]["input"][-2]["output"])["data"]["value"] == "context"
     assert all(r["parallel_tool_calls"] is False for r in requests)
     assert {t["name"] for t in requests[0]["tools"]} == {"read_context", "save_progress", "send_group"}
     metrics = [row for row in result.trace if row.get("status") == "model_request"]
@@ -542,8 +542,8 @@ async def test_native_chat_completions_protocol_feedback_and_accounting(tmp_path
         agent.close()
     assert result.status == "silent" and called == [{}]
     assert len(usages) == 2
-    assert requests[1]["messages"][-1]["role"] == "tool"
-    assert "synthetic receipt" in requests[1]["messages"][-1]["content"]
+    assert requests[1]["messages"][-2]["role"] == "tool"
+    assert "synthetic receipt" in requests[1]["messages"][-2]["content"]
 
 
 @pytest.mark.asyncio
@@ -653,6 +653,32 @@ async def test_real_harness_persists_and_restores_session_after_process_restart(
 
 
 @pytest.mark.asyncio
+async def test_resumed_native_history_keeps_prefix_and_clock_transport_only(tmp_path):
+    from datetime import UTC, datetime
+    client, requests, _ = model_client(lambda _, n: responses_sse(number=n))
+    home = tmp_path / "synthetic-cache-scope"
+    for number in (1, 2):
+        stamp = datetime(2026, 10, 10, 15, 59, 59, tzinfo=UTC) if number == 1 else datetime(2026, 10, 10, 16, tzinfo=UTC)
+        agent = HarnessToolAgent(decision_client=client, session_home=home, session_id="stable-cache-session",
+            clock=lambda: stamp)
+        try:
+            assert (await agent.run(["System persona: stable synthetic persona", "wake " + str(number),
+                "Current persona guidance:\nsynthetic live style " + str(number)], (), Guard())).status == "silent"
+        finally:
+            agent.close()
+    assert requests[0]["instructions"] == requests[1]["instructions"]
+    first_replay = requests[0]["input"][:-2]
+    assert first_replay and requests[1]["input"][:len(first_replay)] == first_replay
+    assert "Current time JSON:" not in json.dumps(requests[1]["input"][:-1])
+    assert "Current persona guidance:" not in json.dumps(requests[1]["input"][:-2])
+    assert "synthetic live style 1" not in json.dumps(requests[1])
+    assert "synthetic live style 1" in requests[0]["input"][-2]["content"][0]["text"]
+    assert "synthetic live style 2" in requests[1]["input"][-2]["content"][0]["text"]
+    assert '"today":"2026-10-11"' in requests[1]["input"][-1]["content"][0]["text"]
+    assert all(body["input"][-1]["role"] == body["input"][-2]["role"] == "developer" for body in requests)
+
+
+@pytest.mark.asyncio
 async def test_real_harness_restores_long_windows_log_and_reads_its_actual_bytes(tmp_path):
     from app.agent.harness_session_files import native_file_path, native_session_logs, native_session_size
     from test_harness_session_files import long_session_home
@@ -711,7 +737,7 @@ async def test_duplicate_write_new_native_call_identity_uses_real_prior_receipt(
     finally:
         agent.close()
     assert result.status == "sent" and calls == ["send"]
-    assert '"duplicate":true' in requests[2]["input"][-1]["output"]
+    assert '"duplicate":true' in requests[2]["input"][-2]["output"]
 
 
 @pytest.mark.asyncio
@@ -742,7 +768,7 @@ async def test_native_tool_failure_feedback_can_choose_another_tool(tmp_path):
     finally:
         agent.close()
     assert [r["status"] for r in result.trace if "tool" in r] == ["failed", "ok"]
-    assert '"status":"failed"' in requests[1]["input"][-1]["output"]
+    assert '"status":"failed"' in requests[1]["input"][-2]["output"]
     assert result.status == "silent"
 
 
@@ -787,4 +813,4 @@ async def test_invoke_callback_gets_native_identity_and_write_budget(tmp_path):
         agent.close()
     assert calls == [("send_group", {"text": "1"}, "call_1|fc_call_1")]
     assert result.status == "sent"
-    assert "write_budget_exhausted" in requests[2]["input"][-1]["output"]
+    assert "write_budget_exhausted" in requests[2]["input"][-2]["output"]
