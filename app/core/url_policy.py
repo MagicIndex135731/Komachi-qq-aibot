@@ -1,6 +1,29 @@
 from __future__ import annotations
 
 import re
+import ipaddress
+from urllib.parse import urlsplit, urlunsplit
+
+
+def public_web_url(value: str) -> str:
+    """Allow only public HTTP URLs for the remote web bridge."""
+    parts = urlsplit(value.strip())
+    host = (parts.hostname or "").lower().rstrip(".")
+    if (parts.scheme not in {"http", "https"} or not host or parts.username is not None
+            or parts.password is not None or parts.port not in {None, 80, 443}
+            or any(ord(c) < 33 for c in value) or "\\" in value):
+        raise ValueError("invalid_public_url")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if ("." not in host or host.endswith((".localhost", ".local", ".internal", ".test", ".invalid"))
+                or host == "localhost" or host.replace(".", "").isdigit()
+                or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host)):
+            raise ValueError("invalid_public_url")
+    else:
+        if not address.is_global:
+            raise ValueError("invalid_public_url")
+    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, parts.query, ""))
 
 
 _EXPLICIT_URL_REQUEST = re.compile(

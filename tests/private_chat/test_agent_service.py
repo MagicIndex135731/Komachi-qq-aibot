@@ -241,7 +241,7 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         assert sender.texts == [(OWNER, "夜空很适合慢慢看")]
         assert len(requests) == 2
         names = {value["name"] for value in requests[0]["tools"]}
-        assert names == {"read_private_context", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup"}
+        assert names == {"read_private_context", "read_message_links", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup"}
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["receipts"][0]["receipt_id"] == "private-receipt-1"
         with session_scope(sqlite_engine) as session:
@@ -561,3 +561,68 @@ def test_nonowner_cannot_schedule_or_keep_legacy_drawing_authority(sqlite_engine
     assert agent._enqueue(user_id=OTHER,source_id=sid,private_scope='daily')['status']=='queued'
     assert not service.private_image_service._agent_private_source_usable(SimpleNamespace(user_id=OTHER,agent_source_message_id=None))
     agent.runtime_runner.close();agent.tool_runner.close()
+
+
+@pytest.mark.parametrize('foreign_quote', [False, True])
+async def test_private_quoted_share_discovery_and_search_fallback(sqlite_engine, tmp_path, foreign_quote):
+    from app.adapters.onebot_models import parse_private_message_event
+    from app.providers.web_search import WebSearchClient
+    web_calls = []
+    def outputs(body, name):
+        calls = {item['call_id']: item['name'] for item in body.get('input', []) if item.get('type') == 'function_call'}
+        values = [item for item in body.get('input', []) if item.get('type') == 'function_call_output' and calls[item['call_id']] == name]
+        return json.loads(values[-1]['output'])
+    def model(body, n):
+        if n == 1:
+            return sse('read_private_context', {}, number=n)
+        if n == 2:
+            found = outputs(body, 'read_private_context')['data']['share_sources']
+            if foreign_quote:
+                assert found == []
+                return sse(number=n)
+            assert found[0]['title'] == '合成分享新闻'
+            return sse('read_message_links', {'source_id': found[0]['source_id']}, number=n)
+        if n == 3:
+            data = outputs(body, 'read_message_links')['data']
+            assert data['metadata_only'] and data['trust'] == 'untrusted_shared_content'
+            return sse('open_web_page', {'ref_id': data['links'][0]['url']}, number=n)
+        if n == 4:
+            assert outputs(body, 'open_web_page')['status'] == 'failed'
+            return sse('search_web', {'query': '合成分享新闻 example.com'}, number=n)
+        if n == 5:
+            return sse('open_web_page', {'ref_id': outputs(body, 'search_web')['data']['sources'][0]['ref_id']}, number=n)
+        if n == 6:
+            assert '完整合成新闻正文' in outputs(body, 'open_web_page')['data']['content']
+            return sse('send_private', {'text': '已查阅补充来源，概要如下'}, number=n)
+        return sse(number=n)
+    def web(request):
+        web_calls.append(json.loads(request.content)['commands'])
+        if len(web_calls) == 1:
+            return httpx.Response(502)
+        return httpx.Response(200, json={'output': '来源 (https://example.org/news)\nciteturn0view0\nL0: 完整合成新闻正文',
+            'results': [{'type': 'text_result', 'url': 'https://example.org/news', 'ref_id': 'turn0view0', 'snippet': '摘要'}]})
+    service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, model)
+    service.web_search_client = WebSearchClient(provider='wyzlab_alpha', base_url='https://synthetic.invalid/v1',
+        api_key='synthetic', timeout_seconds=45, http_client=httpx.Client(transport=httpx.MockTransport(web)))
+    shared = parse_private_message_event({'message_id': 'quoted-card', 'user_id': OWNER if foreign_quote else OTHER,
+        'time': 100, 'message': [{'type': 'share', 'data': {'url': 'https://example.com/news',
+                                                      'title': '合成分享新闻', 'content': '卡片摘要'}}]})
+    dispatcher._persist_inbound(shared)
+    current = event('read-quoted-card', user_id=OTHER, text='看看引用卡片说了什么')
+    current.reply_to_msg_id = 'quoted-card'
+    current.raw_payload['message'].insert(0, {'type': 'reply', 'data': {'id': 'quoted-card'}})
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(current)
+        if foreign_quote:
+            assert len(requests) == 2 and not sender.texts and not web_calls
+        else:
+            assert len(requests) == 7 and len(web_calls) == 3
+            assert sender.texts == [(OTHER, '已查阅补充来源，概要如下')]
+            assert web_calls[0]['open'][0]['ref_id'] == 'https://example.com/news'
+            assert web_calls[2]['open'][0]['ref_id'] == 'https://example.org/news'
+            names = {tool['name'] for tool in requests[0]['tools']}
+            assert {'read_message_links', 'search_web', 'open_web_page'} <= names
+            assert 'request_owner_action' not in names
+    finally:
+        await service.stop()

@@ -10,6 +10,7 @@ from app.adapters.outbound_guard import current_group_dispatch
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.reply_policy import PolicyInput
 from app.core.search_policy import detect_address_intent
+from app.core.shared_content import extract_shared_links
 from app.core.time_utils import shanghai_aware
 from app.storage.db import session_scope
 from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
@@ -121,13 +122,26 @@ class GroupObservationService:
         with session_scope(router.engine) as session:
             messages = MessageRepository(session)
             recent = self._recent(messages, batch.group_id)
-            users_by_id = UserRepository(session).get_users_by_ids(
-                [item.user_id for item in recent]
-            )
             policy = router._resolve_group_policy(
                 groups=GroupRepository(session), group_id=batch.group_id
             )
             events = [self._live_event(event, messages) for event in batch.events]
+            # A quoted card may have fallen outside the 24 recent messages.
+            # Only real ledger reply links grant access, bounded to eight rows.
+            referenced = []
+            observed_ids = {item.id for item in recent}
+            for event in events:
+                if event is None or not event.reply_to_msg_id or len(referenced) >= 8:
+                    continue
+                quoted = messages.get_by_platform_msg_id(event.reply_to_msg_id)
+                if not is_usable_memory_source(quoted, group_id=batch.group_id) or quoted.id in observed_ids:
+                    continue
+                raw = quoted.raw_json
+                if isinstance(raw, dict) and extract_shared_links(raw.get('message', raw.get('raw_message', ''))):
+                    referenced.append(quoted)
+                    observed_ids.add(quoted.id)
+            visible = [*recent, *referenced]
+            users_by_id = UserRepository(session).get_users_by_ids([item.user_id for item in visible])
             sources_valid = bool(events) and all(event is not None for event in events)
             direct_target = next(
                 (
@@ -155,7 +169,7 @@ class GroupObservationService:
                 "suppression": suppression,
                 "memory_enabled": router._group_memory_enabled(group_id=batch.group_id),
                 "persona": router._persona_text_for(persona, batch.group_id),
-                "source_message_ids": tuple(item.id for item in recent),
+                "source_message_ids": tuple(item.id for item in visible),
                 "recent_lines": [
                     f"[{shanghai_aware(item.timestamp).isoformat(timespec='seconds')}] " + router._format_message_line(
                         user_id=item.user_id,
@@ -163,7 +177,7 @@ class GroupObservationService:
                         users_by_id=users_by_id,
                         group_id=batch.group_id,
                     )
-                    for item in recent
+                    for item in visible
                 ],
             }
 

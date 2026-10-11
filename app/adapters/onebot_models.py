@@ -6,6 +6,7 @@ from typing import Any
 
 from app.core.message_content import ImageAttachment, extract_images_from_message, extract_reply_to_msg_id
 from app.core.forward_content import extract_forward_ids
+from app.core.shared_content import extract_shared_links, segment_display
 
 
 @dataclass(slots=True)
@@ -41,11 +42,17 @@ def _flatten_message(message: list[dict[str, Any]] | str) -> str:
     if isinstance(message, str):
         return message
     parts: list[str] = []
+    card_count = 0
     for item in message:
+        if not isinstance(item, dict):
+            continue
         if item.get("type") == "text":
             parts.append(item.get("data", {}).get("text", ""))
         elif extract_forward_ids([item]):
             parts.append("[合并转发消息]")
+        elif item.get('type') in {'share', 'json', 'xml'} and card_count < 8:
+            parts.append(segment_display(item))
+            card_count += 1
     return "".join(parts).strip()
 
 
@@ -61,7 +68,11 @@ def _contains_explicit_mention(message: list[dict[str, Any]] | str, *, bot_qq: i
             return True
     plain_text = _flatten_message(message)
     return plain_text.startswith(f"@{bot_name}") or plain_text.startswith(f"@{bot_qq}")
-def _classify_message_type(*, plain_text: str, images: list[ImageAttachment]) -> str:
+def _classify_message_type(*, plain_text: str, images: list[ImageAttachment], message=None) -> str:
+    if (isinstance(message, list) and not images
+            and any(isinstance(item, dict) and item.get('type') in {'share', 'json', 'xml'} for item in message[:100])
+            and extract_shared_links(message)):
+        return "share"
     if images and plain_text:
         return "mixed"
     if images:
@@ -84,7 +95,7 @@ def parse_group_message_event(payload: dict[str, Any], *, bot_qq: int, bot_name:
         plain_text=plain_text,
         raw_payload=payload,
         timestamp=datetime.fromtimestamp(payload["time"], tz=UTC),
-        msg_type=_classify_message_type(plain_text=plain_text, images=images),
+        msg_type=_classify_message_type(plain_text=plain_text, images=images, message=message),
         images=images,
         mentioned_bot=mentioned_bot,
         reply_to_msg_id=reply_to_msg_id,
@@ -123,7 +134,7 @@ def parse_private_message_event(payload: dict[str, Any]) -> PrivateMessageEvent:
         plain_text=plain_text,
         raw_payload=payload,
         timestamp=datetime.fromtimestamp(payload["time"], tz=UTC),
-        msg_type=_classify_message_type(plain_text=plain_text, images=images),
+        msg_type=_classify_message_type(plain_text=plain_text, images=images, message=message),
         images=images,
         reply_to_msg_id=extract_reply_to_msg_id(message),
     )

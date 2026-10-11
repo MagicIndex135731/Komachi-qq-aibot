@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import re
 import uuid
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from app.agent.tool_agent import AgentTool, ToolOutcome
+from app.core.url_policy import public_web_url
 from app.providers.web_search import WebSearchProviderError, WebSearchReport
 
 logger = logging.getLogger(__name__)
@@ -21,27 +20,6 @@ MAX_TURN_CHARS = 48000
 _REFERENCE = re.compile(r"turn\d+(?:search|view|fetch)\d+")
 _SECTION = re.compile(r"(?m)^.+ \(https?://[^\n]+\)\n(?=cite)")
 _LINE = re.compile(r"(?m)(?:^|\s)L(\d+):")
-
-
-def public_web_url(value: str) -> str:
-    """Only public HTTP URLs reach the remote bridge, never local fetches."""
-    parts = urlsplit(value.strip())
-    host = (parts.hostname or "").lower().rstrip(".")
-    if (parts.scheme not in {"http", "https"} or not host or parts.username is not None
-            or parts.password is not None or parts.port not in {None, 80, 443}
-            or any(ord(c) < 33 for c in value) or "\\" in value):
-        raise ValueError("invalid_public_url")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        if ("." not in host or host.endswith((".localhost", ".local", ".internal", ".test", ".invalid"))
-                or host == "localhost" or host.replace(".", "").isdigit()
-                or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host)):
-            raise ValueError("invalid_public_url")
-    else:
-        if not address.is_global:
-            raise ValueError("invalid_public_url")
-    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, parts.query, ""))
 
 
 def build_web_tools(client, *, settings, runner, guard) -> tuple[AgentTool, ...]:
