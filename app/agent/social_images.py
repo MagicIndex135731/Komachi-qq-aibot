@@ -19,6 +19,7 @@ from app.core.message_content import ImageAttachment
 
 
 MAX_IMAGES = 2
+MAX_POST_IMAGES = 9
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_PIXELS = 16_000_000
 FETCH_SECONDS = 10.0
@@ -81,7 +82,7 @@ def _fetch_pixels(client: httpx.Client, url: str, *, budget: list[int], deadline
 @contextmanager
 def post_image_inputs(post: SocialPost, *, cache_dir: Path, http_client: httpx.Client | None = None):
     """Yield local validated attachments; URLs never enter provider fallbacks."""
-    urls = tuple(dict.fromkeys(url for url in post.images if allowed_media_url(url)))[:MAX_IMAGES]
+    urls = tuple(dict.fromkeys(url for url in post.images if allowed_media_url(url)))[:MAX_POST_IMAGES]
     if not urls:
         yield []
         return

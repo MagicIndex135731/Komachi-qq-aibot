@@ -85,6 +85,70 @@ async def test_feed_handle_is_resolved_to_real_tid_and_rechecked_before_comment(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("container_class", ["comments-item bor3", "comments-list"])
+@pytest.mark.parametrize("comment_owner", [OWNER, OTHER])
+async def test_feed_comment_subtree_does_not_supply_or_conflict_with_post_identity(container_class, comment_owner):
+    html = (f'<i data-uin="{OWNER}" data-tid="{TID}"></i>'
+            f'<li class="{container_class}" data-uin="{comment_owner}" data-tid="comment-id">'
+            '<div><br><img src="https://img.example.test/avatar.png">'
+            f'<a href="https://user.qzone.qq.com/{comment_owner}/mood/other-post">引用</a>'
+            '</div></li>')
+    feed = {"uin": OWNER, "nickname": "合成", "time": STAMP, "appid": 311,
+            "key": "feed-handle-is-not-tid", "html": html}
+    gateway = Gateway([ok({"feeds": [feed], "has_more": False}),
+                       ok({"total": 1, "msglist": [row()]})])
+    assert await QzoneAdapter(gateway).get_feeds(allowed_owner_ids=(OWNER,)) == (post(),)
+    assert gateway.calls[-1] == ("get_qzone_msg_list", {"target_uin": OWNER, "pos": 0, "num": 100})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", [
+    f'<li data-uin="{OTHER}" data-tid="{TID}"></li>',
+    f'<i data-uin="{OWNER}" data-tid="other-post"></i>',
+])
+async def test_post_identity_conflict_after_comment_subtree_still_rejects_feed(conflict):
+    html = (f'<i data-uin="{OWNER}" data-tid="{TID}"></i>'
+            f'<li class="comments-item bor3" data-uin="{OTHER}" data-tid="comment-id">'
+            '<div>合成评论<br></div></li>' + conflict)
+    feed = {"uin": OWNER, "nickname": "合成", "time": STAMP, "appid": 311,
+            "key": TID, "html": html}
+    gateway = Gateway([ok({"feeds": [feed], "has_more": False})])
+    assert await QzoneAdapter(gateway).get_feeds(allowed_owner_ids=(OWNER,)) == ()
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_comment_subtree_cannot_provide_missing_post_identity():
+    html = f'<li class="comments-item" data-uin="{OWNER}" data-tid="{TID}">合成评论</li>'
+    feed = {"uin": OWNER, "nickname": "合成", "time": STAMP, "appid": 311,
+            "key": "unverified-feed-key", "html": html}
+    gateway = Gateway([ok({"feeds": [feed], "has_more": False}),
+                       ok({"total": 1, "msglist": [row()]})])
+    assert await QzoneAdapter(gateway).get_feeds(allowed_owner_ids=(OWNER,)) == ()
+
+
+@pytest.mark.asyncio
+async def test_feed_with_comments_still_requires_exact_original_timestamp():
+    html = (f'<i data-uin="{OWNER}" data-tid="{TID}"></i>'
+            f'<li class="comments-item" data-uin="{OTHER}" data-tid="comment-id"></li>')
+    feed = {"uin": OWNER, "nickname": "合成", "time": STAMP + 1, "appid": 311,
+            "key": TID, "html": html}
+    gateway = Gateway([ok({"feeds": [feed], "has_more": False}),
+                       ok({"total": 1, "msglist": [row()]})])
+    assert await QzoneAdapter(gateway).get_feeds(allowed_owner_ids=(OWNER,)) == ()
+    assert len(gateway.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_html_class_attribute_does_not_break_post_identity():
+    feed = {"uin": OWNER, "nickname": "合成", "time": STAMP, "appid": 311,
+            "key": TID, "html": f'<i class data-uin="{OWNER}" data-tid="{TID}"></i>'}
+    gateway = Gateway([ok({"feeds": [feed], "has_more": False}),
+                       ok({"total": 1, "msglist": [row()]})])
+    assert await QzoneAdapter(gateway).get_feeds(allowed_owner_ids=(OWNER,)) == (post(),)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("html,key", [
     ("<p>没有可靠标识</p>", "guessed-tid"),
     (f'<li data-uin="{OTHER}" data-tid="{TID}"></li>', TID),

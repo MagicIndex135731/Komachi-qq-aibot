@@ -235,3 +235,51 @@ async def test_repeated_page_search_uses_compact_same_turn_receipt_and_rechecks_
     other=tools(c)
     await other['search_web'].handler({'query':'public evidence'})
     assert len(c.calls)==3
+
+
+@pytest.mark.parametrize('status', [429, 500, 502, 503, 504])
+async def test_exhausted_search_service_failure_stops_changed_queries_only_in_this_turn(status):
+    class Unavailable(Client):
+        attempts = 0
+        unavailable = True
+
+        def search_report(self, *args, **kwargs):
+            self.attempts += 1
+            if self.unavailable:
+                response = httpx.Response(status, request=httpx.Request('POST', 'https://bridge.example'))
+                raise httpx.HTTPStatusError('private upstream body', request=response.request, response=response)
+            return super().search_report(*args, **kwargs)
+
+    client, guard = Unavailable(), Guard()
+    current = tools(client, guard)
+    first = await current['search_web'].handler({'query': 'first research query'})
+    assert first.status == 'failed' and client.attempts == 2
+    another = await current['search_web'].handler({'query': 'changed research query'})
+    assert another.status == 'failed'
+    assert another.data['cached_failure_in_turn'] is True and client.attempts == 2
+    assert another.data['error'] == first.data['error'] == f'web_http_{status}'
+    assert '同一回合' in another.data['guidance'] and 'private' not in str(another.data)
+    # A supplied public URL remains usable, and a new turn can retry a service
+    # that recovered. A turn-local failure must not become a global outage.
+    assert (await current['open_web_page'].handler({'ref_id': 'https://example.com/page'})).status == 'ok'
+    client.unavailable = False
+    assert (await tools(client)['search_web'].handler({'query': 'changed research query'})).status == 'ok'
+    guard.valid = False
+    with pytest.raises(RuntimeError, match='source revoked'):
+        await current['search_web'].handler({'query': 'changed again'})
+
+
+async def test_search_timeout_is_not_retried_by_changing_the_query_in_one_turn():
+    class Timeout(Client):
+        attempts = 0
+
+        def search_report(self, *args, **kwargs):
+            self.attempts += 1
+            raise httpx.ReadTimeout('private timeout')
+
+    client = Timeout()
+    current = tools(client)
+    first = await current['search_web'].handler({'query': 'a'})
+    second = await current['search_web'].handler({'query': 'b'})
+    assert first.data['error'] == second.data['error'] == 'web_timeout'
+    assert second.data['cached_failure_in_turn'] is True and client.attempts == 1

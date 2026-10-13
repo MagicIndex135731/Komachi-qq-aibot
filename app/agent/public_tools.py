@@ -176,9 +176,11 @@ def build_public_tools(executor, observation, guard, store):
                 return ToolOutcome({"error": "friend_authority_revoked"}, "blocked")
             if found:
                 viewed.add(key)
-            return ToolOutcome({"post_id": post.post_id, "artifact_ids": [item[0] for item in found], "pixels_attached": bool(found)},
+            return ToolOutcome({"post_id": post.post_id, "artifact_ids": [item[0] for item in found],
+                "pixels_attached": bool(found), "image_count": len(post.images),
+                "viewed_image_count": len(found), "unseen_image_count": max(0, len(post.images) - len(found))},
                 images=tuple(ImageAttachment(url="", local_path=item[1], reference_subject=f"好友{post.owner_id}动态{post.post_id}") for item in found))
-        add("observe_post_images", "读取已观察原帖的实际图片像素并保存产物，不凭描述猜图", schema(owner_id=owner, post_id=text_schema(256)), view_post)
+        add("observe_post_images", "读取已观察原帖的实际图片像素并保存产物，最多9张；返回已读与未读数量，不能猜测未读图片内容", schema(owner_id=owner, post_id=text_schema(256)), view_post)
 
         async def comment(args):
             current, friends = await current_friends()

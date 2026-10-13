@@ -367,6 +367,14 @@ class GroupAgentRuntime:
                     await asyncio.wait_for(self.decide(batch), timeout=self.options.decision_timeout_seconds), batch,
                 )
                 guard.require_valid()
+                if decision.action == 'reply' and decision.reason in {'direct_trigger', 'persona_switch'}:
+                    boundary = self.repository.retain_through_target(
+                        turn_id=batch.turn_id, group_id=batch.group_id, epoch=guard.epoch,
+                        target_message_id=decision.target_message_id,
+                    )
+                    # The executor and its context receive the same prefix as
+                    # the persistent turn. Later questions retain pending IDs.
+                    batch = replace(batch, events=batch.events[:boundary])
                 self.repository.record_decision(turn_id=batch.turn_id, action=decision.action, reason=decision.reason)
                 if decision.action == "wait":
                     # Wait on arrivals once, without re-sampling the same batch.

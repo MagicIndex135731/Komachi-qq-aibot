@@ -1309,6 +1309,66 @@ async def test_native_forged_mention_does_not_exempt_autonomous_send_limits(sqli
 
 
 @pytest.mark.asyncio
+async def test_native_named_then_at_have_separate_targets_and_receipts(
+    sqlite_engine, tmp_path, monkeypatch,
+):
+    from app.agent.harness_runtime import HarnessToolAgent
+    from app.agent.runtime import GroupAgentRuntime
+    from app.agent.contracts import GroupAgentOptions
+    from app.agent.tool_agent import ToolTurnResult
+
+    received = []
+
+    async def reply_to_current(agent, prompt, tools, guard, **kwargs):
+        target = observation_json(prompt)['current_target']
+        expected = [('ambient-name', FRIEND + 1, '小町你在吗？'),
+                    ('explicit-at-question', FRIEND, '现在几点？')][len(received)]
+        received.append(target)
+        assert (target['message_id'], target['author_id'], target['text']) == expected
+        sender = next(tool for tool in tools if tool.name == 'send_group')
+        answer = '在呢。' if len(received) == 1 else '现在是下午四点。'
+        outcome = await agent.invoke_tool(sender, {'text': answer, 'artifact_ids': []}, 'answer-current-question')
+        return ToolTurnResult(outcome.status, outcome.receipt_id, 'tool:send_group')
+
+    monkeypatch.setattr(HarnessToolAgent, 'run', reply_to_current)
+    async with composed(sqlite_engine, tmp_path, SimpleNamespace(), runtime='harness') as fixture:
+        await fixture.agent.stop()
+        fixture.clock[0] = datetime.now(UTC)
+        events = []
+        for message_id, author, text, at in (
+            ('ambient-name', FRIEND + 1, '小町你在吗？', False),
+            ('explicit-at-question', FRIEND, '现在几点？', True),
+        ):
+            payload = {'post_type': 'message', 'message_type': 'group', 'group_id': GROUP,
+                'message_id': message_id, 'user_id': author, 'time': fixture.clock[0].timestamp(),
+                'sender': {'nickname': 'synthetic member'}, 'message': [
+                    *([{'type': 'at', 'data': {'qq': str(BOT)}}] if at else []),
+                    {'type': 'text', 'data': {'text': text}},
+                ]}
+            incoming = parse_group_message_event(payload, bot_qq=BOT, bot_name='小町')
+            fixture.router.ingest_live_group_message(incoming)
+            events.append(incoming)
+        planner = GroupParticipationPlanner(router=fixture.router, decision_client=SimpleNamespace(),
+            autonomous_executor=fixture.executor)
+        runtime = GroupAgentRuntime(engine=sqlite_engine, bot_qq=BOT, bot_name='小町',
+            decide=planner.decide, execute=planner.execute,
+            options=GroupAgentOptions(quiet_seconds=0.02, max_batch_wait_seconds=0.05))
+        runtime.set_connected(True)
+        await runtime.start()
+        try:
+            for incoming in events:
+                await runtime.observe(incoming)
+            async with asyncio.timeout(5):
+                while len(writes(fixture)) < 2:
+                    await asyncio.sleep(0.005)
+            assert [item['message_id'] for item in received] == ['ambient-name', 'explicit-at-question']
+            assert len(writes(fixture)) == 2
+        finally:
+            await runtime.stop()
+            planner.close()
+
+
+@pytest.mark.asyncio
 async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_engine, tmp_path):
     from test_harness_runtime import model_client, responses_sse
 

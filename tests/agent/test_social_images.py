@@ -39,19 +39,49 @@ def test_social_media_verified_pixels_are_bounded_and_removed(tmp_path):
         requested.append(str(request.url))
         return httpx.Response(200, content=image_bytes(), headers={"content-type": "application/octet-stream"})
     cache = tmp_path / "social-media"
-    post = observed(f"https://m.qpic.cn/{index}.png" for index in range(5))
+    post = observed(f"https://m.qpic.cn/{index}.png" for index in range(12))
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         with post_image_inputs(post, cache_dir=cache, http_client=client) as images:
-            assert len(images) == 2
+            assert len(images) == 9
             paths = [Path(image.local_path) for image in images]
             assert all(path.read_bytes() == image_bytes() for path in paths)
             assert all(image.url == "" and not image.fallback_url for image in images)
             assert all(image.source_user_id == post.owner_id and image.source_message_id == post.post_id for image in images)
             assert all(str(post.owner_id) in image.reference_subject and post.post_id in image.reference_subject for image in images)
             assert all(path.stem.isalnum() and len(path.stem) == 64 for path in paths)
-    assert len(requested) == 2
+    assert len(requested) == 9
     assert all(not path.exists() for path in paths)
     assert list(cache.iterdir()) == []
+
+
+def test_three_post_images_are_all_read_in_order(tmp_path):
+    colors = ["red", "green", "blue"]
+    requested = []
+    def respond(request):
+        index = int(request.url.path.removesuffix(".png").lstrip("/"))
+        requested.append(index)
+        stream = io.BytesIO()
+        Image.new("RGB", (8, 8), colors[index]).save(stream, format="PNG")
+        return httpx.Response(200, content=stream.getvalue())
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with post_image_inputs(observed(f"https://m.qpic.cn/{i}.png" for i in range(3)),
+                               cache_dir=tmp_path, http_client=client) as images:
+            assert len(images) == 3
+            assert [Image.open(image.local_path).getpixel((0, 0)) for image in images] == [
+                (255, 0, 0), (0, 128, 0), (0, 0, 255)]
+    assert requested == [0, 1, 2]
+
+
+def test_failed_middle_post_image_does_not_skip_third(tmp_path):
+    requested = []
+    def respond(request):
+        requested.append(request.url.path)
+        return httpx.Response(200, content=b"bad pixels" if request.url.path == "/1.png" else image_bytes())
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with post_image_inputs(observed(f"https://m.qpic.cn/{i}.png" for i in range(3)),
+                               cache_dir=tmp_path, http_client=client) as images:
+            assert len(images) == 2
+    assert requested == ["/0.png", "/1.png", "/2.png"]
 
 
 def test_unknown_redirect_target_is_never_requested(tmp_path):

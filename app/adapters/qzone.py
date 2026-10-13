@@ -29,6 +29,8 @@ _MAX_IMAGES = 9
 _MAX_IMAGE_BYTES = 16 * 1024 * 1024
 _MAX_FEED_AUTHORS = 5
 _MAX_FRIENDS = 10000
+_HTML_VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input",
+                            "link", "meta", "param", "source", "track", "wbr"})
 
 
 class QzoneProtocolError(RuntimeError):
@@ -413,6 +415,7 @@ class _FeedHTML(HTMLParser):
         self.conflicting_owner = False
         self.text: list[str] = []
         self.blocked: list[str] = []
+        self.comment_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in {"script", "style", "iframe", "object", "noscript"}:
@@ -420,7 +423,14 @@ class _FeedHTML(HTMLParser):
         if self.blocked:
             return
         values = dict(attrs)
-        if self.owner is not None:
+        # SnowLuma comment rows carry the COMMENTER's data-uin/data-tid.
+        # Their nested links likewise cannot establish the enclosing post's
+        # identity. Original-post candidates still require author-list proof.
+        comment_region = bool(self.comment_tags) or bool(
+            {"comments-list", "comments-item"}.intersection((values.get("class") or "").split()))
+        if comment_region and tag not in _HTML_VOID_TAGS:
+            self.comment_tags.append(tag)
+        if self.owner is not None and not comment_region:
             tid, owner = values.get("data-tid"), values.get("data-uin") or values.get("data-tuin")
             if tid is not None and owner is not None and _ID.fullmatch(tid):
                 if owner == str(self.owner):
@@ -441,6 +451,9 @@ class _FeedHTML(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if self.blocked and tag == self.blocked[-1]:
             self.blocked.pop()
+        if not self.blocked and tag in self.comment_tags:
+            last = len(self.comment_tags) - 1 - self.comment_tags[::-1].index(tag)
+            del self.comment_tags[last:]
         if not self.blocked and tag in {"p", "div", "li"}:
             self.text.append(" ")
 

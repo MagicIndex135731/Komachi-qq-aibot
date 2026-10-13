@@ -176,6 +176,21 @@ async def test_dynamic_registry_permissions_and_public_persona(context):
     assert "secret" not in (await tools["read_persona"].handler({})).data["expression_style"]
 
 
+@pytest.mark.parametrize("kind", ["qzone_publish", "qzone_comment"])
+@pytest.mark.parametrize("member_profile", [False, True])
+async def test_public_read_persona_keeps_authored_examples_and_excludes_member_samples(context, kind, member_profile):
+    profile = {"name": "公开小町", "example_lines": [f"语感示例{i}" for i in range(16)],
+        "facts": ["private fact marker"], "relationships": [{"member": "private relationship marker"}]}
+    if member_profile:
+        profile["source_user_id"] = AUTHOR
+    context.router.runtime.persona = profile
+    context.observation = SocialObservation(SocialJob(kind, kind, ACCOUNT), datetime.now(UTC), "public")
+    result = await registry(context)["read_persona"].handler({})
+    rendered = result.data["expression_style"]
+    assert all((example in rendered) is (not member_profile) for example in profile["example_lines"])
+    assert "private fact marker" not in rendered and "private relationship marker" not in rendered
+
+
 async def test_wakeup_tools_delegate_to_durable_scheduler(context):
     requests = []
     async def schedule(args):

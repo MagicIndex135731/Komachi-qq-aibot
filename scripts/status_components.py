@@ -344,6 +344,22 @@ def check_live_persona(settings: AppSettings) -> bool:
         client.http_client.close()
 
 
+def check_public_persona(settings: AppSettings) -> bool:
+    from app.config import load_runtime_config
+    from scripts.check_public_persona import inspect_public_personas, PublicPersonaContractError
+
+    try:
+        runtime = load_runtime_config(settings)
+        report = inspect_public_personas({**runtime.personas, "default": runtime.persona})
+    except (ValueError, OSError, TypeError) as exc:
+        reason = str(exc) if isinstance(exc, PublicPersonaContractError) else type(exc).__name__
+        _print("FAIL", "public_persona", reason)
+        return False
+    _print("OK", "public_persona", f"profiles={report['profile_count']} "
+        f"examples={report['rendered_examples']}/{report['configured_examples']} member_samples=excluded")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deep", action="store_true", help="one bounded live model request")
@@ -351,7 +367,8 @@ def main() -> int:
     settings = AppSettings()
     config_ok = check_provider_config(settings)
     storage_ok = check_storage(settings)
-    ok = config_ok and storage_ok
+    persona_ok = check_public_persona(settings)
+    ok = config_ok and storage_ok and persona_ok
     if args.deep:
         ok = check_live_persona(settings) and ok
     else:

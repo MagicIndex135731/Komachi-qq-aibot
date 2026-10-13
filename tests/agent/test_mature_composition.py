@@ -437,6 +437,68 @@ async def test_native_public_friend_scope_and_actual_post_pixels_drive_comment(s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_image", [None, 1])
+@pytest.mark.parametrize("image_count", [3, 9])
+async def test_native_post_image_tool_attaches_all_pixels_and_reports_missing(sqlite_engine, tmp_path, monkeypatch, failed_image, image_count):
+    import httpx
+    from app.agent import public_tools
+    from app.agent.social_images import post_image_inputs
+    fetched = []
+    def pixels(request):
+        index = int(request.url.path.removesuffix(".png").lstrip("/"))
+        fetched.append(index)
+        output = io.BytesIO()
+        Image.new("RGB", (8, 8), (index * 25, 0, 0)).save(output, format="PNG")
+        return httpx.Response(200, content=b"invalid" if index == failed_image else output.getvalue())
+    client, requests, _ = model_steps(("read_friend_posts", {"owner_id": FRIEND}),
+        ("observe_post_images", {"owner_id": FRIEND, "post_id": "observed-photo"}), None)
+    with httpx.Client(transport=httpx.MockTransport(pixels)) as transport:
+        monkeypatch.setattr(public_tools, "post_image_inputs", lambda post, *, cache_dir:
+            post_image_inputs(post, cache_dir=cache_dir, http_client=transport))
+        async with composed(sqlite_engine, tmp_path, client, runtime="harness", kind="qzone_comment") as fixture:
+            fixture.gateway.posts[0].update(content="", images=[f"https://synthetic.qpic.cn/{i}.png" for i in range(image_count)])
+            await wake(fixture)
+            data = latest(requests[2], "observe_post_images")["data"]
+            expected = image_count if failed_image is None else image_count - 1
+            assert fetched == list(range(image_count))
+            assert data["image_count"] == image_count
+            assert data["viewed_image_count"] == expected
+            assert data["unseen_image_count"] == image_count - expected
+            assert len(data["artifact_ids"]) == expected
+            def image_urls(value):
+                if isinstance(value, dict):
+                    return [url for child in value.values() for url in image_urls(child)]
+                if isinstance(value, list):
+                    return [url for child in value for url in image_urls(child)]
+                return [value] if isinstance(value, str) and value.startswith("data:image/png;base64,") else []
+            actual = image_urls(requests[2])
+            assert len(actual) == expected
+            colors = []
+            for url in actual:
+                with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as image:
+                    colors.append(image.getpixel((0, 0)))
+            assert colors == [(i * 25, 0, 0) for i in range(image_count) if i != failed_image]
+            assert not writes(fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["qzone_publish", "qzone_comment"])
+async def test_native_public_prompt_and_persona_tool_include_all_voice_examples(sqlite_engine, tmp_path, kind):
+    import yaml
+    root = Path(__file__).resolve().parents[2]
+    profile = yaml.safe_load((root / "configs/persona.yaml").read_text("utf-8"))
+    client, requests, _ = model_steps(("read_persona", {}), None)
+    async with composed(sqlite_engine, tmp_path, client, runtime="harness", kind=kind) as fixture:
+        fixture.router.runtime.persona = profile
+        await wake(fixture)
+        rendered = latest(requests[1], "read_persona")["data"]["expression_style"]
+        initial_prompt = json.dumps(requests[0], ensure_ascii=False)
+        assert len(profile["example_lines"]) == 16
+        assert all(example in rendered and example in initial_prompt for example in profile["example_lines"])
+        assert not writes(fixture)
+
+
+@pytest.mark.asyncio
 async def test_native_scheduler_persisted_goal_wakes_without_fixed_social_interval(sqlite_engine, tmp_path):
     client, requests, _ = model_steps(("schedule_wakeup", {"goal": "稍后继续核对星空主题", "delay_seconds": 15}), None,
         ("read_work_note", {}), ("remember_intention", {"goal": "星空主题", "progress": "已在到期目标唤醒中继续", "next_step": "暂时等待"}), None)

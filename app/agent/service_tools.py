@@ -26,13 +26,12 @@ from app.agent.memory_integration import (
     call_agent_memory_tool, create_memory_dependency_receipt,
     memory_dependencies_valid, restore_memory_dependency_receipt,
 )
-from app.agent.social_planner import PUBLIC_PERSONA_FIELDS
+from app.agent.social_planner import SocialPlanner
 from app.agent.tool_agent import AgentTool, ToolOutcome
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.memory_tool_executor import MemoryToolExecutor
 from app.core.memory_tools import memory_tool_schemas
 from app.core.message_content import ImageAttachment
-from app.core.persona_engine import render_persona
 from app.runtime.blocking import BoundedBlockingRunner
 from app.storage.autonomous_agent import AutonomousRepository
 from app.storage.db import session_scope
@@ -324,11 +323,9 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
             return ToolOutcome({"persona_key": current.persona_key, "expression_style": current.text,
                 "profile_fingerprint": current.profile_fingerprint,
                 "source_message_ids": current.source_message_ids, "kind": "persona_not_fact_evidence"})
-        else:
-            key = job.persona_key
-            raw = runtime.persona if key == "default" else runtime.personas.get(key, {})
-            persona = {field: raw[field] for field in PUBLIC_PERSONA_FIELDS if field in raw}
-        return ToolOutcome({"persona_key": key, "expression_style": render_persona(persona)[:4000], "kind": "persona_not_fact_evidence"})
+        key = job.persona_key
+        raw = runtime.persona if key == "default" else runtime.personas.get(key, {})
+        return ToolOutcome({"persona_key": key, "expression_style": SocialPlanner._render_public_persona(raw), "kind": "persona_not_fact_evidence"})
 
     async def save_note(args):
         require_valid()

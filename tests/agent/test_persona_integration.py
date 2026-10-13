@@ -350,7 +350,7 @@ async def test_owner_switch_runs_before_harness_and_uses_guarded_confirmation(sq
     assert [action for action, _ in gateway.calls] == ["send_group_msg"]
 
 
-async def test_latest_owner_switch_in_batch_wins_over_other_at_without_intermediate_switch(sqlite_engine, tmp_path):
+async def test_owner_switches_follow_message_order_without_consuming_other_at(sqlite_engine, tmp_path):
     router, gateway = switch_router(sqlite_engine, tmp_path)
     events = (onebot_command("earlier-at", user_id=MEMBER, text="你好"),
               onebot_command("switch-one"), onebot_command("switch-two", target="合成小町"))
@@ -366,12 +366,19 @@ async def test_latest_owner_switch_in_batch_wins_over_other_at_without_intermedi
     batch = AgentBatch(GROUP, events, "switch-turn")
     try:
         decision = await planner.decide(batch)
-        assert decision.target_message_id == "switch-two"
-        await planner.execute(events[-1], batch, decision, Guard())
+        assert decision.target_message_id == 'earlier-at' and decision.reason == 'direct_trigger'
+        first_switch = AgentBatch(GROUP, events[1:], 'first-switch-turn')
+        decision = await planner.decide(first_switch)
+        assert decision.target_message_id == 'switch-one' and decision.reason == 'persona_switch'
+        await planner.execute(events[1], first_switch, decision, Guard())
+        second_switch = AgentBatch(GROUP, events[2:], 'second-switch-turn')
+        decision = await planner.decide(second_switch)
+        assert decision.target_message_id == 'switch-two' and decision.reason == 'persona_switch'
+        await planner.execute(events[2], second_switch, decision, Guard())
     finally:
         planner.close()
-    assert switched == ["default"]
-    assert len(gateway.calls) == 1
+    assert switched == ['member', 'default']
+    assert len(gateway.calls) == 2
 
 
 @pytest.mark.parametrize("case", ["non_owner", "not_mentioned", "not_persisted", "recalled", "spoofed_author", "spoofed_text", "wrong_group"])

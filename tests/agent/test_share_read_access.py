@@ -44,16 +44,27 @@ def test_any_real_group_member_can_request_quote_read(sqlite_engine, requester):
 
 
 @pytest.mark.parametrize('options', [
-    {'mention': False}, {'quote': False}, {'text': '这个分享啊'},
-    {'text': '不要打开这个分享'}, {'text': '', 'trigger_card': True},
-    {'mention': False, 'text': '@小町 看看这个分享'},
-    {'text': '昨天看过这个分享'}, {'text': '我不想看这个分享'},
+    {'mention': False}, {'quote': False},
+    {'text': '不要打开这个分享'}, {'text': '我不想看这个分享'},
     {'text': '不是让你看这个分享'},
 ])
-def test_card_alone_chatter_missing_quote_and_fake_mention_are_denied(sqlite_engine, options):
+def test_card_without_quote_or_address_and_explicit_cancel_are_denied(sqlite_engine, options):
     _, _, access = setup_access(sqlite_engine, **options)
     assert access.authorized_source_ids() == ()
     assert not access.web_allowed()
+
+
+@pytest.mark.parametrize('text', ['', '这个分享啊', '昨天看过这个分享', '随便说两句'])
+def test_group_quote_with_address_needs_no_fixed_read_verb(sqlite_engine, text):
+    source, _, access = setup_access(sqlite_engine, text=text, mention=True, quote=True)
+    assert access.authorized_source_ids() == (source,)
+    assert access.web_allowed()
+
+
+def test_group_quote_with_textual_komachi_name_is_addressed(sqlite_engine):
+    source, _, access = setup_access(sqlite_engine, text='小町你看这个', mention=False, quote=True)
+    assert access.authorized_source_ids() == (source,)
+    assert access.web_allowed()
 
 
 def test_private_quote_needs_same_user_but_no_mention(sqlite_engine):

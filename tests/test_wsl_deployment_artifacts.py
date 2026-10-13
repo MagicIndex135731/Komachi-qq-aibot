@@ -191,6 +191,17 @@ def test_linux_runtime_installer_does_not_restart_production_on_preflight_failur
     assert image_build < activation < stop_runtime
 
 
+def test_installer_checks_public_persona_before_activation_without_live_data() -> None:
+    installer = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text("utf-8")
+    build = installer.index('" build xiaomachi')
+    gate = installer.index("python -B -m scripts.check_public_persona")
+    activation = installer.index("activation_started=true")
+    assert build < gate < activation
+    command = installer[installer.rfind("docker run", build, gate):gate]
+    assert "--network none" in command and "--workdir /workspace" in command
+    assert "-v " not in command and "--mount" not in command
+
+
 def test_linux_runtime_upgrade_recreates_only_bot_and_preserves_llbot() -> None:
     script = (REPO_ROOT / "infra/wsl/scripts/install_linux_runtime.sh").read_text(
         encoding="utf-8"

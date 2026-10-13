@@ -45,6 +45,44 @@ async def test_metadata_discovery_read_and_revalidation(context):
     assert (await read({'source_id': source})).data['error'] == 'share_requires_quoted_request'
 
 
+async def test_request_id_resolves_only_its_live_authorized_quoted_card(context):
+    source, read, access = prepare(context)
+    request = max(context.observed_sources)
+    result = await read({'source_id': request})
+    assert result.status == 'ok'
+    assert result.data['source_id'] == source
+    assert result.data['links'][0]['url'] == 'https://example.com/article'
+    unrelated = seed(context.router.engine, message_id='unrelated-request')
+    context.observed_sources.add(unrelated)
+    assert (await read({'source_id': unrelated})).status == 'blocked'
+    # Resolving an observed trigger cannot expand the observed target scope.
+    context.observed_sources.remove(source)
+    assert (await read({'source_id': request})).data['error'] == 'share_source_out_of_scope'
+    context.observed_sources.add(source)
+    with session_scope(context.router.engine) as session:
+        session.get(Message, source).raw_json = {'delivery_state': 'deleted', 'message': [card()]}
+    assert (await read({'source_id': request})).status == 'blocked'
+
+
+async def test_private_request_id_resolves_same_user_quote_only(context):
+    source, _, _ = prepare(context)
+    request = max(context.observed_sources)
+    with session_scope(context.router.engine) as session:
+        session.get(Message, source).group_id = None
+        session.get(Message, source).platform_msg_id = f'private-inbound-{AUTHOR}-synthetic-source'
+        session.get(Message, request).group_id = None
+    private = SimpleNamespace(router=context.router, observation=context.observation,
+        guard=context.guard, observed_sources={source, request}, private_user_id=AUTHOR)
+    access = build_share_access(context.router, group_id=None, trigger_source_ids=(request,), private_user_id=AUTHOR)
+    read = build_share_tools(private, access=access)[0].handler
+    result = await read({'source_id': request})
+    assert result.status == 'ok' and result.data['source_id'] == source
+    seed(context.router.engine, author=AUTHOR + 1, message_id='other-private-author')
+    with session_scope(context.router.engine) as session:
+        session.get(Message, source).user_id = AUTHOR + 1
+    assert (await read({'source_id': request})).status == 'blocked'
+
+
 async def test_unobserved_cross_group_deleted_and_revoked_sources(context):
     source, read, access = prepare(context)
     other = seed(context.router.engine, group_id=GROUP + 1, message_id='foreign-share', raw_json={'message': [card()]})

@@ -12,7 +12,7 @@
 | `configs/groups.local.yaml` | 真实群号和策略 | 私有，群表整体覆盖模板 |
 | `configs/social.yaml` | 社交、计算、服务许可模板 | 可公开 |
 | `configs/social.local.yaml` | 本机授权对象与社交设置 | 私有，递归覆盖模板 |
-| `configs/persona.yaml` | 启动默认“串子小町”角色 | 仅公开通用角色描述 |
+| `configs/persona.yaml` | 启动默认“嘴臭小町”角色 | 仅公开通用角色描述 |
 | `configs/persona_variants.yaml` | 默认角色的变体覆盖 | 可公开 |
 | `configs/personas/`、`data/personas/` | 本地成员人格与动态覆盖 | 私有 |
 
@@ -60,6 +60,7 @@ groups:
     speak: true
     proactive_reply: true
     proactive_interval_seconds: "120-300"
+    proactive_min_new_messages: 4
     image_generation: true
     memory_enabled: true
     recent_context_limit: null
@@ -68,6 +69,10 @@ groups:
 `enabled` 控制接收；`speak` 控制发送；`archive` 控制归档；`memory_enabled` 控制长期生成和召回；`image_generation` 控制群绘图许可。开启记忆不会授予空间或跨群读取权限。
 
 `proactive_interval_seconds` 是主动发言后的间隔，模型在合格机会仍可沉默；直接 @ 请求使用直接互动路径。Harness 的主动群发送复用群间隔，没有再额外套一层 30 分钟社交冷却。每日/资源限制仍独立存在。
+
+普通主动插话默认还需至少 4 条不同的有效新发言（`proactive_min_new_messages`），重复内容、复读机器人和简短笑声不计入。达到门槛后，模型仍须找到具体参与价值，单纯附和或随口调侃应沉默。消息触发与定时群唤醒使用同一门控。
+
+`proactive_feedback_enabled` 默认开启。嫌烦/闭嘴请求结合真实引用和最近机器人发言识别，不要求写机器人名字；对工作或明确其他人的抱怨不计入。确认后该群主动静默 `proactive_feedback_quiet_seconds`（默认 1200 秒），随后在反馈发出后的 `proactive_feedback_duration_seconds`（默认 7200 秒）内使用 `proactive_feedback_interval_seconds`（默认 `600-1200` 秒）。新反馈重新计时；同一消息重放不延长，来源撤回后失效，过期恢复原间隔。普通 @ 提问保留，但嫌烦请求本身不会被接梗反击。各字段可按群覆盖，群间互不影响。
 
 ## 私聊与主人
 
@@ -91,6 +96,8 @@ groups:
 | `GROUP_IMAGE_*API_KEY` / `GROUP_IMAGE_*BASE_URL` | 独立图片服务；未填写部分字段时按代码规则复用文本服务 |
 
 支持正文的搜索桥接提供 `search_web`、`open_web_page` 和 `find_web_page`，引用仅在当前回合有效；总调用和字符预算防止一次读入无限网页。传统搜索后端的结果能力不同。给一个 GitHub URL 不等于克隆完整仓库，应指出文件或目录再逐个读取。
+
+搜索遇到 429 或暂时性 5xx 最多重试一次，两次都计入调用预算；重试仍失败或超时后，同一回合更换关键词也不会继续请求失效服务，下一回合可重试。已有成功资料和明确 URL 的读取仍可使用。服务失败不代表没有搜索结果，应明确说明尚未查证。
 
 APP 分享卡片解析无需新开关。群聊/私聊可发送卡片后引用提问，`read_message_links` 读取其标题、摘要和目标链接，再使用上述网页工具获取正文或补充搜索。只发送卡片不强制主动回复；联网仍依赖已配置的搜索服务。需要登录、反爬拦截或失效的页面可能无法读取，应说明实际取得的资料范围；不支持观看视频。
 

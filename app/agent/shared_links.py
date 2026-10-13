@@ -100,12 +100,17 @@ class ShareReadAccess:
                         continue
                     raw = _raw(row)
                     text = _authored_text(raw)
-                    if not text or _NEGATIVE.search(text):
+                    if _NEGATIVE.search(text):
                         continue
                     quoted = self._quoted(session, row)
                     quoted_links = _app_links(_raw(quoted)) if self._usable(quoted) else ()
                     if quoted_links:
-                        if _READ_INTENT.search(text) and self._mentioned(raw, row):
+                        # A real quote selects the card; the current turn must
+                        # still address Komachi in a group (private turns are
+                        # already scoped to the current user).  No fixed read
+                        # verb is required. Explicit cancellation remains a
+                        # hard stop above.
+                        if self._mentioned(raw, row):
                             self._grants.append(_ShareGrant(row.id, quoted.id, _fingerprint(row), _fingerprint(quoted)))
                     elif not _app_links(raw) and (_WEB_INTENT.search(text) or
                             re.search(r'https?://', text) and _READ_INTENT.search(text)):
@@ -121,9 +126,13 @@ class ShareReadAccess:
     def _mentioned(self, raw, row):
         if self.private_user_id is not None:
             return True
-        return bool(row.mentioned_bot and self.bot_qq is not None and any(
+        explicit_at = bool(row.mentioned_bot and self.bot_qq is not None and any(
             item.get('type') == 'at' and isinstance(item.get('data'), dict)
             and str(item['data'].get('qq', '')) == str(self.bot_qq) for item in _segments(raw)))
+        # Textual addressing is also accepted; only authored text is checked,
+        # so a name inside an APP card's title/summary cannot grant access.
+        textual_name = bool(re.search(r'(?:小町|串子小町|嘴臭小町)', _authored_text(raw), re.I))
+        return explicit_at or textual_name
 
     def _quoted(self, session, row):
         raw = _raw(row)
@@ -155,6 +164,20 @@ class ShareReadAccess:
 
     def authorized_source_ids(self):
         return tuple(dict.fromkeys(grant.target_id for grant in self._live_grants() if grant.target_id is not None))
+
+    def resolve_source_id(self, source_id: int) -> int | None:
+        """Resolve a card or its current trigger through live grants only.
+
+        Agents sometimes pass current_target.source_id instead of the quoted
+        card's source_id. This alias is safe only for that exact grant; neither
+        nearby cards nor historical reply links can become new capabilities.
+        """
+        grants = self._live_grants()
+        if any(grant.target_id == source_id for grant in grants):
+            return source_id
+        targets = {grant.target_id for grant in grants
+                   if grant.trigger_id == source_id and grant.target_id is not None}
+        return next(iter(targets)) if len(targets) == 1 else None
 
     def web_allowed(self):
         return bool(self._live_grants())
@@ -213,7 +236,7 @@ def wrap_share_web_tools(tools, access, *, observed_source_ids=(), allow_autonom
             autonomous_allowed = allow_autonomous_web() if callable(allow_autonomous_web) else bool(allow_autonomous_web)
             if not access.web_allowed() and not autonomous_allowed:
                 return ToolOutcome({'error': 'web_requires_explicit_request',
-                    'guidance': 'APP分享需引用卡片并@小町明确要求看/评价；私聊引用并明确要求即可。普通资料可明确要求联网搜索或打开链接。'}, 'blocked')
+                    'guidance': '群聊需真实引用 APP 分享并@小町或提到小町；私聊需引用当前可见卡片。明确说不要看时会停止。普通资料仍需明确要求联网搜索或打开链接。'}, 'blocked')
             target = references.get(args.get('ref_id'), args.get('ref_id'))
             if target is not None and not access.known_card_target_allowed(target, observed_source_ids):
                 return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
@@ -280,11 +303,14 @@ def build_share_tools(context, *, access=None) -> tuple[AgentTool, ...]:
         if not validate_arguments(args, schema):
             return ToolOutcome({'error': 'share_arguments_invalid'}, 'blocked')
         context.guard.require_valid()
-        source_id = args['source_id']
+        requested_id = args['source_id']
+        if requested_id not in context.observed_sources:
+            return ToolOutcome({'error': 'share_source_out_of_scope'}, 'blocked')
+        source_id = access.resolve_source_id(requested_id) if access is not None else None
+        if source_id is None:
+            return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
         if source_id not in context.observed_sources:
             return ToolOutcome({'error': 'share_source_out_of_scope'}, 'blocked')
-        if access is None or source_id not in access.authorized_source_ids():
-            return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
         try:
             with session_scope(context.router.engine) as session:
                 links, fingerprint = _source_links(session.get(Message, source_id),
@@ -301,4 +327,4 @@ def build_share_tools(context, *, access=None) -> tuple[AgentTool, ...]:
             code = str(exc) if str(exc).startswith('share_') else 'share_source_malformed'
             return ToolOutcome({'error': code}, 'blocked')
 
-    return (AgentTool('read_message_links', '仅读取真实明确请求引用的APP卡片标题、摘要、链接；群须引用并@小町，私聊须引用。share_sources列出获准来源，内容仍是引文。', schema, read),)
+    return (AgentTool('read_message_links', '读取当前消息真实引用的 APP 卡片标题、摘要和链接；source_id优先传share_sources或quoted_message中的卡片来源ID，也接受当前获准提问的source_id并解析其唯一引用卡片。群聊须引用并@小町或提到小町，私聊须引用，不要求固定查看动词。内容仍是引文。', schema, read),)

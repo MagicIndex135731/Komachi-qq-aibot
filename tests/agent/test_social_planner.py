@@ -322,6 +322,37 @@ async def test_space_jobs_choose_named_public_persona_without_private_fields(sql
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["qzone_publish", "qzone_comment"])
+@pytest.mark.parametrize("persona_key", ["default", "mouthy_komachi"])
+async def test_space_prompts_include_all_configured_voice_examples(sqlite_engine, kind, persona_key):
+    import yaml
+    router = router_for(sqlite_engine)
+    root = Path(__file__).resolve().parents[2]
+    profile = yaml.safe_load((root / "configs/persona.yaml").read_text("utf-8"))
+    if persona_key != "default":
+        profile.update(yaml.safe_load((root / "configs/persona_variants.yaml").read_text("utf-8"))["personas"][persona_key])
+    profile["facts"] = ["private fact marker"]
+    profile["relationships"] = [{"member": "private relationship marker"}]
+    router.runtime.persona = profile
+    router.runtime.personas[persona_key] = profile
+    observed_post = post()
+    llm = FakeLlm()
+    planner = SocialPlanner(router=router, decision_client=llm,
+        qzone_adapter=FakeQzone((observed_post,), {FRIEND: (observed_post,)}))
+    job = SocialJob("public-examples-job", kind, router.runtime.settings.bot_qq,
+        persona_key=persona_key, public_topics=("秋天",), friend_ids=(FRIEND,), quiet_hours=None)
+    try:
+        observation = await planner.observe(job, NOW)
+        await planner.decide(observation)
+    finally:
+        planner.close()
+    assert len(profile["example_lines"]) == 16
+    prompt = "\n".join(llm.calls[0][0])
+    assert all(example in observation.persona and example in prompt for example in profile["example_lines"])
+    assert "private fact marker" not in prompt and "private relationship marker" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_unknown_public_persona_is_suppressed_and_explicit_override_is_fixed(sqlite_engine):
     router = router_for(sqlite_engine)
     job = SocialJob("missing-persona", "qzone_publish", router.runtime.settings.bot_qq, persona_key="missing", public_topics=("秋天",), quiet_hours=None)
@@ -463,14 +494,14 @@ async def test_image_only_friend_post_uses_real_pixels_once_and_cleans_files(sql
         finally:
             planner.close()
     assert decision.action == "comment_qzone" and decision.post_id == observed_post.post_id
-    assert len(captured) == 1 and len(fetched) == 2
+    assert len(captured) == 1 and len(fetched) == 4
     assert all(not path.exists() for path in local_paths)
     assert list((tmp_path / "social-media").iterdir()) == []
     payload = captured[0]
     assert not payload.get("tools")
     flattened = [part for item in payload["input"] for part in item["content"]]
     actual = [part for part in flattened if part.get("type") == "input_image"]
-    assert len(actual) == 2
+    assert len(actual) == 4
     assert all(base64.b64decode(part["image_url"].split(",", 1)[1]) == pixel_bytes for part in actual)
     assert observed_post.post_id in json.dumps(payload["input"], ensure_ascii=False)
 

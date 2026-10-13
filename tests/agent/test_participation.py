@@ -45,7 +45,7 @@ class FakeLlm:
 
     def generate_text(self, lines, **kwargs):
         self.prompts.append(lines)
-        if "JSON 对象" in lines[1]:
+        if any("JSON 对象" in line for line in lines):
             return json.dumps({"action": self.action, "target_message_id": "source-a",
                                "working_note": "正在聊动画", "reason": "话题相关", "wait_seconds": 0.01})
         return "我也觉得这一段挺有意思的。"
@@ -94,6 +94,9 @@ def router_for(engine, tmp_path, llm, gateway):
     router.runtime.settings.data_dir = tmp_path / "isolated"
     router.runtime.group_policy["groups"]["10001"]["memory_enabled"] = False
     router.runtime.group_policy["groups"]["10001"]["archive"] = False
+    # These pipeline tests isolate receipts, provenance, and provider behavior.
+    # Production's higher threshold is exercised in test_participation_feedback.
+    router.runtime.group_policy["groups"]["10001"]["proactive_min_new_messages"] = 1
     return router
 
 
@@ -298,7 +301,7 @@ async def test_autonomous_participation_receives_actual_labeled_pixels(sqlite_en
     assert set(llm.pixel_colors) == {(255, 0, 0), (0, 0, 255)}
     assert all(image.url == "" and "group_id=10001" in image.reference_subject for image in llm.images)
     assert "viewed_image_count" in llm.prompts[0][-1]
-    assert "不能杜撰图片内容" in llm.prompts[0][3]
+    assert any("不能杜撰图片内容" in line for line in llm.prompts[0])
 
 
 @pytest.mark.asyncio

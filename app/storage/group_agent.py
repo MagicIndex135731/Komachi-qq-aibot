@@ -355,11 +355,51 @@ class GroupAgentRepository:
                 turn.status = "deciding"
                 turn.epoch = epoch
                 turn.updated_at = _utc_naive()
+                turn.source_message_ids = [item.source_message_id for item in retained]
             for item in retained:
                 item.status = "processing"
                 item.turn_id = turn_id
             session.flush()
             return ClaimedAgentTurn(turn_id, tuple(events), self._snapshot(state))
+
+    def retain_through_target(
+        self, *, turn_id: str, group_id: int, epoch: int, target_message_id: str,
+    ) -> int:
+        """Consume only the current addressed request; defer its suffix atomically.
+
+        The decision may address an earlier name mention inside a batch ending
+        in a real @. Completing that reply must not complete the later question.
+        Narrowing is allowed only before the durable dispatch marker and only
+        for the current group/session epoch. A crash recovers each part using
+        the existing inbox and receipt ledgers, without replaying a QQ write.
+        """
+        with self._session_scope() as session:
+            state = session.get(GroupAgentSession, group_id)
+            turn = session.get(GroupAgentTurn, turn_id)
+            if (state is None or state.epoch != epoch or turn is None
+                    or turn.group_id != group_id or turn.epoch != epoch or turn.status != 'deciding'):
+                raise ValueError('Agent turn cannot narrow its claimed sources')
+            inbox = list(session.scalars(select(GroupAgentInbox).where(
+                GroupAgentInbox.group_id == group_id,
+                GroupAgentInbox.turn_id == turn_id,
+                GroupAgentInbox.status == 'processing',
+            ).order_by(GroupAgentInbox.id)))
+            if [item.source_message_id for item in inbox] != turn.source_message_ids:
+                raise ValueError('Agent turn source ownership changed')
+            target = session.scalar(select(Message).where(
+                Message.group_id == group_id, Message.platform_msg_id == target_message_id,
+            ))
+            boundary = next((index + 1 for index, item in enumerate(inbox)
+                if target is not None and item.source_message_id == target.id), None)
+            if boundary is None or not is_usable_memory_source(target, group_id=group_id):
+                raise ValueError('Agent reply target is not a usable claimed source')
+            for item in inbox[boundary:]:
+                item.status = 'pending'
+                item.turn_id = None
+            turn.source_message_ids = [item.source_message_id for item in inbox[:boundary]]
+            turn.updated_at = _utc_naive()
+            session.flush()
+            return boundary
 
     def record_decision(self, *, turn_id: str, action: str, reason: str) -> None:
         with self._session_scope() as session:

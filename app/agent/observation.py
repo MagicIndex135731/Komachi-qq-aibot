@@ -11,6 +11,8 @@ from app.core.memory_source_guard import is_usable_memory_source
 from app.core.reply_policy import PolicyInput
 from app.core.search_policy import detect_address_intent
 from app.agent.shared_links import build_share_access, share_context_text
+from app.agent.participation_feedback import detect_feedback, meaningful_new_messages, repeats_bot, third_party_control
+from app.storage.participation_feedback import feedback_for
 from app.core.time_utils import shanghai_aware
 from app.storage.db import session_scope
 from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
@@ -42,6 +44,16 @@ class GroupObservationService:
 
     def _direct(self, event, messages, recent) -> bool:
         router = self.router
+        source = messages.get_by_platform_msg_id(event.platform_msg_id)
+        names = router._build_bot_names('')
+        reply_to_bot = router._is_reply_to_bot(event=event, messages=messages, quoted_raw_payload=None)
+        if source is not None:
+            if detect_feedback(source, recent, bot_id=router.runtime.settings.bot_qq, bot_names=names, messages=messages):
+                return False
+            if not event.mentioned_bot and not reply_to_bot and (
+                repeats_bot(source, recent, router.runtime.settings.bot_qq) or third_party_control(event.plain_text, names)
+            ):
+                return False
         persona = router._active_persona(event.group_id)
         address = detect_address_intent(
             text=event.plain_text.lower(),
@@ -73,8 +85,20 @@ class GroupObservationService:
         enabled, speak, proactive, interval, quiet, _ = policy
         if not enabled or not speak:
             return "group_speak_disabled"
+        feedback = feedback_for(messages.session, group_id=group_id,
+            bot_id=self.router.runtime.settings.bot_qq, now=self.clock()) if self.router._group_policy_bool(
+                group_id=group_id, key='proactive_feedback_enabled', default=True) else None
         if direct:
             return ""
+        if feedback:
+            now_utc = self.clock().astimezone(UTC).replace(tzinfo=None)
+            if now_utc < feedback.quiet_until:
+                return 'group_feedback_quiet'
+            defaults = self.router.runtime.group_policy.get('default_group_behavior', {})
+            configured = self.router.runtime.group_policy.get('groups', {}).get(str(group_id), {})
+            slow = self.router._parse_interval_range(configured.get('proactive_feedback_interval_seconds',
+                defaults.get('proactive_feedback_interval_seconds', '600-1200')))
+            interval = tuple(max(a,b) for a,b in zip(interval, slow))
         if not proactive:
             return "proactive_disabled"
         timestamps = [
@@ -107,6 +131,12 @@ class GroupObservationService:
         # and source but must not be stopped by that turn's own first sent row.
         if not continued_dispatch and self.router.reply_policy._in_cooldown(policy_input):
             return "cooldown"
+        if not continued_dispatch:
+            minimum = max(1, min(24, self.router._group_policy_int(
+                group_id=group_id, key='proactive_min_new_messages', default=1)))
+            if minimum > 1 and meaningful_new_messages(self._recent(messages, group_id), bot_id=self.router.runtime.settings.bot_qq,
+                since=max(timestamps) if timestamps else None) < minimum:
+                return 'below_participation_threshold'
         return ""
 
     def proactive_send_allowed(self, group_id, event_id) -> bool:
@@ -148,11 +178,8 @@ class GroupObservationService:
             users_by_id = UserRepository(session).get_users_by_ids([item.user_id for item in visible])
             sources_valid = bool(events) and all(event is not None for event in events)
             direct_target = next(
-                (
-                    event.platform_msg_id
-                    for event in events
-                    if event is not None and self._direct(event, messages, recent)
-                ),
+                (event.platform_msg_id for event in events
+                    if event is not None and self._direct(event, messages, recent)),
                 None,
             )
             suppression = self._suppression(

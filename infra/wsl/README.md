@@ -42,6 +42,8 @@ Copy-Item configs/groups.yaml configs/groups.local.yaml
 
 只在本地 `.env` 填写机器人/主人账号、模型地址/密钥/实际模型名、QQ 平台和 VNC 密码。公开模板不包含 `BOT_QQ` / `OWNER_QQ` 的实际值，需要自行添加。`LLM_TEXT_ENDPOINT` 选择服务确实支持的 `responses` 或 `chat_completions`。
 
+启用自主空间须同时在源目录 `infra/wsl/.env` 设置 `SOCIAL_AGENT_ENABLED=true`，并在私有 `configs/social.local.yaml` 开启总策略和相应 `qzone.publish` / `qzone.comment`。环境项缺失按关闭处理；仅策略开启、群聊能回复或 heartbeat 正常，不能证明空间巡检已运行。修改后 rebuild；检查实际空间任务和未来巡检时间，额度是上限，Agent仍可沉默。
+
 新数据库先设置 `MEMORY_RAW_V3_ENABLED=false`，按 [记忆与索引流程](../../docs/MEMORY.md) 完成准备/评测/激活。可先开启按群记忆基础流程、分层工具和本地 embedding；这不等于 raw V3 已有合格活动代际。
 
 完整基础编排使用 `MEMORY_ORCHESTRATION_V2_ENABLED=true`。Memory V3 发布与回滚的唯一命令来源为 [记忆指南](../../docs/MEMORY.md#raw-v3-准备评测激活与回滚)，不能跳过其质量门。
@@ -116,6 +118,8 @@ bash /opt/xiaomachi/current/infra/wsl/scripts/status.sh --deep
 
 不要把工作区中尚未部署的 start/status 脚本当成现役发布。
 
+重建在候选镜像中执行 `python -B -m scripts.check_public_persona`，通过后才激活。检查真实人格前16条例句完整进入公开渲染，并用合成样本发现字段遗漏与成员原话泄漏；超长配置导致例句被截断也会失败。失败保留现役应用并恢复原镜像标签。日常 status 同样检查实际加载的公开人格，只输出计数与错误类别，不调用模型。可在源码目录独立运行该命令；修改人格配置后必须重新通过，不能仅凭镜像构建成功认定生效。
+
 ## 5. 开机恢复与监督
 
 Windows 登录后保持 WSL 活跃需要登录级任务。在 Windows PowerShell 安装：
@@ -149,6 +153,8 @@ docker logs --tail 80 xiaomachi-private
 无需先停止。安装脚本复制运行白名单（app/configs/infra/scripts/依赖文件等），先构建新镜像，然后仅重建两个应用，保留现役 QQ 接入容器和数据卷。成功后检查 readiness。**未提交源码也会一起发布**，这不是从 GitHub 拉取最新版的命令。
 
 Linux 等价入口为 `bash infra/wsl/scripts/install_linux_runtime.sh`；更新 Compose 服务 `xiaomachi` 与 `xiaomachi-private`，不重启当前 QQ 接入容器。
+
+这里的 **rebuild 是应用镜像发布，不是驱动安装**：它把当前工作区的 `app/`、`configs/` 和运行脚本复制到新 release，再执行 `docker compose build xiaomachi`。Dockerfile 的 CUDA 基础镜像只在本机没有可复用层、或构建器需要重新解析标签时才会访问镜像仓库；宿主 NVIDIA 驱动、CUDA 运行时、SnowLuma/LLBot/NapCat 容器和数据卷不会因为 rebuild 被重新安装。`start` 只复用现有镜像，因此不会让已修改的代码自动生效。当前发布入口没有把应用文件热加载到运行容器内，修改人格 YAML 或 Python 代码仍应走受控 rebuild；若基础镜像仓库暂时不可用，应先保留现役容器并恢复网络/缓存，再发布应用层变更。
 
 构建/激活失败会尝试恢复之前的 release 和镜像；保留最近一个发布目录及回滚镜像。脚本不是数据库回滚工具，不会撤销已经执行的 QQ 行为。恢复失败时检查 current、容器 image ID 和健康后再操作，不重复执行未知状态的外部动作。
 

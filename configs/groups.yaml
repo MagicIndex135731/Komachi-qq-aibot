@@ -4,6 +4,11 @@ default_group_behavior:
   speak: false
   proactive_reply: true
   proactive_interval_seconds: "180-480"
+  proactive_min_new_messages: 4
+  proactive_feedback_enabled: true
+  proactive_feedback_quiet_seconds: 1200
+  proactive_feedback_duration_seconds: 7200
+  proactive_feedback_interval_seconds: "600-1200"
   # Set a positive value to let a busy group use this local traffic gate
   # instead of an upstream interjection judge.
   proactive_local_traffic_threshold: 0

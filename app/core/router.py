@@ -690,6 +690,11 @@ class InboundRouter(GroupReplyDeliveryMixin):
         )
         self._archive_inbound_message(event)
         self._ingest_bbot_listener_cache(event)
+        from app.agent.participation_feedback import record_feedback
+        try:
+            record_feedback(self, event)
+        except Exception:
+            logger.exception('group_participation_feedback_failed group_id=%s', event.group_id)
         return True
 
     def _build_bot_names(self, persona_name: str) -> set[str]:

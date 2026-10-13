@@ -237,6 +237,11 @@ fi
 # broken build from replacing the current symlink.
 docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi
 
+# Validate actual candidate behavior, not only a successful image build. An
+# old public-field filter must never activate silently with missing examples.
+docker run --rm --network none --workdir /workspace xiaomachi-bot:local \
+  python -B -m scripts.check_public_persona
+
 activation_started=true
 systemctl stop xiaomachi-watchdog.service >/dev/null 2>&1 || true
 

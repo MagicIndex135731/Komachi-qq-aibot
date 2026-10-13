@@ -30,6 +30,7 @@ def build_web_tools(client, *, settings, runner, guard) -> tuple[AgentTool, ...]
     prefix = "web_" + uuid.uuid4().hex[:12] + "_"
     references: dict[str, str] = {}
     completed: dict[tuple, dict] = {}
+    search_failure: dict | None = None
     calls, used_chars, serial = 0, 0, 0
     default_results = int(getattr(settings, "agent_web_search_results", 8))
     timeout = float(getattr(settings, "agent_web_search_timeout_seconds", 45))
@@ -124,7 +125,7 @@ def build_web_tools(client, *, settings, runner, guard) -> tuple[AgentTool, ...]
         return ToolOutcome(data)
 
     async def execute(kind, args):
-        nonlocal calls, used_chars
+        nonlocal calls, used_chars, search_failure
         guard.require_valid()
         try:
             if kind == "search":
@@ -164,6 +165,11 @@ def build_web_tools(client, *, settings, runner, guard) -> tuple[AgentTool, ...]
                 return ToolOutcome({'error': 'web_turn_budget_exhausted'}, 'blocked')
             used_chars += size
             return ToolOutcome(reused)
+        if kind == 'search' and search_failure is not None:
+            # Changing keywords cannot repair a service outage. Keep this
+            # failure local to the current turn so a later request may recover.
+            guard.require_valid()
+            return ToolOutcome({**search_failure, 'cached_failure_in_turn': True}, 'failed')
         if calls >= MAX_CALLS or turn_budget - used_chars < 2000:
             return ToolOutcome({"error": "web_turn_budget_exhausted"}, "blocked")
         try:
@@ -192,8 +198,18 @@ def build_web_tools(client, *, settings, runner, guard) -> tuple[AgentTool, ...]
             else:
                 code = 'web_provider_failed'
             logger.warning("agent_web_failed kind=%s error=%s code=%s", kind, type(exc).__name__, code)
-            return ToolOutcome({"error": code,
-                'guidance': '网页不可用时可按分享标题和站点搜索补充；公开元数据或相关搜索结果不代表已观看视频。'}, "failed")
+            unavailable = kind == 'search' and (
+                isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                or isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _TRANSIENT_HTTP
+            )
+            guidance = ('搜索服务暂时不可用，这不是零搜索结果。同一回合不要换关键词反复重试；'
+                '只能使用已有可靠资料并说明未查证范围，或告知稍后再试。' if unavailable else
+                '搜索请求未成功，不能把失败当作没有资料或编造来源；说明未查证范围。' if kind == 'search' else
+                '网页不可用时可按分享标题和站点搜索补充；公开元数据或相关搜索结果不代表已观看视频。')
+            failure = {'error': code, 'guidance': guidance}
+            if unavailable:
+                search_failure = failure
+            return ToolOutcome(failure, "failed")
         guard.require_valid()
         if isinstance(report, list):
             report = WebSearchReport(report[:limit], "")

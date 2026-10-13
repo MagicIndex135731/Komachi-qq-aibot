@@ -37,7 +37,7 @@ TEXT_LIMITS = {"send_group": 300, "publish_qzone": 1000, "comment_qzone": 300}
 EXPECTED_ACTIONS = {"group": "send_group", "qzone_publish": "publish_qzone", "qzone_comment": "comment_qzone"}
 PUBLIC_PERSONA_FIELDS = (
     "name", "identity", "core_traits", "speaking_style", "speech_habits", "style_avoid",
-    "background", "self_concept", "address_rules", "secondary_personas",
+    "background", "self_concept", "address_rules", "secondary_personas", "example_lines",
 )
 
 
@@ -63,7 +63,12 @@ class SocialPlanner:
 
     @staticmethod
     def _render_public_persona(public: dict) -> str:
-        return render_persona({key: public[key] for key in PUBLIC_PERSONA_FIELDS if key in public})[:4000]
+        profile = {key: public[key] for key in PUBLIC_PERSONA_FIELDS if key in public}
+        # Authored bot examples are public expression. Member-derived examples
+        # can contain private source utterances and must stay out of Qzone.
+        if "source_user_id" in public or "source_group_id" in public:
+            profile.pop("example_lines", None)
+        return render_persona(profile)[:4000]
 
     def _public_persona_for(self, job: SocialJob) -> str | None:
         if self.public_persona is not None:
