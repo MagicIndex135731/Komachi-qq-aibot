@@ -77,7 +77,7 @@ async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, op
                 assert not generated
         if number == (2 if enabled else 1):
             return responses_sse(name="send_group", arguments={"text": "合成回复",
-                "artifact_ids": generated}, call_id="send", number=number)
+                "artifact_ids": generated,'task_status':'progress' if enabled and operation!='foreign' else 'blocked'}, call_id="send", number=number)
         return responses_sse(number=number)
 
     client, requests, _ = model_client(script)
@@ -101,7 +101,7 @@ async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, op
         assert result.status == "sent" and len(writes(fixture)) == 1
         assert not fixture.image_client.calls and not fixture.image_client.edit_calls
         initial_requests = len(requests)
-        assert initial_requests == (3 if enabled else 2)
+        assert initial_requests == (2 if enabled else 1)
         if operation in {'generate', 'edit'}:
             queue = fixture.executor.media_jobs
             queue.running = True

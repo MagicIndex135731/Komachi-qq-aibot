@@ -110,7 +110,7 @@ async def test_private_can_read_own_qzone_fact_without_public_context_or_owner_c
 @pytest.mark.parametrize("rotate_reason", ["context_version", "grok_model", "gemini_model"])
 async def test_native_private_history_bootstraps_once_and_restores_only_after_rotation(sqlite_engine, tmp_path, rotate_reason):
     service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,
-        lambda body,n:sse('send_private',{'text':'正常回复'},number=n) if n%2 else sse(number=n))
+        lambda body,n:sse('send_private',{'text':'正常回复'},number=n))
     def observation(body):
         for item in reversed(body['input']):
             content=item.get('content','')
@@ -226,7 +226,7 @@ async def test_private_native_first_output_has_its_own_budget(sqlite_engine, tmp
     await service.start()
     try:
         await dispatcher.handle_private_message(event())
-        assert sender.texts == [(OWNER, "已核对公开内容")] and len(requests) == 2
+        assert sender.texts == [(OWNER, "已核对公开内容")] and len(requests) == 1
         with session_scope(sqlite_engine) as session:
             assert session.query(Job).filter(Job.job_type == agent.job_type).one().status == "completed"
     finally:
@@ -295,7 +295,7 @@ async def test_private_native_web_body_open_find_and_send_are_wired(sqlite_engin
     try:
         await dispatcher.handle_private_message(event(user_id=OTHER, text='联网搜索公开夜空资料并打开链接'))
         assert sender.texts == [(OTHER, "已核对公开正文")]
-        assert len(web_calls) == 3 and len(requests) == 5
+        assert len(web_calls) == 3 and len(requests) == 4
         assert "DETAILED_PUBLIC_EVIDENCE" in json.dumps(requests[1], ensure_ascii=False)
         assert {"search_web", "open_web_page", "find_web_page"} <= {v["name"] for v in requests[0]["tools"]}
         assert web_calls[1]["open"][0]["ref_id"] == "https://example.com/page"
@@ -316,9 +316,9 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         await dispatcher.handle_private_message(event())
         await dispatcher.handle_private_message(event())
         assert sender.texts == [(OWNER, "夜空很适合慢慢看")]
-        assert len(requests) == 2
+        assert len(requests) == 1
         names = {value["name"] for value in requests[0]["tools"]}
-        assert names == {"read_private_context", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'read_research_resources', 'resume_research_task', 'delegate_research_task', 'media_task_status'}
+        assert names == {"read_private_context", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'read_research_resources', 'resume_research_task', 'delegate_research_task', 'media_task_status', 'set_task_goal', 'review_task_progress'}
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["receipts"][0]["receipt_id"] == "private-receipt-1"
         source_id = snapshot["checkpoint"]["reply_source_id"]
@@ -326,7 +326,7 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         assert snapshot["items"][-2]["source_id"] == snapshot["items"][-1]["reply_source_id"] == source_id
         reader=TraceReader(tmp_path/'agent_monitor');traces=reader.list_traces()
         assert len(traces)==1 and traces[0]['surface']=='private' and traces[0]['source_id']==source_id
-        assert traces[0]['scope_id']==OWNER and traces[0]['model_requests']==2
+        assert traces[0]['scope_id']==OWNER and traces[0]['model_requests']==1
         assert traces[0]['context_kind']=='private' and traces[0]['context_state']=='new'
         assert traces[0]['trigger_kind']=='private_message' and traces[0]['trigger_text']==event().plain_text
         assert reader.list_conversations()[0]['identity_quality']=='logical'
@@ -351,7 +351,7 @@ async def test_formal_private_delivers_long_answer_and_returns_to_chat_without_c
             return sse('update_research_task',{'progress':'入口已核对','next_step':'检查认证',
                 'findings':['入口已核对，未检查认证'],'status':'partial'},number=n)
         if n==3:return sse('send_private',{'text':answer},number=n)
-        if n==5:
+        if n==4:
             return sse('send_private',{'text':'继续聊夜空吧'},number=n)
         return sse(number=n)
     service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,script)
@@ -365,9 +365,9 @@ async def test_formal_private_delivers_long_answer_and_returns_to_chat_without_c
         await dispatcher.handle_private_message(event('research-private',text='打开 https://example.com/source 认真审查这个仓库的代码'))
         await dispatcher.handle_private_message(event('back-to-chat',text='还是聊夜空吧'))
         assert sender.texts==[(OWNER,answer),(OWNER,'继续聊夜空吧')]
-        assert len(requests)==6
-        assert 'RAW_REPOSITORY_CODE' not in json.dumps(requests[4])
-        assert '入口已核对' in json.dumps(requests[4],ensure_ascii=False)
+        assert len(requests)==4
+        assert 'RAW_REPOSITORY_CODE' not in json.dumps(requests[3])
+        assert '入口已核对' in json.dumps(requests[3],ensure_ascii=False)
     finally:await service.stop()
 
 
@@ -382,7 +382,9 @@ async def test_private_native_link_policy_preserves_complete_answer_without_empt
         "max_chars": 8, "auto_split_long_segments": True, "min_delay_seconds": 0.001, "max_delay_seconds": 0.001}
     await service.start()
     try:
-        await dispatcher.handle_private_message(event(text="帮我查询当天套餐，把链接发我" if requested_links else "帮我查询当天套餐"))
+        # This test only verifies formatting of supplied information; actual
+        # lookup/evidence requirements are covered by the web/goal contracts.
+        await dispatcher.handle_private_message(event(text="按已提供的当天套餐回复，把链接发我" if requested_links else "按已提供的当天套餐回复"))
         sent = "".join(text for _, text in sender.texts)
         assert "先核对当天套餐。" in sent
         assert "再核对加价项。" in sent
@@ -418,7 +420,7 @@ async def test_private_source_date_uses_stored_shanghai_and_current_anchor(sqlit
     await service.start()
     try:
         await dispatcher.handle_private_message(incoming)
-        assert len(requests) == 3 and sender.texts == [(OWNER, "已核对本轮日期")]
+        assert len(requests) == 2 and sender.texts == [(OWNER, "已核对本轮日期")]
         body = json.dumps(requests, ensure_ascii=False)
         assert '2026-10-11T03:00:00+08:00' in body
         assert '2026-10-10T22:00:00+08:00' in body
@@ -486,7 +488,7 @@ async def test_private_goal_wakeup_uses_persistent_queue_and_next_native_decisio
             return sse("schedule_private_wakeup", {"goal": "以后聊观星", "delay_seconds": 120}, number=n)
         if n == 2:
             return sse("send_private", {"text": "已记下提醒"}, number=n)
-        if n == 4:
+        if n == 3:
             return sse("send_private", {"text": "记得我们想聊的观星吗"}, number=n)
         return sse(number=n)
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, script)
@@ -494,14 +496,14 @@ async def test_private_goal_wakeup_uses_persistent_queue_and_next_native_decisio
     await service.start()
     try:
         await dispatcher.handle_private_message(event())
-        assert len(requests) == 3 and sender.texts == [(OWNER, "已记下提醒")]
+        assert len(requests) == 2 and sender.texts == [(OWNER, "已记下提醒")]
         with session_scope(sqlite_engine) as session:
             wake = session.query(Job).filter(Job.job_type == agent.job_type, Job.status == "queued").one()
             assert wake.payload_json["kind"] == "wakeup" and wake.payload_json["source_id"] > 0
             wake.run_at = datetime.now(UTC).replace(tzinfo=None)
         await agent._drain_user(OWNER)
         assert sender.texts == [(OWNER, "已记下提醒"), (OWNER, "记得我们想聊的观星吗")]
-        assert "以后聊观星" in json.dumps(requests[3], ensure_ascii=False)
+        assert "以后聊观星" in json.dumps(requests[2], ensure_ascii=False)
         from app.agent.runtime_trace import TraceReader
         traces = TraceReader(tmp_path/'agent_monitor').list_traces()
         wake_trace = next(t for t in traces if t['trigger_kind']=='private_wakeup')
@@ -549,7 +551,7 @@ async def test_private_native_inflight_checkpoint_rotates_before_recovery(sqlite
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["runtime_id"] != "interrupted-native-session"
         assert snapshot["checkpoint"]["in_flight"] is False
-        assert len(requests) == 2 and sender.texts == [(OWNER, "已接续新消息")]
+        assert len(requests) == 1 and sender.texts == [(OWNER, "已接续新消息")]
     finally:
         await service.stop()
 
@@ -588,7 +590,7 @@ async def test_private_native_receives_canonical_actual_pixels(sqlite_engine, tm
     await service.start()
     try:
         await dispatcher.handle_private_message(image_event)
-        assert len(requests) == 2 and sender.texts == [(OWNER, "合成图片是蓝色")]
+        assert len(requests) == 1 and sender.texts == [(OWNER, "合成图片是蓝色")]
         blocks = [part for item in requests[0]["input"] for part in item.get("content", []) if isinstance(part, dict)]
         images = [part for part in blocks if part.get("type") == "input_image"]
         assert images and images[0]["image_url"].startswith("data:image/png;base64,")
@@ -612,7 +614,7 @@ async def test_private_native_rejects_foreign_or_host_image_paths(sqlite_engine,
     await service.start()
     try:
         await dispatcher.handle_private_message(image_event)
-        assert len(requests) == 2 and sender.texts == [(OWNER, "本轮没有可用图片")]
+        assert len(requests) == 1 and sender.texts == [(OWNER, "本轮没有可用图片")]
         assert "data:image/" not in json.dumps(requests)
         with session_scope(sqlite_engine) as session:
             source = session.query(Message).filter(Message.platform_msg_id == f"private-inbound-{OWNER}-{image_event.platform_msg_id}").one()
@@ -747,9 +749,9 @@ async def test_private_quoted_share_discovery_and_search_fallback(sqlite_engine,
     try:
         await dispatcher.handle_private_message(current)
         if foreign_quote:
-            assert len(requests) == 3 and sender.texts == [(OTHER, '无法读取其他用户的引用卡片')] and not web_calls
+            assert len(requests) == 2 and sender.texts == [(OTHER, '无法读取其他用户的引用卡片')] and not web_calls
         else:
-            assert len(requests) == 7 and len(web_calls) == 3
+            assert len(requests) == 6 and len(web_calls) == 3
             assert sender.texts == [(OTHER, '已查阅补充来源，概要如下')]
             assert web_calls[0]['open'][0]['ref_id'] == 'https://example.com/news'
             assert web_calls[2]['open'][0]['ref_id'] == 'https://example.org/news'

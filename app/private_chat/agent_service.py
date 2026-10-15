@@ -455,8 +455,9 @@ class PrivateHarnessService:
                 if not metadata.get('context_snapshot'):
                     known_sources[:] = list(dict.fromkeys([*known_sources, *dependencies]))
                 return True
+            from app.agent.shared_links import authored_request_text
             workspace = ResearchTaskWorkspace(self.settings.data_dir / 'research_tasks', scope=scope,
-                actor_id=user_id, source_id=source_id, request=event.plain_text,
+                actor_id=user_id, source_id=source_id, request=authored_request_text(raw,event.plain_text),
                 valid_source=valid_task_source,
                 dependency_snapshot=lambda: {'sources': list(known_sources), 'context_snapshot': freeze_context()},
                 valid_dependencies=valid_task_dependencies,
@@ -704,6 +705,8 @@ class PrivateHarnessService:
             send_schema['required'] = ['text']
             send_schema['properties']['video_artifact_id'] = _text(64)
             send_schema['properties']['media_artifact_ids'] = {'type': 'array', 'items': _text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}
+            from app.agent.request_task import delivery_properties
+            send_schema['properties'].update(delivery_properties())
             tools = [AgentTool("read_private_context", "读取当前用户的日常上下文和实际图片", _schema(), context),
                 AgentTool("send_private", "向当前用户发送聊天或结果；图片普通最多2张，as_forward=true最多20张。media_artifact_ids配合as_forward=true按原顺序打包图片/视频，不与artifact_ids/video_artifact_id混用；video_artifact_id只发单视频。按真实回执判断成功", send_schema, send, "write"),
                 AgentTool("generate_private_image", "通过既有私聊绘图服务异步画图；排队不是生成或发送成功", _schema(prompt=_text(2000), use_current_images={"type": "boolean"}), draw, "image"),
@@ -873,6 +876,7 @@ class PrivateHarnessService:
                 before_call=reserve_cost,
                 blocking=self.runtime_runner, invoke_tool=invoke, session_home=home, session_id=runtime_id,
                 task_workspace=workspace,
+                initial_evidence=(payload['delegated_result'],) if payload.get('delegated_result') else (),
                 finish_after_delivery=lambda:
                     (payload.get('delegated_result') or {}).get('kind')=='media_result')
             async with self._model_lock:

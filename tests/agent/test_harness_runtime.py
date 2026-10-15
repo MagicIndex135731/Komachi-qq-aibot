@@ -117,6 +117,8 @@ async def test_confirmed_delivery_closes_native_loop_without_extra_upstream_and_
         for n in range(2):
             result=await agent.run(['Synthetic delivery '+str(n)],tools,Guard())
             assert result.status=='sent',result
+            from app.agent.context_recovery import context_reusable
+            assert context_reusable(result),result.trace
         assert len(requests)==2
         if protocol=='openai-responses':
             assert any(x.get('type')=='function_call_output' for x in requests[1]['input'])

@@ -25,7 +25,9 @@ def _safe_trace(trace) -> bool:
             return False
         if row.get('reason') in _UNSAFE_REASONS or str(row.get('reason', '')).startswith(('runtime:', 'runtime_error')):
             return False
-        if row.get('status') == 'model_request':
+        # A failed, independent diagnostic has no incomplete native message
+        # to replay. Its failure cannot invalidate the main conversation.
+        if row.get('status') == 'model_request' and row.get('purpose') != 'task_review':
             requests[(row.get('purpose', 'agent'), row.get('model_call_index', 0))] = row
     return all(row.get('outcome') == 'completed' and row.get('output_disposition') != 'discarded'
         for row in requests.values())

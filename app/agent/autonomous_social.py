@@ -595,6 +595,8 @@ class AutonomousSocialExecutor:
                     current_target = {"message_id": target.platform_msg_id, "source_id": target.id,
                         "author_id": target.user_id, "text": share_context_text(target.raw_json, target.plain_text),
                         "timestamp": shanghai_aware(target.timestamp).isoformat(timespec="seconds")}
+                    from app.agent.shared_links import authored_request_text
+                    current_request_text = authored_request_text(target.raw_json,target.plain_text)
                     trigger_mentioned_bot = bool(target.mentioned_bot)
                     turn_sources = [*observation.source_message_ids, target.id]
                     if target.reply_to_msg_id:
@@ -660,7 +662,7 @@ class AutonomousSocialExecutor:
                     return True
                 workspace = ResearchTaskWorkspace(self.router.runtime.settings.data_dir / 'research_tasks',
                     scope=scope, actor_id=actor_id, source_id=int(current_target['source_id']),
-                    request=current_target['text'], valid_source=valid_task_source,
+                    request=current_request_text, valid_source=valid_task_source,
                     dependency_snapshot=lambda: {'memory': dict(memory_dependencies), 'sources': sorted(observed_sources),
                         'context_snapshot': freeze_context()},
                     valid_dependencies=valid_task_dependencies,
@@ -1179,6 +1181,8 @@ class AutonomousSocialExecutor:
             name = {"group": "send_group", "qzone_publish": "publish_qzone", "qzone_comment": "comment_qzone"}[job.kind]
             send_schema = schema(text=text_schema(12000 if job.kind == 'group' else 300 if job.kind != "qzone_publish" else 1000), artifact_ids={"type": "array", "items": text_schema(64), "maxItems": 20 if job.kind == 'group' else 2})
             if job.kind == 'group':
+                from app.agent.request_task import delivery_properties
+                send_schema['properties'].update(delivery_properties())
                 send_schema['properties']['as_forward'] = {'type': 'boolean'}
                 send_schema['properties']['video_artifact_id'] = text_schema(64)
                 send_schema['properties']['media_artifact_ids'] = {'type': 'array', 'items': text_schema(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}
@@ -1473,6 +1477,10 @@ class AutonomousSocialExecutor:
                 ephemeral_context=True,
                 admission_metrics=getattr(original_guard, 'admission_metrics', None),
                 task_workspace=workspace,
+                initial_evidence=tuple(value for value in (
+                    memory_context.data if memory_context is not None and memory_context.status == 'ok' else None,
+                    research_result)
+                    if value is not None),
                 finish_after_delivery=lambda: participation_approved or
                     bool(research_result and research_result.get('kind')=='media_result'),
                 require_reply=bool(interactive and direct_group_reply),

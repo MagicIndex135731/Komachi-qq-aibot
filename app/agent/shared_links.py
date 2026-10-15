@@ -23,7 +23,7 @@ _READ_INTENT = re.compile(r'看(?:看|一下|下)?(?!过|到|见|起来|完|着)
 _NEGATIVE = re.compile(r'(?:不要|不用|不必|无需|别|不想|不需要|不是(?:让|要|请)(?:你)?).{0,8}(?:看|打开|读|评价|评论|分析|总结|联网|上网|查|搜|扒|拔|下载|提取|保存|搬|取图|发图)|(?:do not|don.t)\s+(?:read|open|search|review|download|extract)', re.I)
 _WEB_INTENT = re.compile(r'联网|上网|网络搜索|网上(?:查|搜)|搜索|检索|搜一下|查一下|查查|查找|查一查|帮我(?:查|搜)|查询|查证|核实|是真的吗|search\s+(?:the\s+)?web|web\s+search', re.I)
 _QUESTION = re.compile(r'[?？]|什么|怎么|咋|为什么|为何|如何|多少|是否|能否|可否|哪(?:个|种|些|里|儿|位|款|家)|(?:吗|么|呢)[啊呀吧嘛\s。！!]*$|\b(?:what|why|how|when|where|who|which)\b', re.I)
-_REQUEST = re.compile(r'^(?:请|麻烦|劳驾|帮我|能不能|可以)?\s*(?:帮我)?\s*(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|找找)|\b(?:please|could you|can you)\b', re.I)
+_REQUEST = re.compile(r'^(?:请|麻烦|劳驾|帮我|能不能|可以)?\s*(?:帮我)?\s*(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|找找|我要看|我想看|想看|给我看|发我|发给我|来点|来张)|\b(?:please|could you|can you|show me|send me|I want to see)\b', re.I)
 _SHARE_REFERENCE = re.compile(r'(?:这[个条张份]?|那[个条张份]?|引用|刚才的?|上面的?)(?:APP)?(?:分享|卡片)', re.I)
 
 WEB_REQUEST_POLICY = ('联网仅用于当前真实用户的提问、资料请求、@或称呼小町时按需查证，不要求用户固定说“联网”。'
@@ -54,6 +54,15 @@ def _authored_text(raw):
                     for item in _segments(raw) if item.get('type') == 'text'
                     and isinstance(item.get('data'), dict)
                     and isinstance(item['data'].get('text'), str))[:4000]
+
+
+def authored_request_text(raw, plain_text=''):
+    """Goal hints use the author's text, never a card title or quoted payload."""
+    if isinstance(raw,str):
+        try:raw=json.loads(raw)
+        except (ValueError,TypeError):raw={}
+    return _authored_text(raw) if isinstance(raw,dict) and (
+        'message' in raw or 'raw_message' in raw) else plain_text
 
 
 def _app_links(raw):

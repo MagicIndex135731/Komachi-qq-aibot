@@ -43,7 +43,7 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         if n==1:return 'download_twitter_media',{'ref_id':URL,'delivery_mode':delivery_mode,'delivery_text':'原帖共3项媒体'}
         if n==2:
             assert output(body)['status']=='queued'
-            return 'send_'+surface,{'text':'已安排下载','artifact_ids':[]}
+            return 'send_'+surface,{'text':'已安排下载','artifact_ids':[],'task_status':'progress'}
         return None
     class Gateway:
         def __init__(self):self.calls=[]
@@ -100,10 +100,9 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         assert [item['type'] for item in media]==['image','video','video']
         assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4,mp4]
         if delivery_mode=='auto':
-            # One bounded native closing decision can inspect remaining work;
-            # a queue acknowledgement must not prematurely end a larger goal.
-            # The actual download/delivery still creates no child model turn.
-            assert len(model_calls)==3 and sent_result==[]
+            # A progress acknowledgement with the actual queued job can close
+            # locally. Formal tasks with remaining work have separate coverage.
+            assert len(model_calls)==2 and sent_result==[]
         record_property('upstream_requests',len(model_calls))
         record_property('delivery_mode',delivery_mode)
         record_property('surface',surface)

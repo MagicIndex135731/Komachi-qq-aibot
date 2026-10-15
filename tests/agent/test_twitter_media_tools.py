@@ -15,6 +15,15 @@ URL = 'https://x.com/synthetic/status/' + POST
 VIDEO = b'\x00\x00\x00\x18ftypisom' + b'synthetic' * 30
 
 
+def test_download_client_uses_explicit_mihomo_instead_of_environment_proxy(monkeypatch):
+    from app.agent.twitter_media import download_client
+    calls=[]
+    monkeypatch.setenv('HTTPS_PROXY','http://127.0.0.1:1')
+    monkeypatch.setattr('app.agent.twitter_media.httpx.AsyncClient',lambda **kwargs:calls.append(kwargs))
+    download_client(SimpleNamespace(web_page_proxy_url='http://127.0.0.1:18797'))
+    assert calls==[{'proxy':'http://127.0.0.1:18797','trust_env':False,'follow_redirects':False}]
+
+
 def provider(monkeypatch, *, video=VIDEO, check=None):
     calls = []
     def respond(request):

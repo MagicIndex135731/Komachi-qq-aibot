@@ -74,7 +74,7 @@ async def test_native_group_share_read_search_fallback_and_reply(sqlite_engine, 
         result = await fixture.executor.execute_group_turn(request, batch,
             AgentDecision('reply', request.platform_msg_id, 'direct_trigger'), InteractiveIngressGuard(batch.turn_id))
         assert result.status == 'sent'
-        assert len(requests) == 7 and len(writes(fixture)) == 1
+        assert len(requests) == 6 and len(writes(fixture)) == 1
         initial_text = next(part['text'] for item in requests[0]['input']
             for part in item.get('content', ()) if isinstance(part, dict)
             and 'Current observation JSON:\n' in part.get('text', ''))

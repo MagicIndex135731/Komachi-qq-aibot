@@ -231,7 +231,7 @@ async def test_group_native_web_body_open_find_and_send_are_wired(sqlite_engine,
         await fixture.executor.run_tools(observed, guard, interactive=True,
             target_user_id=FRIEND, target_message_id='current-web-request', direct_group_reply=True)
         assert len(writes(fixture)) == 1
-        assert len(web_calls) == 3 and len(requests) == 5
+        assert len(web_calls) == 3 and len(requests) == 4
         assert "DETAILED_GROUP_EVIDENCE" in json.dumps(requests[1], ensure_ascii=False)
         assert {"search_web", "open_web_page", "find_web_page"} <= {v["name"] for v in requests[0]["tools"]}
         assert web_calls[1]["open"][0]["ref_id"] == "https://example.com/page"
@@ -1362,7 +1362,7 @@ async def test_native_direct_replies_bypass_social_limits_but_unknown_send_is_no
 
     def script(body, number):
         return responses_sse(name="send_group", arguments={"text": "合成互动回复", "artifact_ids": []},
-                             number=number) if uncertain or number % 2 else responses_sse(number=number)
+                             number=number)
 
     client, requests, _ = model_client(script)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
@@ -1391,7 +1391,7 @@ async def test_native_direct_replies_bypass_social_limits_but_unknown_send_is_no
                 fixture.clock[0] += timedelta(seconds=1)
             assert [result.status for result in results] == (["uncertain", "uncertain"] if uncertain else ["sent", "sent"])
             assert len(writes(fixture)) == (1 if uncertain else 2)
-            assert len(requests) == (2 if uncertain else 4)
+            assert len(requests) == 2
         finally:
             planner.close()
 
@@ -1428,7 +1428,7 @@ async def test_native_forged_mention_does_not_exempt_autonomous_send_limits(sqli
                 results.append(await fixture.executor.execute_group_turn(
                     event, batch, decision, InteractiveIngressGuard(batch.turn_id)))
             assert results[0].status == "sent" and results[1].status == "silent"
-            assert len(writes(fixture)) == 1 and len(requests) == 2
+            assert len(writes(fixture)) == 1 and len(requests) == 1
             from app.agent.runtime_trace import TraceReader
             traces=TraceReader(fixture.router.runtime.settings.data_dir/'agent_monitor').list_traces()
             assert not any(t['trigger_kind']=='group_messages' for t in traces)
@@ -1502,8 +1502,8 @@ async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_eng
     from app.agent.runtime_trace import TraceReader
 
     steps = [
-        ("send_group", {"text": "合成互动回复", "artifact_ids": []}),
         ("set_group_card", {"name": "synthetic-card"}),
+        ("send_group", {"text": "合成互动回复", "artifact_ids": []}),
     ]
 
     def script(body, number):
@@ -1533,7 +1533,7 @@ async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_eng
             assert decision.reason == "direct_trigger"
             result = await fixture.executor.execute_group_turn(
                 event, batch, decision, InteractiveIngressGuard(batch.turn_id))
-            assert result.status == "sent" and len(requests) == 3
+            assert result.status == "sent" and len(requests) == 2
             assert [action for action, _ in writes(fixture)] == ["send_group_msg"]
             with session_scope(sqlite_engine) as session:
                 card_effect = session.scalar(select(AgentToolEffect).where(AgentToolEffect.operation == "set_group_card"))

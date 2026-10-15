@@ -244,6 +244,45 @@ class ResearchTaskWorkspace:
             'coverage_verification': 'model_reported_not_independent_semantic_validation'}
 
     @serialized_checkpoint
+    def save_request_control(self, control):
+        """Lightweight evidence/goal record; does not activate research budgets."""
+        data={'scope':self.scope,'actor_id':self.actor_id,'source_id':self.source_id,
+            'task_id':self.task_id,'updated_at':self.clock(),'control':control}
+        if self.dependency_snapshot:data['dependencies']=self.dependency_snapshot()
+        # Only the latest lightweight request is retained in this requester
+        # scope. Formal checkpoints and queued jobs own durable continuation;
+        # ordinary chat must not create an ever-growing directory per message.
+        self._write(self.root/'request-goal.json',data)
+
+    @serialized_checkpoint
+    def save_execution_experience(self, version, experience):
+        """Only callers with an actual verified delivery may record a method."""
+        self._check()
+        rows=self.execution_experiences(version,experience['delivery'])
+        entry={'scope':self.scope,'actor_id':self.actor_id,'source_id':self.source_id,
+            'updated_at':self.clock(),'version':version,**experience}
+        if self.dependency_snapshot:entry['dependencies']=self.dependency_snapshot()
+        signature=(entry['delivery'],entry['requirements'],entry['tools'])
+        rows=[r for r in rows if (r['delivery'],r['requirements'],r['tools'])!=signature]
+        rows.append(entry)
+        # Per requester/scope; no chat text, artifact payloads or inferred facts.
+        self._write(self.root/'execution-experiences.json',{'scope':self.scope,
+            'actor_id':self.actor_id,'source_id':self.source_id,'updated_at':self.clock(),
+            'experiences':rows[-12:]})
+
+    def execution_experiences(self, version, delivery):
+        self._check()
+        data=self._load(self.root/'execution-experiences.json') or {}
+        result=[]
+        for item in data.get('experiences',[])[-12:]:
+            if not isinstance(item,dict) or item.get('version')!=version or item.get('delivery')!=delivery:
+                continue
+            try:self._check(item)
+            except (ValueError,OSError):continue
+            if item.get('verified_basis')=='observed_tools_and_confirmed_request_delivery':result.append(item)
+        return result[-3:]
+
+    @serialized_checkpoint
     def observe_tool(self, name, args, outcome, call_id):
         if not self.formal or name in {'begin_research_task', 'update_research_task', 'read_research_task',
                 'resume_research_task', 'read_research_evidence', 'read_research_resources'}:

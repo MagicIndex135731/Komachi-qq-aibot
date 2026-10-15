@@ -38,7 +38,7 @@ from app.core.time_utils import CONVERSATION_TIME_POLICY, conversation_time_cont
 
 
 HARNESS_VERSION = "0.1.5rc1"
-CONTEXT_FORMAT_VERSION = 10
+CONTEXT_FORMAT_VERSION = 11
 _DYNAMIC_PERSONA_PREFIX = "Current persona guidance:\n"
 _MEMORY_READ_TOOLS = frozenset({"memory_search", "memory_read", "search_history"})
 _PLUGIN = Path(__file__).with_name("harness_plugins") / "python_tools.mjs"
@@ -85,7 +85,7 @@ class HarnessToolAgent:
                  system_identity: str | None = None, ephemeral_context: bool = False,
                  admission_metrics=None, cache_namespace: str | None = None,
                  finish_after_delivery=None, trace_conversation_key: str | None = None,
-                 task_workspace=None) -> None:
+                 task_workspace=None, initial_evidence=()) -> None:
         if not 1 <= max_steps <= 32 or not 0 <= max_image_calls <= 4 or not 1 <= max_external_writes <= 8:
             raise ValueError("invalid Harness turn budget")
         self.decision_client = decision_client
@@ -99,6 +99,7 @@ class HarnessToolAgent:
         self.trace_conversation_key = trace_conversation_key
         self.finish_after_delivery = finish_after_delivery
         self.task_workspace = task_workspace
+        self.initial_evidence = initial_evidence
         self.final_response = ''
         self.clock = clock or (lambda: datetime.now(UTC))
         self.require_reply = require_reply
@@ -122,12 +123,24 @@ class HarnessToolAgent:
         self.model_progress_timeout_seconds = model_progress_timeout_seconds
         self.model_first_output_timeout_seconds = model_first_output_timeout_seconds
         self.blocking = blocking or BoundedBlockingRunner(1)
+        self.review_blocking = BoundedBlockingRunner(1)
         self._active: set[_Bridge] = set()
 
     async def run(self, prompt: list[str], tools: tuple[AgentTool, ...], guard, *, images=(),
                   resources=None, session_path=None, session_id=None, invoke_tool=None,
                   session_state=None) -> ToolTurnResult:
         from app.agent.tool_contracts import with_contract_descriptions
+        control = None
+        if self.task_workspace is not None and self.require_reply:
+            from app.agent.request_task import RequestTaskControl
+            from app.agent.tool_evidence import capability_version
+            guard.require_valid()
+            control = RequestTaskControl(self.task_workspace,
+                capability_version=capability_version(self.decision_client, tools),
+                initial_result=self.initial_evidence)
+            control._persist()
+            tools = (*tools, *control.tools(guard,
+                review=lambda task, proposed: bridge.review_task(task, proposed)))
         by_name = {tool.name: tool for tool in sorted(with_contract_descriptions(tools), key=lambda tool: tool.name)}
         if len(by_name) != len(tools) or len(tools) > 64:
             raise ValueError("tools must be unique and bounded")
@@ -143,6 +156,7 @@ class HarnessToolAgent:
         patch = home / ("turn-" + uuid4().hex + ".patch.json")
         bridge = _Bridge(self, by_name, guard, asyncio.get_running_loop(), resources,
                          invoke_tool or self.invoke_tool)
+        bridge.control = control
         bridge.observer = AgentTrace(self.trace_root, context={**self.trace_context,
             "model": bridge.model, "protocol": bridge.protocol,
             "context_window_tokens": self.context_policy.context_window},
@@ -168,6 +182,9 @@ class HarnessToolAgent:
             input_lines, bridge.live_context, bridge.live_metrics = split_live_context(input_lines)
             previous_native = snapshot_native_session(home, session_id or self.session_id or 'xiaomachi')
         bridge.instructions = "\n".join(instructions)
+        if control is not None:
+            from app.agent.request_task import TASK_POLICY
+            bridge.instructions += '\n' + TASK_POLICY
         self._active.add(bridge)
         bridge.start()
         native_file_path(patch).write_text(json.dumps(bridge.patch(), ensure_ascii=False), encoding="utf-8")
@@ -299,6 +316,7 @@ class HarnessToolAgent:
         for bridge in tuple(self._active):
             bridge.revoke()
         self.blocking.close()
+        self.review_blocking.close()
 
 
 class _Bridge:
@@ -317,6 +335,7 @@ class _Bridge:
         self.delivery_recovery = False
         self.task_recovery = False
         self.pending_jobs = {}
+        self.control = None
         self.model_turn_id = uuid4().hex
         self.stop_reason = ""
         self.runtime_phase = "queued"
@@ -377,6 +396,13 @@ class _Bridge:
         workspace = self.owner.task_workspace
         try:
             state = workspace.execution_status() if workspace else {}
+            request = self.control.state() if self.control else {}
+            if state and request:
+                state = {**state, 'request_goal': request,
+                    'completion_gaps': list(dict.fromkeys([*state.get('completion_gaps', []),
+                        *request.get('completion_gaps', [])]))}
+            elif request:
+                state = request
             return state or ({'status': 'waiting', 'job_ids': sorted(self.pending_jobs),
                 'completion_gaps': ['background_pending']} if self.pending_jobs else {})
         except (ValueError, OSError):
@@ -385,11 +411,29 @@ class _Bridge:
     def can_recover_task(self):
         state = self.task_state()
         gaps = state.get('completion_gaps', [])
+        if self.control and self.control.can_stop and not (self.owner.task_workspace.formal
+                and state.get('status') == 'active'):
+            return False
         return bool(state and state.get('status') in {'active', 'partial', 'completed'}
             and (gaps or state.get('status') == 'active') and not self.task_recovery
             and 'unknown_external_effect' not in gaps and 'task_dependency_unavailable' not in gaps
             and not self.stop_reason and not self.cancelled.is_set()
             and self.model_calls < self.owner.max_steps and self.deadline - time.monotonic() >= 5.0)
+
+    def delivery_complete(self):
+        if not self.last_write or self.last_write.status != 'sent':
+            return False
+        if self.control is not None:
+            if not self.control.can_stop:
+                return False
+        elif not (self.owner.finish_after_delivery and self.owner.finish_after_delivery()):
+            return False
+        workspace = self.owner.task_workspace
+        if workspace and workspace.formal:
+            state = workspace.execution_status()
+            return state.get('status') in {'waiting', 'partial', 'completed', 'blocked', 'cancelled'} and (
+                not state.get('remaining') or state.get('status') in {'partial', 'blocked', 'cancelled'})
+        return True
 
     def delivery_contract(self):
         if not self.owner.require_reply or not self.delivery_tool():
@@ -399,12 +443,60 @@ class _Bridge:
             "current_turn_failure_notice_calls": self.failure_notice_calls,
             "current_turn_receipt_status": self.last_write.status if self.last_write else "not_dispatched",
             "delivery_recovery": self.delivery_recovery}
+        goal = self.control.state() if self.control else {}
+        if goal:
+            state['request_task'] = goal
+            hints = self.control.method_hints()
+            if hints:
+                state['verified_method_hints'] = hints
         return ("Current delivery target JSON: " + json.dumps(state, ensure_ascii=False) +
             "\nThis application state is authoritative for this turn. Historical sent/uncertain receipts "
             "apply only to their own source messages; they cannot complete a different source, even with "
             "identical text. With no current dispatch, answer the current target via its send tool. "
             "An internal final answer or claim of prior delivery is not a receipt. "
             "After any current external write, never duplicate a confirmed or uncertain action.")
+
+    async def review_task(self, control, proposed):
+        """At most one diagnostic, reserved from the same turn/global budget."""
+        self.require_valid()
+        seconds = min(20.0, self.deadline - time.monotonic() - 5.0)
+        if seconds < 5 or self.model_calls >= self.owner.max_steps - 1:
+            return {'error': 'task_review_budget_unavailable'}
+        if self.owner.before_call and not self.owner.before_call('model'):
+            return {'error': 'task_review_daily_budget'}
+        with self._count_lock:
+            self.model_calls += 1
+            index = self.model_calls
+        from app.agent.task_review import review_progress
+        usages = []
+        def usage(value):
+            usages.append(value)
+            self.owner.decision_client._record_usage(value)
+        started = time.monotonic()
+        status = 'completed'
+        try:
+            async with asyncio.timeout(seconds):
+                result = await self.owner.review_blocking.run(review_progress,
+                    self.owner.decision_client, control, tuple(self.tools.values()), proposed,
+                    seconds=seconds, require_valid=self.require_valid, record_usage=usage,
+                    on_request=lambda body: self.observer.request(f'review-{index}', body,
+                        {'purpose': 'task_review', 'model_call_index': index,
+                            'model': body.get('model'), 'protocol': self.protocol,
+                            'context_estimated_tokens': estimate_request_tokens(body)}, purpose='task_review'))
+            self.require_valid()
+            return result
+        except (TimeoutError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+            status = type(exc).__name__
+            return {'error': 'task_review_unavailable', 'guidance': '使用确定性缺口继续，不能扩大权限。'}
+        finally:
+            metrics = {'status': 'model_request', 'purpose': 'task_review',
+                'model_call_index': index, 'outcome': status, 'protocol': self.protocol,
+                'elapsed_ms': round((time.monotonic() - started) * 1000, 3),
+                'input_tokens': sum(x.input_tokens for x in usages) if usages else None,
+                'cached_input_tokens': sum(x.cached_input_tokens for x in usages) if usages else None,
+                'output_tokens': sum(x.output_tokens for x in usages) if usages else None}
+            self.trace.append(metrics)
+            self.observer.event('model.finished', {'request_id': f'review-{index}', **metrics})
 
     def delivery_due(self):
         return (self.owner.require_reply and not (self.last_write and self.last_write.status in {"sent", "uncertain"})
@@ -546,8 +638,22 @@ class _Bridge:
         tool = self.tools.get(name) if isinstance(name, str) else None
         info = {"name": name, "call_id": call_id, "effect": tool.effect if tool else "unknown"}
         self.observer.event("tool.started", {**info, "arguments": body.get("arguments")})
+        was_seen = isinstance(call_id, str) and call_id in self._seen_calls
         try:
             result = await self._call_tool(body)
+            if (self.control is not None and tool is not None
+                    and validate_arguments(body.get('arguments'), tool.parameters)
+                    and not was_seen and not result.get('duplicate') and not result.get('task_progress')
+                    and result.get('data', {}).get('error') != 'task_completion_unverified'):
+                try:
+                    progress = self.control.observe(name, body['arguments'],
+                        ToolOutcome(result.get('data', {}), result['status'], result.get('receipt_id'),
+                            tuple(result.get('images', ()))), call_id)
+                    if self.control.active:
+                        result['task_progress'] = progress
+                except (ValueError, OSError, RuntimeError):
+                    self.stop_reason = self.stop_reason or 'task_checkpoint_unavailable'
+                    self.trace.append({'status': 'task_checkpoint_unavailable'})
         except asyncio.CancelledError:
             self.observer.event("tool.completed", {**info, "status": "uncertain" if tool and tool.effect == "write" else "interrupted",
                 "data": {"error": "tool_cancelled"}})
@@ -574,6 +680,17 @@ class _Bridge:
                 return {"status": "blocked", "data": {"error": "tool_or_arguments_not_allowed"}}
             if tool.authorization is not None and tool.authorization() is not True:
                 return {"status": "blocked", "data": {"error": "owner_required"}}
+            if self.control is not None:
+                rejected = self.control.preflight(name, args)
+                if rejected is not None:
+                    if self.control.needs_review and not self.control.review_used:
+                        self.control.review_used = True
+                        rejected.data['review'] = await self.review_task(self.control, args.get('text', ''))
+                        self.control._persist()
+                    return {'status': rejected.status, 'data': rejected.data}
+                if name == 'search_web' and self.control.stalled >= 3:
+                    return {'status': 'blocked', 'data': {'error': 'strategy_change_required',
+                        'guidance': '连续查询没有新增目标证据；换用已知资源/其他获准能力，或如实partial/blocked，勿继续改词搜索。'}}
             if name in _MEMORY_READ_TOOLS and self.owner.require_reply:
                 if self.delivery_due():
                     return {"status": "blocked", "data": {"error": "memory_read_budget_exhausted",
@@ -665,11 +782,7 @@ class _Bridge:
 
     def _forward(self, handler, body, budget, *, compaction=False):
         self.require_valid()
-        if (not compaction and self.last_write and self.last_write.status == 'sent'
-                and self.owner.finish_after_delivery and self.owner.finish_after_delivery()
-                and (not self.owner.task_workspace or not self.owner.task_workspace.formal
-                     or self.task_state().get('status') in {'waiting', 'completed', 'blocked', 'cancelled'}
-                     and not self.task_state().get('remaining'))):
+        if not compaction and self.delivery_complete():
             # Close the native tool loop after its real tool result is saved.
             # This is local completion, never an upstream call or usage.
             self.observer.event('delivery.completed', {'source':'application', 'receipt_id':self.last_write.receipt_id})
@@ -677,12 +790,32 @@ class _Bridge:
             handler.stream_started = True
             handler.send_header('Content-Type', 'text/event-stream')
             handler.end_headers()
-            event = ({'type':'response.completed', 'response':{'id':'local-delivery-complete',
-                'object':'response', 'status':'completed', 'output':[]}}
-                if self.protocol == 'openai-responses' else
-                {'id':'local-delivery-complete','object':'chat.completion.chunk',
-                    'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})
-            handler.wfile.write(('data: '+json.dumps(event)+'\n\ndata: [DONE]\n\n').encode())
+            # The native adapter rejects a completed frame with no assistant
+            # item as an empty model response. Emit a complete local message,
+            # so its session closes normally and remains reusable next turn.
+            identity = 'local-' + self.model_turn_id
+            text = 'Application recorded the current delivery receipt. No additional action.'
+            if self.protocol == 'openai-responses':
+                response = {'id': identity, 'object': 'response', 'model': self.model,
+                    'status': 'in_progress', 'output': []}
+                item = {'type': 'message', 'id': identity + '-message', 'role': 'assistant',
+                    'status': 'completed', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}
+                events = [
+                    {'type': 'response.created', 'response': response},
+                    {'type': 'response.output_item.added', 'output_index': 0, 'item': {**item, 'content': []}},
+                    {'type': 'response.content_part.added', 'item_id': item['id'], 'output_index': 0,
+                        'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}},
+                    {'type': 'response.output_text.delta', 'item_id': item['id'], 'output_index': 0,
+                        'content_index': 0, 'delta': text},
+                    {'type': 'response.output_item.done', 'output_index': 0, 'item': item},
+                    {'type': 'response.completed', 'response': {**response, 'status': 'completed', 'output': [item]}}]
+            else:
+                base = {'id': identity, 'object': 'chat.completion.chunk', 'model': self.model}
+                events = [{**base, 'choices': [{'index': 0,
+                    'delta': {'role': 'assistant', 'content': text}, 'finish_reason': None}]},
+                    {**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}]
+            handler.wfile.write((''.join('data: ' + json.dumps(event) + '\n\n' for event in events)
+                + 'data: [DONE]\n\n').encode())
             return
         client = self.owner.decision_client
         names = [tool.get("name", tool.get("function", {}).get("name")) for tool in body.get("tools", [])]

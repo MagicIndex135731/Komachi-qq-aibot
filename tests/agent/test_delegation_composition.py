@@ -63,14 +63,14 @@ def choose(body, counts, *, surface, checkpoint_status):
     if is_result:
         assert checkpoint_status in text and '已验证合成入口' in text
         assert 'delegate_research_task' in {tool['name'] for tool in body['tools']}
-        return (send, args('入口已核对，认证文件尚未检查')) if n == 1 else None
+        return (send, {**args('入口已核对，认证文件尚未检查'),'task_status':'partial'}) if n == 1 else None
     message = obs.get('message', '') if surface == 'private' else obs.get('current_target', {}).get('text', '')
     if '合成文件' in message:
         if n == 1:
             return 'delegate_research_task', DELEGATE
         if n == 2:
             assert 'background_result_returns_to_main' in text
-            return send, args('已安排后台核对')
+            return send, {**args('已安排后台核对'),'task_status':'progress'}
         return None
     return (send, args('晚课结束记得休息')) if n == 1 else None
 

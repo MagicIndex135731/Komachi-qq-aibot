@@ -60,15 +60,15 @@ async def test_private_member_cannot_call_owner_tool_and_manifest_matches_owner(
     from test_owner_actions import setup as owner_setup
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
         lambda body, n: sse('request_owner_action', {'target': 'public', 'group_id': 0, 'include_current_images': False}, number=n)
-        if n == 3 else sse('send_private', {'text': 'synthetic'}, number=n) if n in {1, 4} else sse(number=n))
+        if n == 2 else sse('send_private', {'text': 'synthetic'}, number=n) if n in {1, 3} else sse(number=n))
     agent.owner_service, _ = owner_setup(sqlite_engine, tmp_path)
     await service.start()
     try:
         await dispatcher.handle_private_message(event('prefix-owner', user_id=OWNER))
         await dispatcher.handle_private_message(event('prefix-other', user_id=OTHER))
-        assert requests[0]['tools'] == requests[2]['tools']
-        assert requests[0]['instructions'] == requests[2]['instructions']
-        output = next(item for item in requests[3]['input'] if item.get('type') == 'function_call_output')
+        assert requests[0]['tools'] == requests[1]['tools']
+        assert requests[0]['instructions'] == requests[1]['instructions']
+        output = next(item for item in requests[2]['input'] if item.get('type') == 'function_call_output')
         assert json.loads(output['output'])['data']['error'] == 'owner_required'
         assert sender.texts == [(OWNER, 'synthetic'), (OTHER, 'synthetic')]
     finally:
