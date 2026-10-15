@@ -40,6 +40,10 @@ class AgentTool:
     shared_cooldown_seconds: float = 0
     max_writes_per_wake: int | None = None
     authorization: Callable[[], bool] | None = None
+    # Descriptive contracts do not grant authority. Handlers and explicit child
+    # allowlists still enforce permissions independently of these fields.
+    side_effects: tuple[str, ...] = ()
+    execution: str = 'inline'
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,12 +52,15 @@ class ToolTurnResult:
     receipt_id: str | None = None
     reason: str = ""
     trace: tuple[dict[str, Any], ...] = ()
+    task_status: dict[str, Any] = field(default_factory=dict)
 
 
 def validate_arguments(value: Any, schema: dict) -> bool:
     """Validate our small, closed tool schemas before invoking any handler."""
     if "enum" in schema and value not in schema["enum"]:
         return False
+    if 'anyOf' in schema:
+        return any(validate_arguments(value, item) for item in schema['anyOf'])
     if "const" in schema and value != schema["const"]:
         return False
     kind = schema.get("type")
@@ -75,7 +82,8 @@ def validate_arguments(value: Any, schema: dict) -> bool:
     if kind == "null":
         return value is None
     if kind == "array":
-        return (isinstance(value, list) and len(value) <= schema.get("maxItems", 2)
+        return (isinstance(value, list) and schema.get('minItems', 0) <= len(value) <= schema.get("maxItems", 2)
+                and (not schema.get('uniqueItems') or len({json.dumps(v, sort_keys=True) for v in value}) == len(value))
                 and all(validate_arguments(item, schema["items"]) for item in value))
     return False
 

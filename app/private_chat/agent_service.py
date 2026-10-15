@@ -84,11 +84,13 @@ class PrivateHarnessService:
         self._model_lock = asyncio.Lock()
         self.research_jobs = ResearchDelegationQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_research, deliver=self._return_research, clock=lambda: self.clock(),
+            task_workspace_root=self.settings.data_dir / 'research_tasks',
             authorized=lambda payload: self.running and self.allowed(payload['actor_id'])
                 and (self.gateway is None or self.gateway.websocket is not None))
         from app.agent.media_tasks import MediaTaskQueue
         self.media_jobs = MediaTaskQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_media, deliver=self._return_media, clock=lambda: self.clock(),
+            task_workspace_root=self.settings.data_dir / 'research_tasks',
             available=lambda: self.gateway is None or self.gateway.websocket is not None,
             authorized=lambda payload: self.running and self.allowed(payload['actor_id'])
                 and (self.gateway is None or self.gateway.websocket is not None))
@@ -141,7 +143,8 @@ class PrivateHarnessService:
         result = self._enqueue(user_id=payload['actor_id'], source_id=payload['source_id'],
             private_scope=payload['private_scope'], kind='research_result', goal=payload['goal'],
             key='research-result:' + str(guard.job_id), before_commit=guard.require_valid,
-            delegated_result=payload['result'], dependencies=guard.snapshot())
+            delegated_result={**payload['result'], 'parent_task_id': payload.get('parent_task_id'),
+                'returned_job_id': guard.job_id}, dependencies=guard.snapshot())
         self._wake.set()
         return 'blocked' if result.get('error') else 'completed'
 
@@ -183,10 +186,18 @@ class PrivateHarnessService:
                     raise
 
     def _valid_source(self, source_id, user_id):
+        return self._valid_sources((source_id,), user_id)
+
+    def _valid_sources(self, source_ids, user_id):
+        source_ids = sorted(set(source_ids))
         with session_scope(self.engine) as session:
-            row = session.get(Message, source_id)
-            return bool(row is not None and row.group_id is None and is_usable_memory_source(row, author_id=user_id)
-                and isinstance(row.raw_json, dict) and row.raw_json.get("direction") != "outbound")
+            for index in range(0, len(source_ids), 400):
+                batch = source_ids[index:index + 400]
+                rows = list(session.scalars(select(Message).where(Message.id.in_(batch), Message.group_id.is_(None))))
+                if len(rows) != len(batch) or any(not is_usable_memory_source(row, author_id=user_id)
+                        or not isinstance(row.raw_json, dict) or row.raw_json.get('direction') == 'outbound' for row in rows):
+                    return False
+        return True
 
     def _enqueue(self, *, user_id, source_id, private_scope, kind="message", goal="", delay_seconds=0, key=None,
                  before_commit=None, delegated_result=None, dependencies=None):
@@ -329,7 +340,7 @@ class PrivateHarnessService:
         scope = f"private:{user_id}"
         snapshot = self.sessions.read(scope)
         self.sessions.save(scope, [], {"receipts": snapshot["checkpoint"].get("receipts", []), "runtime_id": uuid4().hex},
-            (), expected_revision=snapshot["revision"])
+            (), expected_revision=snapshot["revision"], reset_dependencies=True)
         await self.cancel_user(user_id)
 
     async def cancel_user(self, user_id):
@@ -349,6 +360,19 @@ class PrivateHarnessService:
         scope = f"private:{user_id}"
         parent = self
         known_sources = [source_id]
+        retained_sources = set()
+        def admit_context_snapshot(identifier):
+            from app.agent.context_dependencies import context_snapshot_valid
+            from app.storage.agent_sessions import read_context_snapshot, CONTEXT_DEPENDENCY_LIMIT
+            if not context_snapshot_valid(self.engine, account_id=self.account_id, scope=scope,
+                    identifier=identifier, private_user_id=user_id, now=self.clock()):
+                return False
+            deps = read_context_snapshot(self.engine, account_id=self.account_id, scope=scope,
+                identifier=identifier, now=self.clock())
+            if deps is None or len(retained_sources | set(deps['sources'])) > CONTEXT_DEPENDENCY_LIMIT:
+                return False
+            retained_sources.update(deps['sources'])
+            return True
         class Guard:
             def valid(inner):
                 if payload.get('kind')=='wakeup' and user_id!=parent.service.owner_qq: return False
@@ -358,7 +382,7 @@ class PrivateHarnessService:
                     row = session.get(Job, job_id)
                     if not row or row.status != "running" or row.locked_by != parent._owner or row.lease_until <= parent.clock().astimezone(UTC).replace(tzinfo=None):
                         return False
-                return all(parent._valid_source(item, user_id) for item in known_sources)
+                return parent._valid_sources(set(known_sources) | retained_sources, user_id)
             def require_valid(inner):
                 if not inner.valid():
                     raise RuntimeError("private_agent_authority_revoked")
@@ -416,37 +440,58 @@ class PrivateHarnessService:
             def valid_task_source(identifier):
                 return type(identifier) is int and self._valid_source(identifier, user_id)
             def valid_task_dependencies(metadata):
+                if metadata.get('context_snapshot'):
+                    from app.agent.context_dependencies import context_snapshot_valid
+                    if not context_snapshot_valid(self.engine, account_id=self.account_id, scope=scope,
+                            identifier=metadata['context_snapshot'], private_user_id=user_id, now=self.clock()):
+                        return False
+                    if not admit_context_snapshot(metadata['context_snapshot']):
+                        return False
                 dependencies = metadata.get('sources', [])
                 if (not isinstance(dependencies, list) or any(type(item) is not int or item <= 0 for item in dependencies)
-                        or len(set(known_sources) | set(dependencies)) > 200
+                        or not metadata.get('context_snapshot') and len(set(known_sources) | set(dependencies)) > 200
                         or any(not self._valid_source(item, user_id) for item in dependencies)):
                     return False
-                known_sources[:] = list(dict.fromkeys([*known_sources, *dependencies]))
+                if not metadata.get('context_snapshot'):
+                    known_sources[:] = list(dict.fromkeys([*known_sources, *dependencies]))
                 return True
             workspace = ResearchTaskWorkspace(self.settings.data_dir / 'research_tasks', scope=scope,
                 actor_id=user_id, source_id=source_id, request=event.plain_text,
                 valid_source=valid_task_source,
-                dependency_snapshot=lambda: {'sources': list(known_sources)},
+                dependency_snapshot=lambda: {'sources': list(known_sources), 'context_snapshot': freeze_context()},
                 valid_dependencies=valid_task_dependencies,
+                cancel_background=lambda identifier: [queue.cancel_task(user_id, user_id, identifier,
+                    before_commit=guard.require_valid) for queue in (self.media_jobs, self.research_jobs)],
                 task_content_budget=getattr(self.settings, 'agent_web_task_max_chars', 96000))
             if payload.get('dependencies') and not valid_task_dependencies(payload['dependencies']):
                 raise RuntimeError('delegated_result_sources_revoked')
             session_scope_key = scope
             previous = self.sessions.read(session_scope_key)
-            for prior_source in previous["source_message_ids"]:
-                if not self._valid_source(prior_source, user_id):
-                    self.sessions.clear_if_source(session_scope_key, prior_source)
+            prior_sources = previous.get('context_source_message_ids', previous['source_message_ids'])
+            if not self._valid_sources(prior_sources, user_id):
+                for prior_source in prior_sources:
+                    if not self._valid_source(prior_source, user_id):
+                        self.sessions.clear_if_source(session_scope_key, prior_source)
+                        break
             previous = self.sessions.read(session_scope_key)
-            sources = list(dict.fromkeys([*previous["source_message_ids"], source_id, *quoted_source_ids, *referenced_source_ids]))
-            if len(sources) > 200:
-                sources = list(dict.fromkeys([source_id, *quoted_source_ids, *referenced_source_ids]))
-                previous = self.sessions.save(session_scope_key, [], {"receipts": previous["checkpoint"].get("receipts", []),
-                    "runtime_id": uuid4().hex, "last_status": "source_budget_compacted"}, (),
-                    expected_revision=previous["revision"], before_commit=guard.require_valid)
+            sources = list(dict.fromkeys([source_id, *quoted_source_ids, *referenced_source_ids]))
+            retained_sources.update(previous.get('context_source_message_ids', previous['source_message_ids']))
+            snapshot_cache = {}
+            def freeze_context():
+                basis = tuple(sorted(set(known_sources) | retained_sources))
+                if snapshot_cache.get('basis') != basis:
+                    snapshot_cache['id'] = self.sessions.freeze_dependencies(session_scope_key,
+                        tuple(sorted(known_sources)), authority_scope=scope, before_commit=guard.require_valid,
+                        retained_context={'sources': sorted(retained_sources)})
+                    snapshot_cache['basis'] = basis
+                return snapshot_cache['id']
             known_sources[:] = list(dict.fromkeys([*known_sources, *sources]))
+            if (payload.get('delegated_result') or {}).get('parent_task_id'):
+                workspace.resume(payload['delegated_result']['parent_task_id'])
             from app.agent.shared_links import build_share_access, observed_share_sources, share_context_text, wrap_share_web_tools, WEB_REQUEST_POLICY
             share_access = build_share_access(SimpleNamespace(engine=self.engine), group_id=None,
-                trigger_source_ids=(source_id,) if payload['kind'] == 'message' else (),
+                trigger_source_ids=(source_id,) if payload['kind'] == 'message'
+                    or payload['kind'] == 'research_result' and payload.get('dependencies') else (),
                 private_user_id=user_id, bot_qq=self.settings.bot_qq)
             runtime_id = previous["checkpoint"].get("runtime_id") or uuid4().hex
             context_version = model_context_format_version(self.service.llm_client)
@@ -469,21 +514,20 @@ class PrivateHarnessService:
             from app.agent.artifacts import AutonomousArtifactStore
             store = AutonomousArtifactStore(self.settings.data_dir / 'autonomous_artifacts',
                 account_id=self.account_id, scope=scope, engine=self.engine,
-                source_message_ids=lambda: tuple(known_sources))
+                source_message_ids=lambda: tuple(known_sources), context_snapshot_factory=freeze_context)
 
-            auto_media_queued = False
             async def submit_media(operation, args, candidates=None):
-                nonlocal auto_media_queued
                 guard.require_valid()
-                if (payload.get('delegated_result') or {}).get('kind') == 'media_result':
+                if (payload.get('delegated_result') or {}).get('kind') == 'media_result' and not workspace.formal:
                     return ToolOutcome({'error': 'media_result_cannot_resubmit'}, 'blocked')
                 result = self.media_jobs.submit({'account_id': self.account_id, 'surface': 'private',
                     'scope': scope, 'scope_id': user_id, 'actor_id': user_id, 'source_id': source_id,
                     'sources': list(known_sources), 'memory': {}, 'operation': operation, 'arguments': args,
+                    'context_snapshot': freeze_context(),
+                    'parent_task_id': workspace.task_id if workspace.formal else None,
                     'candidates': candidates or {},
                     'private_scope': payload['private_scope'], 'goal': '完成媒体下载并交付真实产物'},
-                    parent_turn=job_id, before_commit=guard.require_valid)
-                auto_media_queued |= result.status=='ok' and result.data.get('delivery')=='automatic_delivery_to_original_request'
+                    parent_turn='source:' + str(source_id), before_commit=guard.require_valid)
                 return result
 
             async def send(args):
@@ -683,6 +727,8 @@ class PrivateHarnessService:
                 tools.extend(build_owner_tools(self.owner_service, source_id, guard))
             tools = restrict_directed_tools(tools, owner=user_id == self.service.owner_qq)
             tools.append(self.media_jobs.status_tool(scope_id=user_id, actor_id=user_id, guard=guard))
+            from app.agent.media_tasks import build_media_batch_tool
+            tools.extend(build_media_batch_tool(tools, guard))
             from app.agent.shared_links import build_share_tools
             share_context = SimpleNamespace(router=SimpleNamespace(engine=self.engine),
                 observation=SimpleNamespace(job=SimpleNamespace(kind='private',scope_id=user_id)),
@@ -770,6 +816,8 @@ class PrivateHarnessService:
                 result = self.research_jobs.enqueue({'account_id': self.account_id, 'surface': 'private',
                     'scope_id': user_id, 'scope': scope, 'actor_id': user_id, 'source_id': source_id,
                     'sources': list(child_sources), 'memory': {}, 'goal': args['goal'], 'reason': args['reason'],
+                    'context_snapshot': freeze_context(),
+                    'parent_task_id': workspace.task_id if workspace.formal else None,
                     'deliverable': args['deliverable'], 'task_id': child.task_id, 'task_key': f'delegate:{job_id}',
                     'resume_task_id': args.get('task_id'), 'private_scope': payload['private_scope']},
                     parent_turn=job_id, before_commit=guard.require_valid)
@@ -824,7 +872,8 @@ class PrivateHarnessService:
                 model_progress_timeout_seconds=self.settings.agent_model_progress_timeout_seconds,
                 before_call=reserve_cost,
                 blocking=self.runtime_runner, invoke_tool=invoke, session_home=home, session_id=runtime_id,
-                finish_after_delivery=lambda: auto_media_queued or
+                task_workspace=workspace,
+                finish_after_delivery=lambda:
                     (payload.get('delegated_result') or {}).get('kind')=='media_result')
             async with self._model_lock:
                 with self._transaction() as session:
@@ -863,9 +912,10 @@ class PrivateHarnessService:
                 "context_format_version": context_version,
                 "runtime_id": runtime_id, "session_path": str(home), "in_flight": False,
                 "last_status": result.status, "reply_source_id": source_id,
+                "task_status": result.task_status,
                 "last_reason": result.reason, "context_reusable": context_reusable(result),
                 "receipts": receipts[-100:]}, tuple(dict.fromkeys([*sources, *known_sources])), expected_revision=previous["revision"],
-                before_commit=guard.require_valid)
+                before_commit=guard.require_valid, retained_context={'sources': sorted(retained_sources)})
             if output_texts and result.status == 'sent' and context_reusable(result):
                 with session_scope(self.engine) as session:
                     self.service._append_session_summary(session_id=daily_id, owner_text=event.plain_text,

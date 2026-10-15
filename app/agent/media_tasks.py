@@ -23,6 +23,55 @@ def download_delivery_properties():
             'description':'auto完成后的简短说明，不得提前宣称已发送；可留空。'}}
 
 
+def build_media_batch_tool(tools, guard):
+    """Compose offered operations; each handler still checks its own authority.
+
+    No URLs, site names, tool order or permission decisions are inferred here.
+    The durable queue manages pending work after this model turn has finished.
+    """
+    offered = {tool.name: tool for tool in tools if tool.name in MEDIA_OPERATIONS}
+    if not offered:
+        return ()
+    async def batch(args):
+        operations = args['operations']
+        # Validate the whole batch before any child can be queued. A schema
+        # matching a different operation must not authorize this operation.
+        if any(item['operation'] not in offered or not validate_arguments(
+                item['arguments'], offered[item['operation']].parameters) for item in operations):
+            return ToolOutcome({'error': 'invalid_media_batch_arguments'}, 'blocked')
+        jobs, failures = [], []
+        for index, item in enumerate(operations):
+            guard.require_valid()
+            tool = offered[item['operation']]
+            if tool.authorization is not None and tool.authorization() is not True:
+                failures.append({'index': index, 'error': 'operation_not_authorized'})
+                continue
+            # Generations retain their paid image budget boundary; this batch
+            # is for deterministic downloads only, not a way around it.
+            outcome = await tool.handler(item['arguments'])
+            if outcome.status == 'ok' and type(outcome.data.get('job_id')) is int:
+                jobs.append({'index': index, 'operation': item['operation'], **outcome.data})
+            else:
+                failures.append({'index': index, 'error': outcome.data.get('error') or
+                    outcome.data.get('reason') or 'media_not_queued', 'status': outcome.status})
+        guard.require_valid()
+        return ToolOutcome({'jobs': jobs, 'failures': failures, 'requested_count': len(operations),
+            'accepted_count': len(jobs), 'all_accepted': not failures, 'task_status': 'waiting' if jobs else 'blocked',
+            'guidance': '任务已持久排队，pending等待容量后继续；不是已完成。保留未接受项和覆盖缺口，不重复提交已接受任务。'},
+            'ok' if jobs else 'blocked')
+    offered = {name: tool for name, tool in offered.items() if name != 'generate_image'}
+    if not offered:
+        return ()
+    return (AgentTool('queue_media_batch',
+        '将已发现的多项下载操作按顺序持久排队，每次最多16项。各项仍受原工具权限/大小/格式限制；超过4项先等待容量再继续，排队不代表任务完成。分析筛选用review，纯下载交付可用auto。',
+        {'type': 'object', 'properties': {'operations': {'type': 'array', 'minItems': 1, 'maxItems': 16,
+            'items': {'type': 'object', 'properties': {'operation': {'type': 'string', 'enum': sorted(offered)},
+                'arguments': {'anyOf': [tool.parameters for tool in offered.values()]}},
+                'required': ['operation', 'arguments'], 'additionalProperties': False}}},
+            'required': ['operations'], 'additionalProperties': False}, batch,
+            side_effects=('enqueue_work',), execution='background'),)
+
+
 class MediaJobGuard(ResearchJobGuard):
     def __init__(self, *args):
         super().__init__(*args)
@@ -148,7 +197,8 @@ async def execute_web_media(payload, guard, *, engine, settings, web_client, run
 def media_store(payload, guard, *, engine, settings):
     from app.agent.artifacts import AutonomousArtifactStore
     return AutonomousArtifactStore(settings.data_dir / 'autonomous_artifacts', account_id=payload['account_id'],
-        scope=payload['scope'], engine=engine, source_message_ids=lambda: guard.source_message_ids)
+        scope=payload['scope'], engine=engine, source_message_ids=lambda: guard.source_message_ids,
+        context_snapshot_factory=(lambda: payload['context_snapshot']) if payload.get('context_snapshot') else None)
 
 
 def media_previews(result, store, guard, settings):

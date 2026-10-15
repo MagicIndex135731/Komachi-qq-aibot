@@ -208,7 +208,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
     from app.agent.twitter_media import build_twitter_media_tool
     from app.agent.media_tasks import download_delivery_properties
     return (
-        AgentTool('list_web_images', '从用户指定公开网页提取原图候选及alt/附近说明；获取/扒图先用此工具，offset分页。可跟进人物页或文件说明页；不执行网页脚本或登录。',
+        AgentTool('list_web_images', '从本次获准任务提供或检索发现的公开网页提取原图候选及alt/附近说明；获取/扒图先用此工具，offset分页。可跟进人物页或文件说明页；不执行网页脚本或登录。',
             schema({'ref_id': text(2000), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 159}}, ['ref_id']), serial(listing)),
         AgentTool('download_web_image', '下载本回合list_web_images返回的image_id，校验并展示真实原图像素，保存为当前会话artifact_id。核对目标后用send_group/send_private的artifact_ids发送。',
             schema({'image_id': text(64)}, ['image_id']), serial(download)),

@@ -126,6 +126,9 @@ def context_observation(scope: str, *, previous_id, current_id, checkpoint: dict
             else 'private' if scope.startswith('private:') else 'group' if scope.startswith('group:') else 'public')
     continued = bool(previous_id and previous_id == current_id and history_present)
     reason = 'same_native_session' if continued else 'first_turn'
+    if not continued and not previous_id and checkpoint.get('last_status') in {
+            'source_invalidated', 'memory_changed', 'persona_changed'}:
+        reason = checkpoint['last_status']
     if not continued and previous_id:
         reason = ('interrupted_turn' if checkpoint.get('in_flight') else 'previous_failed'
             if checkpoint.get('last_status') in {'failed','blocked','uncertain'} or checkpoint.get('context_reusable') is False

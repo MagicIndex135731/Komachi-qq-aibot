@@ -95,7 +95,7 @@ def _filename(artifact_id: str, suffix: str) -> str:
 
 class AutonomousArtifactStore:
     def __init__(self, root: Path, *, account_id: int, scope: str, engine,
-                 source_message_ids, allowed_input_roots=None) -> None:
+                 source_message_ids, allowed_input_roots=None, context_snapshot_factory=None) -> None:
         if type(account_id) is not int or not 1 <= account_id <= 2**63 - 1 or not callable(source_message_ids):
             raise ValueError("invalid artifact account or source supplier")
         self.private_user_id = None
@@ -118,6 +118,7 @@ class AutonomousArtifactStore:
         with _CATALOG_LOCKS_GUARD:
             self._catalog_lock = _CATALOG_LOCKS.setdefault(self._catalog, threading.RLock())
         self.source_message_ids = source_message_ids
+        self.context_snapshot_factory = context_snapshot_factory
         self.allowed_input_roots = tuple(Path(value).resolve() for value in (allowed_input_roots if allowed_input_roots is not None else (self.root,)))
         if not self.allowed_input_roots:
             raise ValueError("artifact input roots must be explicit")
@@ -162,6 +163,8 @@ class AutonomousArtifactStore:
                     "file": target.name, "origin": origin, "model": model, "type": media_type,
                     "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
                     "source_message_ids": list(sources), "created_ns": time.time_ns()}
+        if self.context_snapshot_factory:
+            metadata['context_snapshot'] = self.context_snapshot_factory()
         manifest = self.root / (artifact_id + ".meta.json")
         staging = self.root / (artifact_id + ".meta.tmp")
         try:
@@ -245,6 +248,12 @@ class AutonomousArtifactStore:
                     or metadata.get("scope") != self.scope or not self._sources_usable(metadata.get("source_message_ids"))):
                 return None
             filename = metadata.get("file")
+            if metadata.get('context_snapshot'):
+                from app.agent.context_dependencies import context_snapshot_valid
+                if not context_snapshot_valid(self.engine, account_id=self.account_id, scope=self.scope,
+                        identifier=metadata['context_snapshot'], group_id=self.group_id,
+                        private_user_id=self.private_user_id):
+                    return None
             if not isinstance(filename, str) or Path(filename).name != filename:
                 return None
             path = _local_file(self.root / filename, (self.root,))

@@ -166,12 +166,14 @@ class AutonomousSocialExecutor:
         self.research_runner = BoundedBlockingRunner(2)
         self.research_jobs = ResearchDelegationQueue(router.engine, account_id=router.runtime.settings.bot_qq,
             surface='group', execute=self._execute_research, deliver=self._return_research,
-            authorized=self._research_authorized, clock=lambda: self.clock())
+            authorized=self._research_authorized, clock=lambda: self.clock(),
+            task_workspace_root=router.runtime.settings.data_dir / 'research_tasks')
         from app.agent.media_tasks import MediaTaskQueue
         self.media_jobs = MediaTaskQueue(router.engine, account_id=router.runtime.settings.bot_qq,
             surface='group', execute=self._execute_media, deliver=self._return_media,
             available=lambda: getattr(getattr(self.qzone, 'gateway', None), 'websocket', True) is not None,
-            authorized=self._research_authorized, clock=lambda: self.clock())
+            authorized=self._research_authorized, clock=lambda: self.clock(),
+            task_workspace_root=router.runtime.settings.data_dir / 'research_tasks')
 
     async def _execute_media(self, payload, guard):
         from app.agent.media_tasks import execute_web_media, media_result, media_store
@@ -259,7 +261,8 @@ class AutonomousSocialExecutor:
             if item.kind == 'group' and item.scope_id == payload['scope_id']), job)
         observation = SocialObservation(job, self.clock(), '', (), guard.source_message_ids)
         result = await self.run_tools(observation, guard, interactive=True, target_user_id=payload['actor_id'],
-            target_message_id=message_id, direct_group_reply=True, research_result=payload['result'])
+            target_message_id=message_id, direct_group_reply=True, research_result={**payload['result'],
+                'parent_task_id': payload.get('parent_task_id'), 'returned_job_id': guard.job_id})
         return 'completed' if result.status == 'sent' else result.status if result.status in {'uncertain', 'blocked'} else 'failed'
 
     def handles_group(self, group_id):
@@ -460,6 +463,24 @@ class AutonomousSocialExecutor:
         observed_sources = set(observation.source_message_ids)
         original_context_ids = observation.source_message_ids
         memory_dependencies = {}
+        retained_sources = set()
+        retained_memory_dependencies = {}
+        def admit_context_snapshot(identifier):
+            from app.agent.context_dependencies import context_snapshot_valid
+            from app.storage.agent_sessions import read_context_snapshot, CONTEXT_DEPENDENCY_LIMIT
+            if not context_snapshot_valid(self.router.engine, account_id=self.router.runtime.settings.bot_qq,
+                    scope=scope, identifier=identifier, group_id=job.scope_id, now=self.clock()):
+                return False
+            deps = read_context_snapshot(self.router.engine, account_id=self.router.runtime.settings.bot_qq,
+                scope=scope, identifier=identifier, now=self.clock())
+            if (deps is None or len(retained_sources | set(deps['sources'])) +
+                    len(retained_memory_dependencies.keys() | deps['memory'].keys()) > CONTEXT_DEPENDENCY_LIMIT
+                    or any(key in retained_memory_dependencies and retained_memory_dependencies[key] != value
+                        for key, value in deps['memory'].items())):
+                return False
+            retained_sources.update(deps['sources'])
+            retained_memory_dependencies.update(deps['memory'])
+            return True
         intention_memory_dependencies = {}
         store = AutonomousArtifactStore(root, account_id=self.router.runtime.settings.bot_qq, scope=scope,
                     engine=self.router.engine, source_message_ids=lambda: tuple(sorted(observed_sources)))
@@ -468,6 +489,11 @@ class AutonomousSocialExecutor:
         if self.runtime_mode == "harness" and job.kind == "group" and intention:
             from app.agent.memory_integration import restore_memory_dependency_receipt
             note = intention.get("working_intention", {})
+            if note.get('_context_dependency_receipt'):
+                from app.agent.context_dependencies import context_snapshot_valid
+                if not admit_context_snapshot(note['_context_dependency_receipt']):
+                    intention = {}
+                    note = {}
             intention_has_receipt = "_memory_dependency_receipt" in note
             if intention_has_receipt:
                 restored = restore_memory_dependency_receipt(self.router.engine, group_id=job.scope_id,
@@ -500,17 +526,27 @@ class AutonomousSocialExecutor:
             def valid(inner):
                 if not original_guard.valid():
                     return False
+                if self.runtime_mode == 'harness' and job.kind == 'group':
+                    from app.agent.memory_integration import retained_memory_dependencies_valid
+                    if not retained_memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
+                            dependencies=retained_memory_dependencies, now=self.clock()):
+                        return False
                 if self.runtime_mode == "harness" and job.kind == "group" and memory_dependencies:
                     from app.agent.memory_integration import memory_dependencies_valid
                     if not memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
                             dependencies=memory_dependencies, now=self.clock()):
                         return False
-                if job.kind != "group" or not observed_sources:
+                if job.kind != "group" or not (observed_sources or retained_sources):
                     return True
                 with session_scope(self.router.engine) as session:
-                    rows = list(session.scalars(select(Message).where(Message.group_id == job.scope_id,
-                                            Message.id.in_(observed_sources))))
-                    return len(rows) == len(observed_sources) and all(is_usable_memory_source(r, group_id=job.scope_id) for r in rows)
+                    sources = sorted(observed_sources | retained_sources)
+                    for index in range(0, len(sources), 400):
+                        batch = sources[index:index + 400]
+                        rows = list(session.scalars(select(Message).where(Message.group_id == job.scope_id,
+                                                Message.id.in_(batch))))
+                        if len(rows) != len(batch) or any(not is_usable_memory_source(r, group_id=job.scope_id) for r in rows):
+                            return False
+                    return True
             def require_valid(inner):
                 original_guard.require_valid()
                 if not inner.valid():
@@ -523,6 +559,7 @@ class AutonomousSocialExecutor:
         persona_guidance = ''
         persona_fingerprint = None
         memory_context = None
+        delivered_texts = []
         workspace = None
         session_scope_key = ('background:' + scope if self.runtime_mode == 'harness'
             and job.kind == 'group' and not direct_group_reply and not owner_command
@@ -534,7 +571,7 @@ class AutonomousSocialExecutor:
         current_target = None
         from app.agent.shared_links import build_share_access, observed_share_sources, share_context_text, wrap_share_web_tools, WEB_REQUEST_POLICY
         if self.runtime_mode == "harness" and job.kind == "group":
-            from app.agent.memory_integration import build_agent_memory, memory_dependencies_valid
+            from app.agent.memory_integration import build_agent_memory, memory_dependencies_valid, retained_memory_dependencies_valid
             from app.agent.persona_integration import build_group_persona_context, build_group_persona_fallback
             from app.agent.service_tools import ServiceToolContext
             from app.core.persona_engine import render_persona
@@ -590,13 +627,19 @@ class AutonomousSocialExecutor:
                         valid = bool(item and item.user_id == actor_id and is_usable_memory_source(item, group_id=job.scope_id))
                     return valid
                 def valid_task_dependencies(metadata):
+                    if metadata.get('context_snapshot'):
+                        from app.agent.context_dependencies import context_snapshot_valid
+                        if not context_snapshot_valid(self.router.engine,
+                                account_id=self.router.runtime.settings.bot_qq, scope=scope,
+                                identifier=metadata['context_snapshot'], group_id=job.scope_id, now=self.clock()):
+                            return False
                     sources = metadata.get('sources', [])
                     dependencies = metadata.get('memory', {})
                     if (not isinstance(sources, list) or any(type(item) is not int or item <= 0 for item in sources)
                             or not isinstance(dependencies, dict)):
                         return False
                     sources = set(sources)
-                    if (len(observed_sources | sources) > 200
+                    if not metadata.get('context_snapshot') and (len(observed_sources | sources) > 200
                             or len(memory_dependencies.keys() | dependencies.keys()) > 200):
                         return False
                     if not memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
@@ -609,14 +652,20 @@ class AutonomousSocialExecutor:
                             is_usable_memory_source(row, group_id=job.scope_id) for row in rows)
                     if not valid:
                         return False
-                    observed_sources.update(sources)
-                    memory_dependencies.update(dependencies)
+                    if metadata.get('context_snapshot') and not admit_context_snapshot(metadata['context_snapshot']):
+                        return False
+                    if not metadata.get('context_snapshot'):
+                        observed_sources.update(sources)
+                        memory_dependencies.update(dependencies)
                     return True
                 workspace = ResearchTaskWorkspace(self.router.runtime.settings.data_dir / 'research_tasks',
                     scope=scope, actor_id=actor_id, source_id=int(current_target['source_id']),
                     request=current_target['text'], valid_source=valid_task_source,
-                    dependency_snapshot=lambda: {'memory': dict(memory_dependencies), 'sources': sorted(observed_sources)},
+                    dependency_snapshot=lambda: {'memory': dict(memory_dependencies), 'sources': sorted(observed_sources),
+                        'context_snapshot': freeze_context()},
                     valid_dependencies=valid_task_dependencies,
+                    cancel_background=lambda identifier: [queue.cancel_task(job.scope_id, actor_id, identifier,
+                        before_commit=guard.require_valid) for queue in (self.media_jobs, self.research_jobs)],
                     task_content_budget=getattr(self.router.runtime.settings, 'agent_web_task_max_chars', 96000))
                 session_scope_key = workspace.context_scope
                 prior = self.sessions.read(session_scope_key)
@@ -661,13 +710,13 @@ class AutonomousSocialExecutor:
                 logger.info("agent_context_phase phase=persona state=finished elapsed_ms=%.3f", (time.monotonic()-prepared_at)*1000)
         state = self.sessions.read(session_scope_key)
         if self.runtime_mode == "harness" and job.kind == "group":
-            prior_dependencies = state["checkpoint"].get("memory_dependencies", {})
+            prior_dependencies = state.get('context_memory_dependencies', state["checkpoint"].get("memory_dependencies", {}))
             if not intention_has_receipt:
                 intention_memory_dependencies = state["checkpoint"].get("intention_memory_dependencies", {})
             if not memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
                     dependencies=intention_memory_dependencies, now=self.clock()):
                 intention = {}
-            changed_memory = not memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
+            changed_memory = not retained_memory_dependencies_valid(self.router.engine, group_id=job.scope_id,
                 dependencies=prior_dependencies, now=self.clock())
             if (persona_fingerprint is not None and state["checkpoint"]
                     and state["checkpoint"].get("persona_fingerprint") != persona_fingerprint) or changed_memory:
@@ -678,31 +727,39 @@ class AutonomousSocialExecutor:
                     "persona_fingerprint": persona_fingerprint,
                     "intention_memory_dependencies": intention_memory_dependencies},
                     tuple(sorted(observed_sources)), expected_revision=state["revision"],
-                    before_commit=guard.require_valid)
+                    before_commit=guard.require_valid, reset_dependencies=True)
             with session_scope(self.router.engine) as session:
-                prior_ids = state["source_message_ids"]
-                rows = list(session.scalars(select(Message).where(Message.group_id == job.scope_id, Message.id.in_(prior_ids))))
-                invalid = [source_id for source_id in prior_ids if not any(row.id == source_id and is_usable_memory_source(row, group_id=job.scope_id) for row in rows)]
-            for source_id in invalid:
+                prior_ids = state.get('context_source_message_ids', state['source_message_ids'])
+                usable = set()
+                for index in range(0, len(prior_ids), 400):
+                    rows = session.scalars(select(Message).where(Message.group_id == job.scope_id,
+                        Message.id.in_(prior_ids[index:index + 400])))
+                    usable.update(row.id for row in rows if is_usable_memory_source(row, group_id=job.scope_id))
+                invalid = set(prior_ids) - usable
+            for source_id in sorted(invalid)[:1]:
                 self.sessions.clear_if_source(session_scope_key, source_id)
             state = self.sessions.read(session_scope_key)
-            if not invalid and len(observed_sources | set(state["source_message_ids"])) <= 200:
-                observed_sources.update(state["source_message_ids"])
-                prior_dependencies = state["checkpoint"].get("memory_dependencies", {})
-                if len(memory_dependencies.keys() | prior_dependencies.keys()) <= 200:
-                    memory_dependencies.update(prior_dependencies)
-                else:
-                    state = self.sessions.save(session_scope_key, [], {"receipts": state["checkpoint"].get("receipts", []),
-                        "last_status": "memory_dependency_budget", "persona_fingerprint": persona_fingerprint,
-                        "intention_memory_dependencies": intention_memory_dependencies},
-                        tuple(sorted(observed_sources)), expected_revision=state["revision"],
-                        before_commit=guard.require_valid)
-            elif not invalid and state["source_message_ids"]:
-                # Losing provenance while retaining framework context would
-                # permit a recalled old source to survive the next wake.
-                self.sessions.clear_if_source(session_scope_key, state["source_message_ids"][0])
-                state = self.sessions.read(session_scope_key)
+            retained_sources.update(state.get('context_source_message_ids', state['source_message_ids']))
+            retained_memory_dependencies.update(state.get('context_memory_dependencies',
+                state['checkpoint'].get('memory_dependencies', {})))
         from app.agent.owner_actions import OwnerActionService
+        snapshot_cache = {}
+        def freeze_context():
+            if self.runtime_mode != 'harness' or job.kind != 'group':
+                return None
+            basis = (tuple(sorted(observed_sources | retained_sources)),
+                tuple(sorted(memory_dependencies.items())), tuple(sorted(retained_memory_dependencies.items())))
+            if snapshot_cache.get('basis') != basis:
+                snapshot_cache['id'] = self.sessions.freeze_dependencies(session_scope_key,
+                    tuple(sorted(observed_sources)), memory_dependencies, authority_scope=scope,
+                    before_commit=guard.require_valid, retained_context={'sources': sorted(retained_sources),
+                        'memory': retained_memory_dependencies})
+                snapshot_cache['basis'] = basis
+            return snapshot_cache['id']
+        if self.runtime_mode == 'harness' and job.kind == 'group':
+            store.context_snapshot_factory = freeze_context
+        if workspace is not None and research_result and research_result.get('parent_task_id'):
+            workspace.resume(research_result['parent_task_id'])
         owner_service = OwnerActionService(self.router.engine, runtime=self.router.runtime, clock=self.clock)
         owner_source = (owner_service.source(owner_command['source_id']) if owner_command else
             owner_service.source(current_target['source_id']) if interactive and direct_group_reply and current_target else None)
@@ -726,7 +783,11 @@ class AutonomousSocialExecutor:
                 dispatch.repository.recover(scope)
             guard = dispatch
         group_images_allowed = job.kind == "group" and job.allow_images and self.image_service is not None
-        web_source = owner_source if owner_command else current_target if interactive and research_result is None else None
+        from app.agent.research_queue import ResearchJobGuard
+        request_continuation = (isinstance(original_guard, ResearchJobGuard)
+            and original_guard.payload.get('source_id') == (current_target or {}).get('source_id'))
+        web_source = (owner_source if owner_command else current_target
+            if interactive and (research_result is None or request_continuation) else None)
         if hasattr(original_guard, 'reserve_model'):
             web_source = None  # Proactive participation never grants network access.
         web_scope = owner_source['source_group_id'] if owner_command and owner_source else job.scope_id if job.kind == 'group' else None
@@ -794,6 +855,7 @@ class AutonomousSocialExecutor:
             if self.runtime_mode == "harness" and job.kind == "group":
                 from app.agent.memory_integration import create_memory_dependency_receipt
                 note["_memory_dependency_receipt"] = create_memory_dependency_receipt(memory_dependencies)
+                note['_context_dependency_receipt'] = freeze_context()
             return note if len(str(note)) <= 2000 else None
 
         async def remember(args):
@@ -833,13 +895,12 @@ class AutonomousSocialExecutor:
                       "author_id": r.user_id, "text": r.plain_text[:700],
                       "timestamp": shanghai_aware(r.timestamp).isoformat(timespec="seconds")} for r in rows]})
 
-        auto_media_queued = False
         async def submit_media(operation, args, candidates=None):
-            nonlocal auto_media_queued
             guard.require_valid()
             if hasattr(original_guard, 'reserve_model'):
                 return ToolOutcome({'error': 'media_requires_current_user_request'}, 'blocked')
-            if research_result and research_result.get('kind') == 'media_result':
+            if research_result and research_result.get('kind') == 'media_result' and not (
+                    request_continuation and workspace and workspace.formal):
                 return ToolOutcome({'error': 'media_result_cannot_resubmit'}, 'blocked')
             if operation == 'generate_image':
                 try:
@@ -851,11 +912,12 @@ class AutonomousSocialExecutor:
                 'scope': scope, 'scope_id': job.scope_id, 'actor_id': target_user_id,
                 'source_id': current_target['source_id'], 'sources': sorted(observed_sources),
                 'memory': dict(memory_dependencies), 'operation': operation, 'arguments': args,
+                'context_snapshot': freeze_context(),
+                'parent_task_id': workspace.task_id if workspace and workspace.formal else None,
                 'candidates': candidates or {}, 'request_addressed': bool(direct_group_reply),
                 'goal': '完成媒体操作并交付真实产物', 'model_limit': 500 if owner_authority else job.max_model_calls_daily,
                 'image_limit': job.max_image_calls_daily},
-                parent_turn=guard.action_id, before_commit=guard.require_valid)
-            auto_media_queued |= result.status=='ok' and result.data.get('delivery')=='automatic_delivery_to_original_request'
+                parent_turn='source:' + str(current_target['source_id']), before_commit=guard.require_valid)
             return result
 
         async def generate(args):
@@ -1024,6 +1086,8 @@ class AutonomousSocialExecutor:
                     workspace.record_delivery(args['text'], result.status)
                 except (ValueError, OSError):
                     logger.warning('research_delivery_checkpoint_unavailable')
+            if result.status == 'sent':
+                delivered_texts.append(args['text'][:4000])
             details = {"result": result.status}
             if result.status != 'sent':
                 details.update(error=result.reason or 'group_send_failed',
@@ -1214,6 +1278,8 @@ class AutonomousSocialExecutor:
                 memory_search_allowed=memory_search_allowed,
                 available_input_budget=memory_input_budget,
                 memory_dependencies=memory_dependencies,
+                context_snapshot_factory=freeze_context if job.kind == 'group' else None,
+                admit_context_snapshot=admit_context_snapshot if job.kind == 'group' else None,
                 task_service=PersonaTaskService(self.router.engine, account_id=self.router.runtime.settings.bot_qq, clock=self.clock),
                 schedule_wakeup=schedule_wakeup, list_wakeups=list_wakeups, cancel_wakeup=cancel_wakeup)))
             if job.kind == "group":
@@ -1251,6 +1317,8 @@ class AutonomousSocialExecutor:
                     allow_group_images=group_images_allowed)
         if self.runtime_mode == 'harness' and interactive and current_target and not owner_command:
             tools.append(self.media_jobs.status_tool(scope_id=job.scope_id, actor_id=target_user_id, guard=guard))
+            from app.agent.media_tasks import build_media_batch_tool
+            tools.extend(build_media_batch_tool(tools, guard))
         if hasattr(original_guard, 'reserve_model') and interactive:
             tools = [replace(tool, authorization=lambda: False) if tool.effect == 'image' else tool for tool in tools]
         write_available = bool(owner_authority) or interactive or (job.patrol_interval_seconds is not None) or SocialAgentRepository(self.router.engine).action_budget_available(
@@ -1296,11 +1364,7 @@ class AutonomousSocialExecutor:
             # closed recent exchanges have exceeded the retained window.
             current_logs = native_session_logs(session_home, session_id)
             retained_size = native_session_size(current_logs)
-            history_limit = (getattr(self.router.runtime.settings, 'agent_context_history_tokens', 24000)
-                if direct_group_reply or owner_command or research_result is not None or participation_approved else
-                getattr(self.router.runtime.settings, 'agent_background_history_tokens', 8000))
             if (state["checkpoint"].get("in_flight") or should_rotate_context(state['checkpoint']) or retained_size > 8 * 1024 * 1024
-                    or state['checkpoint'].get('last_history_estimated_tokens', 0) > history_limit
                     or state['checkpoint'].get('context_format_version') != context_version):
                 session_id = uuid4().hex
                 from app.agent.live_context import compact_checkpoint_items
@@ -1336,7 +1400,9 @@ class AutonomousSocialExecutor:
             request_policy = RequestContextPolicy.from_settings(settings)
             if not direct_group_reply and not owner_command and research_result is None and not participation_approved:
                 request_policy = replace(request_policy,
-                    history_tokens=getattr(settings, 'agent_background_history_tokens', 8000))
+                    soft_input_tokens=32000, target_input_tokens=20000,
+                    retain_tokens=getattr(settings, 'agent_background_history_tokens', 8000),
+                    summary_tokens=min(request_policy.summary_tokens, 4096))
             total_timeout = (getattr(settings, 'agent_task_turn_timeout_seconds', 600)
                 if direct_group_reply else settings.group_agent_turn_timeout_seconds) if interactive else settings.agent_background_turn_timeout_seconds
             if research_result is not None:
@@ -1370,6 +1436,8 @@ class AutonomousSocialExecutor:
                     result = self.research_jobs.enqueue({'account_id': settings.bot_qq, 'surface': 'group',
                         'scope': scope, 'scope_id': job.scope_id, 'actor_id': actor_id, 'source_id': current_target['source_id'],
                         'sources': list(child_sources), 'memory': dict(memory_dependencies),
+                        'context_snapshot': freeze_context(),
+                        'parent_task_id': workspace.task_id if workspace.formal else None,
                         'request_addressed': bool(direct_group_reply),
                         'goal': args['goal'], 'deliverable': args['deliverable'], 'reason': args['reason'],
                         'task_id': child.task_id, 'task_key': 'delegate:' + str(guard.action_id),
@@ -1404,7 +1472,8 @@ class AutonomousSocialExecutor:
                 context_policy=request_policy,
                 ephemeral_context=True,
                 admission_metrics=getattr(original_guard, 'admission_metrics', None),
-                finish_after_delivery=lambda: auto_media_queued or participation_approved or
+                task_workspace=workspace,
+                finish_after_delivery=lambda: participation_approved or
                     bool(research_result and research_result.get('kind')=='media_result'),
                 require_reply=bool(interactive and direct_group_reply),
                 reply_source_id=current_target.get("source_id") if direct_group_reply and current_target else None,
@@ -1476,6 +1545,8 @@ class AutonomousSocialExecutor:
                     "request": current_target.get("text", "")[:2000] if current_target else "",
                     "reply_source_id": current_target.get("source_id") if current_target else None}, ensure_ascii=False)},
                     {"role": "assistant", "content": json.dumps({"status": result.status, "trace": result.trace,
+                        "task_status": result.task_status,
+                        "answer": '\n'.join(delivered_texts)[:6000],
                         "reply_source_id": current_target.get("source_id") if current_target else None}, ensure_ascii=False)}]
                 pure_silent = result.status == 'silent' and not dispatch.receipts
                 items = (safe_closed_items(items) if context_reusable(result)
@@ -1488,6 +1559,7 @@ class AutonomousSocialExecutor:
                     "intention_memory_dependencies": intention_memory_dependencies,
                     "session_path": str(native_logs[0] if native_logs else self.sessions.session_path(session_scope_key)),
                     "last_status": result.status,
+                    "task_status": result.task_status,
                     "last_reason": result.reason, "context_reusable": context_reusable(result),
                     "last_input_estimated_tokens": (state['checkpoint'].get('last_input_estimated_tokens', 0) if pure_silent else
                         next((row.get("context_estimated_tokens",0) for row in reversed(result.trace) if row.get("status")=="model_request" and row.get("purpose","agent")=="agent"),0)),
@@ -1496,7 +1568,8 @@ class AutonomousSocialExecutor:
                     "reply_source_id": current_target.get("source_id") if current_target else None,
                     "receipts": [{**receipt, "reply_source_id": current_target.get("source_id") if current_target else None}
                         for receipt in dispatch.receipts]}, tuple(sorted(observed_sources)),
-                    expected_revision=state["revision"], before_commit=guard.parent.require_valid)
+                    expected_revision=state["revision"], before_commit=guard.parent.require_valid,
+                    retained_context={'sources': sorted(retained_sources), 'memory': retained_memory_dependencies})
             if result.status == "sent" and result.reason in {"tool:set_nickname", "tool:set_avatar", "tool:set_group_card"}:
                 result = replace(result, reason="profile_ack:" + result.reason[5:])
             root.mkdir(parents=True, exist_ok=True)

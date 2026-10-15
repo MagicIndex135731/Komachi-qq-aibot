@@ -166,6 +166,52 @@ def test_full_envelope_ceiling_includes_schema_and_blocks_before_paid_request(br
     assert bridge.trace[-1]['status']=='context_budget_blocked'
 
 
+def test_main_total_budget_replaces_legacy_history_rotation(bridge_factory):
+    from app.config import AppSettings
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse())
+    policy = RequestContextPolicy.from_settings(AppSettings(NAPCAT_WS_URL='ws://localhost:3001',
+        LLM_BASE_URL='https://example.com', LLM_API_KEY='synthetic', BOT_QQ=900000099, OWNER_QQ=900000101))
+    bridge.owner.context_policy = policy
+    patches = bridge.patch()
+    assert policy.history_tokens == 0
+    assert bridge.compaction_threshold == 96000
+    compaction = next(item for row in patches for item in row.get('insert', [])
+        if item.get('id') == 'xiaomachi-compaction')
+    assert 24000 <= compaction['config']['retainTokens'] <= 32000
+    body = request_body()
+    body['input'] = [{'role': 'user', 'content': '汉' * 165000}]
+    sink = ModelHandler()
+    bridge.forward(sink, body)
+    assert not requests and sink.replies[0][0] == 413
+
+
+@pytest.mark.asyncio
+async def test_native_total_soft_threshold_compacts_without_changing_session(tmp_path):
+    def script(body, number):
+        summary = body.get('max_output_tokens') == 512
+        stream = responses_sse(text='CHECKPOINT: original task and verified evidence; next inspect auth'
+            if summary else 'closed step', number=number)
+        return stream.replace(b'"input_tokens": 10',
+            b'"input_tokens": 100' if summary else b'"input_tokens": 12000')
+    client, requests, _ = model_client(script)
+    policy = RequestContextPolicy(context_window=32000, safety_tokens=1000, tool_reserve_tokens=1000,
+        soft_input_tokens=10000, target_input_tokens=7000, hard_input_tokens=24000,
+        retain_tokens=2000, summary_tokens=512)
+    for index in range(3):
+        agent = HarnessToolAgent(decision_client=client, session_home=tmp_path/'native-total',
+            session_id='same-native-session', context_policy=policy)
+        try:
+            result = await agent.run(['System persona: stable',
+                f'CURRENT_TARGET_{index}: continue original task; ' + 'closed evidence ' * 500], (), Guard())
+            assert result.status == 'silent', (result.reason, result.trace)
+        finally:
+            agent.close()
+    assert any(body.get('max_output_tokens') == 512 for body in requests)
+    assert 'CURRENT_TARGET_2' in json.dumps(requests[-1])
+    assert 'CHECKPOINT' in json.dumps(requests[-1])
+    client.http_client.close()
+
+
 @pytest.mark.asyncio
 async def test_native_threshold_compacts_and_resumes_same_task(tmp_path):
     requests_seen = []

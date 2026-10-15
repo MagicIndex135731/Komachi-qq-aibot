@@ -13,9 +13,9 @@ from tests.agent.test_autonomous_social import add_source, composed, ScriptedMod
 from tests.agent.test_harness_runtime import bridge_factory, request_body, ModelHandler
 
 
-@pytest.mark.parametrize('direct,budget,status,rotates', [(True, 24000, 'sent', True),
-    (False, 8000, 'sent', True), (False, 8000, 'silent', False)])
-async def test_history_budget_rotates_even_if_native_compaction_disabled(sqlite_engine, tmp_path, monkeypatch, direct, budget, status, rotates):
+@pytest.mark.parametrize('direct,budget,status,rotates', [(True, 24000, 'sent', False),
+    (False, 8000, 'sent', False), (False, 8000, 'silent', False), (True, 24000, 'failed', True)])
+async def test_legacy_history_estimate_does_not_preempt_total_budget(sqlite_engine, tmp_path, monkeypatch, direct, budget, status, rotates):
     sessions = []
     class Harness:
         def __init__(self, **kwargs):

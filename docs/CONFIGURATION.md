@@ -104,9 +104,12 @@ Harness在本地检查后才调用模型，每轮最近最多30条群消息；�
 | `WEB_PAGE_PROXY_URL` | 留空直连；可设 `http://127.0.0.1:18797`，用于本地网页及网页图片/视频读取，聊天与搜索接口维持原出口 |
 | `DOWNLOAD_MEDIA_RETENTION_HOURS` | 网页及X下载图片/视频保留24小时，可设1–168小时；群私启动及每小时清理，有效待回传任务保护文件 |
 | `DOWNLOAD_MEDIA_CACHE_MAX_MIB` | 网页/X下载缓存共享上限512MiB，可设128–8192MiB；下载前预留空间，优先清理旧且未使用的媒体，满且全被保护时拒绝新下载 |
-| `AGENT_CONTEXT_COMPACTION_ENABLED` / `AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO` | 原生压缩默认启用；阈值取历史预算加固定输入、窗口62%的较小值；摘要不发送QQ |
-| `AGENT_CONTEXT_RETAIN_TOKENS` / `AGENT_CONTEXT_SUMMARY_TOKENS` | 近期保留上限16000且不超过历史预算三分之一；摘要4096输出token，每轮内部总结最多2次 |
-| `AGENT_CONTEXT_HISTORY_TOKENS` / `AGENT_BACKGROUND_HISTORY_TOKENS` | 主聊天动态历史24000、后台8000 token；固定规则/schema另计，超预算可换段；临时观察约3000软预算，不截断当前明确请求 |
+| `AGENT_CONTEXT_COMPACTION_ENABLED` / `AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO` | 原生压缩默认启用；完整输入软阈值还受窗口62%和硬保护余量约束；摘要不发送QQ |
+| `AGENT_CONTEXT_SOFT_INPUT_TOKENS` / `AGENT_CONTEXT_TARGET_INPUT_TOKENS` | 主会话完整输入默认96000触发压缩，压缩后目标64000；规则、工具、历史和本轮资料统一计入估算 |
+| `AGENT_CONTEXT_HARD_INPUT_TOKENS` | 默认160000，并扣除模型窗口中的输出、安全和后续工具预留；超出不向上游发送 |
+| `AGENT_CONTEXT_RETAIN_TOKENS` / `AGENT_CONTEXT_SUMMARY_TOKENS` | 近期完整内容最多32000，受目标减固定/临时输入及摘要余量限制；摘要最多8192输出token，每轮内部总结最多2次 |
+| `AGENT_MEMORY_CONTEXT_TOKENS` | Agent自动召回及显式记忆工具每次正文默认8000估算token，在最终packer中保留完整证据与来源；不与约3000的近期观察互相挤占 |
+| `AGENT_CONTEXT_HISTORY_TOKENS` / `AGENT_BACKGROUND_HISTORY_TOKENS` | 前者为旧配置兼容字段，不再触发主会话换段；后者控制后台近期保留量（默认8000）。后台总输入软阈值32000、目标20000；当前明确问题不截断 |
 | `AGENT_MONITOR_ENABLED` | 默认false；启用私有最终请求/公开过程采集及本机只读8765网页，操作与保留限额见WSL指南和架构 |
 | `WEB_SEARCH_REASONING_EFFORT` | 搜索独立思考强度；Sol 套餐 low，Gemini 套餐 medium，不随主聊天强度切换 |
 | `LLM_WEB_SEARCH_MODEL` / `LLM_WEB_SEARCH_API_KEY` | 搜索模型留空复用主模型。主接口的 Wyzlab alpha 可覆盖搜索 key；独立外部搜索使用 `SEARCH_BASE_URL` / `SEARCH_API_KEY` 和指定搜索模型，凭据只放私有环境 |

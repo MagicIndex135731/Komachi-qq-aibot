@@ -168,6 +168,17 @@ def memory_dependencies_valid(engine, *, group_id: int, dependencies: Mapping[st
     return True
 
 
+def retained_memory_dependencies_valid(engine, *, group_id: int, dependencies, now) -> bool:
+    """Historical dependencies have their own bounded ledger, not a turn cap."""
+    from app.storage.agent_sessions import CONTEXT_DEPENDENCY_LIMIT
+    if not isinstance(dependencies, dict) or len(dependencies) > CONTEXT_DEPENDENCY_LIMIT:
+        return False
+    entries = list(dependencies.items())
+    return all(memory_dependencies_valid(engine, group_id=group_id,
+        dependencies=dict(entries[index:index + DEPENDENCY_LIMIT]), now=now)
+        for index in range(0, len(entries), DEPENDENCY_LIMIT))
+
+
 def _summary_dependencies(session, row: Summary, now, *, ancestors=frozenset()) -> dict[str, str]:
     if row.id in ancestors or len(ancestors) >= 16:
         raise _MemoryReadError("summary_provenance_invalid")
@@ -314,7 +325,7 @@ def _summary_sources(session, group_id: int, summary: Summary) -> tuple[str, ...
     return tuple(dict.fromkeys(row.platform_msg_id for row in rows))
 
 
-def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | None):
+def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | None, preload: bool = False):
     packed = result.packed_context
     if not isinstance(packed, PackedMemoryContext):
         raise _MemoryReadError("memory_pipeline_unavailable")
@@ -322,6 +333,8 @@ def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | N
     packer = getattr(provider, "_packer", None)
     if packer is None:
         raise _MemoryReadError("memory_pipeline_unavailable")
+    from app.agent.context_policy import estimate_text_tokens
+    packer = packer.with_token_counter(estimate_text_tokens)
     group_id = request.group_id
     known = set(context.observed_sources)
     selected = {"recent": [], "raw": [], "facts": [], "summaries": []}
@@ -352,10 +365,10 @@ def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | N
             ):
                 return
             ids = {row.id for row in rows.values()}
-            if len(known | returned_sources | ids) > SOURCE_LIMIT:
+            if len(known | ids) > SOURCE_LIMIT:
                 return
             dependencies = dependencies or {}
-            if len(set(context.memory_dependencies) | set(selected_dependencies) | set(dependencies)) > DEPENDENCY_LIMIT:
+            if len(set(context.memory_dependencies) | set(dependencies)) > DEPENDENCY_LIMIT:
                 return
             returned_sources.update(ids)
             selected_dependencies.update(dependencies)
@@ -383,7 +396,9 @@ def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | N
 
         # Initial context keeps the configured adaptive packet. Explicit tools
         # retain ranked units and share a bounded result limit across layers.
-        recent = packed.recent_messages if not request.memory_layer else ()
+        # The live observation owns the recent 30 messages. Recall contributes
+        # historical evidence, rather than making a second, competing snapshot.
+        recent = packed.recent_messages if not request.memory_layer and not preload else ()
         for message in recent:
             register("recent", message, (message.source_msg_id,))
         buckets = [("facts", tuple(packed.facts)), ("raw", tuple(packed.evidence_segments)),
@@ -417,10 +432,28 @@ def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | N
             sources = (tuple(message.source_msg_id for message in item.messages)
                        if kind == "raw" else item.source_msg_ids)
             register(kind, item, sources, dependencies)
-    safe = packer.pack(packed.mode, available_input=request.available_input,
-        target_message_id=request.target_message_id, recent_messages=selected["recent"],
-        evidence_segments=selected["raw"], facts=selected["facts"], summaries=selected["summaries"],
-        recent_only=result.resolved_quote_role == "conversation_anchor")
+    available = request.available_input
+    for _ in range(16):
+        safe = packer.pack(packed.mode, available_input=available,
+            target_message_id=request.target_message_id, recent_messages=selected["recent"],
+            evidence_segments=selected["raw"], facts=selected["facts"], summaries=selected["summaries"],
+            recent_only=result.resolved_quote_role == "conversation_anchor")
+        with session_scope(context.router.engine) as session:
+            actual = MessageRepository(session).get_group_messages_by_platform_msg_ids(
+                group_id=group_id, platform_msg_ids=list(safe.source_msg_ids))
+            actual_ids = {row.id for row in actual.values()}
+        actual_dependencies = {}
+        for kind, units in (("facts", safe.facts), ("summaries", safe.summaries)):
+            for unit in units:
+                actual_dependencies.update(item_dependencies[(kind,
+                    unit.memory_id if kind == "facts" else unit.summary_id)])
+        if (len(known | actual_ids) <= SOURCE_LIMIT and
+                len(set(context.memory_dependencies) | set(actual_dependencies)) <= DEPENDENCY_LIMIT):
+            break
+        # Repack complete units; never drop IDs while retaining their text.
+        available = max(0, min(available - 1, int(available * .7)))
+    else:
+        raise _MemoryReadError("source_budget_exhausted")
     # A second packing pass may shrink the packet. Register only what was
     # actually returned, never an earlier oversized intermediate selection.
     with session_scope(context.router.engine) as session:
@@ -438,17 +471,19 @@ def _safe_packet(context: ServiceToolContext, request, result, *, limit: int | N
     return safe, source_ids, dependencies
 
 
-def _read(context: ServiceToolContext, *, query, addressed, layer="", member=None, limit=None):
+def _read(context: ServiceToolContext, *, query, addressed, layer="", member=None, limit=None, preload=False):
     context.guard.require_valid()
     subject_ids = (_member_id(context, member),) if member else None
     request = _request(context, query=query, addressed=addressed, layer=layer, subject_ids=subject_ids)
+    memory_budget = int(getattr(context.router.runtime.settings, 'agent_memory_context_tokens', 8000))
+    request = replace(request, available_input=min(request.available_input, memory_budget))
     orchestrator = getattr(context.router, "memory_orchestrator", None)
     if orchestrator is None:
         raise _MemoryReadError("memory_pipeline_unavailable")
     result = orchestrator.build_context(request)
     if result.group_id != request.group_id:
         raise _MemoryReadError("memory_scope_mismatch")
-    packed, source_ids, dependencies = _safe_packet(context, request, result, limit=limit)
+    packed, source_ids, dependencies = _safe_packet(context, request, result, limit=limit, preload=preload)
     context.guard.require_valid()
     with session_scope(context.router.engine) as session:
         sources = MessageRepository(session).get_group_messages_by_platform_msg_ids(
@@ -469,6 +504,8 @@ def _read(context: ServiceToolContext, *, query, addressed, layer="", member=Non
         "source_timestamps": source_timestamps,
         "memory_dependencies": dependencies,
         "estimated_tokens": packed.estimated_tokens,
+        "memory_budget_tokens": memory_budget,
+        "preload_history_only": bool(preload),
         "layer_counts": {"raw": len(packed.evidence_segments), "facts": len(packed.facts), "summaries": len(packed.summaries)},
         "resolved_subject_ids": result.resolved_subject_ids,
         "resolved_subject_binding": result.resolved_subject_binding,
@@ -536,7 +573,7 @@ async def build_agent_memory(
     context: ServiceToolContext, *, query: str | None = None, addressed: bool = False,
 ) -> ToolOutcome:
     """Build a normal group wake's complete existing memory context."""
-    return await _run_read(context, query=query, addressed=addressed)
+    return await _run_read(context, query=query, addressed=addressed, preload=True)
 
 
 async def call_agent_memory_tool(context: ServiceToolContext, name: str, arguments: dict[str, Any]) -> ToolOutcome:

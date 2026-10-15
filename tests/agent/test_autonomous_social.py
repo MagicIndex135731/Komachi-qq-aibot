@@ -409,7 +409,7 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
     from app.agent.tool_agent import ToolOutcome, ToolTurnResult
 
     captured = []
-    revision = ["first-revision"]
+    revision = ['a' * 64]
 
     def valid(engine, *, group_id, dependencies, now):
         return all(digest == revision[0] for digest in dependencies.values())
@@ -454,10 +454,10 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
         else:
             await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
         first = fixture.executor.sessions.read('background:' + job.key)
-        assert first["checkpoint"]["memory_dependencies"] == {"fact:1": "first-revision"}
-        assert first["checkpoint"]["intention_memory_dependencies"] == ({} if interrupted else {"fact:1": "first-revision"})
-        assert fixture.executor.repository.read_intention(job.key)["working_intention"]["_memory_dependency_receipt"] == {"fact:1": "first-revision"}
-        revision[0] = "replacement-revision"
+        assert first["checkpoint"]["memory_dependencies"] == {"fact:1": 'a' * 64}
+        assert first["checkpoint"]["intention_memory_dependencies"] == ({} if interrupted else {"fact:1": 'a' * 64})
+        assert fixture.executor.repository.read_intention(job.key)["working_intention"]["_memory_dependency_receipt"] == {"fact:1": 'a' * 64}
+        revision[0] = 'b' * 64
         for _ in range(2):
             fixture.clock[0] += timedelta(minutes=31)
             await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))

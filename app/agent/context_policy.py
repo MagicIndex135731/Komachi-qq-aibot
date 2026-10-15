@@ -214,6 +214,9 @@ class RequestContextPolicy:
     retain_tokens: int = 16000
     summary_tokens: int = 4096
     history_tokens: int = 0
+    soft_input_tokens: int = 0
+    target_input_tokens: int = 0
+    hard_input_tokens: int = 0
 
     @classmethod
     def from_settings(cls, settings):
@@ -222,9 +225,11 @@ class RequestContextPolicy:
             tool_reserve_tokens=int(getattr(settings, 'llm_tool_context_reserve_tokens', 32768)),
             compaction_enabled=bool(getattr(settings, 'agent_context_compaction_enabled', True)),
             threshold_ratio=float(getattr(settings, 'agent_context_compaction_threshold_ratio', 0.62)),
-            retain_tokens=int(getattr(settings, 'agent_context_retain_tokens', 16000)),
-            summary_tokens=int(getattr(settings, 'agent_context_summary_tokens', 4096)),
-            history_tokens=int(getattr(settings, 'agent_context_history_tokens', 24000)))
+            retain_tokens=int(getattr(settings, 'agent_context_retain_tokens', 32000)),
+            summary_tokens=int(getattr(settings, 'agent_context_summary_tokens', 8192)),
+            soft_input_tokens=int(getattr(settings, 'agent_context_soft_input_tokens', 96000)),
+            target_input_tokens=int(getattr(settings, 'agent_context_target_input_tokens', 64000)),
+            hard_input_tokens=int(getattr(settings, 'agent_context_hard_input_tokens', 160000)))
 
     def project(self, body: dict, *, protocol: str, current_call_ids: set[str], current_turn_id: str = '',
                 include_current_media: bool = True):

@@ -34,6 +34,9 @@ def test_child_has_small_budget_and_only_explicit_sources():
 
 def test_result_is_a_small_summary_not_raw_task_state():
     class Workspace:
+        task_id = 'a' * 24
+        def resource_page(self):
+            return {'total': 80}
         def summary(self):
             return {'goal': '目' * 2000, 'progress': '进' * 2000, 'next_step': '缺' * 1000,
                 'findings': ['结' * 1000] * 12, 'last_delivery': 'RAW_BODY', 'dependencies': {'secret': 'RAW_BODY'},

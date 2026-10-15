@@ -139,6 +139,36 @@ async def test_initial_recall_uses_existing_v3_pipeline_and_registers_historical
     assert counts(context) == before
 
 
+async def test_final_memory_budget_registers_only_evidence_actually_injected(context, monkeypatch):
+    from app.core.memory_context_packer import MemoryFact, PackedMemoryContext
+    from app.core.memory_orchestrator import MemoryContextResult
+    from app.agent.context_policy import estimate_text_tokens
+    facts = []
+    with session_scope(context.router.engine) as session:
+        source = session.get(Message, context.router.synthetic_source_id)
+        for index in range(24):
+            content = f'预算事实{index} ' + '历史细节' * 110
+            row = MemoryItem(scope_type='group', scope_id=str(GROUP), subject_type='user', subject_id=str(AUTHOR),
+                memory_kind='fact', content=content, source_msg_id=source.platform_msg_id,
+                source_msg_ids=[source.platform_msg_id], importance=.8, confidence=.9, status='active')
+            session.add(row)
+            session.flush()
+            facts.append(MemoryFact(content, (source.platform_msg_id,), group_id=GROUP, memory_id=row.id))
+    packet = PackedMemoryContext('normal', 32000, 0, '', facts=tuple(facts))
+    monkeypatch.setattr(context.router.memory_orchestrator, 'build_context',
+        lambda request: MemoryContextResult(GROUP, packet, (), 0, 'v2'))
+    context.router.runtime.settings.agent_memory_context_tokens = 1500
+    before = set(context.observed_sources)
+    outcome = await build_agent_memory(context, addressed=True)
+    assert outcome.status == 'ok'
+    assert 0 < outcome.data['layer_counts']['facts'] < len(facts)
+    assert estimate_text_tokens(outcome.data['evidence']) <= 1500
+    actual_facts = {f'fact:{fact.memory_id}' for fact in facts if fact.text in outcome.data['evidence']}
+    assert set(context.memory_dependencies) == actual_facts
+    assert context.observed_sources == before | set(outcome.data['source_ids'])
+    assert outcome.data['recent_source_ids'] == []
+
+
 @pytest.mark.parametrize("mode", ["preload", "search"])
 async def test_default_deadline_returns_complete_evidence_after_old_two_second_limit(context, mode):
     context.router.runtime.settings.memory_memory_tool_timeout_seconds = (
@@ -210,7 +240,10 @@ async def test_recent_source_ids_are_canonical_recent_rows_not_all_memory_source
     ids = _install_recent_packet(context, monkeypatch)
     outcome = await build_agent_memory(context)
     assert outcome.status == "ok"
-    assert outcome.data["recent_source_ids"] == [ids["recent-earlier"], ids["recent-chat"]]
+    assert outcome.data["recent_source_ids"] == []
+    assert outcome.data['preload_history_only'] is True
+    assert ids['recent-earlier'] not in outcome.data['source_ids']
+    assert ids['recent-chat'] not in outcome.data['source_ids']
     assert ids["target-query"] not in outcome.data["recent_source_ids"]
     assert ids["historical-star"] in outcome.data["source_ids"]
     assert ids["historical-star"] not in outcome.data["recent_source_ids"]
@@ -221,7 +254,7 @@ async def test_recent_source_ids_follow_final_packet_budget(context, monkeypatch
     ids = _install_recent_packet(context, monkeypatch, max_recent_messages=1)
     outcome = await build_agent_memory(context)
     assert outcome.status == "ok"
-    assert outcome.data["recent_source_ids"] == [ids["recent-chat"]]
+    assert outcome.data["recent_source_ids"] == []
     assert ids["recent-earlier"] not in outcome.data["source_ids"]
     assert "早一点的近聊" not in outcome.data["evidence"]
     assert ids["historical-star"] in outcome.data["source_ids"]
@@ -239,7 +272,7 @@ async def test_recent_source_ids_never_include_rejected_recent_rows(context, mon
         assert len(context.observed_sources) == 200
     outcome = await build_agent_memory(context)
     assert outcome.status == "ok"
-    assert outcome.data["recent_source_ids"] == ([ids["recent-earlier"]] if rejection == "revoked" else [])
+    assert outcome.data["recent_source_ids"] == []
     assert ids["recent-chat"] not in outcome.data["source_ids"]
     assert "今天的天气" not in outcome.data["evidence"]
     assert set(outcome.data["recent_source_ids"]).issubset(context.observed_sources)

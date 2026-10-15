@@ -29,7 +29,8 @@ def split_live_context(lines, *, budget=3000):
         elif line.startswith(MEMORY):
             value = json.loads(line[len(MEMORY):])
             memory = {key: value[key] for key in ('kind', 'status', 'mode', 'resolved_subject_ids',
-                'resolved_subject_binding', 'resolved_personal_memory_intent', 'memory_search_allowed') if key in value}
+                'resolved_subject_binding', 'resolved_personal_memory_intent', 'memory_search_allowed',
+                'layer_counts', 'memory_budget_tokens', 'preload_history_only', 'error') if key in value}
             blocks = list(value.get('evidence_blocks') or [value.get('evidence', '')])
             memory['source_count'] = len(value.get('source_ids', []))
         elif line.startswith(RECEIPTS):
@@ -45,11 +46,11 @@ def split_live_context(lines, *, budget=3000):
         persistent.append('Current request JSON:\n{"kind":"autonomous_observation"}')
     omitted_messages = omitted_blocks = 0
 
-    def render():
+    def render(*, include_memory=True):
         result = list(parts)
         if observation is not None:
             result.append(OBSERVATION + encode(observation))
-        if memory is not None:
+        if memory is not None and include_memory:
             result.append(MEMORY + encode({**memory, 'evidence': '\n\n'.join(blocks),
                 'omitted_evidence_blocks': omitted_blocks,
                 'guidance': '需要更多原文时调用记忆/历史工具；裁剪不代表不存在。'}))
@@ -57,24 +58,33 @@ def split_live_context(lines, *, budget=3000):
             result.append(RECEIPTS + encode(receipts))
         return '\n'.join(result)
 
-    text = render()
+    text = render(include_memory=False)
     while estimate_text_tokens(text) > budget:
         if observation and observation.get('context'):
             observation['context'] = list(observation['context'])[1:]
             omitted_messages += 1
             observation['omitted_context_count'] = omitted_messages
             observation['context_guidance'] = '最近观察有裁剪；需要原文时read_context，不声称读过被省略内容。'
-        elif blocks:
-            blocks.pop(0)
-            omitted_blocks += 1
         elif receipts:
             receipts.pop(0)
         else:
             break  # Trusted rules are not silently truncated by a soft budget.
-        text = render()
+        text = render(include_memory=False)
+    observation_tokens = estimate_text_tokens(text)
+    # Recall has already been atomically packed and admitted with its exact
+    # provenance. A second front-pruning pass here would break that contract.
+    text = render()
+    memory_tokens = max(0, estimate_text_tokens(text) - observation_tokens)
+    memory_budget = int(memory.get('memory_budget_tokens', 8000)) if memory else 0
     return persistent, text, {'live_context_estimated_tokens': estimate_text_tokens(text),
-        'live_context_budget_tokens': budget, 'live_context_omitted_messages': omitted_messages,
-        'live_context_omitted_memory_blocks': omitted_blocks}
+        'live_context_budget_tokens': budget + memory_budget,
+        'observation_context_estimated_tokens': observation_tokens,
+        'observation_context_budget_tokens': budget,
+        'memory_context_estimated_tokens': memory_tokens,
+        'memory_context_budget_tokens': memory_budget,
+        'memory_context_source_count': memory.get('source_count', 0) if memory else 0,
+        'live_context_omitted_messages': omitted_messages,
+        'live_context_omitted_memory_blocks': 0}
 
 
 def compact_checkpoint_items(items):
@@ -86,5 +96,5 @@ def compact_checkpoint_items(items):
         except (ValueError, TypeError):
             continue
         if isinstance(value, dict) and item.get('role') == 'assistant':
-            item['content'] = encode({key: value[key] for key in ('status', 'reason', 'reply_source_id', 'receipts') if key in value})
+            item['content'] = encode({key: value[key] for key in ('status', 'reason', 'answer', 'reply_source_id', 'receipts') if key in value})
     return result

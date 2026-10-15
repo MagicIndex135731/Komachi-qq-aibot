@@ -9,9 +9,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
+from uuid import uuid4
+from datetime import timedelta
 
-from sqlalchemy import DateTime, Integer, JSON, String
+from sqlalchemy import DateTime, Integer, JSON, String, delete, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.storage.autonomous_agent import AutonomousRepository
@@ -35,6 +38,53 @@ class AgentSessionCheckpoint(Base):
 
 class SessionRevisionConflict(RuntimeError):
     """A newer consumer or source invalidation already changed this session."""
+
+
+class AgentSessionDependency(Base):
+    """Content-free provenance retained independently of the current turn cap.
+
+    Compacted summaries conservatively inherit these dependencies. When an
+    invalid dependency cannot be removed precisely, the complete native input
+    is invalidated; it is never kept with a shortened, misleading source list.
+    """
+    __tablename__ = 'agent_session_dependencies'
+    session_key: Mapped[str] = mapped_column(String(240), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    identifier: Mapped[str] = mapped_column(String(80), primary_key=True)
+    revision_value: Mapped[str] = mapped_column(String(64), default='')
+
+
+class AgentContextSnapshot(Base):
+    """Immutable provenance for work that can outlive the main turn."""
+    __tablename__ = 'agent_context_snapshots'
+    id: Mapped[str] = mapped_column(String(24), primary_key=True)
+    account_id: Mapped[int] = mapped_column(Integer, index=True)
+    scope: Mapped[str] = mapped_column(String(160), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+CONTEXT_DEPENDENCY_LIMIT = 16384
+
+
+def _memory_revisions(value):
+    if not isinstance(value, dict) or len(value) > CONTEXT_DEPENDENCY_LIMIT:
+        raise ValueError('invalid context memory dependencies')
+    for key, revision in value.items():
+        if (not isinstance(key, str) or not re.fullmatch(r'(fact|summary):[1-9][0-9]{0,18}', key)
+                or int(key.split(':')[1]) > 2**63 - 1
+                or not isinstance(revision, str) or not re.fullmatch(r'[a-f0-9]{64}', revision)):
+            raise ValueError('invalid context memory dependency')
+    return dict(value)
+
+
+def _retained_context(value):
+    if value is None:
+        return set(), {}
+    sources = value.get('sources', ())
+    if (not isinstance(sources, (list, tuple, set)) or len(sources) > CONTEXT_DEPENDENCY_LIMIT
+            or any(type(source) is not int or not 1 <= source <= 2**63 - 1 for source in sources)):
+        raise ValueError('invalid retained context sources')
+    return set(sources), _memory_revisions(value.get('memory', {}))
 
 
 def _json_copy(value):
@@ -186,7 +236,77 @@ class AgentSessionRepository:
 
         AutonomousRepository._validate_scope(scope)
         with session_scope(self.engine) as session:
-            return self._snapshot(session.get(AgentSessionCheckpoint, f"{self.account_id}:{scope}"))
+            row = session.get(AgentSessionCheckpoint, f"{self.account_id}:{scope}")
+            return self._snapshot(row) | self._context_dependencies(session, scope, row)
+
+    def _context_dependencies(self, session, scope, row):
+        sources = set(row.source_message_ids if row else ())
+        memory = _memory_revisions(row.checkpoint.get('memory_dependencies', {}) if row else {})
+        rows = session.scalars(select(AgentSessionDependency).where(
+            AgentSessionDependency.session_key == f'{self.account_id}:{scope}').limit(CONTEXT_DEPENDENCY_LIMIT + 1))
+        for dependency in rows:
+            if dependency.kind == 'source':
+                sources.add(int(dependency.identifier))
+            elif dependency.kind == 'memory':
+                if dependency.identifier in memory and memory[dependency.identifier] != dependency.revision_value:
+                    raise ValueError('context memory revision conflict')
+                memory[dependency.identifier] = dependency.revision_value
+            else:
+                raise ValueError('invalid context dependency kind')
+        if len(sources) + len(memory) > CONTEXT_DEPENDENCY_LIMIT:
+            raise ValueError('context dependency resource limit')
+        _memory_revisions(memory)
+        return {'context_source_message_ids': sorted(sources), 'context_memory_dependencies': memory}
+
+    def freeze_dependencies(self, scope, sources=(), memory=None, *, authority_scope=None, before_commit=None,
+                            retained_context=None):
+        """Freeze current and retained inputs; a later reset cannot erase them."""
+        from app.storage.db import session_scope
+        AutonomousRepository._validate_scope(scope)
+        authority_scope = authority_scope or scope
+        AutonomousRepository._validate_scope(authority_scope)
+        current_sources = _validate_sources(sources)
+        current_memory = _memory_revisions(memory or {})
+        inherited_sources, inherited_memory = _retained_context(retained_context)
+        with session_scope(self.engine) as session:
+            session.connection().exec_driver_sql('BEGIN IMMEDIATE')
+            # Snapshots and background jobs have the same seven-day lifetime.
+            expired = list(session.scalars(select(AgentContextSnapshot).where(
+                AgentContextSnapshot.account_id == self.account_id,
+                AgentContextSnapshot.created_at < utc_naive(self.clock() - timedelta(days=7))).limit(64)))
+            for old in expired:
+                session.execute(delete(AgentSessionDependency).where(
+                    AgentSessionDependency.session_key == f'{self.account_id}:snapshot:{old.id}'))
+                session.delete(old)
+            count = len(list(session.scalars(select(AgentContextSnapshot.id).where(
+                AgentContextSnapshot.account_id == self.account_id).limit(1025))))
+            if count >= 1024:
+                raise ValueError('context snapshot capacity')
+            row = session.get(AgentSessionCheckpoint, f'{self.account_id}:{scope}')
+            deps = self._context_dependencies(session, scope, row)
+            all_sources = set(deps['context_source_message_ids']) | set(current_sources) | inherited_sources
+            all_memory = deps['context_memory_dependencies']
+            if any(key in all_memory and all_memory[key] != value for key, value in inherited_memory.items()):
+                raise ValueError('context memory revision conflict')
+            all_memory.update(inherited_memory)
+            if any(key in all_memory and all_memory[key] != value for key, value in current_memory.items()):
+                raise ValueError('context memory revision conflict')
+            all_memory.update(current_memory)
+            if len(all_sources) + len(all_memory) > CONTEXT_DEPENDENCY_LIMIT:
+                raise ValueError('context dependency resource limit')
+            identifier = uuid4().hex[:24]
+            session.add(AgentContextSnapshot(id=identifier, account_id=self.account_id,
+                scope=authority_scope, created_at=utc_naive(self.clock())))
+            frozen_key = f'{self.account_id}:snapshot:{identifier}'
+            for kind, key, revision in [*(('source', str(value), '') for value in all_sources),
+                    *(('memory', key, value) for key, value in all_memory.items())]:
+                session.add(AgentSessionDependency(session_key=frozen_key, kind=kind,
+                    identifier=key, revision_value=revision))
+            session.flush()
+            if before_commit:
+                before_commit()
+        return identifier
+
 
     def begin_turn(self, scope: str, checkpoint: dict, sources=(), *, expected_revision: int,
                    before_commit=None) -> dict:
@@ -200,17 +320,14 @@ class AgentSessionRepository:
         if state["revision"] != expected_revision:
             raise SessionRevisionConflict("agent checkpoint revision changed")
         checked = _validate_sources(sources)
-        merged = sorted(set(state["source_message_ids"]) | set(checked))
-        if len(merged) > 200:
-            raise ValueError("in-flight checkpoint source budget exhausted")
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint must be an object")
         beginning = {**checkpoint, "in_flight": True, "last_status": "running"}
-        return self.save(scope, state["items"], beginning, merged,
+        return self.save(scope, state["items"], beginning, checked,
                          expected_revision=expected_revision, before_commit=before_commit)
 
     def save(self, scope: str, items: list[dict], checkpoint: dict, sources=(), *, expected_revision: int,
-             before_commit=None) -> dict:
+             before_commit=None, reset_dependencies=False, retained_context=None) -> dict:
         from app.storage.db import session_scope
 
         AutonomousRepository._validate_scope(scope)
@@ -238,12 +355,36 @@ class AgentSessionRepository:
         packed = [item for turn in turns[first_retained:] for item in turn]
         copied_checkpoint = self._validate_checkpoint(scope, checkpoint)
         checked_sources = _validate_sources(sources)
+        inherited_sources, inherited_memory = _retained_context(retained_context)
         with session_scope(self.engine) as session:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             key = f"{self.account_id}:{scope}"
             row = session.get(AgentSessionCheckpoint, key)
             if (row.revision if row else 0) != expected_revision:
                 raise SessionRevisionConflict("agent checkpoint revision changed")
+            retained = (self._context_dependencies(session, scope, row) if not reset_dependencies else
+                {'context_source_message_ids': [], 'context_memory_dependencies': {}})
+            retained_sources = set(retained['context_source_message_ids']) | set(checked_sources) | inherited_sources
+            retained_memory = retained['context_memory_dependencies']
+            if any(key in retained_memory and retained_memory[key] != value for key, value in inherited_memory.items()):
+                raise ValueError('context memory revision conflict')
+            retained_memory.update(inherited_memory)
+            incoming_memory = _memory_revisions(copied_checkpoint.get('memory_dependencies', {}))
+            if any(key in retained_memory and retained_memory[key] != value for key, value in incoming_memory.items()):
+                raise ValueError('context memory revision conflict')
+            retained_memory.update(incoming_memory)
+            if len(retained_sources) + len(retained_memory) > CONTEXT_DEPENDENCY_LIMIT:
+                raise ValueError('context dependency resource limit')
+            if reset_dependencies:
+                session.execute(delete(AgentSessionDependency).where(AgentSessionDependency.session_key == key))
+            existing = {(dep.kind, dep.identifier) for dep in session.scalars(select(AgentSessionDependency).where(
+                AgentSessionDependency.session_key == key))}
+            for kind, identifier, revision in [
+                *(('source', str(source), '') for source in retained_sources),
+                *(('memory', name, version) for name, version in retained_memory.items())]:
+                if (kind, identifier) not in existing:
+                    session.add(AgentSessionDependency(session_key=key, kind=kind,
+                        identifier=identifier, revision_value=revision))
             if row is None:
                 row = AgentSessionCheckpoint(key=key, account_id=self.account_id, scope=scope)
                 session.add(row)
@@ -256,7 +397,8 @@ class AgentSessionRepository:
             session.flush()
             if before_commit is not None:
                 before_commit()
-            return self._snapshot(row)
+            return self._snapshot(row) | {'context_source_message_ids': sorted(retained_sources),
+                'context_memory_dependencies': dict(retained_memory)}
 
     def clear_if_source(self, scope: str, message_id: int) -> bool:
         from app.storage.db import session_scope
@@ -266,11 +408,43 @@ class AgentSessionRepository:
         with session_scope(self.engine) as session:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             row = session.get(AgentSessionCheckpoint, f"{self.account_id}:{scope}")
-            if row is None or message_id not in row.source_message_ids:
+            if row is None:
                 return False
+            dependencies = self._context_dependencies(session, scope, row)
+            if message_id not in dependencies['context_source_message_ids']:
+                return False
+            session.execute(delete(AgentSessionDependency).where(
+                AgentSessionDependency.session_key == f'{self.account_id}:{scope}'))
             row.items, row.source_message_ids = [], []
             receipts = _safe_receipts(row.checkpoint).get("receipts", [])
             row.checkpoint = {"receipts": receipts, "last_status": "source_invalidated"}
             row.revision += 1
             row.updated_at = utc_naive(self.clock())
             return True
+
+
+def read_context_snapshot(engine, *, account_id, scope, identifier, now):
+    """Return only a server-created, same-account/scope, unexpired manifest."""
+    from app.storage.db import session_scope
+    if not isinstance(identifier, str) or not re.fullmatch(r'[a-f0-9]{24}', identifier):
+        return None
+    with session_scope(engine) as session:
+        row = session.get(AgentContextSnapshot, identifier)
+        if (row is None or row.account_id != account_id or row.scope != scope
+                or row.created_at < utc_naive(now - timedelta(days=7))):
+            return None
+        entries = list(session.scalars(select(AgentSessionDependency).where(
+            AgentSessionDependency.session_key == f'{account_id}:snapshot:{identifier}')
+            .limit(CONTEXT_DEPENDENCY_LIMIT + 1)))
+        if len(entries) > CONTEXT_DEPENDENCY_LIMIT:
+            return None
+        sources, memory = set(), {}
+        for entry in entries:
+            if entry.kind == 'source':
+                sources.add(int(entry.identifier))
+            elif entry.kind == 'memory':
+                memory[entry.identifier] = entry.revision_value
+            else:
+                return None
+        _memory_revisions(memory)
+        return {'sources': sorted(sources), 'memory': memory}

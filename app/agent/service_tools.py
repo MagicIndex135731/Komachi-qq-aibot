@@ -60,6 +60,8 @@ class ServiceToolContext:
     memory_search_allowed: bool = True
     memory_dependencies: dict[str, str] = field(default_factory=dict)
     available_input_budget: int | None = None
+    context_snapshot_factory: Any = None
+    admit_context_snapshot: Any = None
 
 
 def _object(**properties):
@@ -333,6 +335,8 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
         dependencies = dict(context.memory_dependencies) if job.kind == "group" else {}
         try:
             payload = {"note": args["note"], "memory_dependencies": create_memory_dependency_receipt(dependencies)}
+            if context.context_snapshot_factory:
+                payload['context_snapshot'] = context.context_snapshot_factory()
         except ValueError:
             return ToolOutcome({"error": "note_dependency_invalid"}, "blocked")
         if len(str(payload)) > 2000:
@@ -355,6 +359,15 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
         note = await context.blocking.run(notes.read_intention, note_scope)
         payload = note.get("working_intention", {})
         try:
+            if payload.get('context_snapshot'):
+                from app.agent.context_dependencies import context_snapshot_valid
+                if not context_snapshot_valid(router.engine, account_id=runtime.settings.bot_qq,
+                        scope=context.store.scope,
+                        identifier=payload['context_snapshot'], group_id=job.scope_id if job.kind == 'group' else None,
+                        now=clock()):
+                    return ToolOutcome({'error': 'note_context_dependency_revoked'}, 'blocked')
+                if context.admit_context_snapshot and not context.admit_context_snapshot(payload['context_snapshot']):
+                    return ToolOutcome({'error': 'note_context_dependency_revoked'}, 'blocked')
             if job.kind == "group":
                 source_ids = note.get("source_message_ids", ())
                 _sources(router.engine, job.scope_id, source_ids)

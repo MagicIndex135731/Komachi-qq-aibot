@@ -6,20 +6,61 @@ import json
 from pathlib import Path
 import re
 import time
+from functools import wraps
+from threading import RLock, local
 from uuid import uuid4
 
 from app.agent.tool_agent import AgentTool, ToolOutcome
+
+_LOCKS = {}
+_HELD = local()
+
+
+def serialized_checkpoint(method):
+    """Serialize read/modify/replace across model turns and queue workers."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if not self.formal and method.__name__ in {'observe_tool', 'record_delivery'}:
+            return method(self, *args, **kwargs)
+        key = str(self.root)
+        with _LOCKS.setdefault(key, RLock()):
+            held = getattr(_HELD, 'roots', set())
+            if key in held:
+                return method(self, *args, **kwargs)
+            self.root.mkdir(parents=True, exist_ok=True)
+            with (self.root / '.checkpoint.lock').open('a+b') as lock:
+                import os
+                if os.name == 'nt':
+                    import msvcrt
+                    if lock.tell() == 0:
+                        lock.write(b'0'); lock.flush()
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                _HELD.roots = held | {key}
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    _HELD.roots = held
+                    if os.name == 'nt':
+                        lock.seek(0); msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+    return wrapped
 
 
 class ResearchTaskWorkspace:
     def __init__(self, root: Path, *, scope: str, actor_id: int, source_id: int,
                  request: str, valid_source, clock=time.time, dependency_snapshot=None, valid_dependencies=None,
-                 task_content_budget=96000, task_key: str = ''):
+                 task_content_budget=96000, task_key: str = '', cancel_background=None):
         if not scope or not isinstance(actor_id, int) or not isinstance(source_id, int):
             raise ValueError('invalid_task_scope')
         self.scope, self.actor_id, self.source_id = scope, actor_id, source_id
         self.request, self.valid_source, self.clock = request[:4000], valid_source, clock
         self.dependency_snapshot, self.valid_dependencies = dependency_snapshot, valid_dependencies
+        self.cancel_background = cancel_background
         self.task_content_budget = task_content_budget
         self.archived_read_chars = self.web_result_chars = 0
         owner = hashlib.sha256(f'{scope}:{actor_id}'.encode()).hexdigest()
@@ -125,13 +166,22 @@ class ResearchTaskWorkspace:
 
     def prompt_summary(self):
         state = self.summary() if self.formal else self.recent_summary()
-        return {k: state[k] for k in ('task_id', 'goal', 'progress', 'next_step', 'status') if k in state}
+        return {k: state[k] for k in ('task_id', 'goal', 'deliverable', 'progress', 'remaining', 'next_step', 'status') if k in state}
 
-    def begin(self, goal=''):
+    @serialized_checkpoint
+    def begin(self, goal='', deliverable='', remaining=None, delivery='none'):
+        if delivery not in {'none', 'text', 'media'} or remaining is not None and len(remaining) > 24:
+            raise ValueError('invalid_task_checkpoint')
         self.activate()
         state = self.summary()
         if goal:
             state['goal'] = goal[:2000]
+        if deliverable:
+            state['deliverable'] = deliverable[:1000]
+        if remaining is not None:
+            state['remaining'] = [str(item)[:300] for item in remaining]
+        if delivery != 'none':
+            state['delivery_requirement'] = delivery
         if self.dependency_snapshot:
             state['dependencies'] = self.dependency_snapshot()
         state['updated_at'] = self.clock()
@@ -139,16 +189,144 @@ class ResearchTaskWorkspace:
         self._write(self.root / 'active.json', state)
         return state
 
-    def update(self, *, progress, next_step, findings, status='active'):
-        if status not in {'active', 'completed', 'blocked'} or len(findings) > 12:
+    @serialized_checkpoint
+    def update(self, *, progress, next_step, findings, status='active', remaining=None):
+        if status not in {'active', 'waiting', 'partial', 'completed', 'blocked', 'cancelled'} or len(findings) > 12:
             raise ValueError('invalid_task_checkpoint')
         state = self.begin()
+        if status == 'cancelled' and self.cancel_background:
+            self.cancel_background(self.task_id)
+            state['background_jobs'] = {key: 'cancelled' if value in {'pending', 'queued', 'running',
+                'result_ready', 'delivering'} else value for key, value in state.get('background_jobs', {}).items()}
         state.update(progress=progress[:2000], next_step=next_step[:1000],
                      findings=[str(value)[:1000] for value in findings], status=status, updated_at=self.clock())
+        if remaining is not None:
+            if len(remaining) > 24:
+                raise ValueError('invalid_task_checkpoint')
+            state['remaining'] = [str(item)[:300] for item in remaining]
+        # A model declaration cannot override deterministic missing conditions.
+        if status == 'completed':
+            state.pop('completion_gaps', None)
+            gaps = self.completion_gaps(state)
+            if gaps:
+                state.update(status='partial', completion_gaps=gaps)
+            else:
+                state['completion_basis'] = 'recorded_tool_results; semantic_coverage_model_reported'
         self._write(self._file(), state)
         self._write(self.root / 'active.json', state)
-        return {k: state[k] for k in ('task_id', 'goal', 'progress', 'next_step', 'findings', 'status')}
+        return {k: state[k] for k in ('task_id', 'goal', 'progress', 'next_step', 'findings', 'status',
+            'remaining', 'completion_gaps', 'completion_basis') if k in state}
 
+    def completion_gaps(self, state=None):
+        state = state or self.summary()
+        receipts = state.get('execution_receipts', [])
+        gaps = ['remaining_work'] if state.get('remaining') else []
+        if any(value in {'pending', 'queued', 'running', 'result_ready', 'delivering'}
+                for value in state.get('background_jobs', {}).values()):
+            gaps.append('background_pending')
+        if state.get('unknown_external_effect') or any(item.get('status') == 'uncertain'
+                or item.get('job_status') == 'uncertain' for item in receipts):
+            gaps.append('unknown_external_effect')
+        delivery = state.get('delivery_requirement', 'none')
+        sends = [item for item in receipts if item.get('status') == 'sent' and item.get('delivery')]
+        if delivery != 'none' and not sends:
+            gaps.append('delivery_unconfirmed')
+        if delivery == 'media' and not any(item.get('media') for item in sends):
+            gaps.append('media_delivery_unconfirmed')
+        return gaps
+
+    def execution_status(self):
+        if not self.formal:
+            return {}
+        state = self.summary()
+        return {**{k: state[k] for k in ('task_id', 'status', 'remaining', 'next_step') if k in state},
+            'completion_gaps': self.completion_gaps(state),
+            'coverage_verification': 'model_reported_not_independent_semantic_validation'}
+
+    @serialized_checkpoint
+    def observe_tool(self, name, args, outcome, call_id):
+        if not self.formal or name in {'begin_research_task', 'update_research_task', 'read_research_task',
+                'resume_research_task', 'read_research_evidence', 'read_research_resources'}:
+            return
+        state = self.begin()
+        receipts = state.get('execution_receipts', [])
+        entries = outcome.data.get('jobs', []) if name == 'queue_media_batch' else [outcome.data]
+        jobs = state.get('background_jobs', {})
+        for index, data in enumerate(entries):
+            entry = {'call_id': call_id + ':' + str(index), 'tool': name, 'status': outcome.status}
+            if type(data.get('job_id')) is int:
+                entry.update(job_id=data['job_id'], job_status=data.get('execution_status', data.get('status')))
+                # Status reads replace the queue observation for this job.
+                receipts = [item for item in receipts if item.get('job_id') != entry['job_id']]
+                if len(jobs) >= 512 and str(entry['job_id']) not in jobs:
+                    state['unknown_external_effect'] = True  # bounded fail-closed checkpoint
+                else:
+                    jobs[str(entry['job_id'])] = entry['job_status']
+            if entry.get('status') == 'uncertain' or entry.get('job_status') == 'uncertain':
+                state['unknown_external_effect'] = True
+            if name in {'send_group', 'send_private'}:
+                entry.update(delivery=True, media=bool(args.get('artifact_ids') or
+                    args.get('video_artifact_id') or args.get('media_artifact_ids')),
+                    receipt_id=outcome.receipt_id)
+            receipts = [item for item in receipts if item.get('call_id') != entry['call_id']]
+            receipts.append(entry)
+        state['execution_receipts'] = receipts[-128:]
+        state['background_jobs'] = jobs
+        if jobs and not state.get('remaining') and state['status'] == 'active':
+            state['status'] = 'waiting'
+        self._write(self._file(), state)
+        self._write(self.root / 'active.json', state)
+
+    @serialized_checkpoint
+    def record_job_result(self, job_id, status):
+        """Persist a queue terminal state without waking a model or changing
+        another request's active checkpoint. This is transport/work coverage,
+        never a claim that the semantic goal has been independently verified.
+        """
+        state = self.summary()
+        jobs = state.get('background_jobs', {})
+        jobs[str(job_id)] = status
+        state['background_jobs'] = jobs
+        if status == 'uncertain':
+            state['unknown_external_effect'] = True
+        if state.get('status') == 'waiting' and not any(value in {
+                'pending', 'queued', 'running', 'result_ready', 'delivering'} for value in jobs.values()):
+            state['status'] = 'partial' if any(value != 'completed' for value in jobs.values()) else 'active'
+            state['next_step'] = '后台处理结束；按实际交付与覆盖范围核验整体目标'
+        state['updated_at'] = self.clock()
+        self._write(self._file(), state)
+        active = self._active()
+        if active and active.get('task_id') == self.task_id:
+            self._write(self.root / 'active.json', state)
+
+    def resource_page(self, task_id=None, *, offset=0, limit=20):
+        if type(offset) is not int or not 0 <= offset <= 10000 or type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError('invalid_resource_page')
+        from copy import copy
+        from app.core.url_policy import public_web_url
+        selected = self
+        if task_id and task_id != self.task_id:
+            selected = copy(self)
+            selected.resume(task_id)
+        state = selected.summary()
+        selected._check(state)
+        resources = {}
+        for entry in state.get('evidence', []):
+            for value in entry.get('sources', []):
+                try:
+                    url = public_web_url(value)
+                except (TypeError, ValueError):
+                    continue
+                record = resources.setdefault(url, {'url': url, 'kind': 'web_page', 'evidence_ids': []})
+                if entry['evidence_id'] not in record['evidence_ids']:
+                    record['evidence_ids'].append(entry['evidence_id'])
+        values = list(resources.values())
+        return {'task_id': selected.task_id, 'resources': values[offset:offset+limit], 'total': len(values),
+            'next_offset': offset+limit if offset+limit < len(values) else None,
+            'trust': 'untrusted_external_sources', 'coverage': 'discovered_sources_only_not_exhaustive',
+            'guidance': '使用url交给接受URL的工具；evidence_id用于原文读取，不能当URL或artifact_id。'}
+
+    @serialized_checkpoint
     def record_delivery(self, text, status):
         """A confirmed/ambiguous transport outcome never proves the audit complete."""
         if not self.formal or status not in {'sent', 'uncertain'}:
@@ -165,6 +343,7 @@ class ResearchTaskWorkspace:
         sources = [source.get('source', '') for source in data.get('sources', []) if isinstance(source, dict)]
         return hashlib.sha256(json.dumps([content, sources], ensure_ascii=False).encode()).hexdigest()[:24]
 
+    @serialized_checkpoint
     def save_evidence(self, data):
         self._check()
         ref = self.evidence_reference(data)
@@ -216,7 +395,7 @@ class ResearchTaskWorkspace:
             guard.require_valid()
             try:
                 if kind == 'begin':
-                    data = self.begin(args.get('goal', ''))
+                    data = self.begin(**args)
                     data = {k: data[k] for k in ('task_id', 'goal', 'progress', 'next_step', 'status')}
                 elif kind == 'update':
                     data = self.update(**args)
@@ -228,6 +407,8 @@ class ResearchTaskWorkspace:
                 elif kind == 'resume':
                     self.resume(args['task_id'])
                     data = self.prompt_summary()
+                elif kind == 'resources':
+                    data = self.resource_page(**args)
                 else:
                     remaining = (self.task_content_budget if self.formal else 48000) - self.archived_read_chars - self.web_result_chars
                     if remaining < 2000:
@@ -244,12 +425,15 @@ class ResearchTaskWorkspace:
             except (ValueError, OSError):
                 return ToolOutcome({'error': 'task_evidence_unavailable'}, 'blocked')
         return (
-            AgentTool('begin_research_task', '认真资料请求进入任务模式并扩容网页预算；不增加操作权限',
-                      schema({'goal': text(2000)}), lambda args: invoke('begin', args)),
+            AgentTool('begin_research_task', '多步骤工作保存目标、交付要求和剩余项，可组合任何获准工具；资料任务扩容网页预算，不增加权限。普通闲聊和单步请求无需建任务',
+                      schema({'goal': text(2000), 'deliverable': text(1000),
+                          'remaining': {'type': 'array', 'items': text(300), 'maxItems': 24},
+                          'delivery': {'type': 'string', 'enum': ['none', 'text', 'media']}}), lambda args: invoke('begin', args)),
             AgentTool('update_research_task', '保存目标进度、证据结论和下一步；不是长期事实。完成前如实标注未验范围',
                 schema({'progress': text(2000), 'next_step': text(1000), 'findings': {'type': 'array',
                        'items': text(1000), 'maxItems': 12}, 'status': {'type': 'string',
-                       'enum': ['active', 'completed', 'blocked']}}, ('progress', 'next_step', 'findings', 'status')),
+                       'enum': ['active', 'waiting', 'partial', 'completed', 'blocked', 'cancelled']},
+                       'remaining': {'type': 'array', 'items': text(300), 'maxItems': 24}}, ('progress', 'next_step', 'findings', 'status')),
                 lambda args: invoke('update', args)),
             AgentTool('read_research_task', '读取本提问者的任务覆盖、进度和证据索引，不携带全部原文',
                       schema({}), lambda args: invoke('read', args)),
@@ -259,4 +443,7 @@ class ResearchTaskWorkspace:
                 schema({'evidence_id': text(24), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 100000},
                        'max_chars': {'type': 'integer', 'minimum': 1, 'maximum': 32000}}, ('evidence_id',)),
                 lambda args: invoke('evidence', args)),
+            AgentTool('read_research_resources', '分页读取当前提问者任务的全部已发现来源URL和证据ID；子任务摘要只给索引，用此工具续读再组合后续工具',
+                schema({'task_id': text(24), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 10000},
+                    'limit': {'type': 'integer', 'minimum': 1, 'maximum': 20}}), lambda args: invoke('resources', args)),
         )

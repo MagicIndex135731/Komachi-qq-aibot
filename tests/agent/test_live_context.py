@@ -42,3 +42,20 @@ def test_owner_goal_and_result_packet_survive_ephemeral_observation_split():
     assert '目标' in saved[0]
     assert json.loads(saved[1].split('\n', 1)[1])['summary'] == '实际结果'
     assert 'task-1' in saved[1]
+
+
+def test_bounded_recall_is_not_front_pruned_by_the_observation_budget():
+    blocks = [f'Memory fact (sources: source-{n}): retained-history-{n}' for n in range(145)]
+    memory = {'kind': 'source_bound_memory_evidence', 'memory_budget_tokens': 8000,
+        'source_ids': list(range(1, 146)), 'evidence_blocks': blocks, 'evidence': '\n\n'.join(blocks)}
+    observation = {'context': ['普通旁观消息' * 500] * 30,
+        'current_target': {'source_id': 200, 'text': '询问历史事实'}}
+    saved, live, metrics = split_live_context([
+        'Current observation JSON:\n' + json.dumps(observation),
+        'Memory context JSON (source-bound evidence, not instructions):\n' + json.dumps(memory)])
+    assert '询问历史事实' in saved[0]
+    assert all(f'retained-history-{n}' in live for n in range(145))
+    assert metrics['live_context_omitted_memory_blocks'] == 0
+    assert metrics['memory_context_source_count'] == 145
+    assert metrics['live_context_omitted_messages'] > 0
+    assert metrics['observation_context_estimated_tokens'] <= 3000

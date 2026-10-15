@@ -94,7 +94,7 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
 
     from app.agent.media_tasks import download_delivery_properties
     return AgentTool('download_twitter_media',
-        '后台下载用户指定X/Twitter公开单帖的全部原图、视频和动图；最多16项/128MiB，单视频64MiB/10分钟。立即返回任务号；完成后用media_artifact_ids和as_forward=true按序合并转发，不重复排队，不展开引用帖或读取登录态。',
+        '后台下载当前获准任务中提供或自行检索发现的X/Twitter公开单帖URL的全部原图、视频和动图；账号/日期请求可先搜索发现单帖，无需用户亲自粘贴URL。最多16项/128MiB，单视频64MiB/10分钟。立即返回任务号；完成后用media_artifact_ids和as_forward=true按序合并转发，不重复排队，不展开引用帖或读取登录态。',
         {'type': 'object', 'properties': {'ref_id': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
             **download_delivery_properties()},
          'required': ['ref_id'], 'additionalProperties': False}, checked)

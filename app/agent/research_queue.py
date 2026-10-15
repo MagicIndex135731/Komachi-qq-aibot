@@ -17,6 +17,8 @@ from app.storage.db import session_scope
 from app.storage.models import Job, Message
 
 logger = logging.getLogger(__name__)
+ACTIVE_STATES = ('queued', 'running', 'result_ready', 'delivering')
+WAITING_STATES = ('pending', *ACTIVE_STATES)
 
 
 class ResearchJobGuard:
@@ -53,6 +55,14 @@ class ResearchJobGuard:
         return valid
 
     def valid_dependencies(self, metadata):
+        if metadata.get('context_snapshot'):
+            from app.agent.context_dependencies import context_snapshot_valid
+            if not context_snapshot_valid(self.queue.engine, account_id=self.queue.account_id,
+                    scope=self.payload['scope'], identifier=metadata['context_snapshot'],
+                    group_id=self.payload['scope_id'] if self.queue.surface == 'group' else None,
+                    private_user_id=self.payload['actor_id'] if self.queue.surface == 'private' else None,
+                    now=self.queue.clock()):
+                return False
         sources, memory = metadata.get('sources', []), metadata.get('memory', {})
         if (not isinstance(sources, list) or not isinstance(memory, dict)
                 or len(self.sources | set(sources)) > 200 or len(self.memory.keys() | memory.keys()) > 200
@@ -70,11 +80,20 @@ class ResearchJobGuard:
         return True
 
     def snapshot(self):
-        return {'sources': sorted(self.sources), 'memory': dict(self.memory)}
+        return {'sources': sorted(self.sources), 'memory': dict(self.memory),
+            **({'context_snapshot': self.payload['context_snapshot']} if self.payload.get('context_snapshot') else {})}
 
     def valid(self):
         if not self.queue.running or not self.queue.authorized(self.payload):
             return False
+        if self.payload.get('context_snapshot'):
+            from app.agent.context_dependencies import context_snapshot_valid
+            if not context_snapshot_valid(self.queue.engine, account_id=self.queue.account_id,
+                    scope=self.payload['scope'], identifier=self.payload['context_snapshot'],
+                    group_id=self.payload['scope_id'] if self.queue.surface == 'group' else None,
+                    private_user_id=self.payload['actor_id'] if self.queue.surface == 'private' else None,
+                    now=self.queue.clock()):
+                return False
         with session_scope(self.queue.engine) as session:
             row = session.get(Job, self.job_id)
             if not (row and row.job_type == self.queue.job_type and row.locked_by == self.queue.owner
@@ -99,10 +118,12 @@ class ResearchDelegationQueue:
     exhausted_execution_status = 'failed'
     guard_type = ResearchJobGuard
 
-    def __init__(self, engine, *, account_id, surface, execute, deliver, authorized, clock=None):
+    def __init__(self, engine, *, account_id, surface, execute, deliver, authorized, clock=None,
+                 task_workspace_root=None):
         self.engine, self.account_id, self.surface = engine, account_id, surface
         self.execute, self.deliver, self.authorized = execute, deliver, authorized
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.task_workspace_root = task_workspace_root
         self.owner, self.running, self.worker = uuid4().hex, False, None
         self.wake = asyncio.Event()
 
@@ -134,16 +155,20 @@ class ResearchDelegationQueue:
         with self.transaction(before_commit) as session:
             row = session.scalar(select(Job).where(Job.job_type == self.job_type, Job.job_key == key))
             if row is None:
-                active = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
-                    Job.job_key.startswith(self.prefix()), Job.status.in_(('queued', 'running', 'result_ready', 'delivering'))).limit(16)))
-                if len(active) >= 16 or sum(item.payload_json['scope_id'] == payload['scope_id']
-                        and item.payload_json['actor_id'] == payload['actor_id'] for item in active) >= 4:
+                waiting = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
+                    Job.job_key.startswith(self.prefix()), Job.status.in_(WAITING_STATES)).limit(512)))
+                own = lambda item: (item.payload_json['scope_id'] == payload['scope_id']
+                    and item.payload_json['actor_id'] == payload['actor_id'])
+                if len(waiting) >= 512 or sum(own(item) for item in waiting) >= 128:
                     return {'status': 'blocked', 'reason': 'delegation_queue_capacity'}
-                row = Job(job_type=self.job_type, job_key=key, status='queued', run_at=now,
+                active = [item for item in waiting if item.status in ACTIVE_STATES]
+                state = 'pending' if len(active) >= 16 or sum(own(item) for item in active) >= 4 else 'queued'
+                row = Job(job_type=self.job_type, job_key=key, status=state, run_at=now,
                           max_attempts=self.max_execution_attempts, payload_json={**payload, 'created_at': self.clock().timestamp()})
                 session.add(row)
                 session.flush()
             result = {'status': 'queued', 'task_id': row.payload_json['task_id'], 'job_id': row.id,
+                      'execution_status': row.status,
                       'delivery': 'background_result_returns_to_main', 'guidance': '排队不代表完成；主对话可继续处理新消息。'}
         self.wake.set()
         return result
@@ -164,12 +189,35 @@ class ResearchDelegationQueue:
     def cancel_scope(self, scope_id):
         with self.transaction() as session:
             for row in session.scalars(select(Job).where(Job.job_type == self.job_type,
-                    Job.job_key.startswith(self.prefix(scope_id)), Job.status.in_(('queued', 'running', 'result_ready', 'delivering')))):
+                    Job.job_key.startswith(self.prefix(scope_id)), Job.status.in_(WAITING_STATES))):
                 row.status, row.last_error_code = 'cancelled', 'scope_cancelled'
+
+    def cancel_task(self, scope_id, actor_id, task_id, *, before_commit):
+        with self.transaction(before_commit) as session:
+            for row in session.scalars(select(Job).where(Job.job_type == self.job_type,
+                    Job.job_key.startswith(self.prefix(scope_id)), Job.status.in_(WAITING_STATES))):
+                if (row.payload_json.get('actor_id') == actor_id
+                        and row.payload_json.get('parent_task_id') == task_id):
+                    row.status, row.last_error_code = 'cancelled', 'task_cancelled'
 
     def claim(self):
         now = self.clock().astimezone(UTC).replace(tzinfo=None)
         with self.transaction() as session:
+            # Capacity limits execution, not the size of an authorized request.
+            # Promotion is durable; tick revalidates source/permission/TTL before
+            # every read and delivery. It never creates timer authority.
+            active = list(session.scalars(select(Job).where(Job.job_type == self.job_type,
+                Job.job_key.startswith(self.prefix()), Job.status.in_(ACTIVE_STATES))))
+            for pending in session.scalars(select(Job).where(Job.job_type == self.job_type,
+                    Job.job_key.startswith(self.prefix()), Job.status == 'pending')
+                    .order_by(Job.id).limit(512)):
+                if len(active) >= 16:
+                    break
+                if sum(item.payload_json['scope_id'] == pending.payload_json['scope_id']
+                        and item.payload_json['actor_id'] == pending.payload_json['actor_id'] for item in active) < 4:
+                    pending.status = 'queued'
+                    active.append(pending)
+            session.flush()
             rows = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self.prefix()), Job.status.in_(('queued', 'running', 'result_ready', 'delivering')))
                 .order_by(Job.run_at, Job.id).limit(16)))
@@ -197,6 +245,7 @@ class ResearchDelegationQueue:
                 return row.id, dict(row.payload_json), phase
 
     def finish(self, job_id, phase, *, status, payload=None, reason=''):
+        completed_payload = None
         with self.transaction() as session:
             row = session.get(Job, job_id)
             if row and row.status == phase and row.locked_by == self.owner:
@@ -204,6 +253,22 @@ class ResearchDelegationQueue:
                 if payload is not None:
                     row.payload_json = payload
                 row.completed_at = self.clock().astimezone(UTC).replace(tzinfo=None)
+                completed_payload = dict(row.payload_json)
+        if (completed_payload and self.task_workspace_root and completed_payload.get('parent_task_id')
+                and status not in WAITING_STATES):
+            try:
+                from app.agent.research_tasks import ResearchTaskWorkspace
+                check = ResearchJobGuard(self, job_id, completed_payload, phase)
+                if not self.authorized(completed_payload):
+                    return
+                task = ResearchTaskWorkspace(self.task_workspace_root, scope=completed_payload['scope'],
+                    actor_id=completed_payload['actor_id'], source_id=completed_payload['source_id'],
+                    request=completed_payload.get('goal', ''), valid_source=check.valid_source,
+                    valid_dependencies=check.valid_dependencies, clock=lambda: self.clock().timestamp())
+                task.resume(completed_payload['parent_task_id'])
+                task.record_job_result(job_id, status)
+            except (ValueError, OSError, RuntimeError):
+                logger.warning('agent_task_checkpoint_unavailable job_id=%s', job_id)
 
     async def tick(self):
         claimed = self.claim()

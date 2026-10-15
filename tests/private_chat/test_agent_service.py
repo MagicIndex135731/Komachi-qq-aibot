@@ -248,7 +248,7 @@ async def test_private_failure_notice_uses_durable_authority_without_duplicate_s
                 send = next(tool for tool in tools if tool.name == "send_private")
                 await self.invoke(send, {"text": "已开始的回复"}, "original-send")
             if mode == "revoked":
-                monkeypatch.setattr(agent, "_valid_source", lambda *_: False)
+                monkeypatch.setattr(agent, "_valid_sources", lambda *_: False)
             return ToolTurnResult("failed", reason="model_first_output_timeout")
     agent.runtime_factory = FailedRuntime
     await service.start()
@@ -318,7 +318,7 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         assert sender.texts == [(OWNER, "夜空很适合慢慢看")]
         assert len(requests) == 2
         names = {value["name"] for value in requests[0]["tools"]}
-        assert names == {"read_private_context", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'resume_research_task', 'delegate_research_task', 'media_task_status'}
+        assert names == {"read_private_context", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'read_research_resources', 'resume_research_task', 'delegate_research_task', 'media_task_status'}
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["receipts"][0]["receipt_id"] == "private-receipt-1"
         source_id = snapshot["checkpoint"]["reply_source_id"]
@@ -349,7 +349,7 @@ async def test_formal_private_delivers_long_answer_and_returns_to_chat_without_c
         if n==2:
             assert 'RAW_REPOSITORY_CODE' in json.dumps(body)
             return sse('update_research_task',{'progress':'入口已核对','next_step':'检查认证',
-                'findings':['入口已核对，未检查认证'],'status':'active'},number=n)
+                'findings':['入口已核对，未检查认证'],'status':'partial'},number=n)
         if n==3:return sse('send_private',{'text':answer},number=n)
         if n==5:
             return sse('send_private',{'text':'继续聊夜空吧'},number=n)

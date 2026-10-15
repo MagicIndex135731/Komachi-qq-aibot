@@ -100,7 +100,10 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         assert [item['type'] for item in media]==['image','video','video']
         assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4,mp4]
         if delivery_mode=='auto':
-            assert len(model_calls)==2 and sent_result==[]
+            # One bounded native closing decision can inspect remaining work;
+            # a queue acknowledgement must not prematurely end a larger goal.
+            # The actual download/delivery still creates no child model turn.
+            assert len(model_calls)==3 and sent_result==[]
         record_property('upstream_requests',len(model_calls))
         record_property('delivery_mode',delivery_mode)
         record_property('surface',surface)

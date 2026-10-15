@@ -114,9 +114,13 @@ class AppSettings(BaseSettings):
     agent_context_compaction_enabled: bool = Field(default=True, alias="AGENT_CONTEXT_COMPACTION_ENABLED")
     agent_context_compaction_threshold_ratio: float = Field(default=0.62, ge=0.2, le=0.8,
         alias="AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO")
-    agent_context_retain_tokens: int = Field(default=16000, ge=1000, le=64000, alias="AGENT_CONTEXT_RETAIN_TOKENS")
-    agent_context_summary_tokens: int = Field(default=4096, ge=512, le=8192, alias="AGENT_CONTEXT_SUMMARY_TOKENS")
+    agent_context_retain_tokens: int = Field(default=32000, ge=1000, le=64000, alias="AGENT_CONTEXT_RETAIN_TOKENS")
+    agent_context_summary_tokens: int = Field(default=8192, ge=512, le=8192, alias="AGENT_CONTEXT_SUMMARY_TOKENS")
     agent_context_history_tokens: int = Field(default=24000, ge=4000, le=64000, alias="AGENT_CONTEXT_HISTORY_TOKENS")
+    agent_context_soft_input_tokens: int = Field(default=96000, ge=8000, le=200000, alias="AGENT_CONTEXT_SOFT_INPUT_TOKENS")
+    agent_context_target_input_tokens: int = Field(default=64000, ge=4000, le=160000, alias="AGENT_CONTEXT_TARGET_INPUT_TOKENS")
+    agent_context_hard_input_tokens: int = Field(default=160000, ge=12000, le=240000, alias="AGENT_CONTEXT_HARD_INPUT_TOKENS")
+    agent_memory_context_tokens: int = Field(default=8000, ge=1500, le=24000, alias="AGENT_MEMORY_CONTEXT_TOKENS")
     agent_background_history_tokens: int = Field(default=8000, ge=2000, le=24000, alias="AGENT_BACKGROUND_HISTORY_TOKENS")
     agent_monitor_enabled: bool = Field(default=False, alias="AGENT_MONITOR_ENABLED")
     web_search_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = Field(

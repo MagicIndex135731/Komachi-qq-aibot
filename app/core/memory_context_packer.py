@@ -7,6 +7,8 @@ IDs by arithmetic.
 
 from __future__ import annotations
 
+from copy import copy
+
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import re
@@ -204,6 +206,13 @@ class PackedMemoryContext:
 
 
 class MemoryContextPacker:
+    def with_token_counter(self, token_counter: TokenCounter) -> MemoryContextPacker:
+        """Use a transport budget without changing the shared retrieval packer."""
+        bounded = copy(self)
+        bounded._token_counter = token_counter
+        bounded._token_counter_is_additive = True
+        return bounded
+
     def __init__(
         self,
         *,

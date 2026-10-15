@@ -63,10 +63,10 @@ class DownloadedMediaCache:
                 if not db.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone():
                     return set()
                 rows = db.execute("SELECT job_type,payload_json,run_at FROM jobs WHERE "
-                    "(job_type='agent_media_operation' AND status IN ('running','result_ready','delivering')) OR "
+                    "(job_type='agent_media_operation' AND status IN ('pending','queued','running','result_ready','delivering')) OR "
                     "(job_type='private_agent_turn' AND status IN ('queued','running') "
-                    "AND json_extract(payload_json,'$.delegated_result.kind')='media_result') LIMIT 129").fetchall()
-            if len(rows) > 128:
+                    "AND json_extract(payload_json,'$.delegated_result.kind')='media_result') LIMIT 2049").fetchall()
+            if len(rows) > 2048:
                 raise ValueError('media_cache_pending_scan_budget')
             protected = set()
             for kind,raw,run_at in rows:
@@ -82,6 +82,7 @@ class DownloadedMediaCache:
                 values = [*packet.get('preview_artifact_ids', ()), *data.get('artifact_ids', ()),
                     *data.get('media_artifact_ids', ()), *data.get('video_artifact_ids', ())]
                 values += [data.get('artifact_id'), data.get('video_artifact_id')]
+                values += payload.get('arguments', {}).get('reference_artifact_ids', [])
                 protected.update(value for value in values if isinstance(value, str) and _ID.fullmatch(value))
             return protected
         except (sqlite3.Error, TypeError, ValueError, KeyError) as exc:

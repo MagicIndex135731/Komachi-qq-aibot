@@ -27,7 +27,7 @@ RESEARCH_READ_TOOLS = frozenset({
     'read_context', 'read_private_context', 'read_message_links',
     'read_forward_messages', 'memory_search', 'memory_read',
     'begin_research_task', 'update_research_task',
-    'read_research_task', 'read_research_evidence',
+    'read_research_task', 'read_research_evidence', 'read_research_resources',
 })
 WEB_READ_TOOLS = frozenset({'search_web', 'open_web_page', 'find_web_page'})
 
@@ -109,6 +109,8 @@ def _summary(workspace: ResearchTaskWorkspace, *, status: str, reason: str = '',
                      for item in state.get("evidence", [])[-8:]] if verified else [],
         "reason": reason,
         "source_bound": True,
+        "resource_manifest": {'task_id': workspace.task_id, 'reader': 'read_research_resources',
+            'total': workspace.resource_page()['total']} if verified else None,
     }
     while len(json.dumps(result, ensure_ascii=False)) > 6000 and result['evidence']:
         result['evidence'].pop(0)

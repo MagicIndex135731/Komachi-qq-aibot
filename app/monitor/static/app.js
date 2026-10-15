@@ -105,8 +105,12 @@ function updateRequest(r){
  r.output.textContent=stream?.output?outputLabel+"：\n"+stream.output+(stream.truncated?"\n[观测文本达到上限，后续未记录]":""):"";
  r.metrics.textContent=`实际输入 ${number(f?.input_tokens)} · 缓存输入 ${number(f?.cached_input_tokens)} · 实际输出 ${number(f?.output_tokens)} token${typeof f?.elapsed_ms==="number"?" · "+(f.elapsed_ms/1000).toFixed(1)+" s":""}`;
  if(typeof f?.input_tokens==="number"&&typeof f?.cached_input_tokens==="number")r.metrics.textContent+=` · 未缓存 ${number(f.input_tokens-f.cached_input_tokens)}`;
- if(typeof f?.live_context_estimated_tokens==="number")r.metrics.textContent+=` · 临时观察估算 ${number(f.live_context_estimated_tokens)} / ${number(f.live_context_budget_tokens)}`;
- if(typeof f?.context_history_budget_tokens==="number")r.metrics.textContent+=` · 历史预算 ${number(f.context_history_budget_tokens)}`;
+ if(typeof f?.observation_context_estimated_tokens==="number")r.metrics.textContent+=` · 观察估算 ${number(f.observation_context_estimated_tokens)} / ${number(f.observation_context_budget_tokens)}`;
+ else if(typeof f?.live_context_estimated_tokens==="number")r.metrics.textContent+=` · 临时输入估算 ${number(f.live_context_estimated_tokens)} / ${number(f.live_context_budget_tokens)}`;
+ if(typeof f?.memory_context_estimated_tokens==="number")r.metrics.textContent+=` · 记忆估算 ${number(f.memory_context_estimated_tokens)} / ${number(f.memory_context_budget_tokens)} · 记忆来源 ${number(f.memory_context_source_count)}`;
+ if(f?.context_compaction_threshold_tokens)r.metrics.textContent+=` · 压缩阈值 ${number(f.context_compaction_threshold_tokens)}`;
+ if(f?.context_target_input_tokens)r.metrics.textContent+=` · 压缩目标 ${number(f.context_target_input_tokens)}`;
+ if(f?.context_history_budget_tokens)r.metrics.textContent+=` · 旧历史预算 ${number(f.context_history_budget_tokens)}`;
 }
 async function loadTurn(t,generation){
  if(t.loading)return;t.loading=true;try{

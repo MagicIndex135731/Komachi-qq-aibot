@@ -163,7 +163,8 @@ def test_begin_turn_persists_inflight_identity_and_sources_before_framework_runs
     restarted = repository(sqlite_engine, tmp_path).read(SCOPE)
     assert restarted == inflight
     assert restarted["checkpoint"]["in_flight"] is True
-    assert restarted["source_message_ids"] == [1, 2]
+    assert restarted["source_message_ids"] == [2]
+    assert restarted['context_source_message_ids'] == [1, 2]
     assert restarted["items"] == turn(1)
     assert repo.clear_if_source(SCOPE, 2)
     assert "session_id" not in repo.read(SCOPE)["checkpoint"]
@@ -178,3 +179,59 @@ def test_completed_turn_clears_inflight_flag_and_fences_original_revision(sqlite
         (1,), expected_revision=pending["revision"])
     assert "in_flight" not in complete["checkpoint"]
     assert complete["revision"] == 2
+
+
+def test_historical_provenance_exceeds_turn_limit_without_reset_and_remains_revocable(sqlite_engine, tmp_path):
+    repo = repository(sqlite_engine, tmp_path)
+    revision = 0
+    for number in range(15):
+        sources = tuple(range(number * 20 + 1, number * 20 + 21))
+        memory = {f'fact:{source}': 'a' * 64 for source in sources}
+        state = repo.begin_turn(SCOPE, {'session_id': 'stable', 'memory_dependencies': memory},
+            sources, expected_revision=revision)
+        state = repo.save(SCOPE, turn(number), {'session_id': 'stable', 'memory_dependencies': memory,
+            'receipts': [{'call_id': 'unknown-write', 'status': 'uncertain'}]},
+            sources, expected_revision=state['revision'])
+        revision = state['revision']
+    restored = repository(sqlite_engine, tmp_path).read(SCOPE)
+    assert restored['checkpoint']['session_id'] == 'stable'
+    assert len(restored['source_message_ids']) == 20
+    assert len(restored['context_source_message_ids']) == 300
+    assert len(restored['context_memory_dependencies']) == 300
+    assert repo.read('group:900000002')['context_source_message_ids'] == []
+    assert repo.clear_if_source(SCOPE, 1)  # Not in the current turn's list.
+    cleared = repo.read(SCOPE)
+    assert not cleared['context_source_message_ids'] and not cleared['context_memory_dependencies']
+    assert cleared['checkpoint']['receipts'][0]['replay_allowed'] is False
+
+
+def test_dependency_migration_and_guard_rollback_are_atomic(sqlite_engine, tmp_path):
+    from app.storage.agent_sessions import AgentSessionCheckpoint, AgentSessionDependency
+    from app.storage.db import session_scope
+    from sqlalchemy import select, func
+    repo = repository(sqlite_engine, tmp_path)
+    with session_scope(sqlite_engine) as session:
+        session.add(AgentSessionCheckpoint(key=f'{ACCOUNT}:{SCOPE}', account_id=ACCOUNT, scope=SCOPE,
+            items=turn(1), checkpoint={'session_id': 'legacy', 'memory_dependencies': {'fact:1': 'b'*64}},
+            source_message_ids=[1], revision=1, updated_at=NOW.replace(tzinfo=None)))
+    def revoked():
+        raise RuntimeError('revoked while committing')
+    with pytest.raises(RuntimeError, match='revoked'):
+        repo.begin_turn(SCOPE, {'session_id': 'legacy'}, [2], expected_revision=1, before_commit=revoked)
+    with session_scope(sqlite_engine) as session:
+        assert session.scalar(select(func.count()).select_from(AgentSessionDependency)) == 0
+    state = repo.begin_turn(SCOPE, {'session_id': 'legacy'}, [2], expected_revision=1)
+    assert state['context_source_message_ids'] == [1, 2]
+    assert state['context_memory_dependencies'] == {'fact:1': 'b'*64}
+    assert repo.read(SCOPE) == state
+
+
+def test_memory_revision_cannot_change_without_invalidating_old_context(sqlite_engine, tmp_path):
+    repo = repository(sqlite_engine, tmp_path)
+    repo.save(SCOPE, turn(1), {'memory_dependencies': {'fact:1':'a'*64}}, [1], expected_revision=0)
+    with pytest.raises(ValueError, match='revision conflict'):
+        repo.save(SCOPE, turn(2), {'memory_dependencies': {'fact:1':'b'*64}}, [2], expected_revision=1)
+    state = repo.save(SCOPE, [], {'memory_dependencies': {'fact:1':'b'*64}}, [2],
+        expected_revision=1, reset_dependencies=True)
+    assert state['context_source_message_ids'] == [2]
+    assert state['context_memory_dependencies'] == {'fact:1': 'b'*64}
