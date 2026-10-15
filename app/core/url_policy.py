@@ -26,6 +26,15 @@ def public_web_url(value: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, parts.query, ""))
 
 
+def media_resource_url(value: str) -> bool:
+    """A locator hint for ordering/progress, never permission or media proof."""
+    try:
+        path = urlsplit(public_web_url(value)).path
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return '/status/' in path or path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.mp4', '.gif'))
+
+
 _EXPLICIT_URL_REQUEST = re.compile(
     r"(?:"
     r"(?:给|发|贴|附|提供|带|留下).{0,10}(?:网址|链接|url|官网)"

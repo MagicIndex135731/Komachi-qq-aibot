@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 import ipaddress
 import json
+import logging
+import re
 from html import unescape
 from pathlib import Path
 import socket
@@ -16,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.core.url_policy import public_web_url
+from app.core.url_policy import media_resource_url, public_web_url
 from app.core.message_content import ImageAttachment
 from app.providers.llm_client import resolve_reasoning_model
 from app.providers.shared_page_text import read_bilibili_text
@@ -26,6 +28,7 @@ from app.providers.web_search import (
 )
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def _resolve_addresses(host: str, port: int) -> list[str]:
@@ -88,11 +91,16 @@ class GeminiSearchClient(WebSearchClient):
         payload = {
             "contents": [{"role": "user", "parts": [{"text":
                 f"今天是{today}（上海）。请使用Google搜索查证以下问题，优先直接来源，"
-                f"给出简明结果、相关日期及最多{max_results}条来源。不要猜测未经来源确认的事实。\n{query}"}]}],
+                f"给出简明结果、相关日期及最多{max_results}条来源。下面是检索式，不要解释检索式或账号路径的含义。"
+                "找帖子、图片或视频时优先定位具体原帖或含原帖链接的报道，不能只介绍账号。"
+                "保留检索目的中的最新或指定日期要求；不要用多年前的代表作凑数量，来源可少于上限。"
+                "只需简短候选列表。不要拼接、猜测链接或未经来源确认的事实；报道日期不是原帖日期。\n" + query}]}],
             # Mixing server search with ordinary functions disables grounding
             # on this relay. This request deliberately contains one native tool.
             "tools": [{"googleSearch": {}}],
-            "generationConfig": {"maxOutputTokens": 4096},
+            # Native Gemini includes thinking in this cap. 4096 repeatedly
+            # ended real grounded searches with MAX_TOKENS before metadata.
+            "generationConfig": {"maxOutputTokens": 8192},
         }
         texts, metadata, terminal = [], {}, False
         with self.http_client.stream("POST", endpoint, params={"alt": "sse"},
@@ -115,6 +123,7 @@ class GeminiSearchClient(WebSearchClient):
                     if not raw or raw == b"[DONE]":
                         continue
                     try:
+                        invalid_reason = 'invalid_frame'
                         frame = json.loads(raw)
                         if not isinstance(frame, dict) or frame.get("error"):
                             raise ValueError("invalid frame")
@@ -122,6 +131,7 @@ class GeminiSearchClient(WebSearchClient):
                         candidate = candidates[0] if candidates else {}
                         for part in (candidate.get("content") or {}).get("parts") or []:
                             if part.get("functionCall"):
+                                invalid_reason = 'unexpected_client_function'
                                 raise ValueError("client function is not server search")
                             if isinstance(part.get("text"), str) and not part.get("thought"):
                                 texts.append(part["text"])
@@ -130,9 +140,13 @@ class GeminiSearchClient(WebSearchClient):
                             metadata.update(grounding)
                         finish = candidate.get("finishReason")
                         if finish and finish != "STOP":
+                            invalid_reason = ('incomplete_' + finish if finish in {
+                                'MAX_TOKENS', 'SAFETY', 'RECITATION', 'MALFORMED_FUNCTION_CALL',
+                                'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT'} else 'incomplete_unknown')
                             raise ValueError("incomplete native search")
                         terminal = finish == "STOP"
                     except (ValueError, TypeError, AttributeError, IndexError) as exc:
+                        logger.warning('gemini_search_response_invalid reason=%s', invalid_reason)
                         raise WebSearchProviderError("web_response_invalid") from exc
                     if terminal:
                         break
@@ -144,9 +158,73 @@ class GeminiSearchClient(WebSearchClient):
         answer = "".join(texts).strip()
         if not results or not answer:
             raise WebSearchProviderError("web_grounding_unavailable")
+        # Model-authored markdown targets are not grounding metadata. A
+        # plausible-looking invented article URL must not become a locator.
+        allowed = {hit.source for hit in results}
+        answer = self._grounded_links_only(answer, allowed)
+        for hit in results:
+            hit.snippet = self._grounded_links_only(hit.snippet, allowed)
         sources = "\n".join(f"{hit.title} ({hit.source}) cite{hit.ref_id}" for hit in results)
         return WebSearchReport(results, f"Google搜索生成的有来源摘要（不是网页原文）：\n{answer}\n\n来源：\n{sources}",
             "grounded_answer")
+
+    @staticmethod
+    def _grounded_links_only(text: str, allowed: set[str]) -> str:
+        return re.sub(r'https?://[^\s<>\[\]()`，。；]+',
+            lambda match: match.group() if match.group() in allowed else '链接须从来源页核验', text)
+
+    def search_resources(self, query: str, max_results: int = 8, *, goal: str = '') -> WebSearchReport:
+        """Discover actual page links, never links invented in search prose.
+
+        One search and at most three source reads share the normal deadline.
+        Reads use the page/Mihomo transport; targets remain untrusted data and
+        are not downloaded, followed recursively, or treated as verified posts.
+        """
+        deadline = time.monotonic() + self.timeout_seconds
+        intent = f'\n当前用户的检索目的（保留对象和时间范围）：{goal[:1000]}' if goal else ''
+        report = self._search_report(query + intent, max_results, deadline)
+        page_deadline = min(deadline, time.monotonic() + 15)
+        results, sections, seen = list(report.results), [], {hit.source for hit in report.results}
+        candidates = list(enumerate(report.results))
+        if re.search(r'最新|最近|近期|\b(?:latest|recent)\b', goal + ' ' + query, re.I):
+            today = datetime.now(ZoneInfo('Asia/Shanghai'))
+            def priority(item):
+                hit = item[1]
+                # These are unverified ranking hints only, never returned as
+                # post dates or evidence of freshness. A recent source near
+                # the end must not lose all read slots to old top results.
+                hints = [(int(y), int(m)) for y, m in re.findall(
+                    r'\b(20\d{2})[年/-](\d{1,2})(?:月|[/\s-]|\b)', hit.snippet + ' ' + hit.title)
+                    if 1 <= int(m) <= 12 and (int(y), int(m)) <= (today.year, today.month)]
+                return max(hints, default=(0, 0)), media_resource_url(hit.source)
+            candidates.sort(key=priority, reverse=True)
+        for index, hit in candidates[:3]:
+            if time.monotonic() >= page_deadline:
+                break
+            try:
+                title, target, lines, _ = self._page_lines(hit.source,
+                    min(page_deadline, time.monotonic() + 6), client=self.page_http_client)
+            except (httpx.HTTPError, WebSearchProviderError, ValueError, OSError):
+                # Failure of one result says nothing about other sources.
+                sections.append(f'来源{index + 1}本次未能读取；不代表没有原帖或媒体。')
+                continue
+            results[index] = WebSearchResult(title, hit.snippet, target, hit.date, hit.ref_id)
+            links = [line for line in lines if line.startswith('[网页链接，尚未读取]')]
+            sections.append(f'实际读取来源：{title} ({target})\n' + '\n'.join(links[:12]))
+            # Fair room for later sources: the first index page must not fill
+            # the entire 20-source envelope with navigation links.
+            for line in links[:4]:
+                url = line.rsplit(' ', 1)[-1]
+                if url in seen or len(results) >= 20:
+                    continue
+                seen.add(url)
+                results.append(WebSearchResult('来源页内链接（目标尚未核验）',
+                    f'由实际页面 {target} 提取；' + line[:180], url, '', f'turn0search{len(results)}'))
+        if sections:
+            report = WebSearchReport(results,
+                '真实来源读取与链接发现（页面链接不证明作者、日期或媒体存在）：\n' +
+                '\n\n'.join(sections)[:6500] + '\n\n' + report.content, report.content_kind)
+        return report
 
     @staticmethod
     def _grounded_results(metadata: dict, limit: int) -> list[WebSearchResult]:

@@ -60,6 +60,31 @@ def test_blocked_completion_requires_real_attempt_and_never_proves_absence(tmp_p
     assert goal.can_stop
 
 
+def test_found_media_locator_requires_a_real_attempt_before_linkless_refusal(tmp_path):
+    goal = control(tmp_path)
+    goal.observe('search_web', {}, ToolOutcome({'content_kind': 'grounded_answer',
+        'sources': [{'source': 'https://x.com/synthetic/status/900000000000000001'}]}), 'search')
+    goal.observe('open_web_page', {}, ToolOutcome({'error': 'web_http_404'}, 'failed'), 'wrong-page')
+    args = {'text': '没有链接无法下载', 'task_status': 'blocked'}
+    result = goal.preflight('send_private', args)
+    assert 'discovered_media_not_attempted' in result.data['missing']
+    goal.observe('download_twitter_media', {}, ToolOutcome({'error': 'twitter_media_unavailable'}, 'failed'), 'download')
+    assert goal.preflight('send_private', args) is None
+
+
+def test_media_locator_correction_is_bounded_and_does_not_override_authority(tmp_path):
+    goal = control(tmp_path)
+    goal.observe('search_web', {}, ToolOutcome({'content_kind': 'grounded_answer',
+        'sources': [{'source': 'https://media.example/photo.jpg'}]}), 'search')
+    args = {'text': '尚未取得媒体', 'task_status': 'partial'}
+    assert goal.preflight('send_private', args) is not None
+    assert goal.preflight('send_private', args) is not None
+    assert goal.preflight('send_private', args) is None
+    goal.corrections = 0
+    goal.observe('download_web_image', {}, ToolOutcome({'error': 'owner_required'}, 'blocked'), 'no-auth')
+    assert goal.preflight('send_private', args) is None
+
+
 @pytest.mark.parametrize('stage', ['blocked', 'partial'])
 def test_missing_archived_evidence_is_recoverable_before_any_external_attempt(tmp_path, stage):
     goal = control(tmp_path, '那把这个十月十三号的图片发给我')

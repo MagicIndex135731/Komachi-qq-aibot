@@ -71,6 +71,7 @@ class ResearchTaskWorkspace:
         # `begin_research_task` or an explicit delegated child activates the
         # bounded workspace after the model has made that decision.
         self.formal = False
+        self.request_control = {}
         identity = f'{owner}:{source_id}' + (f':{task_key}' if task_key else '')
         self.task_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
         self.context_scope = scope
@@ -254,6 +255,7 @@ class ResearchTaskWorkspace:
         # scope. Formal checkpoints and queued jobs own durable continuation;
         # ordinary chat must not create an ever-growing directory per message.
         self._write(self.root/'request-goal.json',data)
+        self.request_control = dict(control)
 
     @serialized_checkpoint
     def save_execution_experience(self, version, experience):

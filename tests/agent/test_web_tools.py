@@ -302,3 +302,24 @@ async def test_search_timeout_is_not_retried_by_changing_the_query_in_one_turn()
     second = await current['search_web'].handler({'query': 'b'})
     assert first.data['error'] == second.data['error'] == 'web_timeout'
     assert second.data['cached_failure_in_turn'] is True and client.attempts == 1
+
+
+async def test_source_bound_media_goal_selects_discovery_without_changing_normal_search(tmp_path):
+    from app.agent.research_tasks import ResearchTaskWorkspace
+    from app.agent.request_task import RequestTaskControl
+    class Discovery(Client):
+        def search_resources(self, query, max_results, *, goal):
+            self.calls.append(('discovery', query, goal))
+            return WebSearchReport([], 'actual source links', 'grounded_answer')
+    client = Discovery()
+    workspace = ResearchTaskWorkspace(tmp_path, scope='private:900000101', actor_id=900000101,
+        source_id=10, request='帮我下载最近的图片', valid_source=lambda source: source == 10)
+    current = {t.name: t for t in build_web_tools(client, settings=SimpleNamespace(),
+        runner=Runner(), guard=Guard(), workspace=workspace)}
+    control = RequestTaskControl(workspace, capability_version='synthetic')
+    control._persist()
+    assert (await current['search_web'].handler({'query': 'recent photos'})).status == 'ok'
+    assert client.calls == [('discovery', 'recent photos', '帮我下载最近的图片')]
+    normal = tools(client)
+    await normal['search_web'].handler({'query': 'ordinary question'})
+    assert client.calls[-1] == ('search', 'ordinary question', 8)

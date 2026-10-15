@@ -97,3 +97,60 @@ async def test_followup_recovers_old_evidence_and_finds_post_inside_article(
         await service.stop()
         web.http_client.close()
         reader.http_client.close()
+
+
+@pytest.mark.parametrize('owner', [False, True])
+async def test_fresh_media_request_discovers_real_post_and_delivers_without_seeded_context(
+        sqlite_engine, tmp_path, monkeypatch, mp4, owner):
+    downloads = provider(monkeypatch, video=mp4)
+    delivered, searches, pages = [], [], []
+    redirect = 'https://search.example/grounded'
+    article = 'https://example.com/article'
+    def search(request):
+        searches.append(request)
+        return httpx.Response(200, content=('data: ' + json.dumps({'candidates': [{
+            'content': {'parts': [{'text': 'Some photos [wrong](https://example.com/invented).'}]},
+            'finishReason': 'STOP', 'groundingMetadata': {'groundingChunks': [
+                {'web': {'title': 'Real article', 'uri': redirect}}]}}]}) + '\n\n').encode())
+    def page(request):
+        pages.append(request)
+        assert 'x-goog-api-key' not in request.headers
+        if str(request.url) == redirect:return httpx.Response(302, headers={'location': article})
+        assert str(request.url) == article
+        return httpx.Response(200, headers={'content-type': 'text/html'}, text=
+            '<article><p>' + 'Article context. ' * 50 + '</p></article>'
+            '<article><a href="' + URL + '">Actual original post</a></article>')
+    web = GeminiSearchClient(provider='gemini', base_url='https://relay.example/v1', api_key='synthetic',
+        model='gemini-3.8-flash-medium', timeout_seconds=10,
+        http_client=httpx.Client(transport=httpx.MockTransport(search)),
+        page_http_client=httpx.Client(transport=httpx.MockTransport(page)),
+        address_resolver=lambda *_: ['93.184.216.34'])
+    def script(body, n):
+        if n == 1:return sse('search_web', {'query': 'author latest cosplay'}, number=n)
+        if n == 2:
+            data = output(body, 'search_web')['data']
+            assert 'invented' not in data['content']
+            candidate = next(hit for hit in data['sources'] if hit['source'] == URL)
+            return sse('download_twitter_media', {'ref_id': candidate['ref_id'],
+                'delivery_mode': 'auto', 'delivery_text': 'Found original media'}, number=n)
+        if n == 3:return sse('send_private', {'text': '正在下载并发送', 'task_status': 'progress'}, number=n)
+        raise AssertionError('Unexpected extra model request')
+    class Gateway:
+        async def call_api(self, action, params):
+            delivered.append((action, params))
+            return {'status': 'ok', 'retcode': 0, 'data': {'message_id': 'fresh-' + str(len(delivered))}}
+    service, agent, dispatcher, _, requests = setup(sqlite_engine, tmp_path, script)
+    service.sender, service.web_search_client = Sender(Gateway()), web
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('fresh-media', user_id=OWNER if owner else OTHER,
+            text='帮我去X扒一些作者最新的cos视频或图片'))
+        async with asyncio.timeout(20):
+            while not any(action.endswith('forward_msg') for action, _ in delivered):
+                await asyncio.sleep(.05)
+        assert len(requests) == 3 and len(searches) == 1 and len(pages) == 2 and len(downloads) == 4
+        assert len([1 for action, _ in delivered if action.endswith('forward_msg')]) == 1
+    finally:
+        await service.stop()
+        web.http_client.close()
+        web.page_http_client.close()

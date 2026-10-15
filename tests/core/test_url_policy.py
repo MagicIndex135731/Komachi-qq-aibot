@@ -1,3 +1,5 @@
+import pytest
+
 from app.core.url_policy import explicitly_requests_urls, filter_reply_urls, url_reply_policy_instruction
 
 
@@ -46,3 +48,13 @@ def test_filter_removes_url_only_line_with_label_but_keeps_answer() -> None:
 def test_filter_keeps_source_labels_with_meaningful_text_and_plain_headings() -> None:
     reply = "菜品：\n来源：门店说明 https://example.com/shop\n官网：https://example.com/shop"
     assert filter_reply_urls(reply, allow_urls=False) == "菜品：\n来源：门店说明"
+@pytest.mark.parametrize('url,expected', [
+    ('https://x.com/synthetic/status/900000000000000001', True),
+    ('https://cdn.example/photo.JPG?size=orig', True),
+    ('https://twitter.com/intent/tweet?url=https://cdn.example/photo.jpg', False),
+    ('http://127.0.0.1/photo.jpg', False),
+    ('javascript:photo.jpg', False),
+])
+def test_media_locator_hint_never_grants_private_or_share_url_access(url, expected):
+    from app.core.url_policy import media_resource_url
+    assert media_resource_url(url) is expected

@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from app.core.message_content import ImageAttachment
+from app.core.url_policy import media_resource_url
 from app.providers.shared_page_text import read_bilibili_text
 
 
@@ -598,8 +599,10 @@ class WebSearchClient:
         from app.core.url_policy import public_web_url
         fragments = self._candidate_html_fragments(self._strip_noise_blocks(
             HTML_COMMENT_PATTERN.sub(' ', HTML_SCRIPTLIKE_PATTERN.sub(' ', html_text))))
-        fragment = max(fragments, key=lambda value: self._score_text_lines(
-            self._extract_meaningful_lines(value)), default='')
+        # Embeds and next-page links can live in a shorter article region.
+        # Text extraction selects one region; link discovery must cover all
+        # eligible regions, retaining the same noise and public-URL checks.
+        fragment = '\n'.join(fragments)
         links, seen = [], set()
         class Links(HTMLParser):
             href, label = '', ''
@@ -619,7 +622,8 @@ class WebSearchClient:
                     seen.add(target)
                     links.append((target, self._normalize_text(label)[:90]))
         Links().feed(fragment)
-        links.sort(key=lambda item: urlparse(item[0]).hostname == urlparse(base_url).hostname)
+        links.sort(key=lambda item: (not media_resource_url(item[0]),
+            urlparse(item[0]).hostname == urlparse(base_url).hostname))
         lines, size = [], 0
         for target, label in links[:24]:
             line = f'[网页链接，尚未读取] {label} {target}'

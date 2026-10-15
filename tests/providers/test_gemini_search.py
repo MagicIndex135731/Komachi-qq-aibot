@@ -56,6 +56,7 @@ def test_native_search_keeps_grounding_and_never_executes_a_client_function():
     assert len(requests)==1
     body=json.loads(requests[0].content)
     assert body['tools']==[{'googleSearch':{}}]
+    assert body['generationConfig']['maxOutputTokens'] == 8192
     assert 'streamGenerateContent' in str(requests[0].url) and '/v1/v1beta/' not in str(requests[0].url)
     assert requests[0].headers['x-goog-api-key']=='SYNTHETIC_PRIVATE_KEY'
     assert report.content_kind=='grounded_answer' and '0.13.0' in report.content
@@ -193,3 +194,84 @@ def test_interrupted_stream_is_not_a_grounded_success():
     stream=b'data: '+json.dumps({'candidates':[{'content':{'parts':[{'text':'Guess'}]}}]}).encode()+b'\n\n'
     c=make(lambda _:httpx.Response(200,content=stream))
     with c.http_client,pytest.raises(WebSearchProviderError):c.search_report('latest')
+
+
+def test_search_prose_cannot_invent_actionable_urls():
+    payload = native_frames().replace(b'0.13.0, 2026-10-09.',
+        b'[invented](https://example.com/does-not-exist) 0.13.0')
+    c = make(lambda _: httpx.Response(200, content=payload))
+    with c.http_client:
+        result = c.search_report('locate an actual post')
+    assert 'does-not-exist' not in result.content
+    assert 'https://example.com/release' in result.content
+
+
+def test_media_discovery_reads_grounded_sources_and_keeps_short_embed_region():
+    calls = []
+    post = 'https://x.com/synthetic/status/900000000000000001'
+    def handler(request):
+        calls.append(request)
+        if request.method == 'POST':
+            return httpx.Response(200, content=native_frames())
+        if request.url.path == '/release':
+            return httpx.Response(302, headers={'location': '/article'})
+        return httpx.Response(200, headers={'content-type': 'text/html'}, text=
+            '<article><p>' + 'Long news paragraph. ' * 50 + '</p></article>'
+            '<article><a href="' + post + '">Original post</a></article>')
+    c = make(handler)
+    with c.http_client:
+        result = c.search_resources('latest photos')
+    assert result.results[0].source == 'https://example.com/article'
+    assert any(hit.source == post for hit in result.results)
+    assert post in result.content and len(calls) == 3
+    assert all('x-goog-api-key' not in r.headers for r in calls[1:])
+
+
+def test_media_discovery_does_not_turn_one_failed_source_into_global_failure():
+    body = native_frames().replace(b'http://127.0.0.1/private', b'https://other.example/article')
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if request.method == 'POST':return httpx.Response(200, content=body)
+        if request.url.host == 'example.com':return httpx.Response(404)
+        return httpx.Response(200, headers={'content-type': 'text/html'},
+            text='<article><a href="https://media.example/photo.jpg">Photo</a></article>')
+    c = make(handler)
+    with c.http_client:result = c.search_resources('photos')
+    assert any(hit.source == 'https://media.example/photo.jpg' for hit in result.results)
+    assert len(calls) == 3
+
+
+def test_media_discovery_bounds_source_reads_and_prioritizes_media_over_share_actions():
+    sources = [{'web': {'uri': f'https://example.com/article{i}', 'title': f'Source {i}'}} for i in range(5)]
+    frame = ('data: ' + json.dumps({'candidates': [{'content': {'parts': [{'text': 'Candidates'}]},
+        'finishReason': 'STOP', 'groundingMetadata': {'groundingChunks': sources}}]}) + '\n\n').encode()
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if request.method == 'POST':
+            assert '保留对象和时间范围' in json.loads(request.content)['contents'][0]['parts'][0]['text']
+            return httpx.Response(200, content=frame)
+        index = request.url.path[-1]
+        return httpx.Response(200, headers={'content-type': 'text/html'}, text=
+            '<article><p>Actual body</p>' + ''.join(
+                f'<a href="https://share.example/action{i}">Share</a>' for i in range(8)) +
+            f'<a href="https://x.com/synthetic/status/90000000000000000{index}">Post</a></article>')
+    c = make(handler)
+    with c.http_client:result = c.search_resources('profile', goal='最近的图片')
+    assert len(calls) == 4  # One search plus three source pages, no recursion.
+    assert len(result.results) <= 20
+    assert sum('/status/' in hit.source for hit in result.results) == 3
+
+
+def test_recent_media_discovery_uses_later_recent_source_hint_without_asserting_a_post_date():
+    from app.providers.web_search import WebSearchReport, WebSearchResult
+    calls = []
+    c = make(lambda r: calls.append(str(r.url)) or httpx.Response(200,
+        headers={'content-type': 'text/html'}, text='<article><p>Actual source</p></article>'))
+    c._search_report = lambda *args: WebSearchReport([
+        WebSearchResult('Source', '2019年9月', f'https://example.com/old{i}', '') for i in range(3)] +
+        [WebSearchResult('Source', '2020年10月中旬', 'https://example.com/newer', '')], 'summary', 'grounded_answer')
+    with c.http_client:result = c.search_resources('account', goal='最新的图片')
+    assert calls[0] == 'https://example.com/newer' and len(calls) == 3
+    assert all(hit.date == '' for hit in result.results)

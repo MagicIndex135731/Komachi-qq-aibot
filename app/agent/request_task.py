@@ -32,6 +32,8 @@ TASK_POLICY=(
     '历史回复里“不能下载/没有工具”等口头断言不代表当前能力；以本轮工具目录、权限和实际执行结果为准，不能直接沿用旧拒绝。'
     '跨轮证据使用原结果task_id加evidence_id读取，不切换当前目标；本地证据定位失败后按当前请求恢复读取或搜索来源，不能当成网站下载失败。'
     '新闻报道日期、搜索收录日期和原帖发布日期是不同事实；下载最新或指定日期的帖子须核对原帖，缺证据时说明日期未核实。'
+    '媒体请求可用search_web发现实际来源页内的原帖链接，再用对应下载工具；优先source/ref_id，不使用生成摘要猜出的链接。'
+    '一个报道404或一次页面未找到关键词只说明该次定位失败，不证明用户必须亲自提供链接。'
     '工具反馈的missing/no_progress用于调整方法；反复没有新证据时换策略，必要时review_task_progress最多一次短复核。'
     'send_group/send_private可标task_status=progress/partial/blocked/completed：进展提示与诚实受阻可以发送，'
     '图片视频完成须本请求实际产物及真实回执；无依据不要宣称已完成或做不到。'
@@ -156,6 +158,12 @@ class RequestTaskControl:
             if (stage=='blocked' and not self.failures and self.reads<2 and set(self._missing()).intersection(
                     {'source_evidence_missing','primary_source_unverified'})):
                 missing.append('insufficient_attempts_before_blocked')
+            if (self.requires_media and not ids and self.corrections < 2
+                    and any(resource_ready(url) for url in self.resource_urls)
+                    and not any(call['tool'] in {'download_twitter_media','download_web_image',
+                        'download_web_images','download_web_video','queue_media_batch'} for call in self.calls)
+                    and not any(failure['category'] in {'authority','capacity'} for failure in self.failures)):
+                missing.append('discovered_media_not_attempted')
             if ids-self.artifacts:missing.append('artifact_not_observed_for_request')
         elif stage=='progress':
             pass
@@ -175,6 +183,8 @@ class RequestTaskControl:
                 '可用task_status=blocked或partial如实说明范围与原因，不能说未发布或无工具。'
                 +('旧证据定位失败不是下载失败；用原task_id重读，或按当前目标搜索/打开来源，不能直接要求用户代找链接。'
                   if 'recoverable_lookup_not_task_blocker' in missing else '')
+                +('已有本轮可下载的原帖或媒体候选，先用对应下载工具核验；不能略过后要求用户代找链接。'
+                  if 'discovered_media_not_attempted' in missing else '')
                 +('纠偏预算已到建议上限，避免重复搜索，按已有实际尝试报告缺口。' if self.corrections>=2 else '')},'blocked')
 
     def observe(self,name,args,outcome,call_id):

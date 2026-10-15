@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from urllib.parse import urlsplit
+from app.core.url_policy import media_resource_url as resource_ready
 
 
 def evidence_descriptor(name, arguments, outcome):
@@ -61,14 +61,6 @@ def evidence_descriptor(name, arguments, outcome):
                 ('timeout','http_429','http_500','http_502','http_503','http_504'))}
     return {'kind':kind,'resources':resources,'failure':failure,
         'coverage':'observed_results_only','absence_proven':False}
-
-
-def resource_ready(url):
-    """Recognize a resource shape, without selecting a platform workflow."""
-    try:
-        path=urlsplit(url).path
-    except ValueError:return False
-    return '/status/' in path or path.lower().endswith(('.jpg','.jpeg','.png','.webp','.mp4','.gif'))
 
 
 def capability_version(client,tools):
