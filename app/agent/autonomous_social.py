@@ -398,6 +398,11 @@ class AutonomousSocialExecutor:
 
     async def run_tools(self, observation, guard, *, decision=None, interactive=False,
                         target_user_id=None, target_message_id=None, direct_group_reply=False, owner_command=None, research_result=None):
+        if observation.job.kind == 'group':
+            from app.core.context_reset import ContextResetGuard
+            from app.storage.context_resets import ContextResetRepository
+            guard = ContextResetGuard(guard, ContextResetRepository(self.router.engine,
+                account_id=self.router.runtime.settings.bot_qq), f'group:{observation.job.scope_id}')
         scope = (f"owner:{owner_command['target']}:{owner_command['group_id']}:{owner_command['task_id']}"
             if owner_command else self.data_scope(observation.job))
         if (self.runtime_mode == 'harness' and not direct_group_reply and not owner_command
@@ -623,6 +628,10 @@ class AutonomousSocialExecutor:
                 actor_id = int(current_target['author_id'])
                 def valid_task_source(identifier):
                     if type(identifier) is not int:
+                        return False
+                    from app.storage.context_resets import ContextResetRepository
+                    if identifier <= ContextResetRepository(self.router.engine,
+                            account_id=self.router.runtime.settings.bot_qq).latest_source_id(f'group:{job.scope_id}'):
                         return False
                     with session_scope(self.router.engine) as session:
                         item = session.get(Message, identifier)
@@ -1339,6 +1348,11 @@ class AutonomousSocialExecutor:
             receipt_scopes = tuple(dict.fromkeys((scope, *(tool.scope for tool in tools if tool.scope))))
             actual_receipts = [record for receipt_scope in receipt_scopes
                 for record in dispatch.repository.recent(receipt_scope, limit=8)]
+            if job.kind == 'group':
+                from app.storage.context_resets import ContextResetRepository, receipt_identity
+                if ContextResetRepository(self.router.engine, account_id=self.router.runtime.settings.bot_qq
+                        ).latest_source_id(f'group:{job.scope_id}'):
+                    actual_receipts = [receipt_identity(record) for record in actual_receipts]
             prompt.append("Durable tool receipts (actual platform states; unknown effects must not be replayed):\n"
                 + json.dumps(actual_receipts, ensure_ascii=False))
         from app.agent.social_cadence import cost_bucket

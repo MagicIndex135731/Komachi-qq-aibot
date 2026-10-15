@@ -1018,6 +1018,7 @@ class MessageRepository:
                 break
             for message in page:
                 if (self._is_reserved_outbound(message)
+                        or message.context_excluded
                         or skip_unconfirmed and self._is_unconfirmed_outbound(message)
                         or skip_qq_blocked and self.is_qq_blocked_outbound(message)):
                     continue
@@ -5806,10 +5807,14 @@ class DevSessionRepository:
         self.session = session
 
     def get_latest_owner_session(self, *, owner_qq: int, session_mode: str = "project") -> DevSession | None:
+        # A late completion in an older daily session must not reactivate it
+        # after a user explicitly opened a fresh context.
+        ordering = ((DevSession.id.desc(),) if session_mode == 'daily'
+            else (DevSession.last_active_at.desc(), DevSession.id.desc()))
         stmt = (
             select(DevSession)
             .where(DevSession.owner_qq == owner_qq, DevSession.session_mode == session_mode)
-            .order_by(DevSession.last_active_at.desc(), DevSession.id.desc())
+            .order_by(*ordering)
             .limit(1)
         )
         return self.session.execute(stmt).scalar_one_or_none()

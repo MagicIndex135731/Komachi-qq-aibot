@@ -16,6 +16,7 @@ from urllib.parse import unquote_to_bytes, urlparse
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
 from app.adapters.sender import (
@@ -241,6 +242,11 @@ class GroupImageGenerationService:
                     return False
                 if (source.raw_json or {}).get("direction") == "outbound":
                     return False
+                from app.storage.models import ContextReset
+                floor = session.scalar(select(ContextReset.source_id).where(
+                    ContextReset.scope == f'group:{request.group_id}').order_by(ContextReset.source_id.desc()).limit(1)) or 0
+                if source.id <= floor:
+                    return False
         return self.group_source_validator is None or bool(self.group_source_validator(request))
 
     def _update_delivery_state(self, state: str, *, receipt_stage: str | None = None) -> None:
@@ -383,6 +389,8 @@ class GroupImageGenerationService:
             job = session.get(Job, job_id)
             if job is None:
                 raise RuntimeError("image job lost its persistent result record")
+            if job.last_error_code == 'context_reset':
+                return
             payload = dict(job.payload_json or {})
             payload["last_notice_text"] = result.notice_text
             payload["delivery_state"] = result.delivery_state
@@ -816,14 +824,18 @@ class PrivateImageGenerationService(GroupImageGenerationService):
         if permission is not None and not permission(request.user_id):
             return False
         source_id = request.agent_source_message_id
-        if not source_id:
-            return True
-
         if self.engine is None:
-            return False
+            return not source_id
         with session_scope(self.engine) as session:
-            row = MessageRepository(session).get_by_platform_msg_id(source_id)
+            from app.storage.models import ContextReset
+            floor = session.scalar(select(ContextReset.source_id).where(
+                ContextReset.scope == f'private:{request.user_id}').order_by(ContextReset.source_id.desc()).limit(1)) or 0
+            if not source_id and not floor:
+                return True
+            row = MessageRepository(session).get_by_platform_msg_id(source_id or
+                f'private-inbound-{request.user_id}-{request.trigger_message_id}')
             if not bool(row is not None and row.group_id is None
+                and row.id > floor
                 and is_usable_memory_source(row, author_id=request.user_id)
                 and isinstance(row.raw_json, dict) and row.raw_json.get("direction") != "outbound"):
                 return False

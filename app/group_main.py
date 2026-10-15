@@ -673,7 +673,12 @@ async def run() -> None:
                 bot_name=str(runtime.persona.get("name", settings.bot_qq)),
             )
             if group_agent is not None:
+                # A live event may already exist from history backfill; the
+                # durable agent inbox owns live-observation deduplication.
                 router.ingest_live_group_message(event)
+                if await router.try_handle_context_reset(event,
+                        cancel_group=lambda group_id: group_agent.cancel_group(group_id, resume_pending=True)):
+                    return
                 await group_agent.observe(event)
             else:
                 await router.handle_group_message(event)

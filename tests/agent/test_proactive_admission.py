@@ -29,7 +29,7 @@ def observed(ids):
 
 
 def guard(ids):
-    return SimpleNamespace(require_valid=lambda: None,
+    return SimpleNamespace(require_valid=lambda: None, valid=lambda: True,
         trace_trigger={'trigger_evidence': {'source_ids': list(ids)}})
 
 

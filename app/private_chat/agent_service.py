@@ -81,6 +81,7 @@ class PrivateHarnessService:
         self._wake = asyncio.Event()
         self._locks = {}
         self._active = {}
+        self._active_sources = {}
         self._model_lock = asyncio.Lock()
         self.research_jobs = ResearchDelegationQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_research, deliver=self._return_research, clock=lambda: self.clock(),
@@ -324,10 +325,17 @@ class PrivateHarnessService:
                     return
                 task = asyncio.create_task(self._execute(*claimed))
                 self._active[user_id] = task
+                self._active_sources[user_id] = claimed[1]['source_id']
                 try:
                     await task
+                except asyncio.CancelledError:
+                    # Cancelling one user's reset turn must not kill the shared
+                    # scheduler or discard their next already-queued message.
+                    if asyncio.current_task().cancelling():
+                        raise
                 finally:
                     self._active.pop(user_id, None)
+                    self._active_sources.pop(user_id, None)
 
     def _finish(self, job_id, status, reason):
         with self._transaction() as session:
@@ -343,16 +351,19 @@ class PrivateHarnessService:
             (), expected_revision=snapshot["revision"], reset_dependencies=True)
         await self.cancel_user(user_id)
 
-    async def cancel_user(self, user_id):
-        self.research_jobs.cancel_scope(user_id)
-        self.media_jobs.cancel_scope(user_id)
+    async def cancel_user(self, user_id, *, before_source_id=None):
+        self.research_jobs.cancel_scope(user_id, before_source_id=before_source_id)
+        self.media_jobs.cancel_scope(user_id, before_source_id=before_source_id)
         with self._transaction() as session:
             rows = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self._prefix(user_id)), Job.status.in_(("queued", "running")))))
             for row in rows:
+                if before_source_id is not None and (row.payload_json or {}).get('source_id', 0) > before_source_id:
+                    continue
                 row.status, row.last_error_code = "cancelled", "private_user_cancelled"
         task = self._active.get(user_id)
-        if task is not None and task is not asyncio.current_task():
+        if (task is not None and task is not asyncio.current_task()
+                and (before_source_id is None or self._active_sources.get(user_id, 0) <= before_source_id)):
             task.cancel()
 
     async def _execute(self, job_id, payload):
@@ -438,7 +449,9 @@ class PrivateHarnessService:
                 daily = DevSessionRepository(session).get_or_create_owner_session(owner_qq=user_id, session_mode="daily")
                 daily_id = daily.id
             def valid_task_source(identifier):
-                return type(identifier) is int and self._valid_source(identifier, user_id)
+                from app.storage.context_resets import ContextResetRepository
+                floor = ContextResetRepository(self.engine, account_id=self.account_id).latest_source_id(scope)
+                return type(identifier) is int and identifier > floor and self._valid_source(identifier, user_id)
             def valid_task_dependencies(metadata):
                 if metadata.get('context_snapshot'):
                     from app.agent.context_dependencies import context_snapshot_valid

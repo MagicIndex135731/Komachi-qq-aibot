@@ -266,6 +266,9 @@ class PrivateChatService:
         if not await self.access_policy.authorize(event.user_id):
             return False
 
+        if await self._try_context_reset(event):
+            return True
+
         if getattr(event, "reply_to_msg_id", None) is not None or bool(
             list(getattr(event, "images", []) or [])
         ):
@@ -325,6 +328,46 @@ class PrivateChatService:
         ):
             return True
         await self._handle_private_chat_turn(event, private_scope=private_scope)
+        return True
+
+    async def _try_context_reset(self, event) -> bool:
+        from app.core.context_reset import PRIVATE_RESET_COUNT, authored_reset, reset_confirmation
+        from app.storage.context_resets import ContextResetRepository
+        command = authored_reset(event, default_count=PRIVATE_RESET_COUNT)
+        if command is None:
+            return False
+        if command.error:
+            await self._send_private_text(user_id=event.user_id, text=command.error,
+                context=f'context_reset_usage:{event.platform_msg_id}')
+            return True
+        with session_scope(self.engine) as session:
+            source = MessageRepository(session).get_by_platform_msg_id(
+                f'private-inbound-{event.user_id}-{event.platform_msg_id}')
+            if source is None:
+                # Compatibility for legacy direct callers without an ingress ledger.
+                if event.plain_text in SESSION_NEW_COMMANDS:
+                    return False
+                await self._send_private_text(user_id=event.user_id, text='重置未执行：消息尚未入库，请重新发送。',
+                    context=f'context_reset_missing:{event.platform_msg_id}')
+                return True
+            source_id = source.id
+            if source.plain_text != event.plain_text or source.raw_json != event.raw_payload:
+                return True
+        try:
+            result = ContextResetRepository(self.engine, account_id=self._private_sender_user_id()).reset(
+                scope=f'private:{event.user_id}', actor_id=event.user_id, source_id=source_id, count=command.count)
+        except Exception:
+            logger.exception('private_context_reset_failed user_id=%s', event.user_id)
+            await self._send_private_text(user_id=event.user_id, text='上下文重置失败，请稍后重试。',
+                context=f'context_reset_failed:{event.platform_msg_id}')
+            return True
+        if not result['applied']:
+            return True
+        self._reset_private_draw_state(user_id=event.user_id)
+        if self.agent_handler is not None:
+            await self.agent_handler.cancel_user(event.user_id, before_source_id=source_id)
+        await self._send_private_text(user_id=event.user_id, text=reset_confirmation(result, private=True),
+            context=f'context_reset:{event.platform_msg_id}')
         return True
 
     async def _send_private_text(

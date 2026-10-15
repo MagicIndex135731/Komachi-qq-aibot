@@ -186,10 +186,12 @@ class ResearchDelegationQueue:
             await asyncio.gather(self.worker, return_exceptions=True)
             self.worker = None
 
-    def cancel_scope(self, scope_id):
+    def cancel_scope(self, scope_id, *, before_source_id=None):
         with self.transaction() as session:
             for row in session.scalars(select(Job).where(Job.job_type == self.job_type,
                     Job.job_key.startswith(self.prefix(scope_id)), Job.status.in_(WAITING_STATES))):
+                if before_source_id is not None and (row.payload_json or {}).get('source_id', 0) > before_source_id:
+                    continue
                 row.status, row.last_error_code = 'cancelled', 'scope_cancelled'
 
     def cancel_task(self, scope_id, actor_id, task_id, *, before_commit):

@@ -65,6 +65,7 @@ def is_usable_memory_source(
             "is_reserved",
             "is_deleted",
             "ineligible",
+            "context_excluded",
         )
     ):
         return False

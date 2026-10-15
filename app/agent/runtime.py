@@ -221,15 +221,21 @@ class GroupAgentRuntime:
         if not task.cancelled() and task.exception() is not None:
             logger.error("group_agent_worker_retry_failed group_id=%s error_type=%s", group_id, type(task.exception()).__name__)
 
-    async def cancel_group(self, group_id: int) -> None:
+    async def cancel_group(self, group_id: int, *, resume_pending: bool = False) -> None:
         """Invalidate the group immediately; the caller decides when to resume."""
-        self._epochs[group_id] = self._epochs.get(group_id, 0) + 1
-        task = self._workers.pop(group_id, None)
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._wake.pop(group_id, None)
-        self._last_observed.pop(group_id, None)
+        async with self._admission_lock:
+            self._epochs[group_id] = self._epochs.get(group_id, 0) + 1
+            task = self._workers.pop(group_id, None)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._wake.pop(group_id, None)
+            self._last_observed.pop(group_id, None)
+            self._worker_paused.discard(group_id)
+            self._worker_reset_used.discard(group_id)
+            self._worker_failures.pop(group_id, None)
+            if resume_pending and self.repository.has_pending(group_id):
+                self._ensure_worker(group_id)
 
     async def stop(self) -> None:
         if not self.running:

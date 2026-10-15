@@ -3058,6 +3058,43 @@ class InboundRouter(GroupReplyDeliveryMixin):
             return
         await self._handle_persisted_group_message(event)
 
+    async def try_handle_context_reset(self, event, *, cancel_group=None) -> bool:
+        from app.core.context_reset import GROUP_RESET_COUNT, authored_reset, reset_confirmation
+        from app.storage.context_resets import ContextResetRepository
+        command = authored_reset(event, default_count=GROUP_RESET_COUNT,
+            bot_id=self.runtime.settings.bot_qq, bot_names=self._build_bot_names(''))
+        if command is None or not event.mentioned_bot:
+            return False
+        with session_scope(self.engine) as session:
+            source = MessageRepository(session).get_by_platform_msg_id(event.platform_msg_id)
+            enabled, speak, *_ = self._resolve_group_policy(groups=GroupRepository(session), group_id=event.group_id)
+            if (not enabled or not speak or source is None or source.user_id != event.user_id
+                    or source.group_id != event.group_id or source.plain_text != event.plain_text
+                    or source.raw_json != event.raw_payload or not source.mentioned_bot):
+                return True
+            source_id = source.id
+        if event.user_id != self.runtime.settings.owner_qq:
+            await self._send_prebuilt_reply(event, '群上下文由大家共用，只有主人可以重置。私聊可重置你自己的会话。')
+            return True
+        if command.error:
+            await self._send_prebuilt_reply(event, command.error)
+            return True
+        try:
+            result = ContextResetRepository(self.engine, account_id=self.runtime.settings.bot_qq).reset(
+                scope=f'group:{event.group_id}', actor_id=event.user_id, source_id=source_id, count=command.count)
+        except Exception:
+            logger.exception('group_context_reset_failed group_id=%s', event.group_id)
+            await self._send_prebuilt_reply(event, '上下文重置失败，请稍后重试。')
+            return True
+        if result['applied']:
+            for key in tuple(self.pending_group_image_turns):
+                if key[0] == event.group_id:
+                    self.pending_group_image_turns.pop(key, None)
+            if cancel_group is not None:
+                await cancel_group(event.group_id)
+            await self._send_prebuilt_reply(event, reset_confirmation(result, private=False))
+        return True
+
     def build_agent_observation(self, batch) -> dict:
         from app.agent.observation import GroupObservationService
 
@@ -3132,6 +3169,8 @@ class InboundRouter(GroupReplyDeliveryMixin):
         Used by the live path after ingest and by startup replay for messages
         that arrived while the bot was starting (backfilled as history).
         """
+        if await self.try_handle_context_reset(event):
+            return
         if self.memory_compaction_service is not None:
             await self.memory_compaction_service.wake()
         if self._should_hold_group_image_for_followup(event):

@@ -17,9 +17,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    select,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
 
 class Base(DeclarativeBase):
@@ -154,6 +155,23 @@ class User(Base):
     profile_summary: Mapped[str] = mapped_column(Text, default="")
 
 
+class ContextReset(Base):
+    """An authored context reset, separate from the immutable chat ledger."""
+    __tablename__ = 'context_resets'
+    source_id: Mapped[int] = mapped_column(ForeignKey('messages.id'), primary_key=True)
+    account_id: Mapped[int] = mapped_column(Integer)
+    scope: Mapped[str] = mapped_column(String(160), index=True)
+    requested_count: Mapped[int] = mapped_column(Integer)
+    excluded_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class ContextExcludedMessage(Base):
+    __tablename__ = 'context_excluded_messages'
+    message_id: Mapped[int] = mapped_column(ForeignKey('messages.id'), primary_key=True)
+    reset_source_id: Mapped[int] = mapped_column(ForeignKey('context_resets.source_id'), index=True)
+
+
 class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
@@ -172,6 +190,9 @@ class Message(Base):
     msg_type: Mapped[str] = mapped_column(String(32), default="text")
     reply_to_msg_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mentioned_bot: Mapped[bool] = mapped_column(Boolean, default=False)
+    # A rebuildable context mask; original text, JSON and delivery state stay intact.
+    context_excluded = column_property(select(ContextExcludedMessage.message_id).where(
+        ContextExcludedMessage.message_id == id).correlate_except(ContextExcludedMessage).exists())
 
 
 class Summary(Base):
