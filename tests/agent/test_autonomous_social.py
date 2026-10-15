@@ -1201,9 +1201,16 @@ class InteractiveIngressGuard:
 @pytest.mark.asyncio
 async def test_native_proactive_send_uses_chat_interval_and_agent_can_be_silent(sqlite_engine, tmp_path):
     from test_harness_runtime import model_client, responses_sse
-    client, requests, _ = model_client(lambda body, number: (
-        responses_sse(name="send_group", arguments={"text": f"合成主动回复{number}", "artifact_ids": []}, number=number)
-        if number in (1, 3) else responses_sse(number=number)))
+    from test_delegation_composition import observation
+    judgments=[]
+    def model(body,number):
+        if not body['tools']:
+            packet=observation(body,'Group observation JSON:\n')
+            judgments.append(True)
+            return responses_sse(text=json.dumps({'decision':'participate' if len(judgments)<=2 else 'silent',
+                'source_id':packet['messages'][-1]['id'],'reason':'natural_hook'}),number=number)
+        return responses_sse(name='send_group',arguments={'text':f'合成主动回复{number}','artifact_ids':[]},number=number)
+    client, requests, _ = model_client(model)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
                         options={"cooldown_seconds": 1800}) as fixture:
         await fixture.agent.stop()

@@ -143,7 +143,8 @@ class SocialPlanner:
 
     def _observe_group(self, job: SocialJob, now: datetime) -> SocialObservation:
         router = self.router
-        persona = router._persona_text_for(router._active_persona(job.scope_id), job.scope_id)[:4000]
+        persona = ('' if getattr(router.runtime.settings,'agent_runtime','legacy')=='harness' else
+            router._persona_text_for(router._active_persona(job.scope_id), job.scope_id)[:4000])
         observation = SocialObservation(job, now, persona)
         with session_scope(router.engine) as session:
             messages = MessageRepository(session)

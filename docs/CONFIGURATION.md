@@ -81,7 +81,7 @@ Harness在本地检查后才调用模型，每轮最近最多30条群消息；�
 | `proactive_observation_hourly_speeches` | 滚动一小时3次自主插话；分段算一次，不要求用完 |
 | `proactive_observation_speech_cooldown_seconds` | 自主插话至少间隔600秒 |
 
-事件消息和定时群观察共用持久额度，重启不清零。发言冷却或额度不允许时不做插话推理；数量和时间达标仍可沉默。`proactive_min_new_messages`保留为既有参与策略，不能绕过上述限制。
+事件消息和定时群观察共用持久额度，重启不清零。普通群巡检先做一次无工具轻量判断，最多30条/约1500 token观察资料，无完整人格记忆和旧巡检历史；批准后正式回复，判断和回复共同计入上述模型额度。明确互动不经过此判断。发言冷却或额度不允许时不做插话推理；数量和时间达标仍可沉默。`proactive_min_new_messages`保留为既有参与策略，不能绕过上述限制。
 
 `proactive_feedback_enabled` 默认开启。嫌烦/闭嘴请求结合真实引用和最近机器人发言识别，不要求写机器人名字；对工作或明确其他人的抱怨不计入。确认后该群主动静默 `proactive_feedback_quiet_seconds`（默认 1200 秒），随后在反馈发出后的 `proactive_feedback_duration_seconds`（默认 7200 秒）内使用 `proactive_feedback_interval_seconds`（默认 `600-1200` 秒）。新反馈重新计时；同一消息重放不延长，来源撤回后失效，过期恢复原间隔。普通 @ 提问保留，但嫌烦请求本身不会被接梗反击。各字段可按群覆盖，群间互不影响。
 

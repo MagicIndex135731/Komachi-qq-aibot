@@ -33,17 +33,20 @@ def guard(ids):
         trace_trigger={'trigger_evidence': {'source_ids': list(ids)}})
 
 
-async def test_single_messages_only_wake_after_eight_new_sources(sqlite_engine):
+async def test_single_messages_only_wake_after_eight_new_sources(sqlite_engine,monkeypatch):
     service = executor(sqlite_engine)
+    judge=AsyncMock(return_value=(ToolTurnResult('silent'),None))
+    monkeypatch.setattr('app.agent.participation_judge.judge_participation',judge)
     ids = []
     for index in range(8):
         ids.append(add_source(sqlite_engine, platform_id=f'synthetic-{index}', text=f'讨论内容 {index}'))
         await service.run_tools(observed(ids), guard([ids[-1]]), interactive=True)
-        assert service._run_tools.await_count == int(index == 7)
+        assert judge.await_count == int(index == 7)
+        assert service._run_tools.await_count == 0
     # New arrivals cannot immediately trigger another silent judgment.
     next_id = add_source(sqlite_engine, platform_id='synthetic-next', text='新的话题')
     await service.run_tools(observed([*ids, next_id]), guard([next_id]), interactive=True)
-    assert service._run_tools.await_count == 1
+    assert judge.await_count == 1
 
 
 async def test_direct_request_and_result_delivery_bypass_proactive_budget(sqlite_engine):

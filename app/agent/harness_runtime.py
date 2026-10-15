@@ -83,7 +83,8 @@ class HarnessToolAgent:
                  reply_source_id: int | None = None, context_policy: RequestContextPolicy | None = None,
                  trace_root: str | Path | None = None, trace_context: dict | None = None,
                  system_identity: str | None = None, ephemeral_context: bool = False,
-                 admission_metrics=None) -> None:
+                 admission_metrics=None, cache_namespace: str | None = None,
+                 finish_after_delivery=None, trace_conversation_key: str | None = None) -> None:
         if not 1 <= max_steps <= 32 or not 0 <= max_image_calls <= 4 or not 1 <= max_external_writes <= 8:
             raise ValueError("invalid Harness turn budget")
         self.decision_client = decision_client
@@ -93,6 +94,10 @@ class HarnessToolAgent:
         self.system_identity = system_identity
         self.ephemeral_context = ephemeral_context
         self.admission_metrics = admission_metrics
+        self.cache_namespace = cache_namespace
+        self.trace_conversation_key = trace_conversation_key
+        self.finish_after_delivery = finish_after_delivery
+        self.final_response = ''
         self.clock = clock or (lambda: datetime.now(UTC))
         self.require_reply = require_reply
         if reply_source_id is not None and (type(reply_source_id) is not int or not 1 <= reply_source_id <= 2**63 - 1):
@@ -139,7 +144,7 @@ class HarnessToolAgent:
             "model": bridge.model, "protocol": bridge.protocol,
             "context_window_tokens": self.context_policy.context_window},
             session_key=str(home) + ":" + str(session_id or self.session_id or "xiaomachi"),
-            conversation_key=str(home))
+            conversation_key=self.trace_conversation_key or str(home))
         # Scoped live examples retain developer authority, but are not stored
         # as the native session's fixed persona or conversation input. Replayed
         # examples must not outlive their current canonical source checks.
@@ -228,6 +233,7 @@ class HarnessToolAgent:
                             "Internal final text is not a send. Do not repeat another message's completed action."}],
                             session_id=session_id or self.session_id or "xiaomachi")
                     bridge.runtime_phase = "completed"
+                    self.final_response = result.final_response
                     return result
             run_budget = asyncio.timeout(self.timeout_seconds)
             async with run_budget:
@@ -599,6 +605,22 @@ class _Bridge:
 
     def _forward(self, handler, body, budget, *, compaction=False):
         self.require_valid()
+        if (not compaction and self.last_write and self.last_write.status == 'sent'
+                and self.owner.finish_after_delivery and self.owner.finish_after_delivery()):
+            # Close the native tool loop after its real tool result is saved.
+            # This is local completion, never an upstream call or usage.
+            self.observer.event('delivery.completed', {'source':'application', 'receipt_id':self.last_write.receipt_id})
+            handler.send_response(200)
+            handler.stream_started = True
+            handler.send_header('Content-Type', 'text/event-stream')
+            handler.end_headers()
+            event = ({'type':'response.completed', 'response':{'id':'local-delivery-complete',
+                'object':'response', 'status':'completed', 'output':[]}}
+                if self.protocol == 'openai-responses' else
+                {'id':'local-delivery-complete','object':'chat.completion.chunk',
+                    'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})
+            handler.wfile.write(('data: '+json.dumps(event)+'\n\ndata: [DONE]\n\n').encode())
+            return
         client = self.owner.decision_client
         names = [tool.get("name", tool.get("function", {}).get("name")) for tool in body.get("tools", [])]
         model = body.get("model")
@@ -694,6 +716,10 @@ class _Bridge:
                         *base_messages, *live, *guidance, {"role": "user", "content": time_anchor}]
                 if self.protocol == "openai-responses":
                     body = client.prepare_responses_payload(body)
+                    namespace = self.owner.cache_namespace or str(self.owner.session_path or self.owner.session_id or 'ephemeral')
+                    body['prompt_cache_key'] = 'komachi-' + hashlib.sha256(json.dumps(
+                        [namespace, client.base_url, model, self.instructions, body.get('tools', [])],
+                        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
                     if not compaction and str(model).lower().startswith(("grok-", "gemini-")) and names:
                         body["instructions"] += (
                             "\n\nOutput transport contract: Assistant text and final answers are internal, "

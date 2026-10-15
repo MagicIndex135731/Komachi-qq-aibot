@@ -21,11 +21,14 @@ from tests.private_chat.test_agent_service import OTHER, event, setup, sse
 
 @pytest.mark.parametrize('surface',['group','private'])
 @pytest.mark.parametrize('uncertain',[False,True])
-async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlite_engine,tmp_path,monkeypatch,mp4,surface,uncertain):
+@pytest.mark.parametrize('delivery_mode',['review','auto'])
+async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlite_engine,tmp_path,monkeypatch,mp4,surface,uncertain,delivery_mode,record_property):
     requests=provider(monkeypatch,video=mp4)
     web=WebSearchClient(provider='ddgs',base_url='',api_key='',timeout_seconds=10)
     sent_result=[]
+    model_calls=[]
     def command(body,n):
+        model_calls.append(n)
         try:
             packet=observation(body,'Delegated result JSON:\n') if surface=='group' else observation(body,'Private observation JSON:\n')
         except AssertionError:
@@ -37,7 +40,7 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
             assert [item['kind'] for item in data['media']]==['photo','video','gif']
             return 'send_'+surface,{'text':'原帖共3项媒体','artifact_ids':[],
                 'media_artifact_ids':data['media_artifact_ids'],'as_forward':True}
-        if n==1:return 'download_twitter_media',{'ref_id':URL}
+        if n==1:return 'download_twitter_media',{'ref_id':URL,'delivery_mode':delivery_mode,'delivery_text':'原帖共3项媒体'}
         if n==2:
             assert output(body)['status']=='queued'
             return 'send_'+surface,{'text':'已安排下载','artifact_ids':[]}
@@ -96,6 +99,11 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         media=[item for node in nodes for item in node['data']['content'] if item['type'] in {'image','video'}]
         assert [item['type'] for item in media]==['image','video','video']
         assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4,mp4]
+        if delivery_mode=='auto':
+            assert len(model_calls)==2 and sent_result==[]
+        record_property('upstream_requests',len(model_calls))
+        record_property('delivery_mode',delivery_mode)
+        record_property('surface',surface)
         with session_scope(sqlite_engine) as session:
             effects=list(session.scalars(select(AgentToolEffect).where(AgentToolEffect.operation=='send_'+surface)))
             assert effects[-1].status==('uncertain' if uncertain else 'sent')

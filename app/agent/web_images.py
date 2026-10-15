@@ -152,7 +152,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
         except (ValueError, KeyError, TypeError):
             return ToolOutcome({'error': 'invalid_web_video_argument'}, 'blocked')
         if submit is not None:
-            return await submit('download_web_video', {'ref_id': url}, {})
+            return await submit('download_web_video', {**args, 'ref_id': url}, {})
         if url in video_results:
             artifact_id, info = video_results[url]
             try:
@@ -206,14 +206,16 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
                 return await handler(args)
         return checked
     from app.agent.twitter_media import build_twitter_media_tool
+    from app.agent.media_tasks import download_delivery_properties
     return (
         AgentTool('list_web_images', '从用户指定公开网页提取原图候选及alt/附近说明；获取/扒图先用此工具，offset分页。可跟进人物页或文件说明页；不执行网页脚本或登录。',
             schema({'ref_id': text(2000), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 159}}, ['ref_id']), serial(listing)),
         AgentTool('download_web_image', '下载本回合list_web_images返回的image_id，校验并展示真实原图像素，保存为当前会话artifact_id。核对目标后用send_group/send_private的artifact_ids发送。',
             schema({'image_id': text(64)}, ['image_id']), serial(download)),
         AgentTool('download_web_images', '后台按顺序批量下载本轮list_web_images的image_ids，最多20张/32MiB/90秒；立即返回任务编号，完成后回传真实产物和前2张预览。不要重复排队；结果回来后用as_forward=true和artifact_ids合并发送。',
-            schema({'image_ids': {'type': 'array', 'items': text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}}, ['image_ids']), serial(batch)),
+            schema({'image_ids': {'type': 'array', 'items': text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True},
+                **download_delivery_properties()}, ['image_ids']), serial(batch)),
         AgentTool('download_web_video', '后台下载公开网页或获准卡片的真实H.264 MP4，最大64MiB/10分钟；立即返回任务编号，完成后回传video_artifact_id再发送。不要重复排队；不观看/抽帧或执行网页脚本。',
-            schema({'ref_id': text(2000)}, ['ref_id']), serial(video)),
+            schema({'ref_id': text(2000), **download_delivery_properties()}, ['ref_id']), serial(video)),
         build_twitter_media_tool(runner=runner, guard=guard, store=store, settings=settings, submit=submit),
     )

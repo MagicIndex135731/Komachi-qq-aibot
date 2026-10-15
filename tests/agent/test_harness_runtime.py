@@ -101,6 +101,40 @@ def request_body(protocol="openai-responses"):
                 "image_url": "https://synthetic.invalid/private?token=SYNTHETIC_URL_SECRET"}]}]}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('protocol',['openai-responses','openai-completions'])
+async def test_confirmed_delivery_closes_native_loop_without_extra_upstream_and_replays_closed_tools(tmp_path,protocol):
+    def response(body,n):
+        return (responses_sse(name='send_group',arguments={'text':str(n)},number=n)
+            if protocol=='openai-responses' else chat_sse(name='send_group',arguments={'text':str(n)}))
+    client,requests,_=model_client(response)
+    if protocol=='openai-completions':client.responses_model=None
+    async def send(args):return ToolOutcome({},'sent','synthetic-receipt')
+    tools=(tool('send_group',send,effect='write',properties={'text':{'type':'string'}},required=('text',)),)
+    agent=HarnessToolAgent(decision_client=client,session_home=tmp_path/'home',session_id='stable',
+        finish_after_delivery=lambda:True,require_reply=True)
+    try:
+        for n in range(2):
+            result=await agent.run(['Synthetic delivery '+str(n)],tools,Guard())
+            assert result.status=='sent',result
+        assert len(requests)==2
+        if protocol=='openai-responses':
+            assert any(x.get('type')=='function_call_output' for x in requests[1]['input'])
+    finally:agent.close();client.http_client.close()
+
+
+def test_cache_routing_is_stable_across_native_rotation_but_scoped_and_schema_bound(bridge_factory):
+    bridge,requests,_=bridge_factory(lambda *_:responses_sse())
+    bridge.owner.cache_namespace='group:900000001'
+    bridge.forward(ModelHandler(),request_body())
+    bridge.owner.session_id='new-native-id'
+    bridge.forward(ModelHandler(),request_body())
+    assert requests[0]['prompt_cache_key']==requests[1]['prompt_cache_key']
+    bridge.owner.cache_namespace='group:900000002'
+    bridge.forward(ModelHandler(),request_body())
+    assert requests[2]['prompt_cache_key']!=requests[0]['prompt_cache_key']
+
+
 def test_grok_bridge_preserves_persona_and_clock_in_one_authoritative_instruction_block(bridge_factory):
     bridge, requests, _ = bridge_factory(lambda *_: responses_sse(), model="grok-4.7")
     bridge.dynamic_instructions = "SYNTHETIC_DYNAMIC_PERSONA"

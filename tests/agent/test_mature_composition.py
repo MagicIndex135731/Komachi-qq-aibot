@@ -657,8 +657,16 @@ async def test_native_inflight_checkpoint_rotates_uncommitted_framework_history(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("send", [False, True])
 async def test_native_unaddressed_group_event_owns_decision_silence_and_continuation(sqlite_engine, tmp_path, send):
-    client, requests, _ = model_steps(*([
-        ("send_group", {"text": "夜空的颜色很有趣", "artifact_ids": []}), ("read_persona", {}), None] if send else [None]))
+    from test_harness_runtime import model_client,responses_sse
+    from test_delegation_composition import observation
+    def model(body,n):
+        if not body['tools']:
+            packet=observation(body,'Group observation JSON:\n')
+            return responses_sse(text=json.dumps({'decision':'participate' if send else 'silent',
+                'source_id':packet['messages'][-1]['id'],'reason':'natural_hook'}),number=n)
+        if n==2:return responses_sse(name='read_persona',arguments={},call_id=f'mature-{n}',number=n)
+        return responses_sse(name='send_group',arguments={'text':'夜空的颜色很有趣','artifact_ids':[]},call_id=f'mature-{n}',number=n)
+    client,requests,_=model_client(model)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
         await fixture.agent.stop()
         at = datetime.now(UTC)
@@ -699,8 +707,10 @@ async def test_native_unaddressed_group_event_owns_decision_silence_and_continua
             assert len(requests) == (3 if send else 1)
             assert len(writes(fixture)) == int(send)
             checkpoint = fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]
-            assert checkpoint["last_status"] == status
-            assert len(checkpoint["receipts"]) == int(send)
+            assert not checkpoint  # stateless decisions never grow a native patrol history
+            main = fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]
+            assert (main.get('last_status')=='sent') is send
+            assert len(main.get('receipts',[]))==int(send)
         finally:
             await runtime.stop()
             planner.close()

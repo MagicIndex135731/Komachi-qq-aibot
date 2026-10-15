@@ -88,7 +88,7 @@ class PrivateHarnessService:
                 and (self.gateway is None or self.gateway.websocket is not None))
         from app.agent.media_tasks import MediaTaskQueue
         self.media_jobs = MediaTaskQueue(self.engine, account_id=self.account_id, surface='private',
-            execute=self._execute_media, deliver=self._return_research, clock=lambda: self.clock(),
+            execute=self._execute_media, deliver=self._return_media, clock=lambda: self.clock(),
             available=lambda: self.gateway is None or self.gateway.websocket is not None,
             authorized=lambda payload: self.running and self.allowed(payload['actor_id'])
                 and (self.gateway is None or self.gateway.websocket is not None))
@@ -117,6 +117,24 @@ class PrivateHarnessService:
             raise RuntimeError('private_media_authority_revoked')
         return await execute_web_media(payload, guard, engine=self.engine, settings=self.settings,
             web_client=self.service.web_search_client, runner=self.research_runner)
+
+    async def _return_media(self, payload, guard):
+        if payload.get('delivery_mode') != 'auto':
+            return await self._return_research(payload,guard)
+        if not await self.service.access_policy.authorize(payload['actor_id']):
+            return 'blocked'
+        from app.agent.media_tasks import deliver_download
+        async def send(boundary, files, text):
+            receipts=[]
+            delivered,failure = await self.service._send_private_chat_reply(user_id=payload['actor_id'],
+                text=text,context=boundary.action_id,receipt_callback=lambda ids:receipts.extend(ids),
+                before_dispatch=boundary.on_dispatch,**({'media_files':files,'as_forward':True} if files else {}))
+            return ToolOutcome({'error':failure,'message_ids':receipts},
+                'sent' if delivered else 'uncertain' if receipts or failure=='delivery_result_unknown' else 'failed',
+                receipts[0] if receipts else None)
+        return await deliver_download(payload,guard,engine=self.engine,settings=self.settings,
+            runner=self.tool_runner,send=send,clock=self.clock,
+            conversation_key=self.sessions.session_path(payload['scope']).parent/'harness')
 
     async def _return_research(self, payload, guard):
         guard.require_valid()
@@ -453,16 +471,20 @@ class PrivateHarnessService:
                 account_id=self.account_id, scope=scope, engine=self.engine,
                 source_message_ids=lambda: tuple(known_sources))
 
+            auto_media_queued = False
             async def submit_media(operation, args, candidates=None):
+                nonlocal auto_media_queued
                 guard.require_valid()
                 if (payload.get('delegated_result') or {}).get('kind') == 'media_result':
                     return ToolOutcome({'error': 'media_result_cannot_resubmit'}, 'blocked')
-                return self.media_jobs.submit({'account_id': self.account_id, 'surface': 'private',
+                result = self.media_jobs.submit({'account_id': self.account_id, 'surface': 'private',
                     'scope': scope, 'scope_id': user_id, 'actor_id': user_id, 'source_id': source_id,
                     'sources': list(known_sources), 'memory': {}, 'operation': operation, 'arguments': args,
                     'candidates': candidates or {},
                     'private_scope': payload['private_scope'], 'goal': '完成媒体下载并交付真实产物'},
                     parent_turn=job_id, before_commit=guard.require_valid)
+                auto_media_queued |= result.status=='ok' and result.data.get('delivery')=='automatic_delivery_to_original_request'
+                return result
 
             async def send(args):
                 from app.core.url_policy import explicitly_requests_urls, filter_reply_urls
@@ -801,7 +823,9 @@ class PrivateHarnessService:
                 model_first_output_timeout_seconds=getattr(self.settings, "agent_model_first_output_timeout_seconds", 90),
                 model_progress_timeout_seconds=self.settings.agent_model_progress_timeout_seconds,
                 before_call=reserve_cost,
-                blocking=self.runtime_runner, invoke_tool=invoke, session_home=home, session_id=runtime_id)
+                blocking=self.runtime_runner, invoke_tool=invoke, session_home=home, session_id=runtime_id,
+                finish_after_delivery=lambda: auto_media_queued or
+                    (payload.get('delegated_result') or {}).get('kind')=='media_result')
             async with self._model_lock:
                 with self._transaction() as session:
                     row = session.get(Job, job_id)

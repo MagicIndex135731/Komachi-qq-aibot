@@ -38,7 +38,7 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
         except (KeyError, ValueError, TypeError):
             return ToolOutcome({'error': 'invalid_twitter_post_url'}, 'blocked')
         if submit is not None:
-            return await submit('download_twitter_media', {'ref_id': url}, {})
+            return await submit('download_twitter_media', {**args, 'ref_id': url}, {})
         if url in results:
             await runner.run(cache.pin, results[url]['media_artifact_ids'])
             return ToolOutcome({**results[url], 'cached_in_turn': True})
@@ -92,7 +92,9 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
             code = exc.code if isinstance(exc, TwitterMediaError) else str(exc) if isinstance(exc, ValueError) else 'twitter_media_download_failed'
             return ToolOutcome({'error': code, 'guidance': '本次媒体未完成，不能声称已发送；可能是私密/删除/限制、接口验证、文件格式或容量上限。失败半成品已清理。'}, 'failed')
 
+    from app.agent.media_tasks import download_delivery_properties
     return AgentTool('download_twitter_media',
         '后台下载用户指定X/Twitter公开单帖的全部原图、视频和动图；最多16项/128MiB，单视频64MiB/10分钟。立即返回任务号；完成后用media_artifact_ids和as_forward=true按序合并转发，不重复排队，不展开引用帖或读取登录态。',
-        {'type': 'object', 'properties': {'ref_id': {'type': 'string', 'minLength': 1, 'maxLength': 2000}},
+        {'type': 'object', 'properties': {'ref_id': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
+            **download_delivery_properties()},
          'required': ['ref_id'], 'additionalProperties': False}, checked)

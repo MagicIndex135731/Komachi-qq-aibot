@@ -209,12 +209,13 @@ class GroupObservationService:
                 suppression = "source_unavailable"
             if suppression:
                 direct_target = None
-            persona = router._active_persona(batch.group_id)
+            lightweight = getattr(router.runtime.settings,'agent_runtime','legacy')=='harness' and direct_target is None
+            persona = {} if lightweight else router._active_persona(batch.group_id)
             return {
                 "direct_target": direct_target,
                 "suppression": suppression,
                 "memory_enabled": router._group_memory_enabled(group_id=batch.group_id),
-                "persona": router._persona_text_for(persona, batch.group_id),
+                "persona": '' if lightweight else router._persona_text_for(persona, batch.group_id),
                 "source_message_ids": tuple(item.id for item in visible),
                 "recent_lines": [
                     f"[{shanghai_aware(item.timestamp).isoformat(timespec='seconds')}] " + router._format_message_line(

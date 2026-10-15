@@ -16,6 +16,13 @@ from app.storage.models import Message
 MEDIA_OPERATIONS = frozenset({'generate_image', 'download_web_images', 'download_web_video', 'download_twitter_media'})
 
 
+def download_delivery_properties():
+    return {'delivery_mode': {'type':'string', 'enum':['auto','review'],
+        'description':'用户仅要求下载后发送选auto；需要分析、筛选或核对内容选review（默认）。auto绑定原请求，由程序按原顺序交付，无需再次调用发送工具。'},
+        'delivery_text': {'type':'string','maxLength':300,
+            'description':'auto完成后的简短说明，不得提前宣称已发送；可留空。'}}
+
+
 class MediaJobGuard(ResearchJobGuard):
     def __init__(self, *args):
         super().__init__(*args)
@@ -58,13 +65,26 @@ class MediaTaskQueue(ResearchDelegationQueue):
     def submit(self, payload, *, parent_turn, before_commit):
         if payload.get('operation') not in MEDIA_OPERATIONS:
             return ToolOutcome({'error': 'media_operation_not_allowed'}, 'blocked')
-        identity = sha256(json.dumps([payload['operation'], payload['arguments']],
+        arguments = dict(payload['arguments'])
+        mode, caption = arguments.pop('delivery_mode', 'review'), arguments.pop('delivery_text', '')
+        if (mode not in {'auto','review'} or not isinstance(caption,str) or len(caption)>300 or '[CQ:' in caption
+                or mode=='auto' and (payload['operation']=='generate_image'
+                    or payload['surface']=='group' and payload.get('request_addressed') is not True)):
+            return ToolOutcome({'error':'invalid_media_delivery'},'blocked')
+        payload = {**payload, 'arguments':arguments, 'delivery_mode':mode, 'delivery_text':caption}
+        identity = sha256(json.dumps([payload['operation'], arguments],
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         result = self.enqueue({**payload, 'source_fingerprints': self.source_fingerprints(payload['sources']),
             'task_id': 'media-' + uuid4().hex},
             parent_turn=str(parent_turn) + ':' + identity, before_commit=before_commit)
         if result['status'] == 'queued':
-            result['delivery'] = 'background_media_result_returns_to_main'
+            with session_scope(self.engine) as session:
+                # Reusing an existing job cannot change its delivery contract.
+                mode = session.get(Job,result['job_id']).payload_json.get('delivery_mode','review')
+            result['delivery'] = ('automatic_delivery_to_original_request' if mode=='auto'
+                else 'background_media_result_returns_to_main')
+            if mode=='auto':
+                result['guidance'] = '程序会按原请求自动交付；可简短告知排队，不手动重复发送或重新提交。'
         return ToolOutcome(result, 'blocked' if result['status'] == 'blocked' else 'ok')
 
     def status_tool(self, *, scope_id, actor_id, guard):
@@ -144,3 +164,62 @@ def media_previews(result, store, guard, settings):
             previews.append(ImageAttachment(url='', local_path=str(path), reference_subject='后台真实媒体产物 ' + identifier))
     guard.require_valid()
     return previews
+
+
+async def deliver_download(payload, guard, *, engine, settings, runner, send, clock, conversation_key):
+    """Deliver only an explicitly queued download, through the existing ledger."""
+    from app.agent.media_delivery import resolve_media_bundle
+    from app.agent.runtime_trace import AgentTrace
+    from app.agent.tool_dispatch import ToolDispatchBoundary
+    guard.require_valid()
+    if payload.get('delivery_mode')!='auto' or payload['operation'] not in MEDIA_OPERATIONS-{'generate_image'}:
+        raise ValueError('automatic_media_delivery_not_authorized')
+    store = media_store(payload,guard,engine=engine,settings=settings)
+    result = payload['result']
+    data = result.get('data',{})
+    identifiers = data.get('media_artifact_ids') or ([data['video_artifact_id']]
+        if data.get('video_artifact_id') else data.get('artifact_ids',[]))
+    files = ()
+    text = payload.get('delivery_text') or '下载完成，媒体在这里。'
+    download_ok = result.get('status')=='ok' and bool(identifiers)
+    if download_ok:
+        def before_read(identifier):
+            guard.require_valid()
+            provenance = store.provenance(identifier)
+            if not guard.valid_dependencies({'sources':list(provenance),'memory':{}}):
+                raise ValueError('media_delivery_source_revoked')
+            return store.get(identifier)
+        files = await runner.run(resolve_media_bundle,store,settings,identifiers,before_read=before_read)
+        if data.get('all_requested_downloaded') is False:
+            text = f"成功下载{len(files)}项，另有{len(data.get('failures',[]))}项未完成；这里只发送已取得的媒体。"
+    else:
+        text = '这次媒体下载未完成，暂时无法发送。'
+    boundary = ToolDispatchBoundary(engine=engine,account_id=payload['account_id'],scope=payload['scope'],
+        guard=guard,max_daily=500,cooldown_seconds=0,clock=clock,
+        interactive_group_send=payload['surface']=='group')
+    operation = 'send_'+payload['surface']
+    async def handler(args):
+        return await send(boundary, files if args.get('media') else (), args['text'])
+    tool = AgentTool(operation,'交付原请求已授权的下载结果',{},handler,effect='write')
+    observer = AgentTrace(settings.data_dir/'agent_monitor' if getattr(settings,'agent_monitor_enabled',False) else None,
+        context={**guard.trace_trigger,'context_kind':payload['surface'],'surface':payload['surface'],
+            'context_scope':payload['scope'],'scope_id':payload['scope_id'],'actor_id':payload['actor_id'],
+            'source_id':payload['source_id'],'trigger_kind':'media_delivery','request_preview':'下载结果直接交付'},
+        session_key=str(conversation_key)+':media-delivery',conversation_key=str(conversation_key))
+    try:
+        async def dispatch(args,call_id):
+            observer.event('tool.started',{'name':operation,'call_id':call_id,'effect':'write','arguments':args})
+            outcome = await boundary.invoke(tool,args,call_id)
+            observer.event('tool.completed',{'name':operation,'call_id':call_id,'effect':'write',
+                'status':outcome.status,'data':outcome.data,'receipt_id':outcome.receipt_id})
+            return outcome
+        outcome = await dispatch({'text':text,'media':list(identifiers) if files else []},'auto-media')
+        if files and outcome.status=='failed' and outcome.data.get('error') in {
+                'qq_send_rejected','qq_video_requires_standalone_message'}:
+            # A definite rejection permits one notice, never another upload.
+            await dispatch({'text':'媒体已下载，但本次发送被拒绝，暂未送达。','media':[]},'failure-notice')
+        observer.finish(outcome.status,'automatic_media_delivery')
+        return ('completed' if download_ok else 'failed') if outcome.status=='sent' else (
+            outcome.status if outcome.status in {'uncertain','blocked'} else 'failed')
+    finally:
+        observer.close()
