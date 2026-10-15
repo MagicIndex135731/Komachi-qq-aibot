@@ -20,6 +20,67 @@ from test_web_video_delivery import mp4
 from tests.private_chat.test_agent_service import OTHER, event, setup, sse
 
 
+@pytest.mark.parametrize('uncertain', [False, True])
+async def test_private_poll_delivers_then_queued_result_reuses_receipt_without_second_media_send(
+        sqlite_engine, tmp_path, monkeypatch, mp4, uncertain):
+    import threading
+    from tests.agent.test_evidence_followup import output as tool_output
+    from app.storage.models import Job
+    requests = provider(monkeypatch, video=mp4)
+    returned = threading.Event()
+    calls, forwards, holder = [], [], {}
+    def script(body, n):
+        calls.append(n)
+        if n == 1:return sse('download_twitter_media', {'ref_id': URL, 'delivery_mode':'review'},number=n)
+        if n == 2:
+            holder['job'] = tool_output(body,'download_twitter_media')['data']['job_id']
+            assert returned.wait(8), 'background result was not queued during foreground turn'
+            return sse('media_task_status', {'job_id':holder['job']},number=n)
+        if n == 3:
+            status = tool_output(body,'media_task_status')['data']
+            assert status['status'] == 'completed'
+            holder['media'] = status['result']['data']['media_artifact_ids']
+            return sse('send_private', {'text':'First delivery','media_artifact_ids':holder['media'],
+                'as_forward':True,'task_status':'completed'},number=n)
+        if n == 4:
+            packet = observation(body,'Private observation JSON:\n')
+            assert packet['delegated_result']['kind'] == 'media_result'
+            return sse('send_private', {'text':'Different caption in returned turn',
+                'media_artifact_ids':list(reversed(holder['media'])),'as_forward':True,
+                'task_status':'completed'},number=n)
+        raise AssertionError('Unnecessary extra model request')
+    class Gateway:
+        async def call_api(self,action,params):
+            if action.endswith('forward_msg'):
+                forwards.append(params)
+                if uncertain:raise QQMessageDeliveryUncertainError('synthetic lost receipt')
+            return {'status':'ok','retcode':0,'data':{'message_id':'synthetic-actual-receipt'}}
+    service,agent,dispatcher,_,_ = setup(sqlite_engine,tmp_path,script)
+    service.sender=Sender(Gateway())
+    service.web_search_client=WebSearchClient(provider='ddgs',base_url='',api_key='',timeout_seconds=10)
+    original_return=agent.media_jobs.deliver
+    async def deliver(payload,guard):
+        result=await original_return(payload,guard)
+        returned.set()
+        return result
+    agent.media_jobs.deliver=deliver
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('poll-then-return',user_id=OTHER,
+            text='请把这条推文的所有图片和视频下载发给我 '+URL))
+        async with asyncio.timeout(20):
+            while True:
+                with session_scope(sqlite_engine) as session:
+                    active=session.scalar(select(Job.id).where(Job.job_type==agent.job_type,
+                        Job.status.in_(('queued','running'))).limit(1))
+                if active is None and len(calls)>=4:break
+                await asyncio.sleep(.05)
+        assert len(forwards)==1 and len(calls)==4 and len(requests)==4
+    finally:
+        await service.stop()
+        service.web_search_client.http_client.close()
+
+
 @pytest.mark.parametrize('owner', [False, True])
 async def test_private_natural_media_request_searches_without_url_then_downloads_and_delivers(
         sqlite_engine, tmp_path, monkeypatch, mp4, owner):

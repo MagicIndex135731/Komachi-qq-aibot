@@ -787,6 +787,7 @@ class AutonomousSocialExecutor:
                 group_interjection_reserve=getattr(original_guard, 'reserve_speech', None),
                 owner_authority=owner_authority,
                 interactive_group_send=bool(interactive and direct_group_reply and job.kind == "group"),
+                delivery_source_id=current_target.get('source_id') if current_target else None,
                 group_send_allowed=(lambda: GroupObservationService(self.router, clock=self.clock).proactive_send_allowed(
                     job.scope_id, target_message_id or job.key,
                     require_new_messages=getattr(original_guard, 'trace_trigger', {}).get('trigger_reason_code') != 'intention_due')) if job.kind == "group" else None)

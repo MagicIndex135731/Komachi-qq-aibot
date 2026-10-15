@@ -760,6 +760,12 @@ class PrivateHarnessService:
                 tools.extend(build_forward_tools(forward_context,self.gateway))
 
             async def invoke(tool, args, call_id):
+                from app.agent.media_delivery import send_media_once
+                return await send_media_once(self.effects, scope=scope, source_id=source_id,
+                    operation=tool.name, arguments=args, require_valid=guard.require_valid,
+                    invoke=lambda: invoke_effect(tool, args, call_id))
+
+            async def invoke_effect(tool, args, call_id):
                 nonlocal current_dispatch, dispatched
                 guard.require_valid()
                 if tool.effect != "write" and tool.name != "generate_private_image":

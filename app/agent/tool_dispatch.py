@@ -14,7 +14,7 @@ from app.adapters.account_profile import ProfileRejectedError, ProfileUnavailabl
 class ToolDispatchBoundary:
     def __init__(self, *, engine, account_id, scope, guard, clock, max_daily=2, cooldown_seconds=60,
                  interactive_group_send: bool = False, group_send_allowed=None, owner_authority=None,
-                 group_interjection_reserve=None):
+                 group_interjection_reserve=None, delivery_source_id=None):
         if type(interactive_group_send) is not bool:
             raise ValueError("interactive group send authority must be a boolean")
         self.repository = AgentToolEffectRepository(engine, account_id=account_id, clock=clock)
@@ -28,8 +28,18 @@ class ToolDispatchBoundary:
         self.receipts = []
         self.dispatched = False
         self.uncertain = False
+        self.delivery_source_id = delivery_source_id
 
     async def invoke(self, tool, arguments, call_id):
+        self.require_valid()
+        if tool.authorization is not None and tool.authorization() is not True:
+            return ToolOutcome({'error': 'owner_required'}, 'blocked')
+        from app.agent.media_delivery import send_media_once
+        return await send_media_once(self.repository, scope=tool.scope or self.scope,
+            source_id=self.delivery_source_id, operation=tool.name, arguments=arguments,
+            require_valid=self.require_valid, invoke=lambda: self._invoke(tool, arguments, call_id))
+
+    async def _invoke(self, tool, arguments, call_id):
         self.require_valid()
         if tool.authorization is not None and tool.authorization() is not True:
             return ToolOutcome({'error': 'owner_required'}, 'blocked')

@@ -246,6 +246,7 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
         text = '这次媒体下载未完成，暂时无法发送。'
     boundary = ToolDispatchBoundary(engine=engine,account_id=payload['account_id'],scope=payload['scope'],
         guard=guard,max_daily=500,cooldown_seconds=0,clock=clock,
+        delivery_source_id=payload['source_id'],
         interactive_group_send=payload['surface']=='group')
     operation = 'send_'+payload['surface']
     async def handler(args):
