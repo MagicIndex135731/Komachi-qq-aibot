@@ -44,7 +44,7 @@ flowchart LR
 
 `app.main` 保留兼容装配入口；生产群聊与私聊分别从 `app.group_main`、`app.private_main` 启动。QQ 网关类沿用 `NapCatGateway` 名称，实际可以连接三种平台。
 
-独立 X 媒体下载入口为 `scripts/download_twitter_media.py`，外部解析与下载由 `app/providers/twitter_media.py` 负责，仅复用 `public_web_url` 的基础校验。它不在群私进程装配或 Harness 工具注册中，不读取机器人配置、数据库或浏览器登录态。公开嵌入接口和 FxTwitter 只解析指定帖本身，媒体下载限定 `pbs.twimg.com` / `video.twimg.com`，重定向逐跳校验；时限、请求重试、单文件/总字节和媒体数量有界。独立目录原子发布媒体与来源/校验和清单，失败或取消清理 staging；不写入 Agent 产物账本或机器人媒体缓存，用法见[公开 README](../README.md#独立-x--twitter-媒体下载)。
+X/Twitter单帖媒体由共享provider解析与下载，机器人经媒体队列接入群私工具，独立CLI仍可手动运行。仅解析指定帖本身，媒体CDN及逐跳重定向受白名单、时限、重试、文件/总量限制；不读取浏览器登录态。机器人结果注册到有来源的产物和受控缓存，CLI结果由调用者管理。使用方式见[工具清单](TOOLS.md)。
 
 ## 群消息处理
 
@@ -109,24 +109,11 @@ V3预加载和记忆工具保留packer的精确证据块边界，原子聊天证
 
 适用Harness群私交互；扩展须沿用对应类别的来源、权限与结果边界。具体启用情况以当前配置为准，稳定目录不代表授予权限。
 
-| 功能/工具入口 | 执行方式 | 主对话保留内容 |
-|---|---|---|
-| 日常聊天、`send_group/send_private` | 主模型理解和回复；发送器校验实际回执，普通/图文/视频/合并转发均通过此边界 | 当前目标、最终回复及真实回执 |
-| `read_context/read_private_context/search_history`、`memory_search/memory_read` | 小范围直接读取；大量历史分析可委派只读研究 | 必要证据与来源，重复观察/回执去重 |
-| `read_persona/read_work_note/list_wakeups/list_private_wakeups/read_self_activity` | 当前范围只读，按需查询持久事实 | 风格/工作状态/提醒/自身发布事实，不导入后台过程 |
-| `search_web/open_web_page/find_web_page`、`read_message_links` | 单次查询直接执行；多页调研、代码审查、比较交给`delegate_research_task`，分享许可每次复验 | 结论、URL和证据ID；前轮外部正文归档 |
-| `read_forward_messages/observe_forward_images/observe_group_images` | 有界分页/实际像素直接读取；大量转发正文交只读研究，图像判断按需保留实际像素 | 必要引文、已读范围和缺口，前轮像素省略 |
-| `begin_research_task/update_research_task/read_research_task/resume_research_task/read_research_evidence` | 当前任务记录/分段证据；`begin`扩预算，`resume`显式选旧任务，不自动创建子模型 | 目标、进度、证据索引和下一步 |
-| `delegate_research_task` | 独立只读模型任务；每轮一次，结果回传轮禁止再次委派 | 有界摘要、来源、缺口，不接收整批原文 |
-| `generate_image`（群交互） | 持久媒体队列，直接调用图像provider，不启动子聊天模型 | 排队编号；完成后真实产物和至多2张预览，发送仍另取回执 |
-| `generate_private_image/private_image_status` | 既有私聊绘图队列；主人许可、原服务状态/实际发送回执 | 任务号、查询状态及结果 |
-| `search_image_references/list_web_images/download_web_image` | 有界候选检索和单图像素核对直接执行，复杂找图比较可先研究；单图不另开模型 | 候选/必要像素/来源和产物ID |
-| `download_web_images/download_web_video/media_task_status` | 群私交互使用持久媒体队列；确定性下载校验，不启动模型。自主后台已独立，沿用有界直接工具 | 下载数量、失败、产物ID及至多2张图片预览；视频只校验元数据，不假装观看 |
-| `list_artifacts/read_artifact/execute_python` | 产物按需读；单次有界计算直接运行隔离sandbox，耗时多步工作由主人任务执行器完成 | 有界输出和产物；不传代码执行日志全集 |
-| `remember_intention/save_work_note/memory_write/request_persona_refresh/persona_task_status/set_group_persona`、`schedule_wakeup/cancel_wakeup/schedule_private_wakeup/cancel_private_wakeup` | 主人真实来源允许的本地写入/排队；任务服务独立执行人格刷新和到期目标，保留既有配置门限 | 写入或排队回执；笔记/任务摘要不是长期事实 |
-| `request_owner_action/owner_action_status/list_owner_capabilities/report_owner_result` | 跨群/公开域的主人请求进入原有独立任务执行器，仅交原指令和明确来源；原进程回报实际完成 | 有界结果、产物和真实回执；查询好友原帖能返回实际正文 |
-| `find_friend/read_friend_feed/read_friend_posts/observe_post_images/comment_qzone/publish_qzone`、`set_nickname/set_avatar/set_group_card` | 公开自主上下文或获准主人任务执行；写入前复验好友/原帖/配置，账号资料按启用范围处理 | 前台只接收查询或操作结果；自己的发布可从账本查询 |
-| 群后台巡检、公开社交、记忆整理、人格刷新、调度/计费/媒体缓存清理 | 各自后台服务或独立执行上下文；没有模型推理需求的工作不创建子模型 | 按需读取事实或状态，不注入原始后台过程 |
+主模型负责理解与对话；小范围历史、记忆、单页与单图读取直接执行。绘图、批量图片和网页/X视频下载使用确定性媒体队列，直接调用provider；只有多页资料研究等需要独立推理的工作才委派只读模型子任务。执行过程不进入主聊天历史，原会话只接收有界结果和产物索引。工具名、当前用法及权限统一维护在[工具清单](TOOLS.md)。
+
+X单帖下载复用独立provider，机器人将有效图片/视频按原帖顺序注册为有来源的产物，混合媒体通过一个合并转发提交。媒体统一使用容量预留、TTL、短租约和持久待回传保护；成功队列结果在有效期内不因普通缓存淘汰丢失。失败/取消清理本次文件，崩溃遗留临时目录有限回收；下载、生成和平台送达分别判断。未来媒体工具须沿用[开发接入合同](DEVELOPMENT.md#媒体工具接入合同)。
+
+群寻址使用真实@、回复作者和明确呼叫证据；@他人后比较小町不授予直接互动资格。模型输入区分发言者、被叫到的人和被谈论的人，第二人称不自动映射到机器人；真实权限仍由来源守卫决定。
 
 媒体队列复用jobs表及既有租约/来源守卫，群私进程分别消费，每进程最多16项、每提问者每作用域4项。入队保存参数、来源/依赖及canonical消息指纹；执行与回传复验，不存主对话原生日志。图片、引用和下载仍受既有字节/格式/来源上限；结果数据最多12000字符。`media_task_status(job_id)`只查本提问者本会话，再次检查来源，返回状态及不重放标记。执行中断、租约丢失和投递未知不自动重做；图像provider明确临时失败的一次补偿沿用原费用及总超时合同。重启可领取尚未开始/已完成待回传工作。主对话可继续聊天，完成后原主会话核验结果并发送；排队、文件生成和QQ送达分别判断。异步确认与结果回传可能增加短模型请求，是否减少费用须比较总输入、未缓存输入、输出和真实账单，不能只追求缓存百分比。
 

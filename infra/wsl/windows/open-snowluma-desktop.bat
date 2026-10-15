@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "DESKTOP_PORT=6081"
-set "PS_SCRIPT=%~dp0infra\wsl\scripts\open_snowluma_desktop.ps1"
+set "PS_SCRIPT=%~dp0..\scripts\open_snowluma_desktop.ps1"
 
 rem The QQ client desktop (where the login QR lives) is reachable through
 rem noVNC. Prove readiness inside WSL first, then open the current WSL address
@@ -16,7 +16,7 @@ for /f "tokens=1" %%I in ('wsl.exe --user root --exec hostname -I') do (
 if not defined WSL_DESKTOP_IP goto forwarding_unavailable
 
 set "VNC_PASSWD="
-for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b "VNC_PASSWD=" "%~dp0infra\wsl\.env" 2^>nul`) do set "VNC_PASSWD=%%B"
+for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b "VNC_PASSWD=" "%~dp0..\.env" 2^>nul`) do set "VNC_PASSWD=%%B"
 
 set "DESKTOP_URL=http://%WSL_DESKTOP_IP%:%DESKTOP_PORT%/vnc.html?autoconnect=1&resize=scale"
 if defined VNC_PASSWD set "DESKTOP_URL=%DESKTOP_URL%&password=%VNC_PASSWD%"

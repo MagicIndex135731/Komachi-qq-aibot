@@ -11,10 +11,10 @@ def test_supported_wsl_operations_files_exist() -> None:
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
-        "open-napcat-webui.bat",
-        "open-llbot-webui.bat",
-        "open-snowluma-webui.bat",
-        "open-snowluma-desktop.bat",
+        "open-agent-monitor.cmd",
+        "switch-xiaomachi-model.cmd",
+        "infra/wsl/windows/open-snowluma-webui.bat",
+        "infra/wsl/windows/open-snowluma-desktop.bat",
         "infra/wsl/docker-compose.yml",
         "infra/wsl/docker-compose.llbot.yml",
         "infra/wsl/docker-compose.snowluma.yml",
@@ -38,12 +38,13 @@ def test_root_readme_routes_wsl_operations_to_authoritative_docs() -> None:
         "start-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
-        "open-napcat-webui.bat",
-        "open-llbot-webui.bat",
+        "open-agent-monitor.cmd",
+        "switch-xiaomachi-model.cmd",
     ):
         assert launcher in readme
     assert "[WSL/Docker 部署与运维](infra/wsl/README.md)" in readme
     assert "[工程架构与运行原理](docs/ARCHITECTURE.md)" in readme
+    assert '(docs/TOOLS.md)' in readme and 'infra/wsl/windows/' in readme
     assert "(infra/wsl/.env.example)" in readme
     assert "start_xiaomachi.ps1" not in readme
     assert "NAPCAT_SHELL_DIR" not in readme

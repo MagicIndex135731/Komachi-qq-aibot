@@ -42,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File scripts/clean_test_tmp.ps1
 ## 验收层级
 
 1. 先用合成账号/群号、临时数据库和 fake gateway 验证本次规则。
-2. 运行相关测试，再运行完整 pytest、compileall 与 pip check。
+2. 按影响范围运行局部及直接消费方测试、compileall 与必要依赖检查；共享契约或广泛影响时运行完整 pytest。
 3. 改部署时验证 Bash/Compose、构建快照和实际健康检查。
 4. 真实模型回放与实际 QQ 动作分别记录；没有 QQ 回执不能声称平台提交成功。
 
@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File scripts/clean_test_tmp.ps1
 
 ## 公开文档与发布
 
-公开入口为 [README](../README.md)、[配置](CONFIGURATION.md)、[架构](ARCHITECTURE.md)、[记忆](MEMORY.md)、[运维](../infra/wsl/README.md) 和 [安全](SECURITY.md)。读者不需要任何本机 Backlog、内部验收报告或历史快照才能安装使用。
+工具名称和用法统一见[工具清单](TOOLS.md)。公开入口为 [README](../README.md)、[配置](CONFIGURATION.md)、[架构](ARCHITECTURE.md)、[记忆](MEMORY.md)、[运维](../infra/wsl/README.md) 和 [安全](SECURITY.md)。读者不需要任何本机 Backlog、内部验收报告或历史快照才能安装使用。
 
 ```powershell
 python -B -X utf8 scripts/check_public_docs.py
@@ -62,3 +62,14 @@ python -B -X utf8 scripts/check_github_sensitive.py
 敏感检查读取本机 `data/project-tools/.secrets-blocklist`（一行一个禁止公开值），扫描文件和真正暂存 blob，不回显敏感值。独立发布目录可通过 `--root`、`--blocklist` 指向候选仓库与本机标识表。未知账号或新密钥需先加入本地表；模式扫描不能代替人工核对。
 
 完整发布包含运行源码、配置模板、脚本和测试。`data/`、真实人物档案、`.env`、登录态、日志、备份和本地管理材料不属于源码分发。详情见 [安全发布](SECURITY.md)。
+
+## 媒体工具接入合同
+
+新增下载、生成或耗时媒体工具时，先复用现有能力，按下列边界接入：
+
+1. 工具目录及schema保持稳定，执行时按当前真实请求、账号、作用域及原始来源授权；群主动观察不能借子任务绕过联网和调用限额。
+2. 确定性下载/绘图使用持久媒体队列，不额外启动聊天模型。只有确需独立推理的多步资料研究使用只读模型子任务；回传只含有界结果、产物及证据索引。
+3. 机器人外部媒体统一进入DownloadedMediaCache。下载前预留容量、流式限制总字节与时限；原图/视频校验后注册有来源的产物。临时目录受控且可在失败、取消或中断后回收，不使用独立CLI永久输出目录作缓存。
+4. 正在执行的文件用短租约保护，持久有效待回传结果由任务状态继续保护；任务结束后按TTL/容量淘汰，容量全部被占用时明确拒绝。不得删除生成作品或用户手动文件来腾空间。
+5. 多图、多视频及混合媒体保留原顺序，通过合并转发一次提交；单视频继续走专门发送参数，禁止传入任意本地路径。真实账号署名，当前守卫在派发前复验，未知回执不自动重放。
+6. 覆盖群/私聊、来源撤回、跨作用域产物、顺序、失败取消、容量与待回传保护、实际发送及未知回执。更新[工具清单](TOOLS.md)、配置/架构的对应权威段落；README只介绍能力和入口。

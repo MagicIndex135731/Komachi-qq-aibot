@@ -13,7 +13,7 @@ from app.storage.db import session_scope
 from app.storage.models import Job
 from app.storage.models import Message
 
-MEDIA_OPERATIONS = frozenset({'generate_image', 'download_web_images', 'download_web_video'})
+MEDIA_OPERATIONS = frozenset({'generate_image', 'download_web_images', 'download_web_video', 'download_twitter_media'})
 
 
 class MediaJobGuard(ResearchJobGuard):

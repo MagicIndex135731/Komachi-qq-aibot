@@ -1,4 +1,4 @@
-"""Standalone public X post media downloads; deliberately absent from bot wiring."""
+"""Public X single-post downloads, shared by the standalone CLI and bot worker."""
 from __future__ import annotations
 
 import asyncio
@@ -158,6 +158,9 @@ def _parse_media(payload: dict[str, Any], post: TwitterPost, resolver: str) -> l
             photos, videos = media.get("photos") or [], media.get("videos") or []
             if not isinstance(photos, list) or not isinstance(videos, list):
                 raise TwitterMediaError("invalid_media_metadata")
+            if photos and videos:
+                # Separate arrays do not prove the original mixed order.
+                raise TwitterMediaError("media_order_unavailable")
             items = photos + videos
     if post_id != post.post_id:
         raise TwitterMediaError("post_id_mismatch")
@@ -194,7 +197,7 @@ class TwitterMediaDownloader:
 
     def __init__(self, client: httpx.AsyncClient, *, resolver: str = "auto",
                  max_file_bytes: int = 100 * MIB, max_total_bytes: int = 300 * MIB,
-                 timeout_seconds: float = 180, retry_delay: float = 0.5):
+                 timeout_seconds: float = 180, retry_delay: float = 0.5, check=None):
         if resolver not in {"auto", "syndication", "fxtwitter"}:
             raise TwitterMediaError("invalid_resolver")
         if (type(max_file_bytes) is not int or type(max_total_bytes) is not int
@@ -205,12 +208,14 @@ class TwitterMediaDownloader:
         self.client, self.resolver = client, resolver
         self.max_file_bytes, self.max_total_bytes = max_file_bytes, max_total_bytes
         self.timeout_seconds, self.retry_delay = timeout_seconds, retry_delay
+        self.check = check or (lambda: None)
 
     async def _transfer(self, url: str, *, limit: int, target: Path | None = None,
                         kind: str | None = None) -> dict[str, Any]:
         hosts = _MEDIA_HOSTS if target else {urlsplit(url).hostname}
         code = "invalid_media_url" if target else "invalid_resolver_url"
         for attempt in range(3):
+            self.check()
             try:
                 current = url
                 for redirect in range(4):
@@ -239,6 +244,7 @@ class TwitterMediaDownloader:
                         stream = target.open("wb") if target else None
                         try:
                             async for chunk in response.aiter_bytes(64 * 1024):
+                                self.check()
                                 total += len(chunk)
                                 if total > limit:
                                     raise TwitterMediaError("size_limit")

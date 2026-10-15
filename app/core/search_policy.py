@@ -333,8 +333,12 @@ def detect_address_intent(
     quoted_bot: bool,
     bot_recently_participated: bool,
     recent_bot_message_count: int,
+    other_addressee: bool = False,
 ) -> AddressDecision:
     normalized = text.strip()
+    from app.core.message_mentions import calls_bot_by_name
+    if other_addressee and not reply_to_bot and not calls_bot_by_name(normalized, bot_names):
+        return AddressDecision(False, 'other_addressee', 0)
     contains_name = any(name and name in normalized for name in bot_names)
     if contains_name and any(hint in normalized for hint in BOT_META_DISCUSSION_HINTS):
         return AddressDecision(False, "bot_meta_discussion", 0)

@@ -144,7 +144,10 @@ class ShareReadAccess:
             and str(item['data'].get('qq', '')) == str(self.bot_qq) for item in _segments(raw)))
         # Textual addressing is also accepted; only authored text is checked,
         # so a name inside an APP card's title/summary cannot grant access.
-        textual_name = bool(re.search(r'(?:小町|串子小町|嘴臭小町)', _authored_text(raw), re.I))
+        from app.core.message_mentions import addressing_evidence
+        evidence = addressing_evidence(raw, bot_id=self.bot_qq, bot_names={'小町','串子小町','嘴臭小町'}, text=_authored_text(raw))
+        textual_name = bool(re.search(r'(?:小町|串子小町|嘴臭小町)', _authored_text(raw), re.I)) and (
+            not evidence['other_addressee'] or evidence['bot_explicitly_called'])
         return explicit_at or textual_name
 
     def _quoted(self, session, row):

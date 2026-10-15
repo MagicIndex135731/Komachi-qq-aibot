@@ -96,9 +96,20 @@ class Sender:
         return (receipt,) if receipt is not None else ()
 
     async def send_video(self, *, video_file: str, text: str = '', group_id=None, user_id=None) -> tuple[str, ...]:
-        from app.core.video_file import MAX_VIDEO_BYTES
         if (group_id is None) == (user_id is None) or len(text) > 12000 or '[CQ:' in text:
             raise ValueError('invalid video message')
+        segments = [{'type': 'text', 'data': {'text': text}}] if text else []
+        segments.append({'type': 'video', 'data': {'file': self._video_file_payload(video_file)}})
+        target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
+        receipt = await self._send_once(action='send_group_msg' if group_id is not None else 'send_private_msg',
+            params={**target, 'message': segments})
+        if receipt is None:
+            raise QQMessageDeliveryUncertainError('QQ video acknowledged without message receipt')
+        return (receipt,)
+
+    @staticmethod
+    def _video_file_payload(video_file):
+        from app.core.video_file import MAX_VIDEO_BYTES
         path = Path(video_file)
         if path.is_symlink() or not 0 < path.stat().st_size <= MAX_VIDEO_BYTES:
             raise ValueError('video exceeds send budget')
@@ -106,13 +117,28 @@ class Sender:
             content = stream.read(MAX_VIDEO_BYTES + 1)
         if not content or len(content) > MAX_VIDEO_BYTES:
             raise ValueError('video exceeds send budget')
-        segments = [{'type': 'text', 'data': {'text': text}}] if text else []
-        segments.append({'type': 'video', 'data': {'file': 'base64://' + base64.b64encode(content).decode('ascii')}})
+        return 'base64://' + base64.b64encode(content).decode('ascii')
+
+    async def send_media_bundle(self, *, self_id: int, name: str, text: str, media_files,
+                                group_id=None, user_id=None) -> tuple[str, ...]:
+        """One acknowledged forward, preserving mixed image/video node order."""
+        if ((group_id is None) == (user_id is None) or not 1 <= len(media_files) <= 20
+                or len(text) > 12000 or '[CQ:' in text or type(self_id) is not int or self_id <= 0
+                or any(kind not in {'image', 'video'} or Path(path).is_symlink() for kind, path in media_files)):
+            raise ValueError('invalid media bundle')
+        if sum(Path(path).stat().st_size for _, path in media_files) > 128 * 1024 * 1024:
+            raise ValueError('media bundle exceeds send budget')
+        nodes = []
+        for index, (kind, path) in enumerate(media_files):
+            caption = (text + '\n' if index == 0 and text else '') + f'{index + 1}/{len(media_files)}'
+            payload = self._image_file_payload(path) if kind == 'image' else self._video_file_payload(path)
+            nodes.append({'type': 'node', 'data': {'uin': str(self_id), 'name': str(name)[:60],
+                'content': [{'type': 'text', 'data': {'text': caption}}, {'type': kind, 'data': {'file': payload}}]}})
         target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
-        receipt = await self._send_once(action='send_group_msg' if group_id is not None else 'send_private_msg',
-            params={**target, 'message': segments})
+        receipt = await self._send_once(action='send_group_forward_msg' if group_id is not None else 'send_private_forward_msg',
+            params={**target, 'messages': nodes})
         if receipt is None:
-            raise QQMessageDeliveryUncertainError('QQ video acknowledged without message receipt')
+            raise QQMessageDeliveryUncertainError('QQ forward acknowledged without message receipt')
         return (receipt,)
 
     async def send_image_bundle(self, *, self_id: int, name: str, text: str, image_files: tuple[str, ...],

@@ -71,9 +71,9 @@ bootstrap 创建初始本地运行目录、缺失的 `.env` 和持久 watchdog P
 
 | 平台 | QQ_PLATFORM | 管理入口 | 主要端口 |
 |---|---|---|---|
-| SnowLuma | `snowluma` | `open-snowluma-webui.bat`、`open-snowluma-desktop.bat` | WebUI 5099、noVNC 6081、VNC 5900、OneBot 3000/3001 |
-| LLBot | `llbot` | `open-llbot-webui.bat` | WebUI 3080、WS 默认 3002 |
-| NapCat | `napcat` | `open-napcat-webui.bat` | WebUI 6099、WS 3001 |
+| SnowLuma | `snowluma` | `infra/wsl/windows/open-snowluma-webui.bat`、`infra/wsl/windows/open-snowluma-desktop.bat` | WebUI 5099、noVNC 6081、VNC 5900、OneBot 3000/3001 |
+| LLBot | `llbot` | `infra/wsl/windows/open-llbot-webui.bat` | WebUI 3080、WS 默认 3002 |
+| NapCat | `napcat` | `infra/wsl/windows/open-napcat-webui.bat` | WebUI 6099、WS 3001 |
 
 平台容器分别为 `xiaomachi-snowluma`、`xiaomachi-llbot` 和 `xiaomachi-napcat`。
 
@@ -254,7 +254,7 @@ systemctl enable --now xiaomachi-sandbox
 
 ## Agent本机监控
 
-在私有 `infra/wsl/.env` 设置 `AGENT_MONITOR_ENABLED=true` 并 rebuild，两应用采集从新回合开始。安装/启动会加载可选 `docker-compose.monitor.yml`，独立查看容器根文件系统只读，仅可写挂载数据卷的 `agent_monitor` 子目录且不加载机器人 `.env`。启动脚本先确保该目录存在；Docker需支持卷 `subpath`。浏览器打开 [Agent现场](http://127.0.0.1:8765/)，也可双击根目录 `打开Agent监控网页.bat`（调用 `open-agent-monitor.cmd`，使用默认浏览器）。
+在私有 `infra/wsl/.env` 设置 `AGENT_MONITOR_ENABLED=true` 并 rebuild，两应用采集从新回合开始。安装/启动会加载可选 `docker-compose.monitor.yml`，独立查看容器根文件系统只读，仅可写挂载数据卷的 `agent_monitor` 子目录且不加载机器人 `.env`。启动脚本先确保该目录存在；Docker需支持卷 `subpath`。浏览器打开 [Agent现场](http://127.0.0.1:8765/)，也可双击根目录 `open-agent-monitor.cmd`；中文别名位于 `infra/wsl/windows/打开Agent监控网页.bat`（使用默认浏览器）。
 
 一键入口先绕过系统代理检查Windows本机健康、页面和会话API；若WSL回环8765存在但Windows localhost转发失联，启动隐藏的Windows查看器，通过 `\\wsl.localhost\Ubuntu_Migrated\...` 处理同一Docker数据卷中的 `agent_monitor`，不复制聊天记录或加载机器人 `.env`。入口核对卷子挂载；兼容旧版整卷只读挂载。两端都只监听回环8765，重复打开复用健康服务，不使用7897、不修改防火墙或重启QQ/WSL。入口需本机Python；可用 `XIAOMACHI_MONITOR_PYTHON` 指定已安装的python.exe，默认检测PATH与本机Conda目录。日志在 `data/agent-monitor-launcher/viewer.log`；关闭浏览器不停止查看器。升级删除功能时需重启已运行的旧版Windows查看进程；重启Windows后再次双击入口即可恢复。
 
@@ -300,3 +300,5 @@ curl --noproxy '*' http://127.0.0.1:8765/health
 WSL 内删除文件后，Windows VHD 可能不立即缩小。压缩需要先核对发行版/VHD路径、停止服务、trim、退出WSL，再使用 Windows 支持的虚拟磁盘压缩操作并恢复启动/状态验证。不要在容器写数据库时对挂载中的 VHD 操作。
 
 群聊上下文升级会幂等新增`proactive_group_states`，保存每群观察进度、租约和滚动额度。上线前通过SQLite在线backup保留一致快照并执行`PRAGMA integrity_check`；不要删除生产数据库。群消息窗口为30条，主动观察默认8条新消息/5分钟、静默退避至30分钟，每小时最多6次主动模型请求和3次插话。状态跨重启保留，明确互动单独处理。`AGENT_CONTEXT_HISTORY_TOKENS=24000`、`AGENT_BACKGROUND_HISTORY_TOKENS=8000`控制动态历史；升级格式9会安全换原生会话，原始消息、任务及实际平台回执保留。监控同时显示实报未缓存输入和临时观察估算，两者不能互作计费依据。回滚代码可忽略新增表，不恢复旧数据库覆盖上线后的新消息。
+
+辅助 Windows 入口集中在 `infra/wsl/windows/`：四种桥接管理/登录页面、隐藏启动 `start-xiaomachi-wsl.vbs` 和中文监控别名。根目录只保留启动、停止、状态、重建、监控、模型切换六个常用入口。隐藏启动仍调用根目录启动器；正式开机计划任务继续使用 `infra/wsl/scripts/run_windows_runtime_task.vbs`，路径不变。

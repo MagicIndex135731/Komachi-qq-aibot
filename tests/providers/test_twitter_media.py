@@ -103,6 +103,19 @@ async def test_fx_fallback_and_exclusion_of_quoted_media(tmp_path):
     assert result.manifest["resolver_failures"] == [{"resolver": "syndication", "code": "post_unavailable"}]
 
 
+async def test_separate_mixed_arrays_never_invent_original_order(tmp_path):
+    calls=[]
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200,json={'code':200,'tweet':{'id':POST_ID,'media':{
+            'photos':[{'type':'photo','url':'https://pbs.twimg.com/sample.jpg'}],
+            'videos':[{'type':'video','url':'https://video.twimg.com/sample.mp4'}]}}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(TwitterMediaError,match='media_order_unavailable'):
+            await TwitterMediaDownloader(client,resolver='fxtwitter').download(URL,tmp_path)
+    assert len(calls)==1 and not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("payload,code", [
     ({"id_str": "900000000000000002", "mediaDetails": [photo()]}, "post_id_mismatch"),
     (metadata([{"type": "photo", "media_url_https": "https://127.0.0.1/secret.jpg"}]), "invalid_media_url"),

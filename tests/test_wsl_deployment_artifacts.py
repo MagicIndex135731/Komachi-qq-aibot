@@ -48,10 +48,10 @@ def test_wsl_required_files_exist() -> None:
         "rebuild-xiaomachi-wsl.bat",
         "stop-xiaomachi-wsl.bat",
         "status-xiaomachi-wsl.bat",
-        "open-napcat-webui.bat",
-        "open-llbot-webui.bat",
-        "open-snowluma-webui.bat",
-        "open-snowluma-desktop.bat",
+        "infra/wsl/windows/open-napcat-webui.bat",
+        "infra/wsl/windows/open-llbot-webui.bat",
+        "infra/wsl/windows/open-snowluma-webui.bat",
+        "infra/wsl/windows/open-snowluma-desktop.bat",
         "infra/wsl/docker-compose.llbot.yml",
         "infra/wsl/docker-compose.snowluma.yml",
         "infra/wsl/scripts/bootstrap_llbot_runtime.py",
@@ -290,7 +290,7 @@ def test_memory_integrity_audit_is_daily_read_only_and_alerts_without_repair() -
 
 
 def test_open_napcat_webui_shortcut_is_ascii_and_never_starts_wsl_or_docker() -> None:
-    shortcut = REPO_ROOT / "open-napcat-webui.bat"
+    shortcut = REPO_ROOT / "infra/wsl/windows/open-napcat-webui.bat"
     launcher = REPO_ROOT / "infra/wsl/scripts/open_napcat_webui.ps1"
     content = shortcut.read_text(encoding="utf-8")
     launcher_content = launcher.read_text(encoding="utf-8")

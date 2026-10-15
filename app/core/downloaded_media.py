@@ -2,11 +2,14 @@
 from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
+from datetime import UTC, datetime
 import hashlib
 import json
 import logging
 import math
 import os
+import shutil
+import sqlite3
 from pathlib import Path
 import re
 import threading
@@ -36,10 +39,11 @@ def _read_json(path, limit=32768):
 
 class DownloadedMediaCache:
     def __init__(self, data_dir: Path, *, artifact_root=None, max_bytes=DEFAULT_MAX_BYTES,
-                 retention_seconds=DEFAULT_RETENTION_SECONDS, clock=time.time):
+                 retention_seconds=DEFAULT_RETENTION_SECONDS, clock=time.time, sqlite_path=None):
         self.root = Path(data_dir).resolve() / 'downloaded_media'
         self.artifacts = Path(artifact_root or (Path(data_dir) / 'autonomous_artifacts')).resolve()
         self.max_bytes, self.retention, self.clock = int(max_bytes), float(retention_seconds), clock
+        self.sqlite_path = sqlite_path
         if self.max_bytes <= 0 or self.retention <= 0:
             raise ValueError('invalid_media_cache_policy')
 
@@ -47,7 +51,41 @@ class DownloadedMediaCache:
     def for_store(cls, store, settings=None):
         return cls(store.root.parent, artifact_root=store.root,
             max_bytes=int(getattr(settings, 'download_media_cache_max_mib', 512)) * 1024 * 1024,
-            retention_seconds=float(getattr(settings, 'download_media_retention_hours', 24)) * 3600)
+            retention_seconds=float(getattr(settings, 'download_media_retention_hours', 24)) * 3600,
+            sqlite_path=getattr(settings, 'sqlite_path', None))
+
+    def _pending_artifacts(self):
+        """Pending durable results survive lease expiry and capacity pressure."""
+        if self.sqlite_path is None or not Path(self.sqlite_path).is_file():
+            return set()
+        try:
+            with sqlite3.connect('file:' + Path(self.sqlite_path).resolve().as_posix() + '?mode=ro', uri=True, timeout=2) as db:
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone():
+                    return set()
+                rows = db.execute("SELECT job_type,payload_json,run_at FROM jobs WHERE "
+                    "(job_type='agent_media_operation' AND status IN ('running','result_ready','delivering')) OR "
+                    "(job_type='private_agent_turn' AND status IN ('queued','running') "
+                    "AND json_extract(payload_json,'$.delegated_result.kind')='media_result') LIMIT 129").fetchall()
+            if len(rows) > 128:
+                raise ValueError('media_cache_pending_scan_budget')
+            protected = set()
+            for kind,raw,run_at in rows:
+                if len(raw) > 128000:
+                    raise ValueError('media_cache_pending_payload_budget')
+                payload = json.loads(raw)
+                created = (datetime.fromisoformat(run_at).replace(tzinfo=UTC).timestamp()
+                    if kind == 'private_agent_turn' else float(payload.get('created_at', 0)))
+                if self.clock() - created > 7 * 86400:
+                    continue
+                packet = payload.get('delegated_result', {}) if kind == 'private_agent_turn' else payload.get('result', {})
+                data = packet.get('data', {})
+                values = [*packet.get('preview_artifact_ids', ()), *data.get('artifact_ids', ()),
+                    *data.get('media_artifact_ids', ()), *data.get('video_artifact_ids', ())]
+                values += [data.get('artifact_id'), data.get('video_artifact_id')]
+                protected.update(value for value in values if isinstance(value, str) and _ID.fullmatch(value))
+            return protected
+        except (sqlite3.Error, TypeError, ValueError, KeyError) as exc:
+            raise ValueError('media_cache_pending_state_unavailable') from exc
 
     @contextmanager
     def _locked(self):
@@ -125,7 +163,7 @@ class DownloadedMediaCache:
 
     def _cleanup(self, required=0):
         now = self.clock()
-        targets, protected, reservations = [], set(), 0
+        targets, protected, reservations = [], self._pending_artifacts(), 0
         for path in self.root.iterdir():
             if path.is_symlink() or not path.is_file():
                 continue
@@ -156,6 +194,11 @@ class DownloadedMediaCache:
                     elif entry.name.startswith(('.web-download-', '.web-video-')) and not entry.is_symlink() and entry.is_file():
                         if now - entry.stat().st_mtime > LEASE_SECONDS:
                             path.unlink(missing_ok=True)
+                    elif entry.name.startswith('.twitter-download-') and not entry.is_symlink() and entry.is_dir():
+                        if now - entry.stat().st_mtime > LEASE_SECONDS:
+                            if path.resolve().parent != self.artifacts:
+                                raise ValueError('media_cache_staging_path_invalid')
+                            shutil.rmtree(path)
         targets.sort(key=lambda item: item['created'])
         kept, removed = [], 0
         for item in targets:
@@ -220,6 +263,15 @@ class DownloadedMediaCache:
                 raise
             return artifact_id
 
+    def discard(self, artifact_ids):
+        """Remove this failed operation's registered download artifacts only."""
+        with self._locked():
+            for identifier in artifact_ids:
+                if isinstance(identifier, str) and _ID.fullmatch(identifier):
+                    item = self._target(self.artifacts / (identifier + '.meta.json'))
+                    if item:
+                        self._remove(item)
+
     def save_video(self, store, path, info):
         from app.core.video_file import MAX_VIDEO_BYTES
         if path.parent != self.root or path.is_symlink() or not 0 < path.stat().st_size <= MAX_VIDEO_BYTES:
@@ -262,7 +314,8 @@ class DownloadedMediaJanitor:
     def __init__(self, settings, *, interval_seconds=3600):
         self.cache = DownloadedMediaCache(settings.data_dir,
             max_bytes=int(getattr(settings, 'download_media_cache_max_mib', 512))*1024*1024,
-            retention_seconds=float(getattr(settings, 'download_media_retention_hours', 24))*3600)
+            retention_seconds=float(getattr(settings, 'download_media_retention_hours', 24))*3600,
+            sqlite_path=getattr(settings, 'sqlite_path', None))
         self.interval = interval_seconds
         self.task = None
 

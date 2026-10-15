@@ -9,8 +9,8 @@ $message = switch ($Reason) {
     "qq_platform_restart_failed" { "The QQ platform could not be restarted. Run status-xiaomachi-wsl.bat and check the logs." }
     "webui_login_error" { "NapCat reports a QQ login error. Open the NapCat WebUI and sign in again." }
     "llbot_signing_backend_unavailable" { "LLBot cannot reach its QQ signing backend. Login and QR login cannot finish yet. Check LLBot status or update LLBot before trying again." }
-    "llbot_login_required" { "The QQ session expired, so LLBot is waiting for a QR scan. Open the LLBot WebUI (open-llbot-webui.bat) and scan the QR code to sign in again." }
-    "snowluma_login_required" { "SnowLuma is running but the QQ account is not logged in. Double-click open-snowluma-desktop.bat, click 刷新 on the QR window and scan it with the phone QQ app." }
+    "llbot_login_required" { "The QQ session expired, so LLBot is waiting for a QR scan. Open the LLBot WebUI (infra/wsl/windows/open-llbot-webui.bat) and scan the QR code to sign in again." }
+    "snowluma_login_required" { "SnowLuma is running but the QQ account is not logged in. Double-click infra/wsl/windows/open-snowluma-desktop.bat, click 刷新 on the QR window and scan it with the phone QQ app." }
     "onebot_session_unhealthy" { "Xiaomachi QQ did not recover after an automatic platform restart. Open the active QQ platform WebUI and check the QQ login." }
     default { "Xiaomachi QQ is still offline after an automatic platform restart. Open the active QQ platform WebUI and sign in again." }
 }

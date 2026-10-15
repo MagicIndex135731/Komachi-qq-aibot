@@ -102,8 +102,8 @@ Harness在本地检查后才调用模型，每轮最近最多30条群消息；�
 | `AGENT_WEB_TASK_MAX_CALLS` / `AGENT_WEB_TASK_MAX_CHARS` | 正式资料回合默认16次网络尝试、96000结果字符；可设8–24次/48000–128000字符。普通回合8次/48000字符，失败重试也计数 |
 | `AGENT_TASK_TURN_TIMEOUT_SECONDS` | 直接群互动与私聊主回合默认600秒；不再以关键词决定路由或时限。独立资料子任务后台最多300秒，完成摘要回传主会话；模型单次仍受自己的超时控制 |
 | `WEB_PAGE_PROXY_URL` | 留空直连；可设 `http://127.0.0.1:18797`，用于本地网页及网页图片/视频读取，聊天与搜索接口维持原出口 |
-| `DOWNLOAD_MEDIA_RETENTION_HOURS` | 网页下载图片/视频保留24小时，可设1–168小时；群私启动及每小时清理 |
-| `DOWNLOAD_MEDIA_CACHE_MAX_MIB` | 网页下载缓存共享上限512MiB，可设128–8192MiB；下载前预留空间，优先清理旧且未使用的媒体，满且全被保护时拒绝新下载 |
+| `DOWNLOAD_MEDIA_RETENTION_HOURS` | 网页及X下载图片/视频保留24小时，可设1–168小时；群私启动及每小时清理，有效待回传任务保护文件 |
+| `DOWNLOAD_MEDIA_CACHE_MAX_MIB` | 网页/X下载缓存共享上限512MiB，可设128–8192MiB；下载前预留空间，优先清理旧且未使用的媒体，满且全被保护时拒绝新下载 |
 | `AGENT_CONTEXT_COMPACTION_ENABLED` / `AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO` | 原生压缩默认启用；阈值取历史预算加固定输入、窗口62%的较小值；摘要不发送QQ |
 | `AGENT_CONTEXT_RETAIN_TOKENS` / `AGENT_CONTEXT_SUMMARY_TOKENS` | 近期保留上限16000且不超过历史预算三分之一；摘要4096输出token，每轮内部总结最多2次 |
 | `AGENT_CONTEXT_HISTORY_TOKENS` / `AGENT_BACKGROUND_HISTORY_TOKENS` | 主聊天动态历史24000、后台8000 token；固定规则/schema另计，超预算可换段；临时观察约3000软预算，不截断当前明确请求 |

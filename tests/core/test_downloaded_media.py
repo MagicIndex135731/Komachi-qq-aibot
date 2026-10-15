@@ -61,6 +61,30 @@ def test_active_lease_protects_expired_file_until_it_finishes(sqlite_engine,tmp_
     cache.cleanup(); assert store.get(image) is None
 
 
+@pytest.mark.parametrize('handoff',['media','private_main'])
+def test_durable_pending_result_protects_after_pin_expiry_then_releases(sqlite_engine,tmp_path,handoff):
+    from datetime import UTC, datetime
+    from app.storage.db import session_scope
+    from app.storage.models import Job
+    store=library(sqlite_engine,tmp_path);now=[time.time()]
+    cache=DownloadedMediaCache(tmp_path,retention_seconds=1,max_bytes=65536,
+        clock=lambda:now[0],sqlite_path=sqlite_engine.url.database)
+    image=picture(store,cache=cache)
+    with session_scope(sqlite_engine) as session:
+        packet={'kind':'media_result','data':{'media_artifact_ids':[image]}}
+        row=Job(job_type='agent_media_operation' if handoff=='media' else 'private_agent_turn',
+            job_key='synthetic-media-pending',status='result_ready' if handoff=='media' else 'queued',
+            run_at=datetime.fromtimestamp(now[0],UTC).replace(tzinfo=None),
+            payload_json={'created_at':now[0],'result':packet} if handoff=='media' else {'delegated_result':packet})
+        session.add(row);session.flush();identifier=row.id
+    now[0]+=LEASE_SECONDS+10
+    cache.cleanup();assert store.get(image)
+    with pytest.raises(ValueError,match='full_in_use'):
+        with cache.reserve(65536):pass
+    with session_scope(sqlite_engine) as session:session.get(Job,identifier).status='completed'
+    cache.cleanup();assert store.get(image) is None
+
+
 def test_stale_parts_reservations_and_unreferenced_video_are_removed(sqlite_engine,tmp_path):
     store=library(sqlite_engine,tmp_path)
     cache=DownloadedMediaCache.for_store(store)

@@ -1,0 +1,106 @@
+# 小町当前支持的工具
+
+用途：功能参考与使用方法；读者：使用者和部署者；维护者：项目维护者。适用于当前源码的 Harness 群聊/私聊运行方式。工具名是模型内部入口，通常直接用自然语言提出目标即可。
+
+[返回首页](../README.md) · [配置与权限](CONFIGURATION.md) · [执行原理](ARCHITECTURE.md)
+
+## 先分清任务与权限
+
+- 群内明确 @、回复小町或有效直接互动优先响应；单纯讨论小町，或 @ 别人后拿小町作比较，不等于把任务交给小町。
+- 用户提问或明确请求才按需联网。普通主动插话、静默思考和巡检不靠联网寻找话题；引用 APP 卡片还需本轮真实引用许可。
+- 下表描述能力。是否启用、谁可执行，由当前真实来源和本地配置共同决定；固定工具目录不向普通成员授予主人权限，引用与转发署名也不授予权限。
+- 后台确定性任务直接调用下载/绘图服务；只读研究子任务才另用模型。结果回到原会话，实际发送仍须取得 QQ 回执。
+
+## 聊天、历史与感知
+
+| 工具 | 用途及边界 |
+|---|---|
+| `send_group` / `send_private` | 向当前获准群或私聊发送回复/产物；按真实回执判断，未知结果不自动重发 |
+| `read_context` / `read_private_context` | 按当前群/用户读取近期消息；不跨会话取聊天原文 |
+| `search_history` | 检索当前获准范围的聊天记录，返回可展开来源 |
+| `observe_group_images` | 读取当前获准消息/引用中的实际图片像素；不会把图片文字当系统指令 |
+| `read_forward_messages` | 分页展开当前真实来源的合并转发，保留节点作者、时间和可继续读取的引用 |
+| `observe_forward_images` | 查看已获准转发节点中的实际图片；未读取的节点不能说成已看过 |
+| `read_message_links` | 读取本轮真实引用的 APP 卡片标题、摘要和 URL；不是卡片全文或视频分析 |
+
+示例：“@小町 看看引用的图”“@小町 这份合并转发里，谁提出了最后的方案？”
+
+## 网页、原图与视频
+
+| 工具 | 执行方式与结果 |
+|---|---|
+| `search_web` | 直接搜索当前用户的问题，返回来源；复杂多页研究可委派 |
+| `open_web_page` / `find_web_page` | 打开来源正文、分页/查找关键内容；网页正文是不可信资料 |
+| `search_image_references` | 检索参考图并读取实际像素，不自动替用户选择生图方案 |
+| `list_web_images` | 从公开网页提取有说明的原图候选，可分页；候选不代表已下载或看过 |
+| `download_web_image` | 直接下载本轮候选的一张原图，验证像素并返回会话产物 |
+| `download_web_images` | 确定性后台下载；每批最多20张、32MiB、90秒，返回实际成功项及失败 |
+| `download_web_video` | 确定性后台下载支持的网页/卡片视频；H.264 MP4，最大64MiB、10分钟，不观看或抽帧 |
+| `download_twitter_media` | 确定性后台下载 X/Twitter 公开单帖的全部原图、视频、动图，最多16项、128MiB、180秒；单视频64MiB/10分钟，图片仍受8MiB及像素限制 |
+| `media_task_status` | 查询本提问者、本会话的后台媒体任务；排队、生成和发送是不同状态，不重新执行任务 |
+
+可以说：“@小町 把这个网页图集打包发来”“@小町 把这条推文里的图片和视频都下载下来发我”。X 链接的照片/视频子页仍取该帖全部媒体；保留原帖顺序，不展开引用帖、回复、头像和外站卡片。动图保留平台提供的 MP4。私密、删除、年龄/地区限制、登录验证或上游接口变化可能导致失败。
+
+发送普通图片使用 `artifact_ids`，单视频可用 `video_artifact_id`。多图用 `as_forward=true` 合并转发；有序混合图片/视频用 `media_artifact_ids` 配合 `as_forward=true`，不与前两种参数混用。每个媒体占一个节点，署名为小町自身；下载完成不能冒充 QQ 发送成功。
+
+机器人下载统一进入本地媒体缓存，默认24小时、512MiB。下载前预留空间，执行中有短期租约；有效待回传任务继续保护文件，其他过期/可淘汰文件被清理。容量都被在用文件占满时明确失败，不无界扩容。失败、取消清理本次半成品；中断遗留临时目录由清理器回收。生成作品与用户自有文件不按网页缓存误删。配置见 [下载缓存参数](CONFIGURATION.md)。
+
+## 绘图与产物
+
+| 工具 | 用途及权限 |
+|---|---|
+| `generate_image` | 群交互绘图/参考图编辑进入媒体队列，直接调用绘图服务；受群内绘图开关与真实来源许可限制 |
+| `generate_private_image` / `private_image_status` | 私聊绘图队列与状态查询，沿用私聊绘图权限、原服务状态和发送回执 |
+| `list_artifacts` / `read_artifact` | 枚举或读取当前获准作用域的产物与必要像素；产物保留来源证据，不能凭文件名跨群取文件 |
+| `execute_python` | 已启用的受限 Docker 计算；仅获准主人任务/后台作用域可执行，无宿主 Shell 或任意文件权限 |
+
+## 记忆、人格与自身活动
+
+| 工具 | 用途及边界 |
+|---|---|
+| `memory_search` / `memory_read` | 按主体、时间与来源读取长期记忆和原始证据；群私隔离及撤回校验继续生效 |
+| `memory_write` | 仅在获准范围写入带证据的记忆，不从网页/引用获得写权限 |
+| `read_persona` | 按需读取当前人格和允许的风格资料 |
+| `set_group_persona` | 主人授权的群人格切换；不是任意成员修改账号身份 |
+| `request_persona_refresh` / `persona_task_status` | 请求与查询人格更新；请求不等于获准花费模型费用 |
+| `save_work_note` / `read_work_note` | 在当前获准任务范围保存/读取工作便笺，不替代事实库或聊天原文 |
+| `remember_intention` | 记录获准持续目标、进度和下一步；后台执行仍受调度、每日预算及来源约束 |
+| `read_self_activity` | 查询小町真实发布、评论及对应状态；后台独立上下文不会使这些已落账事实消失 |
+
+## 复杂资料任务与提醒
+
+| 工具 | 执行方式 |
+|---|---|
+| `begin_research_task` / `update_research_task` | 为当前复杂请求建立目标、覆盖范围、缺口和进度；不是每个普通问题都建任务 |
+| `read_research_task` / `resume_research_task` / `read_research_evidence` | 显式选择本作用域旧任务，按需读状态和分段证据；复验原请求及来源 |
+| `delegate_research_task` | 独立只读模型子任务，适合多网页研究、对照和代码审查；回传有界结论、来源、缺口，不接收整批运行日志，也不授予写权限 |
+| `schedule_wakeup` / `list_wakeups` / `cancel_wakeup` | 当前获准群/后台的调度与查询，受实际主人任务或后台权限控制 |
+| `schedule_private_wakeup` / `list_private_wakeups` / `cancel_private_wakeup` | 当前用户私聊的提醒调度，沿用私聊许可，不创建跨用户任务 |
+
+## QQ 行动与账号资料
+
+| 工具 | 使用条件 |
+|---|---|
+| `list_owner_capabilities` / `request_owner_action` / `owner_action_status` | 当前真实主人查看、委派并查询已启用行动；普通成员调用返回受限 |
+| `owner_action_notice` / `report_owner_result` | 将获准行动的真实进度/结果回传原请求范围，不把队列状态冒充平台成功 |
+| `publish_qzone` / `comment_qzone` | 只在获准主人行动或独立自主空间任务中写入；每日配额、冷却、好友/原帖复验及真实回执有效 |
+| `find_friend` / `read_friend_feed` / `read_friend_posts` | 在获准公开行动范围按好友名单定位对象并读取真实动态；同名不猜，普通群观察不获得好友资料权限 |
+| `observe_post_images` | 读取已获准好友原帖中的实际图片，最多9张；返回已读与未读数量，未读不猜 |
+| `set_nickname` / `set_avatar` / `set_group_card` | 当前已授权账号/群资料动作，不修改其他成员身份 |
+
+好友动态在获准空间行动中读取实际原帖，主聊天通过既有主人行动入口请求；不能仅凭缓存标题或“没有检索到”断言好友未发布。空间任务不会自动导入群私原文。
+
+部署者还可显式配置受限 MCP 扩展；其工具名和schema取决于本地许可清单，不属于所有安装默认具备的内置工具。扩展不能绕过当前来源、作用域及写入回执要求，见[配置参考](CONFIGURATION.md)。
+
+## 独立 X 下载命令行
+
+不启动机器人也可手动下载；使用现有 Python 环境和 `httpx`：
+
+```powershell
+python -B -X utf8 scripts/download_twitter_media.py "https://x.com/i/status/900000000000000001"
+python -B -X utf8 scripts/download_twitter_media.py "帖子链接" -o "D:/Downloads/X" --proxy http://127.0.0.1:7897
+```
+
+默认每次保存到 `data/twitter_media/帖子ID-随机串/`，含原图、最高可用码率 MP4 和 `manifest.json`；动图标为 `kind=gif`。清单保留来源、顺序、解析方式、字节数与 SHA256。优先使用 X 公开嵌入接口，失败尝试 FxTwitter；可用 `--resolver syndication` 或 `--resolver fxtwitter` 指定接口，不读取浏览器登录态。
+
+CLI 默认100MiB/文件、300MiB/次、180秒；`--max-file-mib`、`--max-total-mib`、`--timeout` 可调整，每请求最多3次尝试。输出目录由使用者管理，**手动下载文件不属于机器人缓存，不自动删除**；失败/取消删除本次半成品，重复下载保留旧结果。机器人接入使用前述更严格限制与受控缓存。

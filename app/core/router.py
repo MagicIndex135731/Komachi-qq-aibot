@@ -1821,6 +1821,11 @@ class InboundRouter(GroupReplyDeliveryMixin):
                 messages=messages,
                 quoted_raw_payload=quoted_raw_payload,
             )
+            from app.core.message_mentions import addressing_evidence
+            quoted_source = messages.get_by_platform_msg_id(event.reply_to_msg_id) if event.reply_to_msg_id else None
+            evidence = addressing_evidence(event.raw_payload, bot_id=self.runtime.settings.bot_qq,
+                bot_names=bot_names, text=event.plain_text,
+                reply_author_id=quoted_source.user_id if quoted_source is not None and quoted_source.group_id == event.group_id else None)
             address_decision = detect_address_intent(
                 text=lowered_message,
                 bot_names=bot_names,
@@ -1828,6 +1833,7 @@ class InboundRouter(GroupReplyDeliveryMixin):
                 quoted_bot=False,
                 bot_recently_participated=bot_recently_participated,
                 recent_bot_message_count=recent_bot_message_count,
+                other_addressee=evidence['other_addressee'] and not event.mentioned_bot,
             )
             time_sensitive = is_time_sensitive_request(event.plain_text)
             named_bot = address_decision.reason == "named_bot"

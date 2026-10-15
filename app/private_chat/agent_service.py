@@ -477,6 +477,26 @@ class PrivateHarnessService:
                 image_ids = args.get('artifact_ids', [])
                 as_forward = bool(args.get('as_forward'))
                 video_id = args.get('video_artifact_id')
+                bundle_ids = args.get('media_artifact_ids', [])
+                bundle = ()
+                if bundle_ids:
+                    if not as_forward or image_ids or video_id:
+                        return ToolOutcome({'error': 'mixed_media_requires_forward_only'}, 'blocked')
+                    from app.agent.media_delivery import resolve_media_bundle
+                    def resolve(identifier):
+                        path = store.get(identifier)
+                        if path is None:
+                            raise ValueError('media_bundle_unavailable')
+                        dependencies = store.provenance(identifier)
+                        if len(set(known_sources) | set(dependencies)) > 200:
+                            raise ValueError('source_budget_exhausted')
+                        known_sources[:] = list(dict.fromkeys((*known_sources, *dependencies)))
+                        return path
+                    try:
+                        bundle = await self.tool_runner.run(resolve_media_bundle, store, self.settings,
+                            bundle_ids, before_read=resolve)
+                    except (ValueError, OSError):
+                        return ToolOutcome({'error': 'media_bundle_unavailable_or_expired'}, 'blocked')
                 if video_id and (image_ids or as_forward):
                     return ToolOutcome({'error': 'video_cannot_mix_media'}, 'blocked')
                 from app.core.downloaded_media import DownloadedMediaCache
@@ -493,7 +513,7 @@ class PrivateHarnessService:
                     except (OSError, ValueError):
                         return ToolOutcome({'error': 'video_artifact_unavailable_or_expired'}, 'blocked')
                 if (not isinstance(image_ids, list) or len(image_ids) > (20 if as_forward else 2)
-                        or len(set(image_ids)) != len(image_ids) or as_forward and not image_ids):
+                        or len(set(image_ids)) != len(image_ids) or as_forward and not (image_ids or bundle)):
                     return ToolOutcome({'error': 'private_image_artifact_invalid'}, 'blocked')
                 image_files = []
                 await self.tool_runner.run(media_cache.pin, image_ids)
@@ -512,6 +532,8 @@ class PrivateHarnessService:
                     if isinstance(actual, (tuple, list)):
                         captured.extend(item for item in actual if isinstance(item, str) and item)
                 options = {'image_files': tuple(image_files), 'as_forward': as_forward} if image_files else {}
+                if bundle:
+                    options.update(media_files=bundle, as_forward=True)
                 if video_file:
                     options['video_file'] = video_file
                 delivered, failure = await self.service._send_private_chat_reply(user_id=user_id,
@@ -615,8 +637,9 @@ class PrivateHarnessService:
                 'items': _text(64), 'maxItems': 20, 'uniqueItems': True}, as_forward={'type': 'boolean'})
             send_schema['required'] = ['text']
             send_schema['properties']['video_artifact_id'] = _text(64)
+            send_schema['properties']['media_artifact_ids'] = {'type': 'array', 'items': _text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}
             tools = [AgentTool("read_private_context", "读取当前用户的日常上下文和实际图片", _schema(), context),
-                AgentTool("send_private", "向当前已授权用户发送聊天或结果；图片普通最多2张，as_forward=true最多20张合并转发。video_artifact_id发送下载的真实视频，不与图片/as_forward混用；按真实回执判断成功", send_schema, send, "write"),
+                AgentTool("send_private", "向当前用户发送聊天或结果；图片普通最多2张，as_forward=true最多20张。media_artifact_ids配合as_forward=true按原顺序打包图片/视频，不与artifact_ids/video_artifact_id混用；video_artifact_id只发单视频。按真实回执判断成功", send_schema, send, "write"),
                 AgentTool("generate_private_image", "通过既有私聊绘图服务异步画图；排队不是生成或发送成功", _schema(prompt=_text(2000), use_current_images={"type": "boolean"}), draw, "image"),
                 AgentTool("private_image_status", "读取当前用户绘图任务的真实状态", _schema(task_id={"type": "integer", "minimum": 1, "maximum": 2**63 - 1}), image_status),
                 AgentTool("schedule_private_wakeup", "保存当前用户的提醒/继续目标，到期唤醒Agent决定是否发送", _schema(goal=_text(500), delay_seconds={"type": "integer", "minimum": 1, "maximum": 604800}), schedule),

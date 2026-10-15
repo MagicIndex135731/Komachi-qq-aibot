@@ -8,7 +8,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 quote = Chr(34)
 
 scriptDirectory = fso.GetParentFolderName(WScript.ScriptFullName)
-batchPath = fso.BuildPath(scriptDirectory, "start-xiaomachi-wsl.bat")
+batchPath = fso.GetAbsolutePathName(fso.BuildPath(scriptDirectory, "..\..\..\start-xiaomachi-wsl.bat"))
 localAppData = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%")
 appDirectory = fso.BuildPath(localAppData, "Xiaomachi")
 logDirectory = fso.BuildPath(appDirectory, "logs")

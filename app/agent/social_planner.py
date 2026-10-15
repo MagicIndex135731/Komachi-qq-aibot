@@ -179,12 +179,23 @@ class SocialPlanner:
                 return replace(observation, suppressed_reason="cooldown")
             if not job.autonomous_tools and not any(str(row.plain_text or "").strip() for row in recent) and not job.public_topics:
                 return replace(observation, suppressed_reason="no_textual_material")
+            from app.core.message_mentions import addressing_evidence
+            quoted_rows = {row.platform_msg_id: row for row in session.scalars(select(Message).where(
+                Message.group_id == job.scope_id, Message.platform_msg_id.in_([row.reply_to_msg_id for row in recent if row.reply_to_msg_id])))
+                if is_usable_memory_source(row, group_id=job.scope_id)}
+            def addressing(row):
+                reply = quoted_rows.get(row.reply_to_msg_id)
+                evidence = addressing_evidence(row.raw_json, bot_id=router.runtime.settings.bot_qq,
+                    bot_names=router._build_bot_names(''), text=row.plain_text,
+                    reply_author_id=reply.user_id if reply else None)
+                return {'addressing': evidence} if evidence['at_user_ids'] or reply else {}
             context = _pack_lines([
                 json.dumps({
                     "source_message_id": row.id, "platform_message_id": row.platform_msg_id,
                     "author_id": row.user_id, "text": str(row.plain_text or "")[:700],
                     "timestamp": shanghai_aware(row.timestamp).isoformat(timespec="seconds"),
                     "media_pixels_unobserved": row.msg_type in {"image", "video"},
+                    **addressing(row),
                 }, ensure_ascii=False)
                 for row in recent
             ], 6000)

@@ -352,6 +352,7 @@ class PrivateChatService:
         image_files=(),
         as_forward=False,
         video_file=None,
+        media_files=(),
     ) -> tuple[bool, str | None]:
         if not self._reserve_private_outbound_reply(user_id=user_id, reply_text=text, context=context):
             logger.info("private_reply_dedup_skip context=%s user_id=%s", context, user_id)
@@ -359,7 +360,10 @@ class PrivateChatService:
         try:
             if before_dispatch is not None:
                 before_dispatch()
-            if video_file:
+            if media_files:
+                receipts = await self.sender.send_media_bundle(user_id=user_id, self_id=self._private_sender_user_id(),
+                    name=self.assistant_name, text=text, media_files=media_files)
+            elif video_file:
                 receipts = await self.sender.send_video(user_id=user_id, text=text, video_file=video_file)
             elif as_forward:
                 receipts = await self.sender.send_image_bundle(user_id=user_id, self_id=self._private_sender_user_id(),
@@ -404,6 +408,7 @@ class PrivateChatService:
         image_files=(),
         as_forward=False,
         video_file=None,
+        media_files=(),
     ) -> tuple[bool, str | None]:
         """Send one chat reply, split into a short burst when configured.
 
@@ -413,10 +418,10 @@ class PrivateChatService:
         key, so reply de-duplication still covers the whole burst.
         """
 
-        if image_files or video_file:
+        if image_files or video_file or media_files:
             return await self._deliver_private_text(user_id=user_id, text=text, context=context,
                 receipt_callback=receipt_callback, before_dispatch=before_dispatch, image_files=image_files,
-                as_forward=as_forward, **({'video_file': video_file} if video_file else {}))
+                as_forward=as_forward, **({'media_files': media_files} if media_files else {'video_file': video_file} if video_file else {}))
         burst = {'enabled': False} if long_form else self.reply_split_config
         segments = [text.strip()] if long_form else split_burst_reply(text, burst)
         # Same window as the group delivery path, from the shared helper.

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "WEBUI_PORT=5099"
-set "PS_SCRIPT=%~dp0infra\wsl\scripts\open_snowluma_webui.ps1"
+set "PS_SCRIPT=%~dp0..\scripts\open_snowluma_webui.ps1"
 
 rem SnowLuma uses WSL host networking. Windows localhost forwarding is not
 rem available on every WSL network configuration, so prove readiness inside

@@ -47,6 +47,11 @@ class GroupObservationService:
         source = messages.get_by_platform_msg_id(event.platform_msg_id)
         names = router._build_bot_names('')
         reply_to_bot = router._is_reply_to_bot(event=event, messages=messages, quoted_raw_payload=None)
+        from app.core.message_mentions import addressing_evidence
+        quoted = messages.get_by_platform_msg_id(source.reply_to_msg_id) if source is not None and source.reply_to_msg_id else None
+        evidence = addressing_evidence(source.raw_json if source is not None else {},
+            bot_id=router.runtime.settings.bot_qq, bot_names=names, text=event.plain_text,
+            reply_author_id=quoted.user_id if is_usable_memory_source(quoted, group_id=event.group_id) else None)
         if source is not None:
             if detect_feedback(source, recent, bot_id=router.runtime.settings.bot_qq, bot_names=names, messages=messages):
                 return False
@@ -68,6 +73,7 @@ class GroupObservationService:
             recent_bot_message_count=sum(
                 item.user_id == router.runtime.settings.bot_qq for item in recent[-3:]
             ),
+            other_addressee=evidence['other_addressee'] and not event.mentioned_bot,
         )
         if address.reason in {'recent_followup', 'take_request'}:
             prior = [row for row in recent if source is not None and row.id < source.id]

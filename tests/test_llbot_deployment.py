@@ -146,7 +146,7 @@ def test_llbot_runtime_bootstrap_migrates_existing_onebot_port(
 
 
 def test_open_llbot_webui_shortcut_uses_the_current_wsl_address_without_starting_stack() -> None:
-    shortcut = (REPO_ROOT / "open-llbot-webui.bat").read_text(encoding="utf-8")
+    shortcut = (REPO_ROOT / "infra/wsl/windows/open-llbot-webui.bat").read_text(encoding="utf-8")
     launcher = read_script("open_llbot_webui.ps1")
 
     assert shortcut.isascii()

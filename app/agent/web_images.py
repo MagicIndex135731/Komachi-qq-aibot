@@ -205,6 +205,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
                 guard.require_valid()
                 return await handler(args)
         return checked
+    from app.agent.twitter_media import build_twitter_media_tool
     return (
         AgentTool('list_web_images', '从用户指定公开网页提取原图候选及alt/附近说明；获取/扒图先用此工具，offset分页。可跟进人物页或文件说明页；不执行网页脚本或登录。',
             schema({'ref_id': text(2000), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 159}}, ['ref_id']), serial(listing)),
@@ -214,4 +215,5 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
             schema({'image_ids': {'type': 'array', 'items': text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}}, ['image_ids']), serial(batch)),
         AgentTool('download_web_video', '后台下载公开网页或获准卡片的真实H.264 MP4，最大64MiB/10分钟；立即返回任务编号，完成后回传video_artifact_id再发送。不要重复排队；不观看/抽帧或执行网页脚本。',
             schema({'ref_id': text(2000)}, ['ref_id']), serial(video)),
+        build_twitter_media_tool(runner=runner, guard=guard, store=store, settings=settings, submit=submit),
     )

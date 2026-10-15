@@ -537,6 +537,10 @@ class AutonomousSocialExecutor:
                                 "timestamp": shanghai_aware(quoted.timestamp).isoformat(timespec="seconds")}
                         else:
                             current_target["quoted_message_unavailable"] = True
+                    from app.core.message_mentions import addressing_evidence
+                    current_target['addressing'] = addressing_evidence(target.raw_json,
+                        bot_id=self.router.runtime.settings.bot_qq, bot_names=self.router._build_bot_names(''),
+                        text=target.plain_text, reply_author_id=current_target.get('quoted_message', {}).get('author_id'))
                     observation = replace(observation, source_message_ids=tuple(dict.fromkeys(
                         turn_sources)))
                     preparation.observation = observation
@@ -702,7 +706,8 @@ class AutonomousSocialExecutor:
             represented = set(memory_context.data.get('recent_source_ids', ()))
             prompt_context = tuple(line for source_id, line in zip(original_context_ids, observation.context)
                 if source_id not in represented)
-        prompt = ["System persona: 当前人格:\n" + persona_text,
+        from app.core.message_mentions import ADDRESSING_POLICY
+        prompt = ["System persona: 当前人格:\n" + persona_text + '\n' + ADDRESSING_POLICY,
                   "Group policy: " + CONVERSATION_TIME_POLICY,
                   "Group policy: " + ("本群所有成员可要求绘图和参考图编辑。只有当前真实主人消息可指挥计算、记忆写入、人格刷新、提醒、空间或其他行为；" if group_images_allowed else
                     "只有当前真实主人消息可指挥绘图、计算、记忆写入、人格刷新、提醒、空间或其他行为；")
@@ -933,6 +938,17 @@ class AutonomousSocialExecutor:
             guard.require_valid()
             as_forward = bool(args.get('as_forward'))
             video_id = args.get('video_artifact_id')
+            bundle_ids = args.get('media_artifact_ids', [])
+            bundle = ()
+            if bundle_ids:
+                if job.kind != 'group' or not as_forward or video_id or args.get('artifact_ids'):
+                    return ToolOutcome({'error': 'mixed_media_requires_forward_only'}, 'blocked')
+                from app.agent.media_delivery import resolve_media_bundle
+                try:
+                    bundle = await self.blocking.run(resolve_media_bundle, store, self.router.runtime.settings,
+                        bundle_ids, before_read=artifact_path)
+                except (ValueError, OSError):
+                    return ToolOutcome({'error': 'media_bundle_unavailable_or_expired'}, 'blocked')
             if video_id and (job.kind != 'group' or as_forward or args.get('artifact_ids')):
                 return ToolOutcome({'error': 'video_cannot_mix_media'}, 'blocked')
             video_path = None
@@ -944,7 +960,7 @@ class AutonomousSocialExecutor:
                         DownloadedMediaCache.for_store(store, self.router.runtime.settings).video, store, video_id)
                 except (ValueError, OSError):
                     return ToolOutcome({'error': 'video_artifact_unavailable_or_expired'}, 'blocked')
-            if as_forward and (job.kind != 'group' or not args.get('artifact_ids')):
+            if as_forward and (job.kind != 'group' or not (args.get('artifact_ids') or bundle)):
                 return ToolOutcome({'error': 'image_bundle_requires_group_images'}, 'blocked')
             try:
                 media = await self.blocking.run(files, args)
@@ -960,7 +976,7 @@ class AutonomousSocialExecutor:
                 result = await executor._send_group(final_observation, actual, guard,
                     max_text_chars=12000 if direct_group_reply else 300,
                     reply_source_id=current_target.get('source_id') if current_target else None,
-                    **({'as_forward': True} if as_forward else {'video_file': video_path} if video_path else {}))
+                    **({'media_files': bundle} if bundle else {'as_forward': True} if as_forward else {'video_file': video_path} if video_path else {}))
             else:
                 result = await self.legacy.execute(final_observation, actual, guard)
             if workspace is not None:
@@ -1057,7 +1073,8 @@ class AutonomousSocialExecutor:
             if job.kind == 'group':
                 send_schema['properties']['as_forward'] = {'type': 'boolean'}
                 send_schema['properties']['video_artifact_id'] = text_schema(64)
-            tools.append(AgentTool(name, "发送到当前已授权目标；图片普通最多2张，群聊as_forward=true最多20张合并转发。video_artifact_id发送下载的真实视频，不能与图片或as_forward混用；这是一次外部写入，按真实回执判断成功", send_schema, send, "write"))
+                send_schema['properties']['media_artifact_ids'] = {'type': 'array', 'items': text_schema(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True}
+            tools.append(AgentTool(name, "发送到当前已授权目标；图片普通最多2张，as_forward=true最多20张合并转发。media_artifact_ids配合as_forward=true按序打包图片和视频，不与artifact_ids/video_artifact_id混用。video_artifact_id只发单视频。按真实回执判断成功", send_schema, send, "write"))
         if self.profile is not None:
             if job.kind == "profile" and "nickname" in job.identity_tools:
                 tools.append(AgentTool("set_nickname", "修改自己的账号昵称，不能修改别人", schema(name=text_schema(32)), nickname, "write"))

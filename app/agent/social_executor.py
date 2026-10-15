@@ -232,14 +232,22 @@ class SocialExecutor:
             row.raw_json = payload
 
     async def _send_group(self, observation, decision, guard, *, max_text_chars=300, as_forward=False, video_file=None,
-                          reply_source_id=None) -> SocialResult:
+                          reply_source_id=None, media_files=()) -> SocialResult:
         # The model can produce one bounded text action, never CQ control segments.
         if max_text_chars not in {300, 12000} or len(decision.text) > max_text_chars:
             return SocialResult("blocked", reason="group_text_too_long")
         provisional_id = self._reserve_group_output(observation, decision, guard.action_id, reply_source_id)
         if provisional_id is None:
             return SocialResult("blocked", reason="duplicate_group_action")
-        if video_file:
+        if media_files:
+            with session_scope(self.router.engine) as session:
+                row = MessageRepository(session).get_by_platform_msg_id(provisional_id)
+                row.msg_type = 'forward'
+                row.raw_json = {**row.raw_json, 'message': [{'type': 'text', 'data': {'text': decision.text}},
+                    *[{'type': 'node', 'data': {'uin': str(self.router.runtime.settings.bot_qq),
+                        'content': [{'type': kind, 'data': {'local_path': path, 'origin': 'web_download'}}]}}
+                      for kind, path in media_files]]}
+        elif video_file:
             with session_scope(self.router.engine) as session:
                 row = MessageRepository(session).get_by_platform_msg_id(provisional_id)
                 row.msg_type = 'video'
@@ -252,7 +260,11 @@ class SocialExecutor:
         # Our provisional row must not turn its own idle/cooldown checks false.
         try:
             with group_dispatch_scope(scope):
-                if video_file:
+                if media_files:
+                    receipts = await self.sender.send_media_bundle(group_id=observation.job.scope_id,
+                        self_id=self.router.runtime.settings.bot_qq, name=self.router.runtime.persona.get('name', '小町'),
+                        text=decision.text, media_files=media_files)
+                elif video_file:
                     receipts = await self.sender.send_video(group_id=observation.job.scope_id,
                         text=decision.text, video_file=str(video_file))
                 elif as_forward:
