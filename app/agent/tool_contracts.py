@@ -8,9 +8,9 @@ _BACKGROUND = frozenset({'delegate_research_task', 'request_owner_action', 'requ
     'download_twitter_media', 'queue_media_batch'})
 _LOCAL = frozenset({'remember_intention', 'save_work_note', 'memory_write', 'begin_research_task',
     'update_research_task', 'resume_research_task', 'schedule_wakeup', 'cancel_wakeup',
-    'schedule_private_wakeup', 'cancel_private_wakeup', 'report_owner_result'})
+    'schedule_private_wakeup', 'cancel_private_wakeup', 'report_owner_result', 'set_group_persona'})
 _ARTIFACT = frozenset({'execute_python', 'download_web_image', 'search_image_references',
-    'observe_group_images', 'observe_forward_images'})
+    'observe_group_images', 'observe_forward_images', 'observe_post_images'})
 
 
 def capability_contract(tool):
