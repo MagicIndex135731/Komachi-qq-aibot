@@ -181,3 +181,44 @@ def test_recent_image_is_not_dropped_when_old_memory_ids_are_appended(sqlite_eng
     latest = add_source(sqlite_engine, platform_id="recent-photo", images=(cached(cache, "recent.png", pixels()),))
     with canonical_group_image_inputs(sqlite_engine, GROUP, (latest, *old_ids), cache_dir=cache) as images:
         assert [image.source_message_id for image in images] == ["recent-photo"]
+
+
+def add_question(engine, text, *, author=AUTHOR, reply=None, age=0):
+    from datetime import timedelta
+    with session_scope(engine) as session:
+        row=MessageRepository(session).add_group_message(platform_msg_id='question-'+str(author)+'-'+text,
+            group_id=GROUP,user_id=author,timestamp=datetime.now(UTC)-timedelta(seconds=age),
+            plain_text=text,msg_type='text',reply_to_msg_id=reply,mentioned_bot=True,raw_json={'message':[]})
+        session.flush()
+        return row.id
+
+
+def test_plain_chat_does_not_select_recent_group_images(sqlite_engine):
+    photo=add_source(sqlite_engine,platform_id='recent',images=({'url':'https://m.qpic.cn/photo.png'},))
+    target=add_question(sqlite_engine,'今晚吃什么')
+    selection=group_vision.select_group_image_sources(sqlite_engine,GROUP,(photo,target),target_source_id=target)
+    assert selection.source_ids==() and selection.reason=='no_image_request'
+
+
+def test_send_picture_then_mention_this_picture_selects_same_sender(sqlite_engine):
+    photo=add_source(sqlite_engine,platform_id='my-photo',images=({'url':'https://m.qpic.cn/photo.png'},))
+    foreign=add_source(sqlite_engine,platform_id='someone-else',author=AUTHOR+1,images=({'url':'https://m.qpic.cn/other.png'},))
+    target=add_question(sqlite_engine,'小町这图怎么样')
+    selection=group_vision.select_group_image_sources(sqlite_engine,GROUP,(photo,foreign,target),target_source_id=target)
+    assert selection.source_ids==(photo,) and selection.reason=='recent_same_sender'
+
+
+def test_quoted_image_is_selected_without_other_recent_images(sqlite_engine):
+    quote=add_source(sqlite_engine,platform_id='quoted',images=({'url':'https://m.qpic.cn/photo.png'},))
+    other=add_source(sqlite_engine,platform_id='other',images=({'url':'https://m.qpic.cn/other.png'},))
+    target=add_question(sqlite_engine,'怎么看',reply='quoted')
+    selection=group_vision.select_group_image_sources(sqlite_engine,GROUP,(other,target),target_source_id=target)
+    assert selection.source_ids==(quote,) and selection.reason=='quoted'
+
+
+@pytest.mark.parametrize('state', ['deleted','blocked','uncertain'])
+def test_retracted_or_ineligible_image_never_supplies_followup(sqlite_engine,state):
+    photo=add_source(sqlite_engine,platform_id='invalid',state=state,images=({'url':'https://m.qpic.cn/photo.png'},))
+    target=add_question(sqlite_engine,'这图怎么样',reply='invalid')
+    selection=group_vision.select_group_image_sources(sqlite_engine,GROUP,(photo,target),target_source_id=target)
+    assert selection.source_ids==() and selection.reason=='image_reference_unavailable'

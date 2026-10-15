@@ -27,6 +27,7 @@ from app.core.memory_compaction import (
 from app.core.memory_fact_ranking import select_diverse_portrait_facts
 from app.core.memory_source_guard import is_usable_memory_source, memory_provenance_ids
 from app.core.memory_tools import (
+    DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS,
     MEMORY_TOOL_KINDS,
     MEMORY_TOOL_LIMIT_MAX,
     validate_memory_search_args,
@@ -131,7 +132,7 @@ class MemoryToolExecutor:
         authorized_subject_ids: Sequence[int] | None = None,
         recent_source_msg_ids: Sequence[str] = (),
         member_names: Mapping[str, int] | None = None,
-        timeout_seconds: float = 2.0,
+        timeout_seconds: float = DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS,
         max_results: int = 5,
     ) -> None:
         self._engine = engine

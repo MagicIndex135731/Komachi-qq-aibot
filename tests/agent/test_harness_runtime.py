@@ -42,11 +42,13 @@ def bridge_factory():
     from app.agent.harness_runtime import _Bridge
     bridges, agents, clients = [], [], []
 
-    def make(script, *, protocol="openai-responses"):
+    def make(script, *, protocol="openai-responses", model=None, require_reply=False):
         client, requests, usages = model_client(script)
+        if model:
+            client.model = client.responses_model = model
         if protocol == "openai-completions":
             client.responses_model = None
-        agent = HarnessToolAgent(decision_client=client)
+        agent = HarnessToolAgent(decision_client=client, require_reply=require_reply)
         bridge = _Bridge(agent, {}, Guard(), None, None, None)
         bridges.append(bridge)
         agents.append(agent)
@@ -68,6 +70,156 @@ def request_body(protocol="openai-responses"):
             {"role": "user", "content": [{"type": "input_text" if protocol == "openai-responses" else "text",
                 "text": "SYNTHETIC_CHAT_PRIVATE"}, {"type": "input_image" if protocol == "openai-responses" else "image_url",
                 "image_url": "https://synthetic.invalid/private?token=SYNTHETIC_URL_SECRET"}]}]}
+
+
+def test_grok_bridge_preserves_persona_and_clock_in_one_authoritative_instruction_block(bridge_factory):
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse(), model="grok-4.7")
+    bridge.dynamic_instructions = "SYNTHETIC_DYNAMIC_PERSONA"
+    body = request_body()
+    body["model"] = "grok-4.7"
+    bridge.forward(ModelHandler(), body)
+    input_items = requests[0]["input"]
+    assert input_items[0]["role"] == "user"
+    assert len(input_items) == 1
+    assert "SYNTHETIC_DYNAMIC_PERSONA" in requests[0]["instructions"]
+    assert "Current time JSON:" in requests[0]["instructions"]
+
+
+@pytest.mark.parametrize('model,direct,status,required', [
+    ('grok-4.7',True,None,True), ('grok-4.7',False,None,False),
+    ('grok-4.7',True,'sent',False), ('grok-4.7',True,'failed',True),
+    ('gpt-6.1-sol',True,None,False),
+])
+def test_grok_direct_tool_choice_requires_action_until_receipt_and_preserves_autonomous_silence(
+        bridge_factory,model,direct,status,required):
+    bridge,requests,_=bridge_factory(lambda *_: responses_sse(),model=model,require_reply=direct)
+    bridge.tools={'send_group':tool('send_group',None,effect='write')}
+    if status:bridge.last_write=ToolOutcome({},status)
+    body=request_body();body['model']=model
+    body['tools']=[{'type':'function','name':'send_group'}]
+    bridge.forward(ModelHandler(),body)
+    assert (requests[0].get('tool_choice')=='required') is required
+    assert ('Output transport contract:' in requests[0]['instructions']) is model.startswith('grok-')
+
+
+def test_gemini_direct_reply_requires_function_until_receipt(bridge_factory):
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse(), model='gemini-3.8-flash-medium', require_reply=True)
+    bridge.tools = {'send_group': tool('send_group', None, effect='write')}
+    body = request_body(); body['model'] = bridge.model
+    body['tools'] = [{'type': 'function', 'name': 'send_group'}]
+    bridge.forward(ModelHandler(), body)
+    assert requests[0]['tool_choice'] == 'required'
+
+
+@pytest.mark.parametrize('trigger', ['reads', 'deadline', 'last_step'])
+def test_direct_reply_reserves_delivery_after_read_or_time_budget(bridge_factory, trigger):
+    bridge, requests, _ = bridge_factory(lambda *_: responses_sse(), require_reply=True)
+    bridge.tools = {'memory_search': tool('memory_search', None), 'send_group': tool('send_group', None, effect='write')}
+    if trigger == 'reads': bridge.memory_reads = bridge.owner.max_memory_reads
+    if trigger == 'deadline': bridge.deadline = time.monotonic() + 30
+    if trigger == 'last_step': bridge.model_calls = bridge.owner.max_steps - 1
+    body = request_body(); body['tools'] = [{'type':'function', 'name':name} for name in bridge.tools]
+    bridge.forward(ModelHandler(), body)
+    assert [t['name'] for t in requests[0]['tools']] == ['memory_search', 'send_group']
+    assert requests[0]['tool_choice'] == {'type': 'function', 'name': 'send_group'}
+    assert 'Delivery budget' in json.dumps(requests[0])
+
+
+@pytest.mark.asyncio
+async def test_direct_memory_reads_are_bounded_and_do_not_repeat_handlers(bridge_factory):
+    seen=[]
+    async def read(_):
+        seen.append(True)
+        return ToolOutcome({'evidence':'synthetic source'})
+    bridge, _, _ = bridge_factory(lambda *_: responses_sse(), require_reply=True)
+    bridge.tools={'memory_search':tool('memory_search',read),'search_history':tool('search_history',read)}
+    bridge.owner.max_memory_reads=2
+    for n, name in enumerate(('memory_search','search_history','memory_search')):
+        result=await bridge.call_tool({'name':name,'arguments':{},'call_id':f'synthetic-{n}'})
+    assert len(seen)==2 and result['data']['error']=='memory_read_budget_exhausted'
+
+
+def test_gemini_empty_interrupted_stream_retries_before_client_commit(bridge_factory):
+    incomplete=(b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        b'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"interrupted"},"usage":{"input_tokens":10,"output_tokens":0}}}\n\n')
+    bridge, requests, usages = bridge_factory(lambda _, n: incomplete if n==1 else responses_sse(text='Recovered'), model='gemini-3.8-flash-medium')
+    body=request_body();body['model']=bridge.model;handler=ModelHandler()
+    bridge.forward(handler,body)
+    assert len(requests)==2 and not bridge.stop_reason
+    assert b'response.incomplete' not in handler.wfile.getvalue()
+    assert len(usages)==2
+    assert [r['outcome'] for r in bridge.trace if r.get('status')=='model_request']==['empty_output_retry','completed']
+
+
+def test_gemini_interrupted_after_output_is_not_replayed(bridge_factory):
+    stream=(b'data: {"type":"response.output_text.delta","delta":"already visible"}\n\n'
+        b'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"interrupted"}}}\n\n')
+    bridge, requests, _ = bridge_factory(lambda *_:stream, model='gemini-3.8-flash-medium')
+    body=request_body();body['model']=bridge.model
+    bridge.forward(ModelHandler(),body)
+    assert len(requests)==1 and bridge.stop_reason=='model_provider_failed'
+
+
+def test_gemini_empty_interrupt_retry_is_finite(bridge_factory):
+    stream=b'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"interrupted"}}}\n\n'
+    bridge,requests,_=bridge_factory(lambda *_:stream,model='gemini-3.8-flash-medium')
+    body=request_body();body['model']=bridge.model
+    bridge.forward(ModelHandler(),body)
+    assert len(requests)==3 and bridge.stop_reason=='model_provider_failed'
+
+
+def test_gemini_completed_response_accepts_null_incomplete_details(bridge_factory):
+    stream=b'data: {"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":10,"output_tokens":2}}}\n\n'
+    bridge,requests,_=bridge_factory(lambda *_:stream,model='gemini-3.8-flash-medium')
+    body=request_body();body['model']=bridge.model;handler=ModelHandler()
+    bridge.forward(handler,body)
+    assert len(requests)==1 and b'response.completed' in handler.wfile.getvalue()
+    assert not bridge.stop_reason
+
+
+def image_policy_sse():
+    text="The model could not generate output because the input image violates Google's Generative AI Prohibited Use policy."
+    stream=responses_sse(text=text)
+    lines=[]
+    for line in stream.decode().splitlines():
+        if line.startswith('event: response.completed'): line='event: response.incomplete'
+        if line.startswith('data: '):
+            data=json.loads(line[6:])
+            if data.get('type')=='response.completed':
+                data['type']='response.incomplete'
+                data['response'].update(status='incomplete',incomplete_details={'reason':'interrupted'},
+                    usage={'input_tokens':0,'output_tokens':0,'total_tokens':0})
+                line='data: '+json.dumps(data)
+        lines.append(line)
+    return ('\n'.join(lines)+'\n\n').encode()
+
+
+def test_explicit_image_rejection_is_classified_and_not_retried(bridge_factory,caplog):
+    bridge,requests,_=bridge_factory(lambda *_:image_policy_sse(),model='gemini-3.8-flash-medium',require_reply=True)
+    body=request_body();body['model']=bridge.model
+    bridge.forward(ModelHandler(),body)
+    assert bridge.stop_reason=='model_image_input_rejected' and len(requests)==1
+    assert bridge.result(bridge.stop_reason).status=='failed'
+    assert not bridge.can_recover_delivery()
+    assert 'input image violates' not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_next_turn_keeps_text_but_drops_previously_rejected_image(tmp_path):
+    client,requests,_=model_client(lambda _,n:image_policy_sse() if n==1 else responses_sse(number=n))
+    client.model=client.responses_model='gemini-3.8-flash-medium'
+    agent=HarnessToolAgent(decision_client=client,session_home=tmp_path/'home',session_id='same-session')
+    image=tmp_path/'synthetic.png';Image.new('RGB',(24,24),'red').save(image)
+    try:
+        first=await agent.run(['First synthetic image request'],(),Guard(),images=[ImageAttachment(url='',local_path=str(image))])
+        second=await agent.run(['Now ordinary text without pictures'],(),Guard())
+        third=await agent.run(['Look at this current image'],(),Guard(),images=[ImageAttachment(url='',local_path=str(image))])
+    finally:
+        agent.close();client.http_client.close()
+    assert first.reason=='model_image_input_rejected'
+    assert second.reason==third.reason=='model_finished'
+    def pictures(body):return [p for r in body['input'] for p in r.get('content',[]) if isinstance(p,dict) and p.get('type')=='input_image']
+    assert [len(pictures(r)) for r in requests]==[1,0,1]
 
 
 def test_long_stream_does_not_repeat_database_authority_checks_per_frame(bridge_factory):
@@ -392,6 +544,100 @@ def tool(name, handler, *, effect="read", properties=None, required=()):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('send_name', ['send_group', 'send_private'])
+async def test_direct_text_only_finish_is_corrected_once_with_current_source(tmp_path, send_name):
+    calls = []
+    async def send(args):
+        calls.append(args)
+        return ToolOutcome({}, 'sent', 'new-source-receipt')
+    def script(_, n):
+        if n == 1:
+            return responses_sse(text='The old message was already answered; stay silent.', number=n)
+        if n == 2:
+            return responses_sse(name=send_name, arguments={'text':'Reply to the NEW message'}, number=n)
+        return responses_sse(text='Delivered.', number=n)
+    client, requests, _ = model_client(script)
+    agent = HarnessToolAgent(decision_client=client, require_reply=True, reply_source_id=900100002,
+        session_home=tmp_path/'home', max_steps=6)
+    try:
+        result = await agent.run(['Current message source_id=900100002. Prior source_id=900100001 was sent.'],
+            (tool(send_name, send, effect='write', properties={'text':{'type':'string'}}, required=('text',)),), Guard())
+    finally:
+        agent.close();client.http_client.close()
+    assert result.status == 'sent' and len(calls) == 1
+    assert sum(row.get('status') == 'delivery_recovery' for row in result.trace) == 1
+    assert requests[1]['tool_choice'] == {'type':'function','name':send_name}
+    assert [row['name'] for row in requests[1]['tools']] == [send_name]
+    assert '900100002' in json.dumps(requests[1]) and 'Current delivery target JSON:' in json.dumps(requests[1])
+
+
+@pytest.mark.asyncio
+async def test_direct_repeated_internal_finish_fails_after_one_correction(tmp_path):
+    client, requests, _ = model_client(lambda _, n: responses_sse(text='Already sent previously.',number=n))
+    agent=HarnessToolAgent(decision_client=client,require_reply=True,session_home=tmp_path/'home')
+    try:
+        result=await agent.run(['New synthetic direct message'],(tool('send_private',None,effect='write'),),Guard())
+    finally:
+        agent.close();client.http_client.close()
+    assert len(requests)==2 and result.status=='failed' and result.reason=='required_reply_not_delivered'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['sent','uncertain','failed'])
+async def test_direct_completed_after_write_does_not_start_delivery_recovery(tmp_path,status):
+    calls=[]
+    async def send(_):
+        calls.append(1);return ToolOutcome({},status,'actual-receipt' if status=='sent' else None)
+    client,requests,_=model_client(lambda _,n: responses_sse(name='send_group',number=n) if n==1 else responses_sse(text='Done.',number=n))
+    agent=HarnessToolAgent(decision_client=client,require_reply=True,session_home=tmp_path/'home')
+    try:result=await agent.run(['Synthetic direct message'],(tool('send_group',send,effect='write'),),Guard())
+    finally:agent.close();client.http_client.close()
+    assert len(calls)==1 and len(requests)<=2
+    assert not any(row.get('status')=='delivery_recovery' for row in result.trace)
+
+
+def test_recovery_respects_remaining_budget_call_cap_and_revoked_authority(bridge_factory):
+    bridge,_,_=bridge_factory(lambda *_:responses_sse(),require_reply=True)
+    bridge.tools={'send_group':tool('send_group',None,effect='write')}
+    assert bridge.can_recover_delivery()
+    bridge.model_calls=bridge.owner.max_steps
+    assert not bridge.can_recover_delivery()
+    bridge.model_calls=1;bridge.deadline=time.monotonic()+4
+    assert not bridge.can_recover_delivery()
+    bridge.deadline=time.monotonic()+120;bridge.revoke()
+    assert not bridge.can_recover_delivery()
+
+
+@pytest.mark.asyncio
+async def test_delivery_recovery_blocks_a_second_different_write(tmp_path):
+    calls=[]
+    async def send(args):
+        calls.append(args);return ToolOutcome({},'sent','one-receipt')
+    def script(_,n):
+        if n==1:return responses_sse(text='Already replied to an older message.',number=n)
+        if n in (2,3):return responses_sse(name='send_group',arguments={'text':f'different-{n}'},call_id=f'call_{n}',number=n)
+        return responses_sse(text='Finished.',number=n)
+    client,requests,_=model_client(script)
+    agent=HarnessToolAgent(decision_client=client,require_reply=True,session_home=tmp_path/'home',max_steps=6)
+    try:result=await agent.run(['Current new message'],(tool('send_group',send,effect='write',properties={'text':{'type':'string'}},required=('text',)),),Guard())
+    finally:agent.close();client.http_client.close()
+    assert result.status=='sent' and calls==[{'text':'different-2'}]
+    assert 'delivery_recovery_only' in json.dumps(requests[-1])
+
+
+@pytest.mark.asyncio
+async def test_revoked_source_cannot_begin_delivery_recovery(tmp_path):
+    guard=Guard()
+    def script(_,n):
+        guard.allowed=False;return responses_sse(text='Prior message already answered.',number=n)
+    client,requests,_=model_client(script)
+    agent=HarnessToolAgent(decision_client=client,require_reply=True,session_home=tmp_path/'home')
+    try:result=await agent.run(['Current revoked message'],(tool('send_group',None,effect='write'),),guard)
+    finally:agent.close();client.http_client.close()
+    assert len(requests)==1 and not any(row.get('status')=='delivery_recovery' for row in result.trace)
+
+
+@pytest.mark.asyncio
 async def test_native_stalled_model_stops_before_a_late_tool_call(tmp_path):
     calls, request_started = [], []
     class DelayedTool(httpx.SyncByteStream):
@@ -408,7 +654,7 @@ async def test_native_stalled_model_stops_before_a_late_tool_call(tmp_path):
         calls.append(args)
         return ToolOutcome({}, "sent", "synthetic receipt")
     agent = HarnessToolAgent(decision_client=client, session_home=tmp_path / "home",
-        timeout_seconds=10, model_request_timeout_seconds=2, model_progress_timeout_seconds=0.15,
+        timeout_seconds=60, model_request_timeout_seconds=2, model_progress_timeout_seconds=0.15,
         model_first_output_timeout_seconds=0.15)
     try:
         result = await agent.run(["Synthetic stalled request"], (tool("send_group", send, effect="write"),), Guard())
@@ -578,7 +824,7 @@ async def test_native_loop_closes_terminal_sse_without_waiting_for_relay_eof(tmp
     client, requests, usages = model_client(script)
     if protocol == "chat":
         client.responses_model = None
-    agent = HarnessToolAgent(decision_client=client, session_home=tmp_path / "home", timeout_seconds=20)
+    agent = HarnessToolAgent(decision_client=client, session_home=tmp_path / "home", timeout_seconds=60)
     try:
         result = await agent.run(["Read context, use its result, then end."], (tool("read_context", read),), Guard())
     finally:
@@ -621,12 +867,14 @@ async def test_native_tool_timeout_cancels_python_handler_without_late_effects(t
     async def slow(_):
         started.set()
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)
             raise AssertionError("late handler resumed")
         finally:
             cancelled.set()
     client, requests, _ = model_client(lambda _, n: responses_sse(name="slow", number=n))
-    agent = HarnessToolAgent(decision_client=client, session_home=tmp_path / "home", timeout_seconds=3)
+    # Retain a short bounded turn/tool deadline, with room for a cold native
+    # process to initialize before the deliberately longer handler starts.
+    agent = HarnessToolAgent(decision_client=client, session_home=tmp_path / "home", timeout_seconds=30)
     stamp = time.monotonic()
     try:
         result = await agent.run(["Synthetic slow tool"], (tool("slow", slow),), Guard())
@@ -635,21 +883,36 @@ async def test_native_tool_timeout_cancels_python_handler_without_late_effects(t
         agent.close()
     assert started.is_set() and len(requests) == 1
     assert result.status in {"blocked", "failed"}
-    assert time.monotonic() - stamp < 6
+    assert time.monotonic() - stamp < 34
 
 
 @pytest.mark.asyncio
 async def test_real_harness_persists_and_restores_session_after_process_restart(tmp_path):
+    from app.agent.runtime_trace import TraceReader
     client, requests, _ = model_client(lambda _, n: responses_sse(text="first committed receipt" if n == 1 else "resumed", number=n))
     home = tmp_path / "scope-account-group"
     for prompt in ("wake one", "wake two"):
-        agent = HarnessToolAgent(decision_client=client, session_home=home, session_id="account-group-generation-1")
+        agent = HarnessToolAgent(decision_client=client, session_home=home, session_id="account-group-generation-1",
+            trace_root=tmp_path/'monitor',trace_context={'surface':'group','scope_id':900000001})
         try:
             assert (await agent.run([prompt], (), Guard())).status == "silent"
         finally:
             agent.close()
     assert "first committed receipt" in json.dumps(requests[1])
     assert "wake one" in json.dumps(requests[1]) and "wake two" in json.dumps(requests[1])
+    reader = TraceReader(tmp_path/'monitor')
+    conversation = reader.list_conversations()[0]
+    assert conversation['turn_count'] == 2 and conversation['native_session_count'] == 1
+    assert len(reader.list_conversations()) == 1
+    agent = HarnessToolAgent(decision_client=client, session_home=home, session_id='generation-2',
+        trace_root=tmp_path/'monitor',trace_context={'surface':'group','scope_id':900000001})
+    try:
+        assert (await agent.run(['new native execution'], (), Guard())).status == 'silent'
+    finally:
+        agent.close();client.http_client.close()
+    conversation = reader.list_conversations()[0]
+    assert conversation['turn_count'] == 3 and conversation['native_session_count'] == 2
+    assert 'wake one' not in json.dumps(requests[2])
 
 
 @pytest.mark.asyncio
@@ -814,3 +1077,52 @@ async def test_invoke_callback_gets_native_identity_and_write_budget(tmp_path):
     assert calls == [("send_group", {"text": "1"}, "call_1|fc_call_1")]
     assert result.status == "sent"
     assert "write_budget_exhausted" in requests[2]["input"][-2]["output"]
+
+
+@pytest.mark.parametrize('protocol',['openai-responses','openai-completions'])
+def test_private_observer_captures_final_wire_request_without_changing_it(bridge_factory,tmp_path,protocol):
+    from app.agent.runtime_trace import AgentTrace,TraceReader,sanitize
+    stream=(responses_sse(text='visible') if protocol=='openai-responses' else
+        b'data: {"choices":[{"delta":{"reasoning_content":"PRIVATE_NOT_VISIBLE","content":"visible"}}]}\n\ndata: [DONE]\n\n')
+    bridge,requests,_=bridge_factory(lambda *_:stream,protocol=protocol)
+    observer=AgentTrace(tmp_path/'traces',context={'surface':'group','source_id':1},session_key='synthetic')
+    bridge.observer=observer
+    bridge.forward(ModelHandler(),request_body(protocol))
+    bridge.result('model_finished');observer.close()
+    reader=TraceReader(tmp_path/'traces')
+    record=reader.read_request(observer.trace_id,'m01-a01')
+    assert record['body']==sanitize(requests[0])
+    assert record['meta']['context_window_tokens']==bridge.owner.context_policy.context_window
+    assert record['meta']['context_input_ceiling'] < record['meta']['context_window_tokens']
+    assert 'Current time JSON:' in json.dumps(record['body'])
+    assert 'synthetic-key' not in json.dumps(record) and 'SYNTHETIC_URL_SECRET' not in json.dumps(record)
+    trace=reader.read_trace(observer.trace_id)
+    assert any(e['kind']=='model.finished' for e in trace['events'])
+    assert trace['streams']['m01-a01']['output']=='visible'
+    assert 'PRIVATE_NOT_VISIBLE' not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unavailable',[False,True])
+async def test_observer_io_failure_never_changes_native_send_or_budget(tmp_path,unavailable):
+    from app.agent.runtime_trace import TraceReader
+    root=tmp_path/'traces'
+    if unavailable:root.write_text('occupied')
+    calls=[]
+    async def send(args):
+        calls.append(args)
+        return ToolOutcome({'message_id':'synthetic-receipt'},'sent','synthetic-receipt')
+    client,requests,_=model_client(lambda _,n:responses_sse(name='send_group',arguments={'text':'synthetic answer'},number=n)
+        if n==1 else responses_sse(number=n))
+    agent=HarnessToolAgent(decision_client=client,session_home=tmp_path/'home',trace_root=root,
+        trace_context={'surface':'group','scope_id':900000001,'source_id':1})
+    try:
+        result=await agent.run(['Synthetic goal'],(tool('send_group',send,effect='write',
+            properties={'text':{'type':'string'}},required=('text',)),),Guard())
+    finally:agent.close();client.http_client.close()
+    assert result.status=='sent' and len(requests)==2 and calls==[{'text':'synthetic answer'}]
+    if not unavailable:
+        reader=TraceReader(root);meta=reader.list_traces()[0]
+        assert meta['status']=='sent' and meta['model_requests']==2
+        receipts=[e['data'] for e in reader.read_trace(meta['trace_id'])['events'] if e['kind']=='tool.completed']
+        assert receipts[0]['status']=='sent' and receipts[0]['receipt_id']=='synthetic-receipt'

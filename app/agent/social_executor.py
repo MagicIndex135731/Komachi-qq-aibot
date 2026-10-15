@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 import logging
 from pathlib import Path
 
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, select
 
 from app.adapters.outbound_guard import GroupDispatchScope, group_dispatch_scope
 from app.adapters.sender import OutboundMessage, QQMessageDeliveryUncertainError
@@ -154,13 +154,42 @@ class SocialExecutor:
             return SocialResult("failed", reason="qzone_definite_rejection")
         return SocialResult("sent", receipt_id=receipt)
 
-    def _reserve_group_output(self, observation, decision, action_id: str) -> str | None:
+    def reply_delivery_state(self, group_id: int, reply_source_id: int) -> str | None:
+        """Fence only the exact answered source, never every observed message."""
+        if type(reply_source_id) is not int or reply_source_id <= 0:
+            return None
+        from app.storage.agent_effects import AgentToolEffect
+        with session_scope(self.router.engine) as session:
+            rows = session.scalars(select(Message).where(Message.group_id == group_id,
+                Message.user_id == self.router.runtime.settings.bot_qq,
+                func.json_extract(Message.raw_json, '$.reply_source_id') == reply_source_id))
+            states = set()
+            for row in rows:
+                raw = row.raw_json or {}
+                state = raw.get('delivery_state')
+                if state == 'sent':
+                    states.add('sent')
+                elif state == 'uncertain':
+                    states.add('uncertain')
+                elif state == 'reserved':
+                    effect = session.get(AgentToolEffect, raw['social_action_id']) if raw.get('social_action_id') else None
+                    if effect is not None and effect.status in {'dispatching', 'uncertain', 'sent'}:
+                        states.add('uncertain')
+            return 'uncertain' if 'uncertain' in states else 'sent' if 'sent' in states else None
+
+    def _reserve_group_output(self, observation, decision, action_id: str, reply_source_id=None) -> str | None:
         provisional_id = "social:" + str(action_id)
         with session_scope(self.router.engine) as session:
             messages = MessageRepository(session)
             if messages.get_by_platform_msg_id(provisional_id) is not None:
                 return None
             group_id = observation.job.scope_id
+            if reply_source_id is not None:
+                source = session.get(Message, reply_source_id) if type(reply_source_id) is int else None
+                if (reply_source_id not in observation.source_message_ids or source is None
+                        or source.user_id == self.router.runtime.settings.bot_qq
+                        or not is_usable_memory_source(source, group_id=group_id)):
+                    raise ValueError('reply_source_unavailable')
             groups = GroupRepository(session)
             if groups.get_group(group_id) is None:
                 groups.upsert_group(group_id=group_id, group_name="", enabled=True, speak_enabled=True)
@@ -171,7 +200,8 @@ class SocialExecutor:
                 timestamp=self.clock(), plain_text=decision.text, msg_type="text", reply_to_msg_id=None,
                 mentioned_bot=False, raw_json={"post_type": "message", "message_type": "group",
                     "social_action_id": str(action_id), "delivery_state": "reserved", "delivery_attempts": 0,
-                    "source_message_ids": list(observation.source_message_ids)},
+                    "source_message_ids": list(observation.source_message_ids),
+                    **({'reply_source_id': reply_source_id} if reply_source_id is not None else {})},
             )
             row = messages.get_by_platform_msg_id(provisional_id)
             if decision.image_files:
@@ -201,13 +231,20 @@ class SocialExecutor:
                 payload.update(failure_kind="delivery_result_unknown", delivery_reason="gateway_ack_timeout")
             row.raw_json = payload
 
-    async def _send_group(self, observation, decision, guard) -> SocialResult:
+    async def _send_group(self, observation, decision, guard, *, max_text_chars=300, as_forward=False, video_file=None,
+                          reply_source_id=None) -> SocialResult:
         # The model can produce one bounded text action, never CQ control segments.
-        if len(decision.text) > 300:
+        if max_text_chars not in {300, 12000} or len(decision.text) > max_text_chars:
             return SocialResult("blocked", reason="group_text_too_long")
-        provisional_id = self._reserve_group_output(observation, decision, guard.action_id)
+        provisional_id = self._reserve_group_output(observation, decision, guard.action_id, reply_source_id)
         if provisional_id is None:
             return SocialResult("blocked", reason="duplicate_group_action")
+        if video_file:
+            with session_scope(self.router.engine) as session:
+                row = MessageRepository(session).get_by_platform_msg_id(provisional_id)
+                row.msg_type = 'video'
+                row.raw_json = {**row.raw_json, 'message': [{'type': 'text', 'data': {'text': decision.text}},
+                    {'type': 'video', 'data': {'local_path': str(video_file), 'origin': 'web_page_video'}}]}
         scope = GroupDispatchScope(observation.job.scope_id,
                                    lambda: guard.valid() and self.policy_check(observation, decision,
                                                                             reserved_action_id=guard.action_id),
@@ -215,8 +252,17 @@ class SocialExecutor:
         # Our provisional row must not turn its own idle/cooldown checks false.
         try:
             with group_dispatch_scope(scope):
-                if decision.image_files:
-                    receipts = await self.sender.send_group_media(group_id=observation.job.scope_id, text=decision.text, image_files=decision.image_files)
+                if video_file:
+                    receipts = await self.sender.send_video(group_id=observation.job.scope_id,
+                        text=decision.text, video_file=str(video_file))
+                elif as_forward:
+                    receipts = await self.sender.send_image_bundle(group_id=observation.job.scope_id,
+                        self_id=self.router.runtime.settings.bot_qq, name=self.router.runtime.persona.get('name', '小町'),
+                        text=decision.text, image_files=decision.image_files)
+                elif decision.image_files:
+                    caption_options = {'max_text_chars': max_text_chars} if max_text_chars != 300 else {}
+                    receipts = await self.sender.send_group_media(group_id=observation.job.scope_id, text=decision.text,
+                        image_files=decision.image_files, **caption_options)
                 else:
                     receipts = await self.sender.send_group_text(OutboundMessage(observation.job.scope_id, decision.text))
             if not receipts:

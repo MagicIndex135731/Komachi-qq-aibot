@@ -164,7 +164,7 @@ class SocialPlanner:
             ).order_by(Message.id.desc()).limit(1)).first()
             if latest is not None and not is_usable_memory_source(latest, group_id=job.scope_id):
                 return replace(observation, suppressed_reason="latest_source_unavailable")
-            recent = [row for row in messages.list_recent_group_messages(group_id=job.scope_id, limit=24) if is_usable_memory_source(row, group_id=job.scope_id)]
+            recent = [row for row in messages.list_recent_group_messages(group_id=job.scope_id, limit=30) if is_usable_memory_source(row, group_id=job.scope_id)]
             if latest is not None and latest.id not in {row.id for row in recent}:
                 recent.append(latest)
             instant = router._normalize_timestamp(now)
@@ -189,7 +189,8 @@ class SocialPlanner:
                 for row in recent
             ], 6000)
             source_ids = tuple(int(row.id) for row in recent)
-        if recent and router._group_memory_enabled(group_id=job.scope_id):
+        if (recent and router.runtime.settings.agent_runtime != 'harness'
+                and router._group_memory_enabled(group_id=job.scope_id)):
             try:
                 packet = self.memory_reader.read(MemoryObservationRequest(
                     group_id=job.scope_id,

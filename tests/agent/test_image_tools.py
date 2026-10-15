@@ -17,6 +17,56 @@ from test_autonomous_social import (BOT, GROUP, OTHER_GROUP, NOW, PolicyGuard, S
     add_source, composed, image_bytes, last_artifact, tool_result, writes)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['recover', 'http502', 'timeout', 'rejected', 'budget'])
+async def test_image_http_failure_classification_and_bounded_same_request_retry(sqlite_engine, tmp_path, failure):
+    calls = []
+
+    def inspect(lines, kwargs):
+        outcome = tool_result(lines, 'generate_image')
+        if failure == 'recover':
+            assert outcome['status'] == 'ok' and outcome['result']['artifact_id']
+        else:
+            data = outcome['result']
+            assert outcome['status'] == 'failed'
+            assert data['error'] == ('image_provider_timeout' if failure == 'timeout' else
+                                     'image_provider_rejected' if failure == 'rejected' else 'image_provider_unavailable')
+            assert data['result_state'] == ('unknown' if failure == 'timeout' else
+                                           'rejected' if failure == 'rejected' else 'failed')
+            if failure not in {'timeout', 'rejected'}:
+                assert data['provider_http_status'] == 502
+        return {'finish': True}
+
+    model = ScriptedModel({'tool': 'generate_image', 'arguments': {'prompt': '一只合成测试的红色小猫'}}, inspect)
+    async with composed(sqlite_engine, tmp_path, model,
+                        options={'max_image_calls_daily': 1 if failure == 'budget' else 10}) as fixture:
+        original = fixture.image_client.generate_image
+
+        def generate(**kwargs):
+            calls.append(dict(kwargs))
+            if failure == 'recover' and len(calls) == 2:
+                return original(**kwargs)
+            request = httpx.Request('POST', 'https://image.example.invalid/generations')
+            if failure == 'timeout':
+                cause = httpx.ReadTimeout('unknown generation result', request=request)
+            else:
+                response = httpx.Response(400 if failure == 'rejected' else 502, request=request,
+                    json={'error': {'code': 'content_policy_violation' if failure == 'rejected' else 'upstream_failed',
+                                    'message': 'PRIVATE_BODY_MUST_NOT_ESCAPE'}})
+                cause = httpx.HTTPStatusError('provider error', request=request, response=response)
+            raise ValueError('images generations request failed after retries') from cause
+
+        fixture.image_client.generate_image = generate
+        job = configured_social_jobs(fixture.router.runtime)[0]
+        observed = SocialObservation(job, NOW, 'synthetic')
+        await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed))
+        assert len(calls) == (2 if failure in {'recover', 'http502'} else 1)
+        assert calls[-1]['timeout_seconds'] <= calls[0]['timeout_seconds'] <= 30
+        assert all(call['max_attempts'] == 1 and call['model'] == 'synthetic-image-model' for call in calls)
+        assert writes(fixture) == []
+        assert 'PRIVATE_BODY_MUST_NOT_ESCAPE' not in str(model.prompts)
+
+
 def saved_reference(fixture, engine, *, group=GROUP, sources=(), content=None, suffix=".png"):
     root = fixture.router.runtime.settings.data_dir / "autonomous_artifacts"
     root.mkdir(parents=True, exist_ok=True)
@@ -40,6 +90,11 @@ async def test_reference_tool_edits_real_owned_pixels_and_preserves_labels_size_
         "reference_artifact_ids": reference_id, "reference_subjects": ["角色甲"]}}, inspect)
     async with composed(sqlite_engine, tmp_path, model) as fixture:
         reference_id.append(saved_reference(fixture, sqlite_engine, sources=(original,)))
+        model_resolutions = []
+        def selected_image_model(*, edit):
+            model_resolutions.append(edit)
+            return "gpt-image-2.5-sunburst"
+        fixture.image_client.resolved_image_model = selected_image_model
         service = fixture.router.group_image_service
         service._resolve_image_size = lambda **kwargs: "1024x1536"
         service.background, service.output_compression, service.moderation = "transparent", 70, "low"
@@ -56,6 +111,7 @@ async def test_reference_tool_edits_real_owned_pixels_and_preserves_labels_size_
         root = fixture.router.runtime.settings.data_dir / "autonomous_artifacts"
         metadata = json.loads((root / (output_ids[0] + ".meta.json")).read_text())
         assert set(metadata["source_message_ids"]) == {original, current}
+        assert metadata["model"] == "gpt-image-2.5-sunburst" and model_resolutions == [True]
         assert writes(fixture) == []
 
 
@@ -128,7 +184,7 @@ async def test_image_reference_search_returns_real_failure_and_never_generates(s
         return [ImageAttachment(url="https://reference.synthetic.invalid/ref.png")]
     model = ScriptedModel({"tool": "search_image_references", "arguments": {"query": "synthetic character", "subject": "人物"}},
         lambda lines, _: {"finish": True, "note": str(tool_result(lines, "search_image_references")["status"])})
-    monkeypatch.setattr("app.agent.autonomous_social.socket.getaddrinfo", lambda *_: [(2, 1, 6, "", ("127.0.0.1" if invalid == "private_address" else "8.8.8.8", 443))])
+    monkeypatch.setattr("app.agent.image_operations.socket.getaddrinfo", lambda *_: [(2, 1, 6, "", ("127.0.0.1" if invalid == "private_address" else "8.8.8.8", 443))])
     async with composed(sqlite_engine, tmp_path, model) as fixture:
         service = fixture.router.group_image_service
         service.web_search_client = SimpleNamespace(image_search=search)

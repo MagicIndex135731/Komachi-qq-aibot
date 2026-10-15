@@ -24,6 +24,10 @@
 
 分层工具默认每层最多 5 条，综合结果也有独立上限；必要时追加检索和出处。记忆写入还要求 `services.memory_write`、真实授权来源和提交前复验。Agent 的临时工作笔记/目标用来继续行为，有时效，不是新的长期事实来源。
 
+正式资料任务与日常聊天分开保存原生会话；任务证据只在 `data/research_tasks/` 按提问者保存。摘要携带V3依赖的语义版本与实际消息来源，恢复会重新验证并纳入当前执行守卫。任务7天过期或来源撤回、事实更正/失效后不能直接沿用旧结论。网页原文不作为新增V3事实/人格样本导入；来源明确的用户可见回复仍属于实际聊天账本。全请求预算覆盖规则/schema/回放/图片；V3召回先扣历史估算、输出、安全及工具余量，相同快照只保留一次。缓存usage、请求估算和内部压缩成本分开记录，缺失缓存字段保持未知。
+
+直接群聊互动的追加记忆检索受 `MEMORY_MEMORY_TOOL_MAX_ROUNDS` 控制，Harness 总读取上限为该值的两倍，默认 4 次（含 `search_history`、`memory_search`、`memory_read`）。达到上限、进入最后一步或剩余时间不足时，模型用已有证据交付，并明确未知与推测；不继续检索到整轮超时。工具 schema 与结果会显示实际 `MEMORY_MEMORY_TOOL_MAX_RESULTS` 上限。
+
 常用开关：`MEMORY_ORCHESTRATION_V2_ENABLED`（完整编排兼容开关）、`MEMORY_RAW_V3_ENABLED`（活动raw索引）、`MEMORY_LAYERED_MEMORY_ENABLED`、`MEMORY_MEMORY_TOOLS_ENABLED`、`MEMORY_EMBEDDING_PROVIDER`。即使名字含V2，编排开关也不是V3回滚按钮。
 
 embedding 默认本地 BGE 与 sqlite-vec；可配置兼容服务。关闭向量仅保留FTS属于降级。改变模型/维度/版本后不能继续把旧向量当作同一语义空间，须重新准备检索代际。

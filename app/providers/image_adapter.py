@@ -24,6 +24,38 @@ class ImageGenerationResult:
     artifacts: list[ImageArtifact] = field(default_factory=list)
 
 
+def image_failure_details(exc: Exception) -> dict[str, Any]:
+    """Expose bounded error facts, including wrapped HTTP failures, without bodies or URLs."""
+    cause, seen = exc, set()
+    while id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, httpx.HTTPStatusError):
+            status = cause.response.status_code
+            code = None
+            try:
+                payload = cause.response.json()
+                error = payload.get('error') if isinstance(payload, dict) else None
+                code = error.get('code') if isinstance(error, dict) else None
+            except ValueError:
+                pass
+            rejected = isinstance(code, str) and code in {'content_policy_violation', 'safety_violation', 'moderation_blocked'}
+            return {'error': 'image_provider_rejected' if rejected else 'image_provider_unavailable'
+                    if status >= 500 else 'image_provider_rate_limited' if status == 429 else 'image_provider_http_error',
+                    'error_type': type(cause).__name__, 'provider_http_status': status,
+                    'result_state': 'rejected' if rejected else 'failed',
+                    'retryable': not rejected and status in {429, 500, 502, 503, 504}}
+        if isinstance(cause, httpx.TransportError):
+            return {'error': 'image_provider_timeout' if isinstance(cause, httpx.TimeoutException)
+                    else 'image_provider_transport_failed', 'error_type': type(cause).__name__,
+                    'result_state': 'unknown', 'retryable': False}
+        next_cause = cause.__cause__
+        if next_cause is None:
+            break
+        cause = next_cause
+    return {'error': 'image_result_invalid' if isinstance(exc, ValueError) else 'image_provider_failed',
+            'error_type': type(exc).__name__, 'result_state': 'failed', 'retryable': False}
+
+
 def normalize_image_response_format(response_format: str | None) -> str:
     normalized = str(response_format or "").strip().lower()
     if normalized in {"url", "b64_json"}:

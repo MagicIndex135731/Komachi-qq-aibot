@@ -868,7 +868,7 @@ def test_dry_run_never_calls_transport(tmp_path):
         {
             "category": "preference",
             "kind": "preference",
-            "query": "小甲喜欢什么",
+            "query": "阿渣喜欢什么",
             "expected_evidence_message_ids": ["p1"],
             "group_id": 1001,
             "recent_context_message_ids": [],
@@ -2073,7 +2073,7 @@ def test_build_eval_clients_luna_medium_answer_and_luna_low_aux():
 
 def test_build_answer_prompt_requires_citation_per_claim_and_recommendation_abstention():
     case = {
-        "query": "小甲最近有什么计划",
+        "query": "阿渣最近有什么计划",
         "gold_text": "参考",
         "expected_evidence_message_ids": ["p1"],
     }
@@ -2164,7 +2164,7 @@ def test_mention_either_judge_contract_accepts_grounded_answer_or_abstention():
 
 def test_build_judge_prompt_allows_open_ended_partial_answers():
     case = {
-        "query": "小甲最近有什么计划",
+        "query": "阿渣最近有什么计划",
         "gold_text": "参考",
         "expected_evidence_message_ids": ["p1"],
     }

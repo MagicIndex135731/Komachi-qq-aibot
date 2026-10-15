@@ -31,7 +31,7 @@ def _find_source_id(con, *, user_id: int, evidence: str) -> str | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="/workspace/data/bot.db")
-    parser.add_argument("--persona", default="/workspace/configs/personas/member_alpha.yaml")
+    parser.add_argument("--persona", default="/workspace/configs/personas/azha.yaml")
     parser.add_argument("--group-id", type=int, required=True)
     parser.add_argument("--user-id", type=int, required=True)
     parser.add_argument("--dry-run", action="store_true")

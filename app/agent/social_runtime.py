@@ -37,6 +37,7 @@ class SocialDispatchGuard:
         self.connection_generation = runtime._connection_generation
         self.dispatched = False
         self.closed = False
+        self.trace_trigger = {}
 
     def valid(self) -> bool:
         runtime = self.runtime
@@ -334,6 +335,18 @@ class SocialRuntime:
                 reason = "reservation_rejected"
                 return
             guard = SocialDispatchGuard(self, observation=observation, decision=decision, action_id=action_id, epoch=epoch, clock=clock)
+            guard.trace_trigger = {
+                'trigger_kind': ('group_goal' if job.kind == 'group' else 'public_goal') if intention_claim is not None
+                    else 'group_schedule' if job.kind == 'group' else job.kind,
+                'trigger_reason_code': 'intention_due' if intention_claim is not None else 'schedule_due',
+                'trigger_reason': ('此前保存的工作目标已到期，调度器领取目标并通过权限、来源与额度检查。'
+                    if intention_claim is not None else '已启用的后台任务到达下次执行时间，通过权限、来源与额度检查后开始。'),
+                'trigger_evidence': {'job_key': job.key, 'action_id': action_id,
+                    'due_at': (scheduled.due_at if scheduled.due_at.tzinfo else scheduled.due_at.replace(tzinfo=UTC)).isoformat(),
+                    'decision_reason': decision.reason[:160],
+                    **({'goal': str(intention_claim.working_intention.get('goal', ''))[:600],
+                        'goal_scope': intention_claim.scope, 'schedule_revision': intention_claim.schedule_revision,
+                        'source_ids': list(intention_claim.source_message_ids)[:20]} if intention_claim is not None else {})}}
             entered_agent = True
             result = await asyncio.wait_for(self.execute(observation, decision, guard), timeout=self.options.execution_timeout_seconds)
             if not isinstance(result, SocialResult) or result.status not in {"sent", "uncertain", "failed", "blocked", "silent"}:
@@ -369,4 +382,6 @@ class SocialRuntime:
                 guard.close()
             self.repository.note_job(account_id=self.account_id, owner=self._owner, epoch=epoch, job_key=job.key,
                                      status=status, reason=reason, now=clock())
-        return entered_agent
+        # Local admission did not run a model. Preserve a due goal for retry
+        # instead of silently consuming it when a rolling quota is exhausted.
+        return entered_agent and not reason.startswith('proactive_admission:')

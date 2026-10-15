@@ -102,6 +102,25 @@ async def test_page_context_budget_and_next_line_use_visible_content():
     assert total <= 48000
 
 
+async def test_formal_budget_expands_calls_and_page_window_with_recoverable_evidence(tmp_path):
+    import json
+    from app.agent.research_tasks import ResearchTaskWorkspace
+    task=ResearchTaskWorkspace(tmp_path,scope='group:900000001',actor_id=900000101,source_id=1,
+        request='审查这个仓库',valid_source=lambda _:True)
+    task.begin('主模型显式扩容资料预算')
+    client=Client()
+    current={tool.name:tool for tool in build_web_tools(client,settings=SimpleNamespace(agent_runtime='harness'),
+        runner=Runner(),guard=Guard(),workspace=task)}
+    for number in range(10):
+        assert (await current['search_web'].handler({'query':str(number)})).status=='ok'
+    page=await current['open_web_page'].handler({'ref_id':'https://example.com/page','max_chars':32000})
+    assert 16000 < len(json.dumps(page.data,ensure_ascii=False)) <= 32000
+    assert task.read_evidence(page.data['evidence_id'],max_chars=32000)['content']==page.data['content']
+    reuse=await current['open_web_page'].handler({'ref_id':'https://example.com/page','max_chars':32000})
+    assert reuse.data['content']=='' and reuse.data['evidence_id']==page.data['evidence_id']
+    assert len(client.calls)==11
+
+
 async def test_source_revocation_failure_timeout_and_cancellation():
     guard = Guard()
     class Revoked(Client):

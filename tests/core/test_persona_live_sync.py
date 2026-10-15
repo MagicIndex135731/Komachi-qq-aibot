@@ -427,12 +427,12 @@ def test_load_runtime_config_merges_live_persona(tmp_path) -> None:
     )
     (config_dir / "groups.yaml").write_text("{}\n", encoding="utf-8")
     (config_dir / "safety.yaml").write_text("{}\n", encoding="utf-8")
-    (config_dir / "personas" / "member_alpha.yaml").write_text(
-        "name: 小甲\ncore_traits:\n- A\n", encoding="utf-8"
+    (config_dir / "personas" / "azha.yaml").write_text(
+        "name: 阿渣\ncore_traits:\n- A\n", encoding="utf-8"
     )
     data_dir = tmp_path / "data"
     (data_dir / "personas").mkdir(parents=True)
-    (data_dir / "personas" / "member_alpha.live.yaml").write_text(
+    (data_dir / "personas" / "azha.live.yaml").write_text(
         "core_traits:\n- A\n- B\nspeech_habits:\n- 短句\n", encoding="utf-8"
     )
     settings = AppSettings.model_construct(
@@ -447,14 +447,14 @@ def test_load_runtime_config_merges_live_persona(tmp_path) -> None:
 
     runtime = load_runtime_config(settings)
 
-    assert runtime.personas["member_alpha"]["core_traits"] == ["A", "B"]
-    assert runtime.personas["member_alpha"]["speech_habits"] == ["短句"]
+    assert runtime.personas["azha"]["core_traits"] == ["A", "B"]
+    assert runtime.personas["azha"]["speech_habits"] == ["短句"]
 
 
 def test_merge_profile_replaces_lists_and_merges_mappings() -> None:
     merged = _merge_profile(
         {
-            "name": "小甲",
+            "name": "阿渣",
             "core_traits": ["A"],
             "speaking_style": {"tone": "casual", "sentence_length": "short"},
         },

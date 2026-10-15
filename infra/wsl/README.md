@@ -6,6 +6,7 @@
 
 ## 1. 运行要求
 
+
 - Python 3.12、Git、Linux `python3-venv`、tar 和 systemd。
 - WSL 内 Docker Engine/Compose，root 可调用 Docker；`systemctl show-environment` 应成功。
 - 可用模型 API 和一个用于机器人运行的 QQ 账号。
@@ -160,6 +161,21 @@ Linux 等价入口为 `bash infra/wsl/scripts/install_linux_runtime.sh`；更新
 
 只执行 start/stop 不会同步源码变化。修改生产 `shared/.env` 后容器须重新创建，单纯重启进程不会更新创建时的环境。正常维护优先修改源目录私有配置并 rebuild。
 
+### 模型套餐快捷切换
+
+首次接入并验收两套接口后，双击根目录 `switch-xiaomachi-model.cmd`，选 `1` 使用原接口 Sol 6.1 low + image 2.5，选 `2` 使用 Gemini 套餐。也可在项目目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File infra/wsl/scripts/switch_model_profile.ps1 -Profile sol
+powershell -ExecutionPolicy Bypass -File infra/wsl/scripts/switch_model_profile.ps1 -Profile gemini
+powershell -ExecutionPolicy Bypass -File infra/wsl/scripts/switch_model_profile.ps1 -Profile gemini -Reasoning high
+powershell -ExecutionPolicy Bypass -File infra/wsl/scripts/switch_model_profile.ps1 -Profile gemini -Check
+```
+
+私有套餐在 `infra/wsl/runtime/model-profiles/{sol,gemini}.env`，密钥只放此目录；占位模板在 `model-profiles/`。已保存的套餐不会因再次 capture 被覆盖。`gemini.reasoning.json` 声明经接口验证的 `low/medium/high/tiered` 别名；`minimal` 当前没有可切换的已验型号。成功选择强度会保存，之后菜单切回 Gemini 使用上次选择。辅助整理/判断保持 low；tiered 是代理动态别名，主强度字段为空，复杂任务可能显著变慢。套餐中的独立搜索地址、凭据、`LLM_WEB_SEARCH_MODEL` 和 `WEB_SEARCH_REASONING_EFFORT` 不随主强度改变。Gemini 套餐使用新接口的原生 Google Search，搜索型号和强度固定 medium；Sol 套餐使用原接口搜索。搜索返回带来源摘要，网页打开/查找直接读取实际页面；不保证绕过网站或网络限制。 Gemini 图片套餐的 medium 画质在已验通道返回2K；high可能返回4K并超过当前8MiB媒体预算，不能只根据请求size认定返回尺寸。
+
+切换无需重建镜像：脚本保留实际运行应用的镜像、QQ 平台、GPU 和其他开关，原子更新源目录及共享环境，显式 `--no-deps` 仅重建群私两个应用，再验证健康、接口和 QQ/计算容器身份。失败自动恢复配置及应用；备份位于 `/opt/xiaomachi/shared/runtime/model-profile-backups/`。每次切换最多两次有限的合成文本探测，`-Check` 仅一次探测、不切换，不调用生图或发送 QQ。不要与 rebuild/start 并发；原生会话按 Gemini 型号/接口轮换，保留历史数据。此入口仅切换已接入套餐，应用代码升级仍使用受控 rebuild。
+
 切换 QQ 平台需要在 `.env` 修改 `QQ_PLATFORM` 后受控停止/启动并更新部署配置，准备新平台登录；不要在持续业务中反复试多个平台。
 
 ## 7. 数据与备份
@@ -174,7 +190,7 @@ Linux 等价入口为 `bash infra/wsl/scripts/install_linux_runtime.sh`；更新
 | 平台专属卷 | QQ/WebUI/客户端登录状态 |
 | `wsl_sandbox_data`（启用时） | 计算侧车持久运行数据 |
 
-生产数据不用 Windows bind mount。曾经的 `infra/wsl/runtime/` 迁移目录不是现役数据库；只有确认卷迁移与备份后才清理旧文件。
+生产数据不用 Windows bind mount。曾经的 `infra/wsl/runtime/` 迁移目录不是现役数据库；只有确认卷迁移与备份后才清理旧文件。正式资料任务的检查点/证据在应用卷 `research_tasks/`，按群/私聊与提问者隔离，7天有效；不是事实库，原始聊天和记忆撤回规则仍适用。
 
 创建一致 SQLite 备份（容器中执行）：
 
@@ -187,6 +203,8 @@ docker exec xiaomachi-bot python -m scripts.backup_memory_v2 \
 验证输出 `integrity_check=ok`，保存生成的 manifest 与备份；真实数据不要上传 GitHub。其他账号卷另行备份。记忆索引的 prepare/activate/rollback 见 [MEMORY](../../docs/MEMORY.md)，代码升级不等于索引激活。
 
 ## 8. GPU 与模型缓存
+
+网页独立出口：项目固定使用WSL回环18797，7897留给Windows用户代理；配置生成、客户端白名单、systemd就绪及启动/健康检查须同步，回退也不得重启旧7897配置。将私有订阅YAML放在 `/opt/xiaomachi/shared/mihomo/`（目录0700、文件0600），用 `render_mihomo_config.py --source <私有文件> --output <候选文件> --page-only` 只保留香港x1节点并创建url-test组，每300秒测延迟、容差0、关闭TUN/LAN。未标倍率仅在确认运营商默认x1约定时加 `--unmarked-rate-one`；这与明确标x1应区分。先 `mihomo -t -d /opt/xiaomachi/shared/mihomo -f <候选文件>` 校验，再保存旧配置并激活服务。只设置 `WEB_PAGE_PROXY_URL=http://127.0.0.1:18797`，不设置全局HTTP/HTTPS代理；主模型/搜索/find/QQ维持原出口。环境与订阅不进入Git，启动/status复验服务。模型套餐切换保留该非套餐字段。页面代理失败会如实返回失败，不静默换出口。
 
 基础镜像包含 CUDA/cuDNN 和 fastembed-gpu，但 GPU 设备是可选。无 NVIDIA 设置 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`，用 CPU；启用需 Windows NVIDIA 驱动、WSL GPU 支持和 NVIDIA Container Toolkit/CDI。
 
@@ -234,6 +252,29 @@ systemctl enable --now xiaomachi-sandbox
 
 再在私有 social 配置开启 compute 并 rebuild。侧车 service 使用预建镜像，start/stop/status 会覆盖已启用侧车。认证失败、镜像缺失或执行不可用应返回 unavailable，不用宿主 Python 替代。
 
+## Agent本机监控
+
+在私有 `infra/wsl/.env` 设置 `AGENT_MONITOR_ENABLED=true` 并 rebuild，两应用采集从新回合开始。安装/启动会加载可选 `docker-compose.monitor.yml`，独立查看容器根文件系统只读，仅可写挂载数据卷的 `agent_monitor` 子目录且不加载机器人 `.env`。启动脚本先确保该目录存在；Docker需支持卷 `subpath`。浏览器打开 [Agent现场](http://127.0.0.1:8765/)，也可双击根目录 `打开Agent监控网页.bat`（调用 `open-agent-monitor.cmd`，使用默认浏览器）。
+
+一键入口先绕过系统代理检查Windows本机健康、页面和会话API；若WSL回环8765存在但Windows localhost转发失联，启动隐藏的Windows查看器，通过 `\\wsl.localhost\Ubuntu_Migrated\...` 处理同一Docker数据卷中的 `agent_monitor`，不复制聊天记录或加载机器人 `.env`。入口核对卷子挂载；兼容旧版整卷只读挂载。两端都只监听回环8765，重复打开复用健康服务，不使用7897、不修改防火墙或重启QQ/WSL。入口需本机Python；可用 `XIAOMACHI_MONITOR_PYTHON` 指定已安装的python.exe，默认检测PATH与本机Conda目录。日志在 `data/agent-monitor-launcher/viewer.log`；关闭浏览器不停止查看器。升级删除功能时需重启已运行的旧版Windows查看进程；重启Windows后再次双击入口即可恢复。
+
+左侧选择会话，右侧连续查看触发消息、公开思考摘要/状态、模型请求、工具行动和发送回执。「为什么开始行动」显示@/回复、消息批次、到期目标或后台任务的实际原因；可展开查看来源、队列/任务号和到期时间。回合之间明确标记执行上下文延续或失败后重建；独立审查/委派任务单列。点击每步「查看本次输入」打开实际请求抽屉，按顺序展开历史并对比同一执行会话的上一请求；多次重试标注同一步的不同尝试。支持群/私筛选、加载更早回合、暂停更新和跟随最新过程。旧记录缺少逻辑关联时显示未知，不补采或推定；上游未提供公开摘要时仅显示进度，不显示隐藏思维链。
+
+底部固定显示最近主请求输入/配置窗口、最近缓存率、会话加权缓存率及累计输入/输出/请求数。单位是token；配置窗口不等于日志KiB。窗口占用以最近请求实报优先，没有实报才标估算；累计仅限当前保留记录，缺失不按0计算，缓存已包含在输入。上下文重建后不沿用旧执行段占用；旧记录未采集窗口时使用已核验的当前配置参考并标明；参考24小时过期，无有效参考才显示未知，新增请求以实际捕获值优先。切换会话同步更新，暂停更新也暂停统计；查看网页不调用模型。
+
+列表项右侧的「删除」或选中会话右上角「删除记录」会显示确认框。确认后只删除当前已采集监控回合及其输入/流/统计；聊天、记忆和正在执行的任务保留，后续新回合可重新出现。删除没有网页撤销入口；暂停更新时仍可删除并同步刷新。只整理显示列表不会重建机器人上下文。
+
+手动仅启动查看器（从当前 release 的 `infra/wsl`，按实际平台替换基础Compose文件）：
+
+```bash
+docker compose -f docker-compose.snowluma.yml -f docker-compose.monitor.yml up -d --no-deps xiaomachi-monitor
+curl --noproxy '*' http://127.0.0.1:8765/health
+```
+
+源码独立预览可用 `python -B -m app.monitor.server --root data/agent_monitor --port 8765`。必须通过本机回环访问；服务拒绝非本机Host和跨站Origin，不应增加LAN绑定/公网转发。页面显示私有聊天和脱敏请求，勿将记录目录复制到公开报告。内容/存储上限与故障隔离合同见 [架构观测说明](../../docs/ARCHITECTURE.md#本机-agent-观测)。保留清理在下一次采集时执行，页面关闭不会停止机器人或采集。
+
+停用时设置 `AGENT_MONITOR_ENABLED=false` 并 rebuild，采集关闭且查看容器移除；已有私有记录仍在数据卷中。普通stop也移除查看容器，正常start根据开关恢复；查看器不可用不阻断群私聊天。回滚到旧release时只重建旧版应用并移除不支持的查看器，不切换QQ桥接。
+
 ## 11. 常见问题
 
 | 现象 | 核查顺序 |
@@ -254,5 +295,8 @@ systemctl enable --now xiaomachi-sandbox
 用 `docker system df`、`docker ps -a`、当前 `readlink -f /opt/xiaomachi/current` 和目录统计确认消费方，再清理过期 release、历史镜像、闲置构建缓存和已结束测试临时数据。不得一键删除现役数据卷或计算基础镜像。
 
 测试临时产物在源码 `data/test-work/`，使用 `scripts/clean_test_tmp.ps1` 预览后按需清理。必要验收报告保留在私有工程 data 中，根目录不再创建测试缓存目录。
+在 PowerShell 中可用 `& ./scripts/clean_test_tmp.ps1 -Name 'qq-61','qq-65' -ExcludeName 'qq-64-git'` 仅预览指定名称，核对后加 `-Force`；名称只接受直接子项，不接受路径或通配符。`-ReportPath` 应位于仓库内、测试目录外；清理前保存必要证据并排除仍有消费方的目录。
 
 WSL 内删除文件后，Windows VHD 可能不立即缩小。压缩需要先核对发行版/VHD路径、停止服务、trim、退出WSL，再使用 Windows 支持的虚拟磁盘压缩操作并恢复启动/状态验证。不要在容器写数据库时对挂载中的 VHD 操作。
+
+群聊上下文升级会幂等新增`proactive_group_states`，保存每群观察进度、租约和滚动额度。上线前通过SQLite在线backup保留一致快照并执行`PRAGMA integrity_check`；不要删除生产数据库。群消息窗口为30条，主动观察默认8条新消息/5分钟、静默退避至30分钟，每小时最多6次主动模型请求和3次插话。状态跨重启保留，明确互动单独处理。`AGENT_CONTEXT_HISTORY_TOKENS=24000`、`AGENT_BACKGROUND_HISTORY_TOKENS=8000`控制动态历史；升级格式9会安全换原生会话，原始消息、任务及实际平台回执保留。监控同时显示实报未缓存输入和临时观察估算，两者不能互作计费依据。回滚代码可忽略新增表，不恢复旧数据库覆盖上线后的新消息。

@@ -429,8 +429,8 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             speak_enabled=True,
         )
         users = UserRepository(session)
-        users.upsert_user(user_id=42, nickname="Member-A", group_card="小甲")
-        users.upsert_user(user_id=43, nickname="Garfield", group_card="小丁丁")
+        users.upsert_user(user_id=42, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=43, nickname="Garfield", group_card="加菲猫")
         users.upsert_user(user_id=44, nickname="Xiao Ming", group_card="小明")
         users.upsert_user(user_id=99, nickname="Questioner", group_card="提问者")
         messages = MessageRepository(session)
@@ -457,11 +457,11 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             )
 
         add_message(
-            platform_msg_id="member_alpha-fact-source",
+            platform_msg_id="azha-fact-source",
             user_id=42,
             plain_text="我最喜欢葫芦兄弟动画。",
-            nickname="Member-A",
-            card="小甲",
+            nickname="A-Zha",
+            card="阿渣",
             minutes=0,
         )
         add_message(
@@ -469,7 +469,7 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             user_id=43,
             plain_text="今天聊了动画。",
             nickname="Garfield",
-            card="小丁丁",
+            card="加菲猫",
             minutes=1,
         )
         add_message(
@@ -487,10 +487,10 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             subject_type="user",
             subject_id="42",
             memory_kind="preference",
-            content="小甲最喜欢葫芦兄弟动画。",
+            content="阿渣最喜欢葫芦兄弟动画。",
             importance=4,
             confidence=0.9,
-            source_msg_id="member_alpha-fact-source",
+            source_msg_id="azha-fact-source",
             valid_from=observed_at,
         )
         memories.add_memory(
@@ -505,10 +505,10 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
             source_msg_id="other-fact-source",
             valid_from=observed_at,
         )
-        member_alpha_query = add_message(
-            platform_msg_id="query-member_alpha",
+        azha_query = add_message(
+            platform_msg_id="query-azha",
             user_id=99,
-            plain_text="小甲最喜欢什么动画？",
+            plain_text="阿渣最喜欢什么动画？",
             nickname="Questioner",
             card="提问者",
             minutes=3,
@@ -516,7 +516,7 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
         garfield_query = add_message(
             platform_msg_id="query-garfield",
             user_id=99,
-            plain_text="小丁丁最喜欢什么动画？",
+            plain_text="加菲猫最喜欢什么动画？",
             nickname="Questioner",
             card="提问者",
             minutes=4,
@@ -529,7 +529,7 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
                 message_id=int(row.id),
                 embedding_generation=None,
             )
-        member_alpha_query_id = int(member_alpha_query.id)
+        azha_query_id = int(azha_query.id)
         garfield_query_id = int(garfield_query.id)
 
     runtime = build_memory_runtime(
@@ -539,16 +539,16 @@ def test_runtime_v2_fact_loader_filters_direct_member_queries_by_resolved_subjec
         bot_display_name="bot",
     )
 
-    member_alpha_trace = runtime.v2_provider.evaluate(
-        runtime.build_request(group_id=10001, message_id=member_alpha_query_id)
+    azha_trace = runtime.v2_provider.evaluate(
+        runtime.build_request(group_id=10001, message_id=azha_query_id)
     )
     garfield_trace = runtime.v2_provider.evaluate(
         runtime.build_request(group_id=10001, message_id=garfield_query_id)
     )
 
-    assert member_alpha_trace.resolved_query.speaker_ids == ("42",)
-    assert member_alpha_trace.result.packed_context.facts == ()
-    assert "member_alpha-fact-source" in member_alpha_trace.result.selected_source_msg_ids
+    assert azha_trace.resolved_query.speaker_ids == ("42",)
+    assert azha_trace.result.packed_context.facts == ()
+    assert "azha-fact-source" in azha_trace.result.selected_source_msg_ids
     assert garfield_trace.resolved_query.speaker_ids == ("43",)
     assert garfield_trace.result.packed_context.facts == ()
 
@@ -683,15 +683,15 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
         seed_member(
             group_id=10001,
             user_id=42,
-            card="小甲",
-            platform_msg_id="duplicate-member_alpha-42",
+            card="阿渣",
+            platform_msg_id="duplicate-azha-42",
             content="我最喜欢葫芦兄弟动画。",
         )
         seed_member(
             group_id=10001,
             user_id=43,
-            card="小甲",
-            platform_msg_id="duplicate-member_alpha-43",
+            card="阿渣",
+            platform_msg_id="duplicate-azha-43",
             content="同名成员发言。",
         )
         for user_id, card, source_id in (
@@ -720,18 +720,18 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             subject_type="user",
             subject_id="42",
             memory_kind="preference",
-            content="小甲最喜欢葫芦兄弟动画。",
+            content="阿渣最喜欢葫芦兄弟动画。",
             importance=4,
             confidence=0.9,
-            source_msg_id="duplicate-member_alpha-42",
+            source_msg_id="duplicate-azha-42",
             valid_from=observed_at,
         )
 
         multi_messages = []
         multi_memories = []
         for user_id, card, source_id, animation in (
-            (52, "小甲", "multi-member_alpha", "葫芦兄弟"),
-            (53, "小丁丁", "multi-garfield", "猫和老鼠"),
+            (52, "阿渣", "multi-azha", "葫芦兄弟"),
+            (53, "加菲猫", "multi-garfield", "猫和老鼠"),
         ):
             message = seed_member(
                 group_id=10002,
@@ -807,7 +807,7 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             source_id=str(episode.id),
             start_at=observed_at,
             end_at=observed_at,
-            content="小甲和小丁丁讨论了最喜欢的动画。",
+            content="阿渣和加菲猫讨论了最喜欢的动画。",
             metadata_json={"episode_id": episode.id},
             content_hash="runtime-episode-document",
             source_message_ids=[message.id for message in multi_messages],
@@ -844,9 +844,9 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
             )
         )
 
-    duplicate = evaluate(10001, "小甲最喜欢什么动画？")
-    unique = evaluate(10002, "小丁丁最喜欢什么动画？")
-    multiple = evaluate(10002, "小甲和小丁丁最喜欢什么动画？")
+    duplicate = evaluate(10001, "阿渣最喜欢什么动画？")
+    unique = evaluate(10002, "加菲猫最喜欢什么动画？")
+    multiple = evaluate(10002, "阿渣和加菲猫最喜欢什么动画？")
     unknown = evaluate(10002, "陌生猫最喜欢什么动画？")
     first_person = evaluate(10002, "我最喜欢什么动画？")
     second_person = evaluate(10002, "你最喜欢什么动画？")
@@ -858,7 +858,7 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
     assert duplicate.result.packed_context.facts == ()
     unique_candidate_ids = {document_id for document_id, _score in unique.candidate_scores}
     assert raw_document_ids["multi-garfield"] in unique_candidate_ids
-    assert raw_document_ids["multi-member_alpha"] not in unique_candidate_ids
+    assert raw_document_ids["multi-azha"] not in unique_candidate_ids
     assert episode_document_id not in unique_candidate_ids
     assert multiple.resolved_query.subject_ids == ()
     assert multiple.result.packed_context.facts == ()
@@ -884,7 +884,7 @@ def test_runtime_v2_fact_loader_distinguishes_ambiguous_and_unbound_member_queri
         for segment in unique.result.packed_context.evidence_segments
         if segment.document_id is not None
     }
-    assert raw_document_ids["multi-member_alpha"] not in unique_segment_ids
+    assert raw_document_ids["multi-azha"] not in unique_segment_ids
     for trace in (multiple, unknown):
         segment_ids = {
             int(segment.document_id)
@@ -943,7 +943,7 @@ def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
                 mentioned_bot=False,
             )
 
-        seed("eligible-member_alpha", group_id=10001, user_id=42, card="小甲", offset=0)
+        seed("eligible-azha", group_id=10001, user_id=42, card="阿渣", offset=0)
         seed(
             "blocked-renamed",
             group_id=10001,
@@ -960,7 +960,7 @@ def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
             offset=2,
             delivery_state="reserved",
         )
-        seed("cross-group-member_alpha", group_id=10002, user_id=43, card="小甲", offset=1)
+        seed("cross-group-azha", group_id=10002, user_id=43, card="阿渣", offset=1)
         messages.add_private_message(
             platform_msg_id="private-sender-snapshot",
             user_id=46,
@@ -1004,7 +1004,7 @@ def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
     trace = runtime.v2_provider.evaluate(
         MemoryV2Request(
             group_id=10001,
-            query="小甲昨天的劲爆发言",
+            query="阿渣昨天的劲爆发言",
             recent_messages=(),
             quoted_message=None,
             target_message_id=None,
@@ -1023,7 +1023,7 @@ def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
             user_id=43,
             timestamp=observed_at + timedelta(minutes=10),
             plain_text="sender snapshot",
-            raw_json={"sender": {"nickname": "user-43", "card": "王小甲"}},
+            raw_json={"sender": {"nickname": "user-43", "card": "王阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -1032,7 +1032,7 @@ def test_runtime_member_loader_uses_latest_eligible_target_group_snapshot(
     refreshed_trace = runtime.v2_provider.evaluate(
         MemoryV2Request(
             group_id=10001,
-            query="王小甲昨天的劲爆发言",
+            query="王阿渣昨天的劲爆发言",
             recent_messages=(),
             quoted_message=None,
             target_message_id=None,
@@ -1182,8 +1182,8 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
         )
         UserRepository(session).upsert_user(
             user_id=42,
-            nickname="Member-A",
-            group_card="小甲",
+            nickname="A-Zha",
+            group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99,
@@ -1197,7 +1197,7 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             user_id=42,
             timestamp=observed_at,
             plain_text="我最喜欢喝冰美式。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -1207,7 +1207,7 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             group_id=10001,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=1),
-            plain_text="小甲以前说过喜欢喝什么？",
+            plain_text="阿渣以前说过喜欢喝什么？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -1220,7 +1220,7 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             subject_type="user",
             subject_id="42",
             memory_kind="preference",
-            content="小甲喜欢喝冰美式",
+            content="阿渣喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="layered-fact-source",
@@ -1233,7 +1233,7 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             summary_key="episode:1:test",
             start_at=observed_at,
             end_at=observed_at + timedelta(hours=1),
-            content="小甲饮品偏好：冰美式",
+            content="阿渣饮品偏好：冰美式",
             source_count=1,
             source_start_msg_id="layered-fact-source",
             source_end_msg_id="layered-fact-source",
@@ -1262,7 +1262,7 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
             source_id=str(memory.id),
             start_at=observed_at,
             end_at=observed_at,
-            content="小甲喜欢喝冰美式",
+            content="阿渣喜欢喝冰美式",
             metadata_json={"subject_id": "42", "kind": "preference"},
             content_hash="hash-layered-memory",
             source_message_ids=[int(fact_source.id)],
@@ -1287,12 +1287,12 @@ def test_layered_raw_v3_facts_and_summaries_reach_packed_context(
     packed = trace.result.packed_context
 
     assert any(
-        "小甲喜欢喝冰美式" in fact.text
+        "阿渣喜欢喝冰美式" in fact.text
         and "layered-fact-source" in fact.source_msg_ids
         for fact in packed.facts
     )
     assert any(
-        "小甲饮品偏好" in summary.text
+        "阿渣饮品偏好" in summary.text
         and "layered-fact-source" in summary.source_msg_ids
         for summary in packed.summaries
     )
@@ -1324,8 +1324,8 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
         )
         UserRepository(session).upsert_user(
             user_id=42,
-            nickname="Member-A",
-            group_card="小甲",
+            nickname="A-Zha",
+            group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99,
@@ -1339,7 +1339,7 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
             user_id=42,
             timestamp=observed_at,
             plain_text="我最喜欢喝冰美式。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -1349,7 +1349,7 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
             group_id=10001,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=1),
-            plain_text="小甲以前说过喜欢喝什么？",
+            plain_text="阿渣以前说过喜欢喝什么？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -1362,7 +1362,7 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
             subject_type="user",
             subject_id="42",
             memory_kind="preference",
-            content="小甲喜欢喝冰美式",
+            content="阿渣喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="non-layered-fact-source",
@@ -1375,7 +1375,7 @@ def test_raw_v3_without_layered_keeps_facts_and_summaries_empty(
             summary_key="episode:2:test",
             start_at=observed_at,
             end_at=observed_at + timedelta(hours=1),
-            content="小甲饮品偏好：冰美式",
+            content="阿渣饮品偏好：冰美式",
             source_count=1,
             source_start_msg_id="non-layered-fact-source",
             source_end_msg_id="non-layered-fact-source",
@@ -1430,8 +1430,8 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
         )
         UserRepository(session).upsert_user(
             user_id=20001,
-            nickname="Member-A",
-            group_card="小甲",
+            nickname="A-Zha",
+            group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99,
@@ -1445,7 +1445,7 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
             user_id=20001,
             timestamp=observed_at,
             plain_text="我在给 agent 做前后端。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -1456,7 +1456,7 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
             user_id=20001,
             timestamp=observed_at + timedelta(minutes=1),
             plain_text="我一直在看海贼王。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -1466,7 +1466,7 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
             group_id=10001,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=2),
-            plain_text="小甲喜欢什么动画？",
+            plain_text="阿渣喜欢什么动画？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -1480,7 +1480,7 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
             subject_type="user",
             subject_id="20001",
             memory_kind="profile",
-            content="小甲在给 agent 做前后端",
+            content="阿渣在给 agent 做前后端",
             importance=5,
             confidence=0.95,
             source_msg_id="unrelated-fact-src",
@@ -1492,7 +1492,7 @@ def test_member_fact_supplement_prefers_query_relevant_facts(
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="小甲一直在看海贼王动画",
+            content="阿渣一直在看海贼王动画",
             importance=2,
             confidence=0.8,
             source_msg_id="anime-fact-src",
@@ -1547,7 +1547,7 @@ def test_recent_viewing_event_reaches_packed_context_for_member_query(
             group_id=10001, group_name="group", enabled=True, speak_enabled=True,
         )
         UserRepository(session).upsert_user(
-            user_id=20001, nickname="Member-A", group_card="小甲",
+            user_id=20001, nickname="A-Zha", group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99, nickname="Questioner", group_card="提问者",
@@ -1557,13 +1557,13 @@ def test_recent_viewing_event_reaches_packed_context_for_member_query(
             platform_msg_id="recent-viewing-source", group_id=10001,
             user_id=20001, timestamp=observed_at,
             plain_text="我看完了《食戟之灵》。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text", reply_to_msg_id=None, mentioned_bot=False,
         )
         query = messages.add_group_message(
             platform_msg_id="recent-viewing-query", group_id=10001,
             user_id=99, timestamp=observed_at + timedelta(minutes=1),
-            plain_text="小甲最近在看什么动画？",
+            plain_text="阿渣最近在看什么动画？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text", reply_to_msg_id=None, mentioned_bot=False,
         )
@@ -1614,12 +1614,12 @@ def test_complete_portrait_composes_diverse_stable_memory_kinds(
     )
     observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
     portrait_facts = (
-        ("profile", "小甲长期从事软件开发"),
-        ("preference", "小甲喜欢冰美式"),
-        ("taboo", "小甲不接受剧透"),
-        ("relationship", "小甲是提问者的朋友"),
-        ("fact", "小甲养了一只猫"),
-        ("current", "小甲最近在看某部动画"),
+        ("profile", "阿渣长期从事软件开发"),
+        ("preference", "阿渣喜欢冰美式"),
+        ("taboo", "阿渣不接受剧透"),
+        ("relationship", "阿渣是提问者的朋友"),
+        ("fact", "阿渣养了一只猫"),
+        ("current", "阿渣最近在看某部动画"),
     )
     with session_scope(sqlite_engine) as session:
         GroupRepository(session).upsert_group(
@@ -1630,8 +1630,8 @@ def test_complete_portrait_composes_diverse_stable_memory_kinds(
         )
         UserRepository(session).upsert_user(
             user_id=20001,
-            nickname="Member-A",
-            group_card="小甲",
+            nickname="A-Zha",
+            group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99,
@@ -1646,7 +1646,7 @@ def test_complete_portrait_composes_diverse_stable_memory_kinds(
                 user_id=20001,
                 timestamp=observed_at + timedelta(minutes=index),
                 plain_text=content,
-                raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+                raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
                 msg_type="text",
                 reply_to_msg_id=None,
                 mentioned_bot=False,
@@ -1656,7 +1656,7 @@ def test_complete_portrait_composes_diverse_stable_memory_kinds(
             group_id=10001,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=10),
-            plain_text="给出小甲的完整个人画像",
+            plain_text="给出阿渣的完整个人画像",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -1722,8 +1722,8 @@ def test_preference_question_prefers_preference_kind_over_current(
         )
         UserRepository(session).upsert_user(
             user_id=20001,
-            nickname="Member-A",
-            group_card="小甲",
+            nickname="A-Zha",
+            group_card="阿渣",
         )
         UserRepository(session).upsert_user(
             user_id=99,
@@ -1742,7 +1742,7 @@ def test_preference_question_prefers_preference_kind_over_current(
                 user_id=user_id,
                 timestamp=observed_at + timedelta(minutes=minutes),
                 plain_text=text,
-                raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+                raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
                 msg_type="text",
                 reply_to_msg_id=None,
                 mentioned_bot=False,
@@ -1752,7 +1752,7 @@ def test_preference_question_prefers_preference_kind_over_current(
             group_id=10001,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=3),
-            plain_text="小甲喜欢什么动画？",
+            plain_text="阿渣喜欢什么动画？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -1766,7 +1766,7 @@ def test_preference_question_prefers_preference_kind_over_current(
             subject_type="user",
             subject_id="20001",
             memory_kind="current",
-            content="小甲在给agent做前后端",
+            content="阿渣在给agent做前后端",
             importance=5,
             confidence=0.95,
             source_msg_id="current-src",
@@ -1778,7 +1778,7 @@ def test_preference_question_prefers_preference_kind_over_current(
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="小甲一直在看海贼王",
+            content="阿渣一直在看海贼王",
             importance=2,
             confidence=0.8,
             source_msg_id="anime-src",
@@ -1790,7 +1790,7 @@ def test_preference_question_prefers_preference_kind_over_current(
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="小甲喜欢看动画",
+            content="阿渣喜欢看动画",
             importance=1,
             confidence=0.7,
             source_msg_id="matched-src",

@@ -195,6 +195,8 @@ class PackedMemoryContext:
     adaptive_enabled: bool = False
     spillover: Literal["none", "recent_to_history", "history_to_recent", "bidirectional"] = "none"
     degradation_reason: str = ""
+    # Exact renderer boundaries; an evidence segment remains an atomic unit.
+    evidence_blocks: tuple[str, ...] = ()
 
     @property
     def recent_source_msg_ids(self) -> tuple[str, ...]:
@@ -553,6 +555,7 @@ class MemoryContextPacker:
             budget=budget,
             estimated_tokens=total_estimated_tokens,
             text=text,
+            evidence_blocks=tuple(blocks),
             recent_messages=recent,
             evidence_segments=tuple(selected_segments),
             facts=tuple(selected_facts),
@@ -661,6 +664,7 @@ class MemoryContextPacker:
                 budget=budget,
                 estimated_tokens=self._estimate(text),
                 text=text,
+                evidence_blocks=(text,) if text else (),
                 blocked_output_present=blocked_output_present,
                 grounding_policy=policy,
                 history_estimated_tokens=self._estimate(text),
@@ -897,6 +901,7 @@ class MemoryContextPacker:
             budget=budget,
             estimated_tokens=total_tokens,
             text=text,
+            evidence_blocks=tuple([*policy_blocks, grounding_policy, *packed_history_blocks, *recent_blocks]),
             recent_messages=tuple(selected_recent),
             evidence_segments=tuple(selected_segments),
             facts=tuple(selected_facts),

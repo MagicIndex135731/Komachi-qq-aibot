@@ -57,3 +57,4 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "app.agent" = ["harness_plugins/*.mjs"]
+"app.monitor" = ["static/*.html", "static/*.css", "static/*.js"]

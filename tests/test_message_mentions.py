@@ -34,12 +34,12 @@ def test_at_name_detected() -> None:
 
 
 def test_historical_persona_names_detected() -> None:
-    for name in ("小町", "小甲", "小乙乙"):
+    for name in ("小町", "阿渣", "逆蝶蝶"):
         raw = {"message": f"@{name} 在吗"}
         assert message_mentions_bot(
             raw,
             bot_qqs={900001},
-            bot_text_names={"比企谷小町", "小甲", "小乙乙", "小町"},
+            bot_text_names={"比企谷小町", "阿渣", "逆蝶蝶", "小町"},
         )
 
 
@@ -77,16 +77,16 @@ def test_bot_text_names_excludes_member_shared_names() -> None:
     names = bot_text_mention_names(
         bot_qqs={900001},
         default_name="比企谷小町",
-        bot_display_names={"比企谷小町", "小甲", "小乙乙"},
-        member_display_names={"小甲", "小乙乙"},
+        bot_display_names={"比企谷小町", "阿渣", "逆蝶蝶"},
+        member_display_names={"阿渣", "逆蝶蝶"},
     )
     assert names == {"比企谷小町", "小町"}
 
 
 def test_shared_name_text_mention_not_filtered() -> None:
-    # @小甲 without an at-type payload may target the real member and must
-    # survive filtering when 小甲 is also a member name.
-    raw = {"message": "@小甲 晚上打游戏吗"}
+    # @阿渣 without an at-type payload may target the real member and must
+    # survive filtering when 阿渣 is also a member name.
+    raw = {"message": "@阿渣 晚上打游戏吗"}
     assert not message_mentions_bot(
         raw,
         bot_qqs={900001, 900003},
@@ -106,10 +106,10 @@ def test_second_bot_account_at_mention_detected() -> None:
 
 def test_collect_bot_display_names_parses_senders() -> None:
     values = [
-        {"sender": {"card": "小甲", "nickname": "比企谷小町"}},
-        {"sender": {"card": "小乙乙", "nickname": ""}},
+        {"sender": {"card": "阿渣", "nickname": "比企谷小町"}},
+        {"sender": {"card": "逆蝶蝶", "nickname": ""}},
         "not json",
         None,
         '{"sender": {"card": "比企谷小町", "nickname": "x"}}',
     ]
-    assert collect_bot_display_names(values) == {"小甲", "小乙乙", "比企谷小町", "x"}
+    assert collect_bot_display_names(values) == {"阿渣", "逆蝶蝶", "比企谷小町", "x"}

@@ -58,8 +58,8 @@ def _seed(sqlite_engine) -> dict[str, int]:
             return int(row.id)
 
         ids = {
-            "template": add_memory("小甲 likes 坐床上看动画.", "坐床上看动画"),
-            "fragment": add_memory("示例长昵称（QQ昵称 likes 16的.", ""),
+            "template": add_memory("阿渣 likes 坐床上看动画.", "坐床上看动画"),
+            "fragment": add_memory("足泽满灰交（QQ昵称 likes 16的.", ""),
             "clean_short": add_memory("不吃香菜", "香菜"),
             "clean_normal": add_memory("用户表示自己一直看《海贼王》。", "《海贼王》"),
         }

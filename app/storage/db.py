@@ -25,6 +25,7 @@ from app.storage import autonomous_agent as _autonomous_agent_models
 from app.storage import agent_sessions as _agent_session_models
 from app.storage import agent_effects as _agent_effect_models
 from app.storage import participation_feedback as _participation_feedback_models
+from app.storage import proactive as _proactive_models
 from app.providers.embeddings import hashed_text_embedding
 
 

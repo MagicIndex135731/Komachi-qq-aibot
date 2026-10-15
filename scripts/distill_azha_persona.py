@@ -6,15 +6,15 @@ Two-stage pipeline:
   2. validation against held-out samples and a revised profile
 
 Usage:
-  python scripts/distill_member_alpha_persona.py \
-    --stream data/personas/member_alpha/group_stream.jsonl \
-    --corpus data/personas/member_alpha/corpus.jsonl \
+  python scripts/distill_azha_persona.py \
+    --stream data/personas/azha/group_stream.jsonl \
+    --corpus data/personas/azha/corpus.jsonl \
     --user-id <MEMBER_QQ> \
     --target-name <DISPLAY_NAME> --group-card <GROUP_CARD>
 
 Outputs are local-only persona artifacts (private-chat derived style):
-  configs/personas/member_alpha.yaml
-  data/personas/member_alpha/samples.jsonl
+  configs/personas/azha.yaml
+  data/personas/azha/samples.jsonl
 """
 
 from __future__ import annotations
@@ -129,9 +129,9 @@ def main() -> int:
     parser.add_argument("--group-card", default="")
     parser.add_argument("--source-group-id", type=int, default=0)
     parser.add_argument("--exclude-user-ids", default="")
-    parser.add_argument("--output", default="configs/personas/member_alpha.yaml")
-    parser.add_argument("--samples", default="data/personas/member_alpha/samples.jsonl")
-    parser.add_argument("--stage1-draft", default="data/personas/member_alpha/stage1_draft.yaml")
+    parser.add_argument("--output", default="configs/personas/azha.yaml")
+    parser.add_argument("--samples", default="data/personas/azha/samples.jsonl")
+    parser.add_argument("--stage1-draft", default="data/personas/azha/stage1_draft.yaml")
     parser.add_argument("--reuse-stage1", action="store_true")
     parser.add_argument("--skip-refine", action="store_true")
     parser.add_argument("--max-samples", type=int, default=700)

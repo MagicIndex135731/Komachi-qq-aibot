@@ -9,7 +9,8 @@
 #
 # Build it from an upstream source tree:
 #   docker build -f docker/Dockerfile.local.patched --network=host \
-#     --build-arg BUILD_PROXY=http://127.0.0.1:7897 -t xiaomachi-llbot:<tag> .
+#     -t xiaomachi-llbot:<tag> .
+# Set BUILD_PROXY explicitly only when a separate build proxy is needed.
 
 FROM node:24-bookworm-slim AS builder
 

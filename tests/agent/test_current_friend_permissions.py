@@ -55,15 +55,17 @@ async def test_friend_deleted_during_post_verification_prevents_write():
 
 
 @pytest.mark.asyncio
-async def test_all_friends_tools_discover_feed_without_scheduler_selected_target(sqlite_engine):
+@pytest.mark.parametrize("count", [1, 5, 20])
+async def test_all_friends_tools_discover_feed_without_scheduler_selected_target(sqlite_engine, count):
     feed = {"uin": OWNER, "nickname": "synthetic", "time": int(post().published_at.timestamp()),
             "appid": 311, "key": post().post_id, "html": ""}
     friends = ok([{"user_id": OWNER}])
-    gateway = Gateway([friends, ok({"feeds": [feed], "has_more": False}), friends,
+    gateway = Gateway([friends, ok({"feeds": [feed] * (count + 1), "has_more": False}), friends,
                        ok({"total": 1, "msglist": [row()]}), friends, friends])
     executor, observation = setup(sqlite_engine, QzoneAdapter(gateway))
     tools = {tool.name: tool for tool in build_public_tools(executor, observation, Guard(), object())}
-    result = await tools["read_friend_feed"].handler({"count": 20})
+    result = await tools["read_friend_feed"].handler({"count": count})
+    assert result.status == "ok"
     assert result.data["posts"][0]["owner_id"] == OWNER
     assert result.data["posts"][0]["post_id"] == post().post_id
 

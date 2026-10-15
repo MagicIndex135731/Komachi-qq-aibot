@@ -2,7 +2,7 @@
 
 Deactivates old V1 extraction-template rows: active preference/taboo/profile
 facts whose content still carries the legacy "likes"/"dislikes"/"（QQ昵称"
-marker (e.g. "小甲 likes 坐床上看动画." or "XX（QQ昵称 likes 16的.").
+marker (e.g. "阿渣 likes 坐床上看动画." or "XX（QQ昵称 likes 16的.").
 These rows are recoverable (valid_until set) and their retrieval documents and
 persistent semantic vectors are cleaned. Clean short facts such as
 "住在大新。" / "不吃香菜" (content < 6 but no template marker) are preserved.

@@ -171,8 +171,11 @@ async def run() -> None:
 
     logging.info(f"qq-ai-private starting with owner={settings.owner_qq} model={settings.llm_model}")
     gateway_task = asyncio.create_task(gateway.connect_and_consume(handle_payload))
+    from app.core.downloaded_media import DownloadedMediaJanitor
+    media_janitor = DownloadedMediaJanitor(settings)
     try:
         await heartbeat.start()
+        await media_janitor.start()
         await _wait_for_gateway_ready(gateway, gateway_task)
         await private_chat_service.start()
         if owner_notice_worker is not None:
@@ -187,6 +190,7 @@ async def run() -> None:
             await owner_notice_worker.stop()
         await private_chat_service.stop()
         await heartbeat.stop()
+        await media_janitor.stop()
 
 
 def main() -> int:

@@ -40,8 +40,8 @@ class AgentActionResult:
 
 @dataclass(frozen=True, slots=True)
 class GroupAgentOptions:
-    quiet_seconds: float = 1.5
-    max_batch_wait_seconds: float = 5.0
+    quiet_seconds: float = 1.0
+    max_batch_wait_seconds: float = 3.0
     max_batch_messages: int = 20
     max_pending_per_group: int = 200
     max_message_age_seconds: float = 180.0
@@ -49,6 +49,7 @@ class GroupAgentOptions:
     model_concurrency: int = 2
     decision_timeout_seconds: float = 45.0
     execution_timeout_seconds: float = 180.0
+    task_execution_timeout_seconds: float = 600.0
     shutdown_timeout_seconds: float = 5.0
     max_wait_rounds: int = 2
     max_wait_seconds: float = 10.0
@@ -62,7 +63,7 @@ class GroupAgentOptions:
         positive = (
             "max_batch_wait_seconds", "max_batch_messages", "max_pending_per_group",
             "max_message_age_seconds", "max_active_groups", "model_concurrency",
-            "decision_timeout_seconds", "execution_timeout_seconds",
+            "decision_timeout_seconds", "execution_timeout_seconds", "task_execution_timeout_seconds",
             "shutdown_timeout_seconds", "working_note_max_chars", "working_note_max_age_seconds",
             "working_note_max_sources",
             "completed_retention_seconds", "prune_interval_seconds",

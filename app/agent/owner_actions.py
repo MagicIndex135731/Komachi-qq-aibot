@@ -12,6 +12,7 @@ from hashlib import sha256
 import json
 import logging
 from uuid import uuid4
+from dataclasses import replace
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,13 +30,15 @@ OWNER_CONTROL_TOOLS = frozenset({'remember_intention', 'save_work_note', 'genera
     'schedule_private_wakeup', 'cancel_private_wakeup', 'set_nickname', 'set_avatar', 'set_group_card', 'set_group_persona'})
 
 def restrict_directed_tools(tools, *, owner, allow_group_images=False):
-    """Keep drawing available only when the caller authorizes this group scope."""
+    """Keep a stable manifest; authority belongs to execution, never discovery."""
     if owner:
         return tools
-    return [tool for tool in tools
-        if (allow_group_images and tool.name == 'generate_image' and tool.effect == 'image')
+    async def denied(args):
+        return ToolOutcome({'error': 'owner_required'}, 'blocked')
+    return [tool if (allow_group_images and tool.name == 'generate_image' and tool.effect == 'image')
         or (tool.name not in OWNER_CONTROL_TOOLS
-            and (tool.effect not in {'image', 'write'} or tool.name in {'send_group', 'send_private'}))]
+            and (tool.effect not in {'image', 'write'} or tool.name in {'send_group', 'send_private'}))
+        else replace(tool, handler=denied, authorization=lambda: False) for tool in tools]
 
 
 class OwnerActionService:
@@ -239,23 +242,26 @@ class OwnerActionService:
                         run_at=row.completed_at, status='queued', payload_json={**original, 'result': result})
 
 
-def build_owner_tools(service, source_id, guard):
-    if service.source(source_id) is None:
-        return ()
+def build_owner_tools(service, source_id, guard, *, authorized=None):
+    def allowed():
+        return ((authorized is None or authorized() is True)
+                and service.source(source_id) is not None)
     async def request(args):
         guard.require_valid()
+        if not allowed():
+            return ToolOutcome({'error': 'owner_required'}, 'blocked')
         value = service.enqueue(source_id, target=args['target'], group_id=args['group_id'],
             include_images=args['include_current_images'], before_commit=guard.require_valid)
         return ToolOutcome(value, 'blocked' if value.get('error') else 'ok')
     async def status(args):
         guard.require_valid()
-        if service.source(source_id) is None:
+        if not allowed():
             return ToolOutcome({'error': 'owner_required'}, 'blocked')
         value=service.get(args['task_id'],source_id=source_id)
         return ToolOutcome(value,'blocked' if value.get('error') else 'ok')
     async def capabilities(args):
         guard.require_valid()
-        if service.source(source_id) is None:
+        if not allowed():
             return ToolOutcome({'error': 'owner_required'}, 'blocked')
         jobs = configured_agent_jobs(service.runtime)
         return ToolOutcome({'enabled_surfaces': sorted({job.kind for job in jobs}),

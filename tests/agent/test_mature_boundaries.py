@@ -1,5 +1,5 @@
 """Independent architecture review probes for mature runtime boundaries."""
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -87,7 +87,7 @@ async def test_real_runtime_rotates_prior_session_at_source_budget_or_interrupti
     new_source = add_source(sqlite_engine, platform_id="rotation-current", text="synthetic new event")
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
         job = next(job for job in configured_social_jobs(fixture.router.runtime) if job.kind == "group")
-        scope = f"group:{GROUP}"
+        scope = f"background:group:{GROUP}"
         old_identity = "synthetic-old-session"
         checkpoint = {"session_id": old_identity, "session_path": str(fixture.executor.sessions.session_path(scope))}
         if rotation_reason == "in_flight":
@@ -97,7 +97,7 @@ async def test_real_runtime_rotates_prior_session_at_source_budget_or_interrupti
             {"role": "assistant", "content": "synthetic closed prior result"}], checkpoint,
             old_sources, expected_revision=0)
         observation = SocialObservation(job, FIXTURE_NOW, "synthetic persona", source_message_ids=(new_source,))
-        result = await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation))
+        result = await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
         assert result.status == "silent"
         restored = fixture.executor.sessions.read(scope)
         assert restored["checkpoint"]["session_id"] != old_identity
@@ -119,17 +119,22 @@ async def test_production_group_long_native_checkpoint_resumes_without_rotating(
     from test_harness_session_files import long_session_home
 
     client, requests, _ = model_client(lambda _, number: responses_sse(
-        text="production long-path first receipt" if number == 1 else "restored second wake", number=number))
+        name="send_group" if number == 1 else None, arguments={"text": "production long-path first receipt", "artifact_ids": []},
+        text="production long-path first receipt" if number <= 2 else "restored second wake", number=number))
     source = add_source(sqlite_engine, platform_id="long-path-production-source")
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
         fixture.executor.sessions.session_root = long_session_home(tmp_path) / "agent_sessions"
         job = next(job for job in configured_social_jobs(fixture.router.runtime) if job.kind == "group")
         observation = SocialObservation(job, FIXTURE_NOW, "synthetic persona", source_message_ids=(source,))
-        scope = f"group:{GROUP}"
+        scope = f"background:group:{GROUP}"
         identity = None
         for _ in range(2):
-            result = await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation))
-            assert result.status == "silent"
+            from types import SimpleNamespace
+            guard = SimpleNamespace(action_id='long-path-fixture', require_valid=lambda: None,
+                valid=lambda: True, on_dispatch=lambda: None,
+                trace_trigger={'trigger_reason_code': 'intention_due'})
+            result = await fixture.executor.run_tools(observation, guard)
+            assert result.status == ("sent" if identity is None else "silent")
             state = fixture.executor.sessions.read(scope)
             checkpoint = state["checkpoint"]
             logical_path = Path(checkpoint["session_path"])
@@ -141,5 +146,6 @@ async def test_production_group_long_native_checkpoint_resumes_without_rotating(
             if identity is not None:
                 assert checkpoint["session_id"] == identity
             identity = checkpoint["session_id"]
-    assert len(requests) == 2
+            fixture.clock[0] += timedelta(minutes=11)
+    assert len(requests) == 3
     assert "production long-path first receipt" in json.dumps(requests[1])

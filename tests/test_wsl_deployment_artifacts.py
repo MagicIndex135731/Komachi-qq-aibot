@@ -12,6 +12,15 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_video_validation_runtime_and_periodic_cleanup_are_packaged():
+    dockerfile=(REPO_ROOT/'infra/wsl/Dockerfile.xiaomachi').read_text(encoding='utf8')
+    assert 'apt-get install -y --no-install-recommends ffmpeg' in dockerfile
+    for name in ('app/group_main.py','app/private_main.py'):
+        source=(REPO_ROOT/name).read_text(encoding='utf8')
+        assert 'DownloadedMediaJanitor(settings)' in source
+        assert 'await media_janitor.start()' in source and 'await media_janitor.stop()' in source
+
+
 def test_wsl_required_files_exist() -> None:
     required = [
         "infra/wsl/README.md",

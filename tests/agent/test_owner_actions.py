@@ -63,6 +63,18 @@ def test_nonowner_quote_and_deleted_owner_source_cannot_delegate(sqlite_engine, 
     assert service.claim('worker', lease_seconds=600) is None
     assert service.get(task['task_id'])['status'] == 'blocked'
 
+
+async def test_stable_owner_definitions_do_not_grant_nonaddressed_observation(sqlite_engine, tmp_path):
+    from app.agent.owner_actions import build_owner_tools
+    service, _ = setup(sqlite_engine, tmp_path)
+    identifier = source(sqlite_engine)
+    tools = build_owner_tools(service, identifier, SimpleNamespace(require_valid=lambda: None), authorized=lambda: False)
+    assert len(tools) == 3
+    args = {'target': 'public', 'group_id': 0, 'include_current_images': False}
+    assert (await tools[0].handler(args)).data['error'] == 'owner_required'
+    assert (await tools[1].handler({'task_id': 1})).status == 'blocked'
+    assert (await tools[2].handler({})).status == 'blocked'
+
 def test_private_owner_can_target_only_an_enabled_group(sqlite_engine, tmp_path):
     service, _ = setup(sqlite_engine, tmp_path)
     sid = source(sqlite_engine, group=None, text='查询指定群历史')

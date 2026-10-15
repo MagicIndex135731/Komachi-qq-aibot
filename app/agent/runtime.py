@@ -403,9 +403,12 @@ class GroupAgentRuntime:
                     )
                     return
                 target = next(event for event in batch.events if event.platform_msg_id == decision.target_message_id)
+                timeout = (self.options.task_execution_timeout_seconds
+                    if decision.reason == 'direct_trigger'
+                    else self.options.execution_timeout_seconds)
                 result = await asyncio.wait_for(
                     self.execute(target, batch, decision, guard),
-                    timeout=self.options.execution_timeout_seconds,
+                    timeout=timeout,
                 )
                 if not isinstance(result, AgentActionResult) or result.status not in {
                     "sent", "uncertain", "blocked", "failed", "silent",

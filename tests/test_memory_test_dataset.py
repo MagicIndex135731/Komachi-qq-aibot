@@ -52,30 +52,30 @@ def _make_db(path):
         "INSERT INTO messages (id, group_id, platform_msg_id, user_id, timestamp, "
         "plain_text, reply_to_msg_id, mentioned_bot) VALUES (?,?,?,?,?,?,?,?)",
         [
-            (1, 1001, "p1", 11, "2026-08-01T10:00:00+08:00", "小甲喜欢看动画", None, 0),
+            (1, 1001, "p1", 11, "2026-08-01T10:00:00+08:00", "阿渣喜欢看动画", None, 0),
             (2, 1001, "p2", 12, "2026-08-01T10:01:00+08:00", "小町 帮我查一下昨天说的计划", None, 1),
             (3, 1001, "p3", 11, "2026-08-01T10:02:00+08:00", "我讨厌吃香菜", None, 0),
             (4, 1002, "p4", 21, "2026-08-01T10:03:00+08:00", "晚上吃什么", None, 0),
-            (5, 1001, "p5", 11, "2026-01-01T10:00:00+08:00", "小甲打算开发一键上号功能", None, 0),
-            (6, 1001, "p6", 11, "2026-07-20T10:00:00+08:00", "小甲打算周六去海雅唱歌", None, 0),
-            (7, 1001, "p7", 11, "2026-08-05T10:00:00+08:00", "小甲打算下月搬家", None, 0),
+            (5, 1001, "p5", 11, "2026-01-01T10:00:00+08:00", "阿渣打算开发一键上号功能", None, 0),
+            (6, 1001, "p6", 11, "2026-07-20T10:00:00+08:00", "阿渣打算周六去海雅唱歌", None, 0),
+            (7, 1001, "p7", 11, "2026-08-05T10:00:00+08:00", "阿渣打算下月搬家", None, 0),
         ],
     )
     connection.executemany(
         "INSERT INTO users (user_id, nickname, group_card) VALUES (?,?,?)",
-        [(11, "小甲", "小甲"), (12, "小乙乙", "小乙乙"), (21, "灰泽满", "灰泽满")],
+        [(11, "阿渣", "阿渣"), (12, "逆蝶蝶", "逆蝶蝶"), (21, "灰泽满", "灰泽满")],
     )
     connection.executemany(
         "INSERT INTO memory_items (id, scope_type, scope_id, subject_id, memory_kind, "
         "predicate, object_text, content, source_msg_id, source_msg_ids, status) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            (1, "group", "1001", "11", "preference", "likes", "动画", "小甲喜欢看动画", "p1", '["p1"]', "active"),
+            (1, "group", "1001", "11", "preference", "likes", "动画", "阿渣喜欢看动画", "p1", '["p1"]', "active"),
             (2, "group", "1001", "11", "taboo", "dislikes", "香菜", "我讨厌吃香菜", "p3", '["p3"]', "active"),
-            (3, "group", "1001", "12", "profile", "is", "很会接梗", "小乙乙很会接梗", "p2", '["p2"]', "active"),
-            (4, "group", "1001", "11", "plan", "plans", "一键上号", "小甲打算开发一键上号功能", "p5", '["p5"]', "active"),
-            (5, "group", "1001", "11", "plan", "plans", "唱歌", "小甲打算周六去海雅唱歌", "p6", '["p6"]', "active"),
-            (7, "group", "1001", "11", "plan", "plans", "搬家", "小甲打算下月搬家", "p7", '["p7"]', "active"),
+            (3, "group", "1001", "12", "profile", "is", "很会接梗", "逆蝶蝶很会接梗", "p2", '["p2"]', "active"),
+            (4, "group", "1001", "11", "plan", "plans", "一键上号", "阿渣打算开发一键上号功能", "p5", '["p5"]', "active"),
+            (5, "group", "1001", "11", "plan", "plans", "唱歌", "阿渣打算周六去海雅唱歌", "p6", '["p6"]', "active"),
+            (7, "group", "1001", "11", "plan", "plans", "搬家", "阿渣打算下月搬家", "p7", '["p7"]', "active"),
             (6, "group", "1001", "group", "event", "happened", "球赛", "群里聊了球赛", "p6", '["p6"]', "active"),
         ],
     )
@@ -132,7 +132,7 @@ def test_build_cases_never_treats_bot_reply_sender_as_member_subject(tmp_path):
             "bot-reply-question-1",
             999999999,
             "2026-08-05T10:01:00+08:00",
-            "你是群里的小甲。",
+            "你是群里的阿渣。",
             "question-1",
             0,
         ),
@@ -781,7 +781,7 @@ def test_group_aliases_prefer_real_sender_snapshot_and_do_not_leak_cards(tmp_pat
     connection.execute("ALTER TABLE messages ADD COLUMN raw_json TEXT")
     connection.execute(
         "UPDATE messages SET raw_json = ? WHERE id = 7",
-        ('{"sender":{"nickname":"小甲","card":"群一卡"}}',),
+        ('{"sender":{"nickname":"阿渣","card":"群一卡"}}',),
     )
     connection.execute(
         "INSERT INTO messages (id, group_id, platform_msg_id, user_id, timestamp, "
@@ -796,7 +796,7 @@ def test_group_aliases_prefer_real_sender_snapshot_and_do_not_leak_cards(tmp_pat
             "同一个人在另一个群",
             None,
             0,
-            '{"sender":{"nickname":"小甲","card":"群二卡"}}',
+            '{"sender":{"nickname":"阿渣","card":"群二卡"}}',
         ),
     )
     connection.commit()

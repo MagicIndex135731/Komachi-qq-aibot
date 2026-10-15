@@ -13,7 +13,7 @@ set -euo pipefail
 
 llbot_ref="${1:-${LLBOT_REF:-main}}"
 image_tag="${LLBOT_IMAGE_TAG:-}"
-build_proxy="${BUILD_PROXY:-http://127.0.0.1:7897}"
+build_proxy="${BUILD_PROXY:-}"
 source_dir="${LLBOT_SOURCE_DIR:-/root/llbot-main}"
 upstream_url="https://github.com/LLOneBot/LuckyLilliaBot.git"
 

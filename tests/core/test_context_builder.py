@@ -145,7 +145,7 @@ def test_render_persona_includes_relationships_and_address_rules() -> None:
                 "member": "路人甲",
                 "relation": "同事",
                 "address_terms": ["老哥"],
-                "how_member_alpha_talks": "直接，不客气",
+                "how_azha_talks": "直接，不客气",
             }
         ],
     }
@@ -409,7 +409,7 @@ def test_context_builder_keeps_v2_no_evidence_policy_in_packed_section() -> None
         recent_messages=[],
         summaries=[],
         memories=[],
-        target_message="Alice: 小丁丁最喜欢什么？",
+        target_message="Alice: 加菲猫最喜欢什么？",
         packed_memory_context=packed,
     )
 

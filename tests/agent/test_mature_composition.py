@@ -68,6 +68,41 @@ def model_steps(*steps):
     return model_client(script)
 
 
+async def scheduled_wake(fixture):
+    """Explicit scheduled fixture work; conservative traffic defaults are tested separately."""
+    group = fixture.router.runtime.group_policy['groups'][str(GROUP)]
+    group.update(proactive_observation_hourly_models=100,
+        proactive_observation_hourly_speeches=30, proactive_observation_speech_cooldown_seconds=1)
+    fixture.clock[0] += timedelta(seconds=61)
+    scope = f'group:{GROUP}'
+    repo = fixture.executor.repository
+    if not repo.read_intention(scope).get('working_intention'):
+        repo.write_intention(scope, {'goal': '合成的已配置后台任务', 'progress': '', 'next_step': ''}, ())
+    repo.schedule_intention(scope, next_due=fixture.clock[0], status='active')
+    await fixture.agent.tick(fixture.clock[0])
+
+
+async def owner_request(fixture):
+    """A canonical owner task, permitted to search and compute without unsolicited cadence."""
+    from app.storage.repositories import UserRepository
+    text = '请联网核对合成天文数字并计算，保存结果'
+    if not hasattr(fixture, 'formal_source'):
+        fixture.formal_source = add_source(fixture.router.engine, platform_id='formal-owner-task', text=text)
+        with session_scope(fixture.router.engine) as session:
+            owner = fixture.router.runtime.settings.owner_qq
+            UserRepository(session).upsert_user(user_id=owner, nickname='synthetic owner', group_card='')
+            row = session.get(Message, fixture.formal_source)
+            row.user_id = owner
+            row.raw_json = {'message': [{'type': 'text', 'data': {'text': text}}]}
+    job = configured_social_jobs(fixture.router.runtime)[0]
+    observation = SocialObservation(job, NOW, '小町', source_message_ids=(fixture.formal_source,))
+    guard = SimpleNamespace(action_id='formal-owner-task', require_valid=lambda: None,
+        valid=lambda: True, on_dispatch=lambda: None)
+    return await fixture.executor.run_tools(observation, guard, interactive=True, owner_command={
+        'source_id': fixture.formal_source, 'target': 'group', 'group_id': GROUP,
+        'task_id': 1, 'instruction': text})
+
+
 @pytest.mark.asyncio
 async def test_native_forward_discovery_read_pixels_and_reply(sqlite_engine, tmp_path, monkeypatch):
     import httpx
@@ -106,7 +141,7 @@ async def test_native_forward_discovery_read_pixels_and_reply(sqlite_engine, tmp
                     {"type": "image", "data": {"url": "https://example.qq.com/synthetic.png"}}]}]}}
             return await original(action, args)
         fixture.gateway.call_api = api
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(requests) == 5 and len(writes(fixture)) == 1
         assert writes(fixture)[0][0] == "send_group_msg"
         assert effects(sqlite_engine)[0] == ("send_group", "sent", "actual-group-receipt")
@@ -161,7 +196,7 @@ async def test_native_group_observed_reference_edits_owned_pixels_and_reuses_out
         with session_scope(sqlite_engine) as session:
             session.get(Message, origin).raw_json = {"message": [{"type": "image", "data": {"local_path": str(reference_path)}}]}
         fixture.router.runtime.settings = fixture.router.runtime.settings.model_copy(update={"llm_supports_vision_input": True})
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(requests) == 5 and writes(fixture) == []
         assert fixture.image_client.calls == [] and len(fixture.image_client.edit_calls) == 1
         edit = fixture.image_client.edit_calls[0]
@@ -178,9 +213,9 @@ async def test_native_group_observed_reference_edits_owned_pixels_and_reuses_out
         assert reference_metadata["source_message_ids"] == output_metadata["source_message_ids"] == [origin]
         assert "data:image/png;base64," in json.dumps(requests[1])
         assert latest(requests[3], "read_artifact")["data"]["pixels_attached"]
-        first_session = fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"]
-        await wake(fixture)
-        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"] == first_session
+        first_session = fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"]
+        await scheduled_wake(fixture)
+        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"] == first_session
         assert len(requests) == 9 and fixture.image_client.calls == [] and len(fixture.image_client.edit_calls) == 1
         assert "编辑产物已保存" in json.dumps(requests[5], ensure_ascii=False)
         assert [action for action, _ in writes(fixture)] == ["send_group_msg", "set_group_card"]
@@ -232,9 +267,10 @@ async def test_native_public_agent_searches_reference_pixels_then_edits_and_publ
         edit_searched, inspect_output,
         lambda _: ("publish_qzone", {"text": "由公开参考继续探索猫画", "artifact_ids": outputs}),
         lambda _: ("set_avatar", {"artifact_id": outputs[0]}), None)
-    original_dns = autonomous_social.socket.getaddrinfo
-    monkeypatch.setattr(autonomous_social.socket, "getaddrinfo", lambda host, port, *args, **kwargs:
-        [(autonomous_social.socket.AF_INET, autonomous_social.socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+    from app.agent import image_operations
+    original_dns = image_operations.socket.getaddrinfo
+    monkeypatch.setattr(image_operations.socket, "getaddrinfo", lambda host, port, *args, **kwargs:
+        [(image_operations.socket.AF_INET, image_operations.socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
         if host == "reference.synthetic.invalid" else original_dns(host, port, *args, **kwargs))
     with httpx.Client(transport=httpx.MockTransport(pixels)) as transport:
         async with composed(sqlite_engine, tmp_path, client, runtime="harness", kind="qzone_publish", options={"max_steps": 8}) as fixture:
@@ -312,7 +348,7 @@ async def test_native_production_group_pixels_history_memory_persona_goal_and_ar
         fixture.router.runtime.group_policy["groups"][str(GROUP)]["memory_enabled"] = True
         fixture.router.runtime.social_policy["services"] = {"memory_write": True, "persona_refresh": True}
         fixture.router.runtime.personas["synthetic"] = {"live_refresh": True, "source_group_id": GROUP, "source_user_id": FRIEND}
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(requests) == 10 and writes(fixture) == []
         assert latest(requests[4], "memory_write")["status"] == "ok"
         assert "猫和星星" in latest(requests[5], "memory_read")["data"]["evidence"]
@@ -320,11 +356,11 @@ async def test_native_production_group_pixels_history_memory_persona_goal_and_ar
         assert "data:image/png;base64," in json.dumps(requests[3])
         assert "FOREIGN_SECRET" not in json.dumps(requests, ensure_ascii=False)
         assert latest(requests[1], "read_persona")["data"]["expression_style"] in requests[0]["input"][0]["content"]
-        state = fixture.executor.sessions.read(f"group:{GROUP}")
+        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
         assert source in state["source_message_ids"]
         first_session = state["checkpoint"]["session_id"]
-        await wake(fixture)
-        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"] == first_session
+        await scheduled_wake(fixture)
+        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"] == first_session
         assert "复用猫画探索夜空主题" in json.dumps(requests[10], ensure_ascii=False)
         assert len(fixture.image_client.calls) == 1
         assert [a for a, _ in writes(fixture)] == ["send_group_msg"]
@@ -332,7 +368,7 @@ async def test_native_production_group_pixels_history_memory_persona_goal_and_ar
         assert recorded[0][:2] == ("send_group", "sent")
         assert recorded[0][2] == "actual-group-receipt"
         assert len(requests) == 14
-        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["receipts"][0]["status"] == "sent"
+        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["receipts"][0]["status"] == "sent"
 
 
 @pytest.mark.asyncio
@@ -354,7 +390,7 @@ async def test_native_persona_refresh_receipt_tracks_current_execution_configura
         task_ids = []
         for execution_enabled in (initial_execution, not initial_execution):
             services["persona_task_execution"] = execution_enabled
-            await wake(fixture)
+            await scheduled_wake(fixture)
             receipt = latest(requests[-1], "request_persona_refresh")
             assert receipt["status"] == "ok"
             task = receipt["data"]
@@ -503,7 +539,7 @@ async def test_native_scheduler_persisted_goal_wakes_without_fixed_social_interv
     client, requests, _ = model_steps(("schedule_wakeup", {"goal": "稍后继续核对星空主题", "delay_seconds": 15}), None,
         ("read_work_note", {}), ("remember_intention", {"goal": "星空主题", "progress": "已在到期目标唤醒中继续", "next_step": "暂时等待"}), None)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness", options={"max_steps": 8}) as fixture:
-        await wake(fixture)
+        await scheduled_wake(fixture)
         initial_count = len(requests)
         fixture.clock[0] += timedelta(seconds=16)
         await fixture.agent.tick(fixture.clock[0])
@@ -545,12 +581,12 @@ async def test_native_unknown_gateway_receipt_persists_uncertainty_and_never_aut
         ("read_persona", {}), None)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness", options={"max_steps": 8}) as fixture:
         fixture.gateway.write_response = {"status": "ok", "retcode": 0, "data": {}}
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(requests) == 1
         assert len(writes(fixture)) == 1 and effects(sqlite_engine)[0][1] == "uncertain"
-        state = fixture.executor.sessions.read(f"group:{GROUP}")
+        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
         assert state["checkpoint"]["receipts"][0]["status"] == "uncertain"
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(writes(fixture)) == 1
 
 
@@ -558,11 +594,12 @@ async def test_native_unknown_gateway_receipt_persists_uncertainty_and_never_aut
 async def test_native_daily_budget_blocks_continuation_before_an_external_write(sqlite_engine, tmp_path):
     client, requests, _ = model_steps(("read_context", {}), ("send_group", {"text": "超预算消息", "artifact_ids": []}))
     async with composed(sqlite_engine, tmp_path, client, runtime="harness", options={"max_model_calls_daily": 1}) as fixture:
-        await wake(fixture)
+        await scheduled_wake(fixture)
         assert len(requests) == 1 and writes(fixture) == []
-        state = fixture.executor.sessions.read(f"group:{GROUP}")
+        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
         assert state["checkpoint"]["last_status"] == "blocked"
-        assert "model_daily_budget" in json.dumps(state["items"])
+        assert state["checkpoint"]["last_reason"] == "model_daily_budget"
+        assert state["items"] == []
 
 
 @pytest.mark.asyncio
@@ -575,38 +612,44 @@ async def test_native_revoked_sources_rotate_framework_history_and_block_saved_p
     client, requests, _ = model_steps(("generate_image", {"prompt": "合成猫"}), save, None,
         lambda _: ("read_artifact", {"artifact_id": saved[0]}), None)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness", options={"max_steps": 8}) as fixture:
+        fixture.router.runtime.group_policy["groups"][str(GROUP)]["proactive_observation_hourly_models"] = 100
         job = configured_social_jobs(fixture.router.runtime)[0]
         observation = SocialObservation(job, NOW, "小町", ("SOURCE_TO_REVOKE",), (origin,))
-        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation))
-        first = fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"]
+        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
+        first = fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"]
         with session_scope(sqlite_engine) as session:
             session.get(Message, origin).raw_json = {"delivery_state": "deleted"}
         current = add_source(sqlite_engine, platform_id="native-safe-current", text="SAFE_CURRENT")
         later = replace(observation, context=("SAFE_CURRENT",), source_message_ids=(current,))
-        await fixture.executor.run_tools(later, PolicyGuard(fixture.executor, later))
-        assert fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"] != first
+        await fixture.executor.run_tools(later, PolicyGuard(fixture.executor, later, scheduled=True))
+        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"] != first
         assert "SOURCE_TO_REVOKE" not in json.dumps(requests[3], ensure_ascii=False)
         assert latest(requests[-1], "read_artifact")["status"] in {"failed", "blocked"}
         assert writes(fixture) == []
 
 
 @pytest.mark.asyncio
-async def test_native_inflight_checkpoint_rotates_uncommitted_framework_history(sqlite_engine, tmp_path):
+@pytest.mark.parametrize("rotate_reason", ["inflight", "grok_model"])
+async def test_native_inflight_checkpoint_rotates_uncommitted_framework_history(sqlite_engine, tmp_path, rotate_reason):
     client, requests, _ = model_client(lambda _, n: responses_sse(
         text="UNCOMMITTED_NATIVE_HISTORY" if n == 1 else "safe resumed work", number=n))
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
+        fixture.router.runtime.group_policy["groups"][str(GROUP)]["proactive_observation_hourly_models"] = 100
         job = configured_social_jobs(fixture.router.runtime)[0]
         observation = SocialObservation(job, NOW, "synthetic persona")
-        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation))
-        state = fixture.executor.sessions.read(job.key)
+        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
+        state = fixture.executor.sessions.read('background:' + job.key)
         initial = state["checkpoint"]["session_id"]
         # Simulate a killed process after its native log was appended but the
         # project's source/effect checkpoint had not reached a closed turn.
-        fixture.executor.sessions.begin_turn(job.key, state["checkpoint"], (),
-                                             expected_revision=state["revision"])
-        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation))
+        if rotate_reason == "grok_model":
+            client.model = client.responses_model = "grok-4.7"
+        else:
+            fixture.executor.sessions.begin_turn('background:' + job.key, state["checkpoint"], (),
+                                                 expected_revision=state["revision"])
+        await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
         assert len(requests) == 2
-        assert fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"] != initial
+        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"] != initial
         assert "UNCOMMITTED_NATIVE_HISTORY" not in json.dumps(requests[1])
         assert writes(fixture) == []
 
@@ -620,28 +663,31 @@ async def test_native_unaddressed_group_event_owns_decision_silence_and_continua
         await fixture.agent.stop()
         at = datetime.now(UTC)
         fixture.clock[0] = at
-        row_id = add_source(sqlite_engine, platform_id="native-interactive-event", text="大家今天在聊夜空")
-        payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
-            "message_id": "native-interactive-event", "user_id": FRIEND, "time": at.timestamp(),
-            "sender": {"nickname": "synthetic", "card": ""},
-            "message": [{"type": "text", "data": {"text": "大家今天在聊夜空"}}]}
-        event = parse_group_message_event(payload, bot_qq=BOT, bot_name="小町")
-        assert not event.mentioned_bot
-        with session_scope(sqlite_engine) as session:
-            source = session.get(Message, row_id)
-            source.timestamp, source.raw_json = at.astimezone(ASIA_SHANGHAI).replace(tzinfo=None), payload
+        events = []
+        for index in range(8):
+            payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
+                "message_id": f"native-interactive-event-{index}", "user_id": FRIEND, "time": at.timestamp(),
+                "sender": {"nickname": "synthetic", "card": ""},
+                "message": [{"type": "text", "data": {"text": f"大家今天在聊夜空 {index}"}}]}
+            event = parse_group_message_event(payload, bot_qq=BOT, bot_name="小町")
+            assert not event.mentioned_bot
+            fixture.router.ingest_live_group_message(event)
+            events.append(event)
         planner = GroupParticipationPlanner(router=fixture.router, decision_client=client,
                                              autonomous_executor=fixture.executor)
         runtime = GroupAgentRuntime(engine=sqlite_engine, bot_qq=BOT, bot_name="小町",
             decide=planner.decide, execute=planner.execute, options=GroupAgentOptions(
                 quiet_seconds=0.01, max_batch_wait_seconds=0.03, decision_timeout_seconds=5,
-                execution_timeout_seconds=30, shutdown_timeout_seconds=5))
+                execution_timeout_seconds=90, shutdown_timeout_seconds=5))
         await runtime.start()
         runtime.set_connected(True)
         try:
-            assert await runtime.observe(event)
-            assert not await runtime.observe(event)
-            async with asyncio.timeout(15):
+            for event in events:
+                assert await runtime.observe(event)
+                assert not await runtime.observe(event)
+            # This is a native-runtime behavior test, not a cold-start speed
+            # assertion; profile initialization has its own bounded budget.
+            async with asyncio.timeout(90):
                 while True:
                     with session_scope(sqlite_engine) as session:
                         turn = session.scalars(select(GroupAgentTurn)).first()
@@ -652,7 +698,7 @@ async def test_native_unaddressed_group_event_owns_decision_silence_and_continua
             assert status == ("sent" if send else "silent")
             assert len(requests) == (3 if send else 1)
             assert len(writes(fixture)) == int(send)
-            checkpoint = fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]
+            checkpoint = fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]
             assert checkpoint["last_status"] == status
             assert len(checkpoint["receipts"]) == int(send)
         finally:
@@ -706,12 +752,12 @@ async def test_native_registered_mcp_search_and_compute_feedback_plus_unknown_wr
                 permission_check=lambda: config in fixture.router.runtime.social_policy["mcp"])
             fixture.executor.register_tool_factory(provider.tools_for)
             try:
-                await wake(fixture)
+                await owner_request(fixture)
                 assert len(requests) == 5 and searches == [("合成天文数字", 8)]
                 assert fake.calls == [("print(6*7)", {})]
                 assert '"answer":42' in latest(requests[-1], "read_artifact")["data"]["text"]
                 assert "forbidden_public_action" not in {t["name"] for t in requests[0]["tools"]}
-                await wake(fixture)
+                await owner_request(fixture)
                 assert len(requests) == 6
                 assert sum(c.get("params", {}).get("name") == "remote_write" for c in mcp_calls) == 1
                 assert effects(sqlite_engine)[0][:2] == ("remote_write", "uncertain")

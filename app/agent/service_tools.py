@@ -30,7 +30,7 @@ from app.agent.social_planner import SocialPlanner
 from app.agent.tool_agent import AgentTool, ToolOutcome
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.memory_tool_executor import MemoryToolExecutor
-from app.core.memory_tools import memory_tool_schemas
+from app.core.memory_tools import DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS, memory_tool_schemas
 from app.core.message_content import ImageAttachment
 from app.runtime.blocking import BoundedBlockingRunner
 from app.storage.autonomous_agent import AutonomousRepository
@@ -59,6 +59,7 @@ class ServiceToolContext:
     cancel_wakeup: Any = None
     memory_search_allowed: bool = True
     memory_dependencies: dict[str, str] = field(default_factory=dict)
+    available_input_budget: int | None = None
 
 
 def _object(**properties):
@@ -409,10 +410,10 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
         return tuple(tools)
 
     owner_authority=getattr(guard,'owner_authority',None)
-    if owner_authority is not None:
+    if getattr(router, 'persona_manager', None) is not None:
         async def set_group_persona(args):
             require_valid()
-            if owner_authority() is not True:
+            if owner_authority is None or owner_authority() is not True:
                 return ToolOutcome({'error':'owner_required'},'blocked')
             manager=router.persona_manager
             from app.core.persona_switch import persona_aliases
@@ -453,7 +454,7 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
         executor = MemoryToolExecutor(engine=router.engine, group_id=job.scope_id,
             current_user_id=context.target_user_id, authorized_subject_ids=subjects, now=observation.now,
             recent_source_msg_ids=tuple(row[1] for row in source_rows), member_names=member_names,
-            timeout_seconds=getattr(runtime.settings, "memory_memory_tool_timeout_seconds", 2),
+            timeout_seconds=getattr(runtime.settings, "memory_memory_tool_timeout_seconds", DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS),
             max_results=getattr(runtime.settings, "memory_memory_tool_max_results", 5))
         def execute():
             with group_dispatch_scope(GroupDispatchScope(job.scope_id, valid, lambda: None)):
@@ -469,8 +470,7 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
             return ToolOutcome(value, "failed")
         return ToolOutcome(value if isinstance(value, dict) else {"result": value})
 
-    if (getattr(runtime.settings, "memory_memory_tools_enabled", False)
-            and context.memory_search_allowed):
+    if getattr(runtime.settings, "memory_memory_tools_enabled", False):
         for specification in memory_tool_schemas():
             name = specification["name"]
             if name == "memory_write" and services.get("memory_write") is not True:
@@ -482,6 +482,9 @@ def build_service_tools(context: ServiceToolContext) -> tuple[AgentTool, ...]:
                     value["maxLength"] = 500
                 if value.get("type") == "array":
                     value["maxItems"] = 20
+            if name == "memory_search":
+                maximum = max(1, min(20, int(getattr(runtime.settings, "memory_memory_tool_max_results", 5))))
+                parameters["properties"]["limit"].update(maximum=maximum, default=maximum)
             async def handler(args, name=name):
                 return await memory_call(name, args)
             tools.append(AgentTool(name, specification["description"], parameters, handler))

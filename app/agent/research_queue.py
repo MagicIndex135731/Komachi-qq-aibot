@@ -1,0 +1,246 @@
+"""Durable read-only child jobs, separately consumed by group/private processes."""
+from __future__ import annotations
+
+import asyncio
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+import logging
+from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.memory_source_guard import is_usable_memory_source
+from app.storage.db import session_scope
+from app.storage.models import Job, Message
+
+logger = logging.getLogger(__name__)
+
+
+class ResearchJobGuard:
+    def __init__(self, queue, job_id, payload, phase):
+        self.queue, self.job_id, self.payload, self.phase = queue, job_id, payload, phase
+        self.sources = set(payload['sources'])
+        self.memory = dict(payload.get('memory', {}))
+        self.action_id = 'research-result:' + str(job_id)
+        self.dispatched = False
+        self.trace_trigger = {'trigger_kind': 'research_result', 'trigger_reason_code': 'delegated_result_ready',
+            'trigger_reason': '独立资料任务已结束，将摘要回传原主会话。',
+            'trigger_evidence': {'task_id': payload['task_id'], 'source_id': payload['source_id']}}
+
+    @property
+    def source_message_ids(self):
+        return tuple(sorted(self.sources))
+
+    def valid_source(self, identifier, *, author=False):
+        return self.valid_sources((identifier,), author=author)
+
+    def valid_sources(self, identifiers, *, author=False):
+        if any(type(identifier) is not int for identifier in identifiers):
+            return False
+        identifiers = set(identifiers)
+        def confirmed_bot_dependency(row):
+            return (not author and getattr(self.queue, 'allow_confirmed_bot_dependencies', False)
+                and row.user_id == self.queue.account_id and (row.raw_json or {}).get('direction') == 'outbound')
+        with session_scope(self.queue.engine) as session:
+            rows = tuple(session.scalars(select(Message).where(Message.id.in_(identifiers))))
+            valid = len(rows) == len(identifiers) and all(is_usable_memory_source(row, group_id=self.payload['scope_id'] if self.queue.surface == 'group' else None)
+                and row.group_id == (self.payload['scope_id'] if self.queue.surface == 'group' else None)
+                and (not author and self.queue.surface == 'group' or row.user_id == self.payload['actor_id'] or confirmed_bot_dependency(row))
+                and ((row.raw_json or {}).get('direction') != 'outbound' or confirmed_bot_dependency(row)) for row in rows)
+        return valid
+
+    def valid_dependencies(self, metadata):
+        sources, memory = metadata.get('sources', []), metadata.get('memory', {})
+        if (not isinstance(sources, list) or not isinstance(memory, dict)
+                or len(self.sources | set(sources)) > 200 or len(self.memory.keys() | memory.keys()) > 200
+                or not self.valid_sources(sources)):
+            return False
+        if self.queue.surface == 'group':
+            from app.agent.memory_integration import memory_dependencies_valid
+            if not memory_dependencies_valid(self.queue.engine, group_id=self.payload['scope_id'],
+                    dependencies=memory, now=self.queue.clock()):
+                return False
+        elif memory:
+            return False
+        self.sources.update(sources)
+        self.memory.update(memory)
+        return True
+
+    def snapshot(self):
+        return {'sources': sorted(self.sources), 'memory': dict(self.memory)}
+
+    def valid(self):
+        if not self.queue.running or not self.queue.authorized(self.payload):
+            return False
+        with session_scope(self.queue.engine) as session:
+            row = session.get(Job, self.job_id)
+            if not (row and row.job_type == self.queue.job_type and row.locked_by == self.queue.owner
+                    and row.status == self.phase and row.lease_until and row.lease_until.replace(tzinfo=UTC) > self.queue.clock()
+                    and self.queue.clock().timestamp() - self.payload['created_at'] <= 7 * 86400):
+                return False
+        return self.valid_source(self.payload['source_id'], author=True) and self.valid_dependencies(self.snapshot())
+
+    def require_valid(self):
+        if not self.valid():
+            raise RuntimeError('research_job_authority_revoked')
+
+    def on_dispatch(self):
+        self.require_valid()
+        self.dispatched = True
+
+
+class ResearchDelegationQueue:
+    job_type = 'delegated_research'
+    max_execution_attempts = 2
+    interrupted_execution_status = 'queued'
+    exhausted_execution_status = 'failed'
+    guard_type = ResearchJobGuard
+
+    def __init__(self, engine, *, account_id, surface, execute, deliver, authorized, clock=None):
+        self.engine, self.account_id, self.surface = engine, account_id, surface
+        self.execute, self.deliver, self.authorized = execute, deliver, authorized
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.owner, self.running, self.worker = uuid4().hex, False, None
+        self.wake = asyncio.Event()
+
+    def prefix(self, scope_id=None):
+        return f'research:{self.account_id}:{self.surface}:' + (f'{scope_id}:' if scope_id is not None else '')
+
+    @contextmanager
+    def transaction(self, before_commit=None):
+        with self.engine.connect() as connection:
+            connection.exec_driver_sql('BEGIN IMMEDIATE')
+            with Session(bind=connection) as session:
+                try:
+                    yield session
+                    session.flush()
+                    if before_commit:
+                        before_commit()
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+    def enqueue(self, payload, *, parent_turn, before_commit):
+        before_commit()
+        if (not self.authorized(payload) or len(payload['sources']) > 200
+                or len(json.dumps(payload, ensure_ascii=False)) > 64000):
+            return {'status': 'blocked', 'reason': 'delegation_source_or_size_invalid'}
+        key = self.prefix(payload['scope_id']) + hashlib.sha256(str(parent_turn).encode()).hexdigest()[:24]
+        now = self.clock().astimezone(UTC).replace(tzinfo=None)
+        with self.transaction(before_commit) as session:
+            row = session.scalar(select(Job).where(Job.job_type == self.job_type, Job.job_key == key))
+            if row is None:
+                active = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
+                    Job.job_key.startswith(self.prefix()), Job.status.in_(('queued', 'running', 'result_ready', 'delivering'))).limit(16)))
+                if len(active) >= 16 or sum(item.payload_json['scope_id'] == payload['scope_id']
+                        and item.payload_json['actor_id'] == payload['actor_id'] for item in active) >= 4:
+                    return {'status': 'blocked', 'reason': 'delegation_queue_capacity'}
+                row = Job(job_type=self.job_type, job_key=key, status='queued', run_at=now,
+                          max_attempts=self.max_execution_attempts, payload_json={**payload, 'created_at': self.clock().timestamp()})
+                session.add(row)
+                session.flush()
+            result = {'status': 'queued', 'task_id': row.payload_json['task_id'], 'job_id': row.id,
+                      'delivery': 'background_result_returns_to_main', 'guidance': '排队不代表完成；主对话可继续处理新消息。'}
+        self.wake.set()
+        return result
+
+    async def start(self):
+        if not self.running:
+            self.running = True
+            self.worker = asyncio.create_task(self._run(), name=self.prefix() + 'worker')
+
+    async def stop(self):
+        self.running = False
+        self.wake.set()
+        if self.worker:
+            self.worker.cancel()
+            await asyncio.gather(self.worker, return_exceptions=True)
+            self.worker = None
+
+    def cancel_scope(self, scope_id):
+        with self.transaction() as session:
+            for row in session.scalars(select(Job).where(Job.job_type == self.job_type,
+                    Job.job_key.startswith(self.prefix(scope_id)), Job.status.in_(('queued', 'running', 'result_ready', 'delivering')))):
+                row.status, row.last_error_code = 'cancelled', 'scope_cancelled'
+
+    def claim(self):
+        now = self.clock().astimezone(UTC).replace(tzinfo=None)
+        with self.transaction() as session:
+            rows = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
+                Job.job_key.startswith(self.prefix()), Job.status.in_(('queued', 'running', 'result_ready', 'delivering')))
+                .order_by(Job.run_at, Job.id).limit(16)))
+            for row in rows:
+                if row.status in {'running', 'delivering'}:
+                    if row.lease_until and row.lease_until > now:
+                        continue
+                    if row.status == 'delivering':
+                        row.status, row.last_error_code = 'uncertain', 'delivery_owner_lost'
+                        continue
+                    if row.attempt_count >= row.max_attempts:
+                        row.status, row.last_error_code = self.exhausted_execution_status, 'research_attempts_exhausted'
+                        continue
+                    row.status = 'queued'
+                if row.run_at > now:
+                    continue
+                phase = 'running' if row.status == 'queued' else 'delivering'
+                if phase == 'running' and row.attempt_count >= row.max_attempts:
+                    row.status, row.last_error_code = self.exhausted_execution_status, 'research_attempts_exhausted'
+                    continue
+                row.status, row.locked_by, row.locked_at = phase, self.owner, now
+                row.lease_until = now + timedelta(seconds=900)
+                if phase == 'running':
+                    row.attempt_count += 1
+                return row.id, dict(row.payload_json), phase
+
+    def finish(self, job_id, phase, *, status, payload=None, reason=''):
+        with self.transaction() as session:
+            row = session.get(Job, job_id)
+            if row and row.status == phase and row.locked_by == self.owner:
+                row.status, row.last_error_code = status, reason[:96]
+                if payload is not None:
+                    row.payload_json = payload
+                row.completed_at = self.clock().astimezone(UTC).replace(tzinfo=None)
+
+    async def tick(self):
+        claimed = self.claim()
+        if not claimed:
+            return False
+        job_id, payload, phase = claimed
+        guard = self.guard_type(self, job_id, payload, phase)
+        try:
+            guard.require_valid()
+            if phase == 'running':
+                result = await asyncio.wait_for(self.execute(payload, guard), timeout=330)
+                guard.require_valid()
+                self.finish(job_id, phase, status='result_ready', payload={**payload, **guard.snapshot(), 'result': result})
+            else:
+                result = await asyncio.wait_for(self.deliver(payload, guard), timeout=650)
+                guard.require_valid()
+                self.finish(job_id, phase, status=result if result in {'completed', 'uncertain', 'failed', 'blocked'} else 'failed')
+        except asyncio.CancelledError:
+            # Reads may be safely resumed at most once; delivery may already
+            # have happened and must never be automatically replayed.
+            self.finish(job_id, phase, status=self.interrupted_execution_status if phase == 'running' else 'uncertain', reason='worker_stopped')
+            raise
+        except Exception as exc:
+            self.finish(job_id, phase, status='uncertain' if guard.dispatched else 'blocked', reason=type(exc).__name__)
+            logger.warning('delegated_research_job_failed surface=%s error_type=%s', self.surface, type(exc).__name__)
+        return True
+
+    async def _run(self):
+        while self.running:
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('delegated_research_scheduler_failed surface=%s error_type=%s', self.surface, type(exc).__name__)
+            self.wake.clear()
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=1)
+            except TimeoutError:
+                pass

@@ -48,6 +48,82 @@ def args(source, **overrides):
     return {"source_id": source, "forward_index": 0, "path": [], "offset": 0, "count": 2, **overrides}
 
 
+def embedded_card(name="MultiMsg_synthetic-child"):
+    return {"type": "xml", "data": {"data":
+        f'<msg serviceID="35" action="viewMultiMsg" m_fileName="{name}"/>', "resid": 1}}
+
+
+@pytest.mark.asyncio
+async def test_embedded_xml_has_executable_navigation_and_bound_container(context, monkeypatch):
+    from app.adapters.forward_messages import ForwardMessageAdapter, ForwardResource, _node
+    source, gateway, tools = setup_tools(context, {"synthetic-root": [node(message=[embedded_card()])]})
+    calls = []
+    async def embedded(self, container_id, file_name):
+        calls.append((container_id, file_name))
+        return ForwardResource((_node(node("包内第二层内容")),), False)
+    monkeypatch.setattr(ForwardMessageAdapter, "read_embedded", embedded, raising=False)
+    read = tools["read_forward_messages"].handler
+    root = await read(args(source))
+    assert root.data["nodes"][0]["forward_count"] == 1
+    locator = root.data["nodes"][0]["nested_reads"][0]
+    assert locator == args(source, count=20, path=[{"node_index": 0, "forward_index": 0}])
+    result = await read(locator)
+    assert result.status == "ok" and result.data["nodes"][0]["text"] == "包内第二层内容"
+    assert calls == [("synthetic-root", "MultiMsg_synthetic-child")]
+    assert len(gateway.calls) == 1
+    assert (await read(locator)).status == "ok" and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_images_page_beyond_first_two(context, monkeypatch):
+    from app.agent import group_forward
+    picture = io.BytesIO(); Image.new("RGB", (8, 8), "blue").save(picture, "PNG")
+    fetched = []
+    def http(request):
+        fetched.append(str(request.url)); return httpx.Response(200, content=picture.getvalue())
+    monkeypatch.setattr(group_forward, "media_client", lambda: httpx.Client(transport=httpx.MockTransport(http)))
+    source, gateway, tools = setup_tools(context, {"synthetic-root": [node(message=[
+        {"type": "image", "data": {"url": f"https://multimedia.nt.qq.com.cn/{i}.png"}} for i in range(9)])]})
+    root = await tools["read_forward_messages"].handler(args(source))
+    assert root.data["nodes"][0]["viewable_image_count"] == 9
+    observe = tools["observe_forward_images"].handler
+    locator = dict(source_id=source, forward_index=0, path=[], node_index=0, image_offset=2)
+    result = await observe(locator)
+    assert result.status == "ok" and len(result.images) == 2
+    assert result.data["next_image_offset"] == 4
+    assert fetched == [f"https://multimedia.nt.qq.com.cn/{i}.png" for i in (2, 3)]
+    assert [image["image_index"] for image in result.data["images"]] == [2, 3]
+    assert (await observe({**locator, "image_offset": 9})).status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_local_cycle_and_revoked_source_stay_blocked(context, monkeypatch):
+    from app.adapters.forward_messages import ForwardMessageAdapter, ForwardResource, _node
+    source, gateway, tools = setup_tools(context, {"synthetic-root": [node(message=[embedded_card()])]})
+    async def embedded(self, container_id, file_name):
+        return ForwardResource((_node(node(message=[embedded_card()])),), False)
+    monkeypatch.setattr(ForwardMessageAdapter, "read_embedded", embedded, raising=False)
+    read = tools["read_forward_messages"].handler
+    root = await read(args(source)); child = root.data["nodes"][0]["nested_reads"][0]
+    second = await read(child)
+    cycle = await read(second.data["nodes"][0]["nested_reads"][0])
+    assert cycle.status == "blocked" and cycle.data["error"] == "forward_cycle_detected"
+    with session_scope(context.router.engine) as db:
+        db.get(Message, source).raw_json = {"delivery_state": "deleted"}
+    assert (await read(child)).status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_nested_navigation_keeps_page_content_bounded(context):
+    source, gateway, tools = setup_tools(context, {"synthetic-root": [node("x" * 320,
+        message=[{"type": "text", "data": {"text": "x" * 320}},
+                 *[segment(f"synthetic-child-{i}") for i in range(8)]]) for _ in range(20)]})
+    root = await tools["read_forward_messages"].handler(args(source, count=20))
+    assert sum(len(n["nested_reads"]) for n in root.data["nodes"]) == 20
+    assert any(n["nested_navigation_truncated"] for n in root.data["nodes"])
+    assert len(json.dumps(root.data, ensure_ascii=False)) < 18000
+
+
 @pytest.mark.parametrize("message", [
     [segment("opaque+/=")],
     [{"type": "forward", "data": {"res_id": "opaque+/="}}],

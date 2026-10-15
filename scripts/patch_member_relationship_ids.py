@@ -1,7 +1,7 @@
 """Backfill stable member_user_id into existing persona relationship entries.
 
 Handles both runtime member personas (data/personas/*.yaml) and static persona
-profiles (configs/personas/*.yaml, e.g. member_alpha.yaml). A relationship whose
+profiles (configs/personas/*.yaml, e.g. azha.yaml). A relationship whose
 ``member`` is a bare QQ number is rewritten to the current display name while
 keeping the numeric id in ``member_user_id``.
 """
@@ -37,7 +37,7 @@ def main() -> int:
     parser.add_argument(
         "--config-dir",
         default="/workspace/configs/personas",
-        help="Optional static persona profiles (e.g. member_alpha.yaml).",
+        help="Optional static persona profiles (e.g. azha.yaml).",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

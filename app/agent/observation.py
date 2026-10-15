@@ -38,7 +38,7 @@ class GroupObservationService:
     def _recent(self, messages, group_id: int):
         return [
             item
-            for item in messages.list_recent_group_messages(group_id=group_id, limit=24)
+            for item in messages.list_recent_group_messages(group_id=group_id, limit=30)
             if is_usable_memory_source(item, group_id=group_id)
         ]
 
@@ -69,6 +69,14 @@ class GroupObservationService:
                 item.user_id == router.runtime.settings.bot_qq for item in recent[-3:]
             ),
         )
+        if address.reason in {'recent_followup', 'take_request'}:
+            prior = [row for row in recent if source is not None and row.id < source.id]
+            bot = next((row for row in reversed(prior) if row.user_id == router.runtime.settings.bot_qq), None)
+            previous = next((row for row in reversed(prior) if bot is not None and row.id < bot.id
+                and row.user_id != router.runtime.settings.bot_qq), None)
+            if (bot is None or previous is None or previous.user_id != event.user_id
+                    or not 0 <= (shanghai_aware(event.timestamp) - shanghai_aware(bot.timestamp)).total_seconds() <= 120):
+                return False
         return bool(event.mentioned_bot or address.is_addressed)
 
     def _suppression(
@@ -81,6 +89,7 @@ class GroupObservationService:
         direct=False,
         last_sent_at=None,
         continued_dispatch=False,
+        require_new_messages=True,
     ) -> str:
         enabled, speak, proactive, interval, quiet, _ = policy
         if not enabled or not speak:
@@ -131,21 +140,21 @@ class GroupObservationService:
         # and source but must not be stopped by that turn's own first sent row.
         if not continued_dispatch and self.router.reply_policy._in_cooldown(policy_input):
             return "cooldown"
-        if not continued_dispatch:
-            minimum = max(1, min(24, self.router._group_policy_int(
+        if not continued_dispatch and require_new_messages:
+            minimum = max(1, min(30, self.router._group_policy_int(
                 group_id=group_id, key='proactive_min_new_messages', default=1)))
             if minimum > 1 and meaningful_new_messages(self._recent(messages, group_id), bot_id=self.router.runtime.settings.bot_qq,
                 since=max(timestamps) if timestamps else None) < minimum:
                 return 'below_participation_threshold'
         return ""
 
-    def proactive_send_allowed(self, group_id, event_id) -> bool:
+    def proactive_send_allowed(self, group_id, event_id, *, require_new_messages=True) -> bool:
         """Final chat cadence for both event turns and scheduled wakeups."""
         with session_scope(self.router.engine) as session:
             messages = MessageRepository(session)
             policy = self.router._resolve_group_policy(groups=GroupRepository(session), group_id=group_id)
             return not self._suppression(group_id=group_id, event_id=event_id,
-                messages=messages, policy=policy)
+                messages=messages, policy=policy, require_new_messages=require_new_messages)
 
     def build_agent_observation(self, batch) -> dict:
         router = self.router
@@ -161,7 +170,7 @@ class GroupObservationService:
                     for event in reversed(events) if event is not None),
                 bot_qq=router.runtime.settings.bot_qq)
             share_ids = set(share_access.authorized_source_ids())
-            # A quoted card may have fallen outside the 24 recent messages.
+            # A quoted card may have fallen outside the 30 recent messages.
             # Only real ledger reply links grant access, bounded to eight rows.
             referenced = []
             observed_ids = {item.id for item in recent}

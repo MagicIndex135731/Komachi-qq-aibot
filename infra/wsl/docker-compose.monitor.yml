@@ -1,0 +1,27 @@
+services:
+  xiaomachi-monitor:
+    image: xiaomachi-bot:local
+    container_name: xiaomachi-monitor
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /workspace
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: Asia/Shanghai
+    # Only monitor records are writable. No bot env, database or execution stores.
+    volumes:
+      - type: volume
+        source: xiaomachi_data
+        target: /workspace/data/agent_monitor
+        volume:
+          subpath: agent_monitor
+    command: [python, -B, -m, app.monitor.server, --root, /workspace/data/agent_monitor, --port, "8765"]
+    healthcheck:
+      test: [CMD, python, -c, "from urllib.request import build_opener,ProxyHandler; build_opener(ProxyHandler({})).open('http://127.0.0.1:8765/health',timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

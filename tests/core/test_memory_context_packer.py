@@ -47,7 +47,7 @@ def test_memory_answer_anchor_points_to_dated_direct_observation_without_copying
             episode_id="raw:1", fused_score=1.0,
             messages=(EvidenceMessage(
                 source_msg_id="direct-source", speaker="member",
-                content="小丁丁在看向日葵马戏团",
+                content="加菲猫在看向日葵马戏团",
                 sent_at=datetime(2026, 9, 13, tzinfo=UTC),
             ),),
             hit_source_msg_ids=("direct-source",),
@@ -55,7 +55,7 @@ def test_memory_answer_anchor_points_to_dated_direct_observation_without_copying
     )
     packed = replace(packed, direct_current_source_ids=("direct-source",))
 
-    anchor = build_memory_answer_anchor("小丁丁最近在看什么动画", packed)
+    anchor = build_memory_answer_anchor("加菲猫最近在看什么动画", packed)
 
     assert "direct-source" in anchor
     assert "向日葵马戏团" not in anchor

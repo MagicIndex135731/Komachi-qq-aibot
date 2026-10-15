@@ -88,7 +88,16 @@ recreate_bot_only() {
   if grep -Eq '^[[:space:]]*ENABLE_GPU[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "${compose_dir}/.env"; then
     compose_args+=(-f "${compose_dir}/docker-compose.gpu.yml")
   fi
+  if [[ -f "${compose_dir}/docker-compose.monitor.yml" ]] && grep -Eiq '^[[:space:]]*AGENT_MONITOR_ENABLED[[:space:]]*=[[:space:]]*(true|1|yes|on)([[:space:]]|$)' "${compose_dir}/.env"; then
+    :
+  else
+    docker rm -f xiaomachi-monitor >/dev/null 2>&1 || true
+  fi
   docker compose "${compose_args[@]}" up -d --no-deps --force-recreate --no-build "${app_services[@]}"
+  if [[ -f "${compose_dir}/docker-compose.monitor.yml" ]] && grep -Eiq '^[[:space:]]*AGENT_MONITOR_ENABLED[[:space:]]*=[[:space:]]*(true|1|yes|on)([[:space:]]|$)' "${compose_dir}/.env"; then
+    docker exec xiaomachi-bot python -B -c 'from pathlib import Path; import os; (Path(os.environ.get("DATA_DIR", "/workspace/data")) / "agent_monitor").mkdir(parents=True, exist_ok=True)' || echo "Agent monitor directory unavailable; chat remains running." >&2
+    docker compose "${compose_args[@]}" -f "${compose_dir}/docker-compose.monitor.yml" up -d --no-deps --force-recreate --no-build xiaomachi-monitor || echo "Agent monitor unavailable; chat remains running." >&2
+  fi
 }
 
 restore_previous_runtime() {

@@ -163,12 +163,12 @@ def test_parse_personal_claim_distinguishes_sender_and_named_subject() -> None:
 
 
 def test_parse_personal_claim_carries_explicit_correction_metadata() -> None:
-    corrected = parse_personal_claim("你记错了，是小甲喜欢坐床上看动画。")
+    corrected = parse_personal_claim("你记错了，是阿渣喜欢坐床上看动画。")
     reassigned = parse_personal_claim("不是 Alice，是 Bob 不喜欢早起。")
 
     assert corrected is not None
     assert corrected.is_correction is True
-    assert corrected.subject_alias == "小甲"
+    assert corrected.subject_alias == "阿渣"
     assert corrected.old_subject_alias is None
     assert reassigned is not None
     assert reassigned.is_correction is True
@@ -180,12 +180,12 @@ def test_parse_personal_claim_carries_explicit_correction_metadata() -> None:
 def test_parse_personal_claim_rejects_ambiguous_pronouns_and_general_discussion() -> None:
     assert parse_personal_claim("他喜欢动画。") is None
     assert parse_personal_claim("我们聊过很多动画。") is None
-    assert parse_personal_claim("小甲可能喜欢动画。") is None
+    assert parse_personal_claim("阿渣可能喜欢动画。") is None
     assert parse_personal_claim("我喜欢的不是动画。") is None
-    assert parse_personal_claim("小甲喜欢动画，但 Alice 讨厌早起。") is None
-    assert parse_personal_claim("小甲喜欢动画吗？") is None
+    assert parse_personal_claim("阿渣喜欢动画，但 Alice 讨厌早起。") is None
+    assert parse_personal_claim("阿渣喜欢动画吗？") is None
     assert parse_personal_claim("我喜欢什么动画？") is None
-    assert parse_personal_claim("小甲喜欢动画吧。") is None
+    assert parse_personal_claim("阿渣喜欢动画吧。") is None
 
 
 def test_parse_addressing_rule_claim_accepts_explicit_self_declarations_only() -> None:

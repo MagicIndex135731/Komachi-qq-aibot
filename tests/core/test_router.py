@@ -625,7 +625,7 @@ async def test_router_carries_bot_id_for_raw_onebot_mention_in_impersonation(
     )
     router.runtime.persona["name"] = "比企谷小町"
     router.persona_manager.personas["member_persona"] = {
-        "name": "小甲",
+        "name": "阿渣",
         "identity": "group member",
         "source_user_id": 30001,
     }
@@ -664,7 +664,7 @@ async def test_router_does_not_mark_plain_human_mention_as_bot_address(
         memory_orchestrator=memory,
     )
     router.persona_manager.personas["member_persona"] = {
-        "name": "小甲",
+        "name": "阿渣",
         "identity": "group member",
         "source_user_id": 30001,
     }
@@ -1164,7 +1164,7 @@ async def test_router_collapses_model_line_breaks_into_one_message(sqlite_engine
 @pytest.mark.asyncio
 async def test_router_scrubs_honorifics_while_impersonating(sqlite_engine) -> None:
     sender = FakeSender()
-    llm = LongReplyLlm("主人，小甲啊，打游戏看球写日报的那个")
+    llm = LongReplyLlm("主人，阿渣啊，打游戏看球写日报的那个")
     router = InboundRouter.build_for_test(
         sqlite_engine=sqlite_engine,
         sender=sender,
@@ -1183,7 +1183,7 @@ async def test_router_scrubs_honorifics_while_impersonating(sqlite_engine) -> No
     )
 
     assert [outbound.text for outbound in sender.sent] == [
-        "你，小甲啊，打游戏看球写日报的那个"
+        "你，阿渣啊，打游戏看球写日报的那个"
     ]
 
 
@@ -4914,7 +4914,7 @@ async def test_router_scopes_builtin_search_when_a_search_model_is_configured(
             group_id=10001,
             mentioned_bot=False,
             message_id="scoped-casual-1",
-            plain_text="小甲喜欢什么动画",
+            plain_text="阿渣喜欢什么动画",
         )
     )
 
@@ -4961,7 +4961,7 @@ async def test_router_keeps_wide_builtin_search_without_a_search_model(
             group_id=10001,
             mentioned_bot=False,
             message_id="wide-casual-1",
-            plain_text="小甲喜欢什么动画",
+            plain_text="阿渣喜欢什么动画",
         )
     )
 
@@ -4993,7 +4993,7 @@ async def test_router_attaches_builtin_web_search_for_addressed_turn_without_tim
             group_id=10001,
             mentioned_bot=False,
             message_id="builtin-auto-1",
-            plain_text="小甲喜欢什么动画",
+            plain_text="阿渣喜欢什么动画",
         )
     )
 
@@ -5099,7 +5099,7 @@ async def test_router_caps_memory_budget_for_auto_search_turn(sqlite_engine, mon
             group_id=10001,
             mentioned_bot=False,
             message_id="compact-auto-1",
-            plain_text="小甲喜欢什么动画",
+            plain_text="阿渣喜欢什么动画",
         )
     )
 
@@ -5130,7 +5130,7 @@ async def test_router_keeps_memory_budget_when_search_is_unavailable(sqlite_engi
             group_id=10001,
             mentioned_bot=False,
             message_id="no-search-budget-1",
-            plain_text="小甲喜欢什么动画",
+            plain_text="阿渣喜欢什么动画",
         )
     )
 
@@ -5204,14 +5204,14 @@ async def test_router_correction_reassigns_named_fact_and_keeps_raw_messages(sql
         )
         users = UserRepository(session)
         users.upsert_user(user_id=20001, nickname="Alice", group_card="")
-        users.upsert_user(user_id=20002, nickname="Member-A", group_card="小甲")
+        users.upsert_user(user_id=20002, nickname="A-Zha", group_card="阿渣")
         MessageRepository(session).add_group_message(
             platform_msg_id="target-member-seed",
             group_id=10001,
             user_id=20002,
             timestamp=observed_at - timedelta(minutes=5),
             plain_text="在看动画。",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -5221,7 +5221,7 @@ async def test_router_correction_reassigns_named_fact_and_keeps_raw_messages(sql
             group_id=10001,
             user_id=20001,
             timestamp=observed_at - timedelta(days=1),
-            plain_text="小甲喜欢坐床上看动画。",
+            plain_text="阿渣喜欢坐床上看动画。",
             raw_json={},
             msg_type="text",
             reply_to_msg_id=None,
@@ -5246,7 +5246,7 @@ async def test_router_correction_reassigns_named_fact_and_keeps_raw_messages(sql
             group_id=10001,
             mentioned_bot=False,
             message_id="explicit-correction",
-            plain_text="你记错了，是小甲喜欢坐床上看动画。",
+            plain_text="你记错了，是阿渣喜欢坐床上看动画。",
             timestamp=observed_at,
             user_id=20001,
             nickname="Alice",
@@ -5278,7 +5278,7 @@ async def test_router_correction_reassigns_named_fact_and_keeps_raw_messages(sql
     assert facts[0].id == old_id
     assert facts[0].superseded_by_id == facts[1].id
     assert facts[1].supersedes_id == facts[0].id
-    assert facts[1].content == "小甲 likes 坐床上看动画."
+    assert facts[1].content == "阿渣 likes 坐床上看动画."
     assert facts[1].source_msg_ids == ["explicit-correction"]
     assert {message.platform_msg_id for message in source_messages} == {
         "target-member-seed",
@@ -5798,7 +5798,7 @@ def test_generate_group_reply_text_uses_memory_tools_when_executor_present(
     executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
     reply = PreparedGroupReply(
         should_reply=True,
-        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 小甲喜欢什么"],
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 阿渣喜欢什么"],
         use_memory_tools=True,
         memory_tool_executor=executor,
     )
@@ -5928,7 +5928,7 @@ def test_generate_group_reply_text_uses_envelope_and_returns_answer(
     executor = SimpleNamespace(execute=lambda _name, _args: "tooled reply")
     reply = PreparedGroupReply(
         should_reply=True,
-        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 小甲喜欢什么"],
+        prompt_lines=["Group policy: keep safe.", "Target message: Alice: 阿渣喜欢什么"],
         use_memory_tools=True,
         memory_tool_executor=executor,
         memory_source_ids=("m1",),
@@ -6138,10 +6138,10 @@ def test_query_mentions_member_detects_nickname_card_and_id() -> None:
 
     router = object.__new__(InboundRouter)
     users = {
-        10001: SimpleNamespace(nickname="Member-A", group_card="小甲", user_id=10001),
+        10001: SimpleNamespace(nickname="A-Zha", group_card="阿渣", user_id=10001),
         10002: SimpleNamespace(nickname="Bob", group_card="", user_id=10002),
     }
-    assert router._query_mentions_member("小甲觉得八仙怎么样？", users) is True
+    assert router._query_mentions_member("阿渣觉得八仙怎么样？", users) is True
     assert router._query_mentions_member("Bob 怎么说？", users) is True
     assert router._query_mentions_member("10002 咋看？", users) is True
     assert router._query_mentions_member("八仙怎么样？", users) is False

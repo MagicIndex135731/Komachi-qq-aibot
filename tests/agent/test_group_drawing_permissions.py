@@ -19,7 +19,7 @@ async def unused(args):
 
 
 @pytest.mark.parametrize("group_images", [False, True])
-def test_filter_allows_only_explicit_group_drawing(group_images):
+async def test_filter_allows_only_explicit_group_drawing(group_images):
     names = {"generate_image": "image", "generate_private_image": "image",
         "execute_python": "compute", "set_group_card": "write", "memory_write": "write",
         "send_group": "write", "send_private": "write", "read_context": "read",
@@ -28,12 +28,15 @@ def test_filter_allows_only_explicit_group_drawing(group_images):
     expected = {"send_group", "send_private", "read_context"}
     if group_images:
         expected.add("generate_image")
-    assert {tool.name for tool in restrict_directed_tools(tools, owner=False,
-        allow_group_images=group_images)} == expected
+    restricted = restrict_directed_tools(tools, owner=False, allow_group_images=group_images)
+    assert [(t.name, t.description, t.parameters, t.effect) for t in restricted] == [
+        (t.name, t.description, t.parameters, t.effect) for t in tools]
+    for tool in restricted:
+        assert (await tool.handler({})).status == ('ok' if tool.name in expected else 'blocked')
     assert restrict_directed_tools(tools, owner=True, allow_group_images=group_images) == tools
-    assert "generate_image" not in {tool.name for tool in restrict_directed_tools(tools, owner=False)}
+    assert (await next(t for t in restrict_directed_tools(tools, owner=False) if t.name == 'generate_image').handler({})).status == 'blocked'
     forged = AgentTool("generate_image", "forged write", {}, unused, "write")
-    assert restrict_directed_tools([forged], owner=False, allow_group_images=True) == []
+    assert (await restrict_directed_tools([forged], owner=False, allow_group_images=True)[0].handler({})).status == 'blocked'
 
 
 @pytest.mark.asyncio
@@ -47,7 +50,20 @@ async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, op
     def script(body, number):
         tools = {tool["name"] for tool in body["tools"]}
         assert ("generate_image" in tools) is enabled
-        assert not tools.intersection({"generate_private_image", "execute_python", "memory_write", "set_group_card"})
+        assert 'generate_private_image' not in tools
+        if 'Delegated result JSON:' in str(body):
+            if not generated:
+                import json
+                for item in body['input']:
+                    for part in item.get('content', []) if isinstance(item.get('content'), list) else []:
+                        value = part.get('text', '')
+                        if 'Delegated result JSON:\n' in value:
+                            result = json.JSONDecoder().raw_decode(value.split('Delegated result JSON:\n', 1)[1])[0]
+                            assert result['status'] == 'ok' and result['data']['ready']
+                            generated.append(result['data']['artifact_id'])
+                return responses_sse(name='send_group', arguments={'text': '合成作品', 'artifact_ids': generated},
+                    call_id='media-complete', number=number)
+            return responses_sse(number=number)
         if number == 1 and enabled:
             assert "本群所有成员可要求绘图" in str(body)
             return responses_sse(name="generate_image", arguments={"prompt": "合成猫",
@@ -57,8 +73,8 @@ async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, op
             if operation == "foreign":
                 assert output["status"] != "ok"
             else:
-                assert output["status"] == "ok" and output["data"]["ready"]
-                generated.append(output["data"]["artifact_id"])
+                assert output["status"] == "ok" and output["data"]["status"] == 'queued'
+                assert not generated
         if number == (2 if enabled else 1):
             return responses_sse(name="send_group", arguments={"text": "合成回复",
                 "artifact_ids": generated}, call_id="send", number=number)
@@ -83,8 +99,18 @@ async def test_nonowner_native_group_drawing(sqlite_engine, tmp_path, author, op
             AgentDecision("reply", event.platform_msg_id, "direct_trigger"),
             InteractiveIngressGuard(batch.turn_id))
         assert result.status == "sent" and len(writes(fixture)) == 1
+        assert not fixture.image_client.calls and not fixture.image_client.edit_calls
+        initial_requests = len(requests)
+        assert initial_requests == (3 if enabled else 2)
+        if operation in {'generate', 'edit'}:
+            queue = fixture.executor.media_jobs
+            queue.running = True
+            assert await queue.tick()
+            assert len(requests) == initial_requests
+            assert await queue.tick()
+            assert len(writes(fixture)) == 2
+            assert requests[0]['tools'] == requests[-1]['tools']
         assert len(fixture.image_client.calls) == (operation == "generate")
         assert len(fixture.image_client.edit_calls) == (operation == "edit")
         if operation == "edit":
             assert fixture.image_client.edit_calls[0]["images"]
-        assert len(requests) == (3 if enabled else 2)

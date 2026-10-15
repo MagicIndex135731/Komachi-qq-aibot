@@ -23,7 +23,12 @@ strip_optional_env_quotes() {
 }
 
 xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
-if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:7897" ]]; then
+page_proxy="$(sed -n 's/^[[:space:]]*WEB_PAGE_PROXY_URL[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+if [[ "${page_proxy}" == "http://127.0.0.1:18797" ]]; then
+  systemctl is-active --quiet xiaomachi-mihomo.service || { echo "Web page proxy is unavailable."; exit 1; }
+  echo "Mihomo page route: service=active loopback_only=true"
+fi
+if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:18797" ]]; then
   echo "Mihomo provider proxy probe:"
   systemctl is-active --quiet xiaomachi-mihomo.service || {
     echo "xiaomachi-mihomo.service is not active."
@@ -411,6 +416,14 @@ if [[ "${private_ok}" != true ]]; then
 fi
 
 echo "Component diagnostics:"
+if grep -Eiq '^[[:space:]]*AGENT_MONITOR_ENABLED[[:space:]]*=[[:space:]]*(true|1|yes|on)([[:space:]]|$)' .env; then
+  # Optional inspection never gates QQ readiness or provider health.
+  if curl --noproxy '*' -fsS --max-time 3 http://127.0.0.1:8765/health >/dev/null; then
+    echo "Agent monitor: http://127.0.0.1:8765/ local_only=true read_only=true"
+  else
+    echo "Agent monitor: unavailable (chat remains independent)" >&2
+  fi
+fi
 if systemctl is-enabled --quiet xiaomachi-sandbox.service; then
   systemctl is-active --quiet xiaomachi-sandbox.service || {
     echo "xiaomachi-sandbox.service is not active."

@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.style_distill import merge_persona_lists
+from app.core.memory_tools import DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS
 
 
 # Reasoning votes accepted by every upstream-model call site.  The provider
@@ -23,8 +24,8 @@ class AppSettings(BaseSettings):
     group_agent_enabled: bool = Field(default=True, alias="GROUP_AGENT_ENABLED")
     agent_runtime: Literal["harness", "legacy"] = Field(default="harness", alias="AGENT_RUNTIME")
     agent_max_external_writes: int = Field(default=2, ge=1, le=8, alias="AGENT_MAX_EXTERNAL_WRITES")
-    group_agent_batch_quiet_seconds: float = Field(default=1.5, ge=0, le=30, alias="GROUP_AGENT_BATCH_QUIET_SECONDS")
-    group_agent_batch_max_seconds: float = Field(default=5.0, gt=0, le=60, alias="GROUP_AGENT_BATCH_MAX_SECONDS")
+    group_agent_batch_quiet_seconds: float = Field(default=1.0, ge=0, le=30, alias="GROUP_AGENT_BATCH_QUIET_SECONDS")
+    group_agent_batch_max_seconds: float = Field(default=3.0, gt=0, le=60, alias="GROUP_AGENT_BATCH_MAX_SECONDS")
     group_agent_batch_max_messages: int = Field(default=20, ge=1, le=100, alias="GROUP_AGENT_BATCH_MAX_MESSAGES")
     group_agent_max_concurrent_turns: int = Field(default=2, ge=1, le=8, alias="GROUP_AGENT_MAX_CONCURRENT_TURNS")
     group_agent_turn_timeout_seconds: float = Field(default=180, ge=1, le=900, alias="GROUP_AGENT_TURN_TIMEOUT_SECONDS")
@@ -59,6 +60,7 @@ class AppSettings(BaseSettings):
         alias="LLM_BUILTIN_WEB_SEARCH_CONTEXT_SIZE",
     )
     llm_web_search_model: str = Field(default="", alias="LLM_WEB_SEARCH_MODEL")
+    llm_web_search_api_key: str = Field(default="", alias="LLM_WEB_SEARCH_API_KEY")
     llm_reasoning_effort: ReasoningEffort = Field(
         default="medium",
         alias="LLM_REASONING_EFFORT",
@@ -79,6 +81,7 @@ class AppSettings(BaseSettings):
         alias="GROUP_IMAGE_TRANSPORT",
     )
     group_image_model: str = Field(default="gpt-image-2", alias="GROUP_IMAGE_MODEL")
+    group_image_edit_model: str = Field(default="", alias="GROUP_IMAGE_EDIT_MODEL")
     # Standard Responses separates the mainline model from image_generation.model.
     # Empty preserves the existing relay-specific image-model-as-outer contract.
     group_image_responses_model: str = Field(default="", alias="GROUP_IMAGE_RESPONSES_MODEL")
@@ -102,6 +105,20 @@ class AppSettings(BaseSettings):
     search_timeout_seconds: float = Field(default=8.0, alias="SEARCH_TIMEOUT_SECONDS")
     agent_web_search_timeout_seconds: float = Field(default=45.0, ge=5, le=90, alias="AGENT_WEB_SEARCH_TIMEOUT_SECONDS")
     agent_web_search_results: int = Field(default=8, ge=1, le=20, alias="AGENT_WEB_SEARCH_RESULTS")
+    agent_web_task_max_calls: int = Field(default=16, ge=8, le=24, alias="AGENT_WEB_TASK_MAX_CALLS")
+    agent_task_turn_timeout_seconds: float = Field(default=600, ge=180, le=900, alias="AGENT_TASK_TURN_TIMEOUT_SECONDS")
+    agent_web_task_max_chars: int = Field(default=96000, ge=48000, le=128000, alias="AGENT_WEB_TASK_MAX_CHARS")
+    web_page_proxy_url: str = Field(default="", alias="WEB_PAGE_PROXY_URL")
+    download_media_retention_hours: float = Field(default=24, ge=1, le=168, alias='DOWNLOAD_MEDIA_RETENTION_HOURS')
+    download_media_cache_max_mib: int = Field(default=512, ge=128, le=8192, alias='DOWNLOAD_MEDIA_CACHE_MAX_MIB')
+    agent_context_compaction_enabled: bool = Field(default=True, alias="AGENT_CONTEXT_COMPACTION_ENABLED")
+    agent_context_compaction_threshold_ratio: float = Field(default=0.62, ge=0.2, le=0.8,
+        alias="AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO")
+    agent_context_retain_tokens: int = Field(default=16000, ge=1000, le=64000, alias="AGENT_CONTEXT_RETAIN_TOKENS")
+    agent_context_summary_tokens: int = Field(default=4096, ge=512, le=8192, alias="AGENT_CONTEXT_SUMMARY_TOKENS")
+    agent_context_history_tokens: int = Field(default=24000, ge=4000, le=64000, alias="AGENT_CONTEXT_HISTORY_TOKENS")
+    agent_background_history_tokens: int = Field(default=8000, ge=2000, le=24000, alias="AGENT_BACKGROUND_HISTORY_TOKENS")
+    agent_monitor_enabled: bool = Field(default=False, alias="AGENT_MONITOR_ENABLED")
     web_search_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = Field(
         default="medium", alias="WEB_SEARCH_REASONING_EFFORT")
     search_region: str = Field(default="wt-wt", alias="SEARCH_REGION")
@@ -182,7 +199,7 @@ class AppSettings(BaseSettings):
     memory_embedding_version: str = Field(default="", alias="MEMORY_EMBEDDING_VERSION")
     memory_embedding_timeout_seconds: float = Field(default=10.0, alias="MEMORY_EMBEDDING_TIMEOUT_SECONDS")
     memory_retrieval_channel_timeout_seconds: float = Field(
-        default=4.0, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
+        default=45.0, gt=0, le=60, alias="MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS"
     )
     memory_episode_idle_minutes: int = Field(default=10, alias="MEMORY_EPISODE_IDLE_MINUTES")
     memory_episode_max_messages: int = Field(default=70, alias="MEMORY_EPISODE_MAX_MESSAGES")
@@ -371,8 +388,9 @@ class AppSettings(BaseSettings):
         alias="MEMORY_MEMORY_TOOL_MAX_RESULTS",
     )
     memory_memory_tool_timeout_seconds: float = Field(
-        default=2.0,
+        default=DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS,
         gt=0,
+        le=120,
         alias="MEMORY_MEMORY_TOOL_TIMEOUT_SECONDS",
     )
     memory_member_fact_supplement_limit: int = Field(

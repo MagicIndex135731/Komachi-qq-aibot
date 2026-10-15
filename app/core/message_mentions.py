@@ -19,7 +19,7 @@ def message_mentions_bot(
     must never be used as style samples, distillation corpus, or fact
     evidence for the member. The QQ at-type match is exact; the text
     ``@name`` match only fires for names that are bot-exclusive (no real
-    member shares the name), so ``@小甲`` aimed at the real member is kept.
+    member shares the name), so ``@阿渣`` aimed at the real member is kept.
     """
 
     if isinstance(raw_json, str):
@@ -94,7 +94,7 @@ def bot_text_mention_names(
 ) -> set[str]:
     """Text mention names that unambiguously address the bot.
 
-    Every bot card (比企谷小町/小甲/小乙乙) may collide with a real member's
+    Every bot card (比企谷小町/阿渣/逆蝶蝶) may collide with a real member's
     name; only names absent from the real-member set are safe to filter on
     text form. The short form 小町 is added only when no real member uses it.
     """

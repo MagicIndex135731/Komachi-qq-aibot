@@ -142,8 +142,8 @@ def main() -> int:
     members = member_identities
     resolver = MemoryQueryResolver()
     bind_cases = {
-        "你最近面了哪些企业（'你'指小甲本人）": "self_hint",
-        "小乙乙喜欢什么": "third_person",
+        "你最近面了哪些企业（'你'指阿渣本人）": "self_hint",
+        "逆蝶蝶喜欢什么": "third_person",
         "如何评价我": "requester",
     }
     for query, kind in bind_cases.items():

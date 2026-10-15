@@ -123,17 +123,55 @@ async def test_ordinary_web_permission_cannot_open_unrequested_observed_card(sql
     assert (await wrapped.handler({'ref_id': 'https://example.org/weather'})).status == 'ok'
 
 
-async def test_autonomous_web_keeps_independent_goals_but_not_unrequested_card(sqlite_engine):
-    source, trigger, access = setup_access(sqlite_engine, text='普通群聊', mention=False, quote=False)
+async def test_ordinary_question_ignores_unrelated_old_card_but_cannot_open_it(sqlite_engine):
+    source, trigger, access = setup_access(sqlite_engine, text='这个角色是打什么伤害的，是c还是辅啊', mention=False, quote=False)
     calls = []
     async def invoke(args):
         calls.append(args)
         return ToolOutcome({'content': 'body'})
     tool = AgentTool('open_web_page', 'open', {}, invoke)
-    wrapped = wrap_share_web_tools((tool,), access, observed_source_ids={source, trigger}, allow_autonomous_web=True)[0]
+    wrapped = wrap_share_web_tools((tool,), access, observed_source_ids={source, trigger})[0]
     assert (await wrapped.handler({'ref_id': 'https://example.org/research'})).status == 'ok'
     assert (await wrapped.handler({'ref_id': 'https://example.com/article'})).status == 'blocked'
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('text', ['普通群聊', '今天上课比较晚', '昨天看过这个分享', '今天天气真好', '刚才的新闻挺有趣', 'https://example.org/search?query=what'])
+async def test_casual_chat_never_grants_autonomous_network(sqlite_engine, text):
+    source, trigger, access = setup_access(sqlite_engine, text=text, mention=False, quote=False)
+    calls = []
+    async def invoke(args):
+        calls.append(args)
+        return ToolOutcome({})
+    tool = AgentTool('search_web', 'search', {}, invoke)
+    result = await wrap_share_web_tools((tool,), access, observed_source_ids={source, trigger})[0].handler({'query': 'unrequested'})
+    assert result.status == 'blocked' and not calls
+
+
+@pytest.mark.parametrize('text,mention', [('小町', False), ('聊聊', True), ('请核对这些文件', False), ('这个角色强吗', False)])
+def test_current_question_request_or_real_address_allows_lookup(sqlite_engine, text, mention):
+    _, _, access = setup_access(sqlite_engine, text=text, mention=mention, quote=False)
+    assert access.web_allowed() and not access.authorized_source_ids()
+
+
+def test_address_only_in_card_never_grants_lookup(sqlite_engine):
+    _, _, access = setup_access(sqlite_engine, text='', mention=False, quote=False, trigger_card=True)
+    assert not access.web_allowed()
+
+
+@pytest.mark.parametrize('change', ['deleted', 'changed'])
+async def test_question_grant_rechecked_after_provider_returns(sqlite_engine, change):
+    _, trigger, access = setup_access(sqlite_engine, text='这个角色强吗', mention=False, quote=False)
+    calls = []
+    async def invoke(args):
+        calls.append(args)
+        with session_scope(sqlite_engine) as db:
+            row = db.get(Message, trigger)
+            row.raw_json = {'delivery_state': 'deleted'} if change == 'deleted' else {'message': [{'type': 'text', 'data': {'text': '不用查了'}}]}
+        return ToolOutcome({'content': 'late result'})
+    tool = AgentTool('search_web', 'search', {}, invoke)
+    result = await wrap_share_web_tools((tool,), access)[0].handler({'query': '角色'})
+    assert len(calls) == 1 and result.data['error'] == 'share_request_revoked'
 
 
 async def test_search_reference_to_unrequested_card_does_not_bypass_guard(sqlite_engine):

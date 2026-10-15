@@ -13,12 +13,12 @@ def test_same_alias_snapshot_keeps_target_and_external_scope_separate() -> None:
         SimpleNamespace(
             user_id=42,
             group_id=200,
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
         ),
         SimpleNamespace(
             user_id=42,
             group_id=100,
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
         ),
     )
 
@@ -29,29 +29,29 @@ def test_same_alias_snapshot_keeps_target_and_external_scope_separate() -> None:
 
 def test_exact_member_resolution_groups_card_and_nickname_by_user_id() -> None:
     members = (
-        GroupMemberIdentity(user_id=42, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=42, nickname="A-Zha", group_card="阿渣"),
         GroupMemberIdentity(user_id=43, nickname="Bob", group_card=""),
     )
 
-    resolved = resolve_group_member_reference(" 小甲！", members, match_mode="exact")
+    resolved = resolve_group_member_reference(" 阿渣！", members, match_mode="exact")
 
     assert resolved is not None
     assert resolved.user_id == 42
-    assert resolved.matched_alias == "小甲"
+    assert resolved.matched_alias == "阿渣"
 
 
 def test_member_resolution_rejects_unknown_duplicate_and_excluded_identity() -> None:
     duplicate = (
-        GroupMemberIdentity(user_id=42, nickname="小甲"),
-        GroupMemberIdentity(user_id=43, group_card="小甲"),
+        GroupMemberIdentity(user_id=42, nickname="阿渣"),
+        GroupMemberIdentity(user_id=43, group_card="阿渣"),
     )
 
-    assert resolve_group_member_reference("小甲", duplicate, match_mode="exact") is None
+    assert resolve_group_member_reference("阿渣", duplicate, match_mode="exact") is None
     assert resolve_group_member_reference("未知", duplicate, match_mode="exact") is None
     assert (
         resolve_group_member_reference(
-            "小甲",
-            (GroupMemberIdentity(user_id=42, nickname="小甲"),),
+            "阿渣",
+            (GroupMemberIdentity(user_id=42, nickname="阿渣"),),
             match_mode="exact",
             exclude_user_ids={42},
         )
@@ -61,15 +61,15 @@ def test_member_resolution_rejects_unknown_duplicate_and_excluded_identity() -> 
 
 def test_member_reference_classification_distinguishes_unbound_resolved_and_ambiguous() -> None:
     members = (
-        GroupMemberIdentity(user_id=42, nickname="小甲"),
-        GroupMemberIdentity(user_id=43, group_card="小甲"),
-        GroupMemberIdentity(user_id=44, group_card="小丁丁"),
+        GroupMemberIdentity(user_id=42, nickname="阿渣"),
+        GroupMemberIdentity(user_id=43, group_card="阿渣"),
+        GroupMemberIdentity(user_id=44, group_card="加菲猫"),
     )
 
-    duplicate = classify_group_member_reference("小甲喜欢什么", members, match_mode="contained")
-    multiple = classify_group_member_reference("小甲和小丁丁喜欢什么", members, match_mode="contained")
+    duplicate = classify_group_member_reference("阿渣喜欢什么", members, match_mode="contained")
+    multiple = classify_group_member_reference("阿渣和加菲猫喜欢什么", members, match_mode="contained")
     unknown = classify_group_member_reference("未知人物喜欢什么", members, match_mode="contained")
-    unique = classify_group_member_reference("小丁丁喜欢什么", members, match_mode="contained")
+    unique = classify_group_member_reference("加菲猫喜欢什么", members, match_mode="contained")
 
     assert duplicate.status == "ambiguous"
     assert multiple.status == "ambiguous"

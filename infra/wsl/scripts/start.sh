@@ -19,7 +19,8 @@ if [[ ! -f .env ]]; then
 fi
 
 xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
-if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:7897" ]]; then
+page_proxy="$(sed -n 's/^[[:space:]]*WEB_PAGE_PROXY_URL[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+if [[ "${xiaomachi_proxy}" == "http://127.0.0.1:18797" || "${page_proxy}" == "http://127.0.0.1:18797" ]]; then
   if ! systemctl is-active --quiet xiaomachi-mihomo.service \
       && ! systemctl start xiaomachi-mihomo.service; then
     echo "Xiaomachi requires the local Mihomo proxy, but its service is unavailable." >&2
@@ -157,6 +158,12 @@ docker compose -f "${compose_file}" ${gpu_flag} up -d --no-deps xiaomachi
 # server broadcasts every event to every connected client, so both processes
 # share the same WebSocket.
 docker compose -f "${compose_file}" up -d --no-deps xiaomachi-private
+if [[ -f docker-compose.monitor.yml ]] && grep -Eiq '^[[:space:]]*AGENT_MONITOR_ENABLED[[:space:]]*=[[:space:]]*(true|1|yes|on)([[:space:]]|$)' .env; then
+  docker exec xiaomachi-bot python -B -c 'from pathlib import Path; import os; (Path(os.environ.get("DATA_DIR", "/workspace/data")) / "agent_monitor").mkdir(parents=True, exist_ok=True)' || echo "Agent monitor directory unavailable; chat remains running." >&2
+  docker compose -f "${compose_file}" -f docker-compose.monitor.yml up -d --no-deps xiaomachi-monitor || echo "Agent monitor unavailable; chat remains running." >&2
+else
+  docker rm -f xiaomachi-monitor >/dev/null 2>&1 || true
+fi
 if systemctl is-enabled --quiet xiaomachi-sandbox.service; then
   systemctl start xiaomachi-sandbox.service
 fi

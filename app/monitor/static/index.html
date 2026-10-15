@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小町 · Agent 现场</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<div class="workspace">
+<aside class="sidebar">
+ <div class="brand"><span class="brand-mark">町</span><div><h1>小町 · Agent 现场</h1><p>持续对话与执行过程</p></div></div>
+ <div class="sidebar-heading"><h2>会话</h2><span id="conversation-count">0</span></div>
+ <div class="filters"><select id="surface" aria-label="筛选会话"><option value="all">全部会话</option><option value="group">群聊</option><option value="private">私聊</option><option value="public">公开任务</option></select><input id="search" placeholder="搜索群、用户或任务" aria-label="搜索会话"></div>
+ <nav id="conversations" class="conversations" aria-label="Agent会话"></nav>
+ <div class="sidebar-footer"><span id="connection">正在连接</span><p>仅本机 · 可删除监控记录 · 最近24小时</p><button id="pause" class="quiet">暂停更新</button></div>
+</aside>
+<main class="main">
+ <section id="empty" class="empty"><div class="empty-icon">◌</div><h2>等待 Agent 会话</h2><p>新回合会按所属会话连续排列。<br>打开网页不触发执行，也不额外请求模型。</p></section>
+ <div id="detail" class="detail" hidden>
+  <header class="conversation-header"><div><div id="scope-label" class="eyebrow"></div><h2 id="conversation-title"></h2><p id="conversation-subtitle"></p></div><div class="header-actions"><span id="conversation-status" class="chip"></span><button id="delete-selected" class="quiet danger">删除记录</button><button id="open-input" class="quiet">模型输入</button></div></header>
+  <div class="conversation-info"><span id="identity-note"></span><label><input id="follow" type="checkbox" checked>跟随最新过程</label></div>
+  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><div id="turn-list"></div><div id="tail"></div></div></div>
+  <footer class="main-footer usage-footer" aria-label="当前会话上下文和用量">
+   <div class="usage-grid">
+    <div class="usage-context" title="最近主模型请求的输入量；实报优先，尚无实报时使用估算。总量是当前配置的窗口，不是累计消耗。"><span>最近请求输入 / 配置窗口</span><strong id="context-usage">未知 / 未知</strong><progress id="context-progress" max="1" value="0" aria-label="上下文占用比例"></progress><small id="context-source">等待请求</small></div>
+    <div title="最近主模型请求：实际缓存输入 ÷ 实际输入。缺失字段保持未知。"><span>最近缓存命中率</span><strong id="latest-cache-ratio">未知</strong><small id="latest-cache-tokens">等待用量实报</small></div>
+    <div title="本会话保留记录中，有完整缓存和输入实报的请求按 token 加权；包括重试和压缩。"><span>会话累计缓存率</span><strong id="total-cache-ratio">未知</strong><small id="total-cache-tokens">等待用量实报</small></div>
+    <div><span>累计输入 token</span><strong id="total-input-tokens">未知</strong><small id="uncached-input-tokens">未缓存输入未知</small></div>
+    <div><span>累计输出 token</span><strong id="total-output-tokens">未知</strong><small>以上游实报为准</small></div>
+    <div><span>累计模型请求</span><strong id="total-model-requests">未知</strong><small>含重试和压缩</small></div>
+   </div>
+   <div id="usage-coverage" class="usage-coverage">选择会话后显示统计。缺失值不按零计算。</div>
+  </footer>
+ </div>
+</main>
+<aside id="input-drawer" class="input-drawer" aria-label="模型请求输入" hidden>
+ <header class="drawer-header"><div><div class="eyebrow">最终发送请求</div><h2>模型输入</h2></div><button id="close-input" class="quiet" aria-label="关闭模型输入">关闭</button></header>
+ <div class="drawer-toolbar"><label>选择请求<select id="requests" aria-label="选择模型请求"></select></label><button id="compare" class="quiet" disabled>对比上一请求</button></div>
+ <div class="drawer-scroll"><div id="input-meta" class="notice"></div><div id="input-body"></div><details class="raw"><summary>请求 JSON（脱敏）</summary><pre id="raw-input"></pre></details><section id="comparison" hidden><div class="section-heading"><h3>相邻请求对照</h3><button id="close-compare" class="quiet">收起</button></div><p id="compare-info" class="muted small"></p><h4>上一请求</h4><pre id="previous-body"></pre><h4>当前请求</h4><pre id="current-body"></pre></section></div>
+</aside>
+</div>
+<dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title">
+ <form method="dialog"><h2 id="delete-title">删除这段会话的监控记录？</h2><p id="delete-description"></p><p class="muted">只删除已采集的监控记录，不清空聊天或记忆，也不停止正在执行的任务。后续新回合会重新出现在列表中。</p><div class="dialog-actions"><button value="cancel" class="quiet" autofocus>取消</button><button value="delete" class="quiet danger">确认删除</button></div></form>
+</dialog>
+<script src="/app.js" defer></script>
+</body></html>

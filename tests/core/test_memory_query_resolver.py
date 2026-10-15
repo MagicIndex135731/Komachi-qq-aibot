@@ -33,8 +33,8 @@ def test_typed_impersonated_subject_binds_without_rewriting_query() -> None:
     members = [
         GroupMemberIdentity(
             user_id=222,
-            nickname="小甲",
-            group_card="示例长昵称",
+            nickname="阿渣",
+            group_card="足泽满灰交",
             in_scope=True,
         )
     ]
@@ -77,7 +77,7 @@ def test_addressed_persona_candidate_binds_implicit_personal_processes(
         now=NOW,
         requester_id=111,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=True,
@@ -110,7 +110,7 @@ def test_addressed_persona_candidate_does_not_bind_general_or_group_queries(
         now=NOW,
         requester_id=111,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=True,
@@ -126,7 +126,7 @@ def test_unaddressed_persona_candidate_does_not_bind_implicit_subject() -> None:
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=False,
@@ -141,7 +141,7 @@ def test_company_choice_question_is_not_parsed_as_location() -> None:
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=True,
@@ -155,8 +155,8 @@ def test_company_choice_question_is_not_parsed_as_location() -> None:
 
 def test_addressed_persona_candidate_keeps_requester_and_explicit_member_precedence() -> None:
     members = (
-        GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
-        GroupMemberIdentity(user_id=333, nickname="小丁丁", in_scope=True),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="加菲猫", in_scope=True),
     )
     requester = MemoryQueryResolver().resolve(
         "我最近工作咋样",
@@ -168,7 +168,7 @@ def test_addressed_persona_candidate_keeps_requester_and_explicit_member_precede
         impersonated_subject_addressed=True,
     )
     explicit = MemoryQueryResolver().resolve(
-        "小丁丁最近工作咋样",
+        "加菲猫最近工作咋样",
         recent_messages=(),
         now=NOW,
         requester_id=111,
@@ -186,7 +186,7 @@ def test_addressed_persona_candidate_keeps_requester_and_explicit_member_precede
 def test_addressed_persona_candidate_keeps_quoted_member_precedence() -> None:
     quoted = Recent(
         "quoted-other",
-        "小丁丁",
+        "加菲猫",
         "我找到新工作了",
         datetime(2026, 9, 27, 12, 0),
         user_id=333,
@@ -198,8 +198,8 @@ def test_addressed_persona_candidate_keeps_quoted_member_precedence() -> None:
         now=NOW,
         requester_id=111,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
-            GroupMemberIdentity(user_id=333, nickname="小丁丁", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+            GroupMemberIdentity(user_id=333, nickname="加菲猫", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=True,
@@ -218,7 +218,7 @@ def test_unknown_person_process_query_never_falls_back_to_persona_candidate() ->
         now=NOW,
         requester_id=111,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
         impersonated_subject_addressed=True,
@@ -238,8 +238,8 @@ def test_bot_address_alias_does_not_override_typed_impersonated_subject() -> Non
         ),
         GroupMemberIdentity(
             user_id=222,
-            nickname="小甲",
-            group_card="示例长昵称",
+            nickname="阿渣",
+            group_card="足泽满灰交",
             in_scope=True,
         ),
     )
@@ -266,12 +266,12 @@ def test_bot_address_alias_does_not_override_typed_impersonated_subject() -> Non
 def test_real_human_alias_still_precedes_typed_impersonated_subject() -> None:
     members = (
         GroupMemberIdentity(user_id=123456789, nickname="比企谷小町", in_scope=True),
-        GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
-        GroupMemberIdentity(user_id=333, nickname="小乙乙", in_scope=True),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", in_scope=True),
     )
 
     result = MemoryQueryResolver().resolve(
-        "@小乙乙 最近在看什么动画",
+        "@逆蝶蝶 最近在看什么动画",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -293,12 +293,12 @@ def test_bot_address_is_removed_before_human_subject_topic_extraction() -> None:
             group_card="小町",
             in_scope=False,
         ),
-        GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
-        GroupMemberIdentity(user_id=333, nickname="小乙乙", in_scope=True),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", in_scope=True),
     )
 
     result = MemoryQueryResolver().resolve(
-        "@比企谷小町 @小乙乙 最近在看什么动画",
+        "@比企谷小町 @逆蝶蝶 最近在看什么动画",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -323,8 +323,8 @@ def test_impersonated_subject_must_be_an_in_scope_group_member() -> None:
         group_members=(
             GroupMemberIdentity(
                 user_id=222,
-                nickname="小甲",
-                group_card="示例长昵称",
+                nickname="阿渣",
+                group_card="足泽满灰交",
                 in_scope=False,
             ),
         ),
@@ -342,7 +342,7 @@ def test_requester_subject_precedes_impersonated_subject() -> None:
         now=NOW,
         requester_id=111,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
     )
@@ -379,7 +379,7 @@ def test_impersonated_subject_generalized_current_fact_matrix(
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=222, nickname="小甲", in_scope=True),
+            GroupMemberIdentity(user_id=222, nickname="阿渣", in_scope=True),
         ),
         impersonated_subject_id=222,
     )
@@ -397,11 +397,11 @@ def test_third_person_query_binds_the_named_member_not_impersonated_one() -> Non
     from app.core.member_identity import GroupMemberIdentity
 
     members = [
-        GroupMemberIdentity(user_id=222, nickname="小甲", group_card="示例长昵称", in_scope=True),
-        GroupMemberIdentity(user_id=333, nickname="小乙乙", group_card="小乙乙", in_scope=True),
+        GroupMemberIdentity(user_id=222, nickname="阿渣", group_card="足泽满灰交", in_scope=True),
+        GroupMemberIdentity(user_id=333, nickname="逆蝶蝶", group_card="逆蝶蝶", in_scope=True),
     ]
     result = MemoryQueryResolver().resolve(
-        "小乙乙喜欢什么",
+        "逆蝶蝶喜欢什么",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -593,12 +593,12 @@ def test_nickname_in_question_binds_the_matching_recent_speaker() -> None:
 def test_direct_nickname_question_binds_unique_group_member_without_rewriting_query() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Garfield", group_card="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="Garfield", group_card="加菲猫"),
         GroupMemberIdentity(user_id=10002, nickname="Bob", group_card=""),
     )
 
     result = resolver.resolve(
-        "小丁丁最喜欢什么动画？",
+        "加菲猫最喜欢什么动画？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -606,7 +606,7 @@ def test_direct_nickname_question_binds_unique_group_member_without_rewriting_qu
 
     assert result.retrieval_query == "动画"
     assert result.topic_query == "动画"
-    assert result.entities == ("小丁丁",)
+    assert result.entities == ("加菲猫",)
     assert result.speaker_ids == ("10001",)
     assert result.subject_ids == ("10001",)
 
@@ -614,22 +614,22 @@ def test_direct_nickname_question_binds_unique_group_member_without_rewriting_qu
 def test_bound_assessment_extracts_subject_independent_topic_query() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "小甲如何评价八仙动画？",
+        "阿渣如何评价八仙动画？",
         recent_messages=(),
         now=NOW,
         group_members=members,
     )
 
-    assert result.original_query == "小甲如何评价八仙动画？"
+    assert result.original_query == "阿渣如何评价八仙动画？"
     assert result.retrieval_query == "八仙动画"
     assert result.topic_query == "八仙动画"
     assert result.topic_terms == ("八仙动画", "八仙")
     assert result.topic_extraction == "deterministic"
-    assert result.subject_aliases_removed == ("小甲",)
+    assert result.subject_aliases_removed == ("阿渣",)
     assert result.subject_ids == ("10001",)
     assert result.answer_mode == "assessment"
     assert result.coverage_mode == "relevance"
@@ -638,11 +638,11 @@ def test_bound_assessment_extracts_subject_independent_topic_query() -> None:
 def test_possessive_assessment_binds_speaker_and_extracts_media_core_topic() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "小甲对八仙电影的评价",
+        "阿渣对八仙电影的评价",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -659,8 +659,8 @@ def test_possessive_assessment_binds_speaker_and_extracts_media_core_topic() -> 
 @pytest.mark.parametrize(
     ("query", "topic"),
     (
-        ("小甲如何评价八仙动画？", "八仙动画"),
-        ("小甲对八仙电影的评价", "八仙电影"),
+        ("阿渣如何评价八仙动画？", "八仙动画"),
+        ("阿渣对八仙电影的评价", "八仙电影"),
     ),
 )
 def test_media_topic_wins_when_title_core_collides_with_member_alias(
@@ -672,7 +672,7 @@ def test_media_topic_wins_when_title_core_collides_with_member_alias(
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=10001, nickname="小甲"),
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
             GroupMemberIdentity(user_id=10002, nickname="八仙"),
         ),
     )
@@ -686,18 +686,18 @@ def test_media_topic_wins_when_title_core_collides_with_member_alias(
 def test_subject_only_assessment_has_no_topic_instead_of_alias_query_fallback() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "如何评价小甲？",
+        "如何评价阿渣？",
         recent_messages=(),
         now=NOW,
         group_members=members,
     )
 
-    assert result.original_query == "如何评价小甲？"
-    assert result.retrieval_query == "如何评价小甲？"
+    assert result.original_query == "如何评价阿渣？"
+    assert result.retrieval_query == "如何评价阿渣？"
     assert result.topic_query is None
     assert result.topic_terms == ()
     assert result.topic_extraction == "none"
@@ -707,18 +707,18 @@ def test_subject_only_assessment_has_no_topic_instead_of_alias_query_fallback() 
 def test_dated_history_binds_unique_member_despite_common_word_alias_collision() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="昨天", group_card=""),
     )
 
     result = resolver.resolve(
-        "小甲昨天的劲爆发言",
+        "阿渣昨天的劲爆发言",
         recent_messages=(),
         now=NOW,
         group_members=members,
     )
 
-    assert result.entities == ("小甲",)
+    assert result.entities == ("阿渣",)
     assert result.speaker_ids == ("10001",)
     assert result.subject_ids == ("10001",)
     assert result.time_range == TimeRange(
@@ -731,12 +731,12 @@ def test_dated_history_binds_unique_member_despite_common_word_alias_collision()
 def test_relative_day_alias_with_member_joiner_still_fails_closed() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="昨天"),
     )
 
     result = resolver.resolve(
-        "昨天和小甲都说了什么？",
+        "昨天和阿渣都说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -749,16 +749,16 @@ def test_relative_day_alias_with_member_joiner_still_fails_closed() -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲昨天说了哪些话？",
-        "小甲昨天有哪些发言？",
-        "小甲昨天有什么内容？",
+        "阿渣昨天说了哪些话？",
+        "阿渣昨天有哪些发言？",
+        "阿渣昨天有什么内容？",
     ),
 )
 def test_plural_dated_speech_query_uses_summary_coverage_instead_of_top_one(
     query: str,
 ) -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10001, nickname="小甲"),)
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
 
     result = resolver.resolve(
         query,
@@ -791,7 +791,7 @@ def test_explicit_group_history_prefixes_remain_subjectless(
 ) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         # A quoted topic may collide with a real member alias. The explicit
         # group-history grammar still asks about the topic across the group.
         GroupMemberIdentity(user_id=10002, nickname="动画"),
@@ -829,14 +829,14 @@ def test_group_running_joke_query_marks_group_subject_role() -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲 和 昨天说了什么？",
-        "小甲和@昨天说了什么？",
+        "阿渣 和 昨天说了什么？",
+        "阿渣和@昨天说了什么？",
     ),
 )
 def test_spaced_or_at_relative_day_member_joiner_still_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="昨天"),
     )
 
@@ -854,12 +854,12 @@ def test_spaced_or_at_relative_day_member_joiner_still_fails_closed(query: str) 
 def test_excluded_alias_cannot_redirect_dated_query_to_relative_day_member() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="昨天"),
     )
 
     result = resolver.resolve(
-        "小甲昨天说了什么？",
+        "阿渣昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -898,8 +898,8 @@ def test_bare_relative_day_alias_does_not_hijack_temporal_or_unknown_person_quer
 def test_explicit_member_qq_binds_and_conflicting_alias_fails_closed() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     explicit = resolver.resolve(
@@ -909,7 +909,7 @@ def test_explicit_member_qq_binds_and_conflicting_alias_fails_closed() -> None:
         group_members=members,
     )
     conflicting = resolver.resolve(
-        "@10002 小甲昨天说了什么？",
+        "@10002 阿渣昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -937,7 +937,7 @@ def test_chinese_user_prefix_qq_binds_to_requester_id() -> None:
 
 def test_chinese_user_prefix_qq_binds_to_group_member() -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10002, nickname="小丁丁"),)
+    members = (GroupMemberIdentity(user_id=10002, nickname="加菲猫"),)
     result = resolver.resolve(
         "用户10002最近决定了什么",
         recent_messages=(),
@@ -964,8 +964,8 @@ def test_unknown_or_excluded_explicit_qq_fails_closed(
 ) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
         GroupMemberIdentity(user_id=10003, nickname="昨天"),
     )
 
@@ -984,7 +984,7 @@ def test_unknown_or_excluded_explicit_qq_fails_closed(
 def test_unknown_text_mention_fails_closed_and_bare_group_qq_binds() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
         GroupMemberIdentity(user_id=10003, nickname="昨天"),
     )
 
@@ -1020,8 +1020,8 @@ def test_known_bare_qq_joined_with_unknown_or_excluded_qq_fails_closed(
 ) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1039,15 +1039,15 @@ def test_known_bare_qq_joined_with_unknown_or_excluded_qq_fails_closed(
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲和陌生猫昨天说了什么？",
-        "@小丁丁和陌生猫昨天说了什么？",
+        "阿渣和陌生猫昨天说了什么？",
+        "@加菲猫和陌生猫昨天说了什么？",
     ),
 )
 def test_known_alias_joined_with_unknown_alias_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1064,8 +1064,8 @@ def test_known_alias_joined_with_unknown_alias_fails_closed(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲还有陌生猫昨天说了什么？",
-        "小甲以及陌生猫昨天说了什么？",
+        "阿渣还有陌生猫昨天说了什么？",
+        "阿渣以及陌生猫昨天说了什么？",
         "10002还有99999昨天说了什么？",
         "10002以及99999昨天说了什么？",
     ),
@@ -1073,8 +1073,8 @@ def test_known_alias_joined_with_unknown_alias_fails_closed(query: str) -> None:
 def test_multichar_joiner_with_unknown_member_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1110,14 +1110,14 @@ def test_joined_relative_days_remain_a_subjectless_temporal_query() -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲昨天的消息",
+        "阿渣昨天的消息",
         "@10001 昨天的消息",
     ),
 )
 def test_strong_member_reference_wins_over_common_word_alias(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="消息"),
     )
 
@@ -1135,15 +1135,15 @@ def test_strong_member_reference_wins_over_common_word_alias(query: str) -> None
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲和小丁丁昨天说了什么？",
-        "@小甲和@小丁丁昨天说了什么？",
+        "阿渣和加菲猫昨天说了什么？",
+        "@阿渣和@加菲猫昨天说了什么？",
     ),
 )
 def test_joined_excluded_alias_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1161,16 +1161,16 @@ def test_joined_excluded_alias_fails_closed(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲再加上陌生猫昨天都说了什么？",
-        "小甲并且陌生猫昨天都说了什么？",
+        "阿渣再加上陌生猫昨天都说了什么？",
+        "阿渣并且陌生猫昨天都说了什么？",
         "10001并且99999昨天都说了什么？",
     ),
 )
 def test_additional_joiner_with_unknown_member_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1187,15 +1187,15 @@ def test_additional_joiner_with_unknown_member_fails_closed(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲外加陌生猫昨天都说了什么？",
+        "阿渣外加陌生猫昨天都说了什么？",
         "10001外加99999昨天都说了什么？",
     ),
 )
 def test_unenumerated_join_phrase_with_unknown_member_fails_closed(query: str) -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = resolver.resolve(
@@ -1212,20 +1212,20 @@ def test_unenumerated_join_phrase_with_unknown_member_fails_closed(query: str) -
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲外加陌生猫发生了什么？",
-        "小甲外加陌生猫怎么了？",
-        "说说小甲外加陌生猫昨天的事",
-        "@10001 小甲和小丁丁昨天都说了什么？",
-        "QQ号10001 小甲小丁丁昨天都说了什么？",
-        "@10001 小甲外加陌生猫昨天都说了什么？",
+        "阿渣外加陌生猫发生了什么？",
+        "阿渣外加陌生猫怎么了？",
+        "说说阿渣外加陌生猫昨天的事",
+        "@10001 阿渣和加菲猫昨天都说了什么？",
+        "QQ号10001 阿渣加菲猫昨天都说了什么？",
+        "@10001 阿渣外加陌生猫昨天都说了什么？",
     ),
 )
 def test_unknown_conjunction_shape_fails_closed_without_predicate_enumeration(
     query: str,
 ) -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = MemoryQueryResolver().resolve(
@@ -1241,9 +1241,9 @@ def test_unknown_conjunction_shape_fails_closed_without_predicate_enumeration(
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲2026-07-21说了什么？",
-        "小甲7月21日说了什么？",
-        "小甲上周说了什么？",
+        "阿渣2026-07-21说了什么？",
+        "阿渣7月21日说了什么？",
+        "阿渣上周说了什么？",
     ),
 )
 def test_strong_member_alias_allows_trailing_explicit_date(query: str) -> None:
@@ -1251,7 +1251,7 @@ def test_strong_member_alias_allows_trailing_explicit_date(query: str) -> None:
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.speaker_ids == ("10001",)
@@ -1261,14 +1261,14 @@ def test_strong_member_alias_allows_trailing_explicit_date(query: str) -> None:
 
 def test_same_member_nickname_and_card_in_query_are_one_identity() -> None:
     result = MemoryQueryResolver().resolve(
-        "小甲（Member-A）昨天说了什么？",
+        "阿渣（A-Zha）昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=(
             GroupMemberIdentity(
                 user_id=10001,
-                nickname="小甲",
-                group_card="Member-A",
+                nickname="阿渣",
+                group_card="A-Zha",
             ),
         ),
     )
@@ -1280,18 +1280,18 @@ def test_same_member_nickname_and_card_in_query_are_one_identity() -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲昨天外加陌生猫都说了什么？",
-        "小甲昨天外加小丁丁都说了什么？",
-        "小甲2026-07-21外加陌生猫都说了什么？",
-        "@10001 小甲昨天外加陌生猫都说了什么？",
-        "小甲也和陌生猫昨天都说了什么？",
-        "小甲为什么和陌生猫昨天都说了什么？",
+        "阿渣昨天外加陌生猫都说了什么？",
+        "阿渣昨天外加加菲猫都说了什么？",
+        "阿渣2026-07-21外加陌生猫都说了什么？",
+        "@10001 阿渣昨天外加陌生猫都说了什么？",
+        "阿渣也和陌生猫昨天都说了什么？",
+        "阿渣为什么和陌生猫昨天都说了什么？",
     ),
 )
 def test_safe_prefix_is_consumed_before_checking_for_second_member(query: str) -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = MemoryQueryResolver().resolve(
@@ -1304,13 +1304,13 @@ def test_safe_prefix_is_consumed_before_checking_for_second_member(query: str) -
     assert result.subject_ids == ()
 
 
-@pytest.mark.parametrize("query", ("小甲7/21说了什么？", "小甲7-21说了什么？"))
+@pytest.mark.parametrize("query", ("阿渣7/21说了什么？", "阿渣7-21说了什么？"))
 def test_strong_member_alias_allows_short_trailing_date(query: str) -> None:
     result = MemoryQueryResolver().resolve(
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ("10001",)
@@ -1320,14 +1320,14 @@ def test_strong_member_alias_allows_short_trailing_date(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "请问小甲昨天的劲爆发言",
-        "关于小甲昨天的劲爆发言",
-        "帮我看看小甲昨天的劲爆发言",
+        "请问阿渣昨天的劲爆发言",
+        "关于阿渣昨天的劲爆发言",
+        "帮我看看阿渣昨天的劲爆发言",
     ),
 )
 def test_polite_intro_keeps_prefix_alias_strong(query: str) -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="发言"),
     )
 
@@ -1344,16 +1344,16 @@ def test_polite_intro_keeps_prefix_alias_strong(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲的朋友小丁丁昨天说了什么？",
-        "小甲说小丁丁昨天做了什么？",
-        "我想问小甲外加陌生猫昨天都说了什么？",
-        "能不能说说小甲外加陌生猫昨天的事",
+        "阿渣的朋友加菲猫昨天说了什么？",
+        "阿渣说加菲猫昨天做了什么？",
+        "我想问阿渣外加陌生猫昨天都说了什么？",
+        "能不能说说阿渣外加陌生猫昨天的事",
     ),
 )
 def test_complete_second_alias_or_unknown_suffix_fails_closed(query: str) -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
     )
 
     result = MemoryQueryResolver().resolve(
@@ -1369,9 +1369,9 @@ def test_complete_second_alias_or_unknown_suffix_fails_closed(query: str) -> Non
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲刚刚说了什么？",
-        "小甲之前说了什么？",
-        "小甲曾说过什么？",
+        "阿渣刚刚说了什么？",
+        "阿渣之前说了什么？",
+        "阿渣曾说过什么？",
     ),
 )
 def test_common_single_member_time_adverbs_remain_bound(query: str) -> None:
@@ -1379,7 +1379,7 @@ def test_common_single_member_time_adverbs_remain_bound(query: str) -> None:
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ("10001",)
@@ -1388,10 +1388,10 @@ def test_common_single_member_time_adverbs_remain_bound(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲的朋友陌生猫昨天说了什么？",
-        "小甲说陌生猫昨天做了什么？",
-        "小甲提到陌生猫昨天的事",
-        "我想问小甲的朋友陌生猫昨天说了什么？",
+        "阿渣的朋友陌生猫昨天说了什么？",
+        "阿渣说陌生猫昨天做了什么？",
+        "阿渣提到陌生猫昨天的事",
+        "我想问阿渣的朋友陌生猫昨天说了什么？",
     ),
 )
 def test_unknown_relation_or_quote_target_fails_closed(query: str) -> None:
@@ -1400,8 +1400,8 @@ def test_unknown_relation_or_quote_target_fails_closed(query: str) -> None:
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=10001, nickname="小甲"),
-            GroupMemberIdentity(user_id=10002, nickname="小丁丁"),
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=10002, nickname="加菲猫"),
         ),
     )
 
@@ -1411,10 +1411,10 @@ def test_unknown_relation_or_quote_target_fails_closed(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲在群里说了什么？",
-        "小甲最近在群里说了什么？",
-        "小甲刚才说了什么？",
-        "小甲上次说了什么？",
+        "阿渣在群里说了什么？",
+        "阿渣最近在群里说了什么？",
+        "阿渣刚才说了什么？",
+        "阿渣上次说了什么？",
     ),
 )
 def test_common_group_preposition_and_time_adverb_remain_bound(query: str) -> None:
@@ -1422,7 +1422,7 @@ def test_common_group_preposition_and_time_adverb_remain_bound(query: str) -> No
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ("10001",)
@@ -1431,8 +1431,8 @@ def test_common_group_preposition_and_time_adverb_remain_bound(query: str) -> No
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲的室友陌生猫昨天说了什么？",
-        "小甲的好友陌生猫昨天说了什么？",
+        "阿渣的室友陌生猫昨天说了什么？",
+        "阿渣的好友陌生猫昨天说了什么？",
     ),
 )
 def test_unenumerated_relation_target_fails_closed(query: str) -> None:
@@ -1440,7 +1440,7 @@ def test_unenumerated_relation_target_fails_closed(query: str) -> None:
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ()
@@ -1449,9 +1449,9 @@ def test_unenumerated_relation_target_fails_closed(query: str) -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲说动画昨天上映了吗？",
-        "小甲提到项目昨天上线了吗？",
-        "小甲聊到游戏昨天更新了吗？",
+        "阿渣说动画昨天上映了吗？",
+        "阿渣提到项目昨天上线了吗？",
+        "阿渣聊到游戏昨天更新了吗？",
     ),
 )
 def test_quote_verb_with_known_topic_remains_single_member(query: str) -> None:
@@ -1459,7 +1459,7 @@ def test_quote_verb_with_known_topic_remains_single_member(query: str) -> None:
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ("10001",)
@@ -1467,12 +1467,12 @@ def test_quote_verb_with_known_topic_remains_single_member(query: str) -> None:
 
 def test_cross_group_alias_is_detected_but_never_bound() -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
         GroupMemberIdentity(user_id=20001, nickname="动画", in_scope=False),
     )
 
     relation = MemoryQueryResolver().resolve(
-        "小甲的室友动画昨天说了什么？",
+        "阿渣的室友动画昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -1558,11 +1558,11 @@ def test_polite_prefix_cannot_bypass_cross_group_superstring_shadow(query: str) 
 
 def test_shadow_check_covers_every_matching_alias_of_resolved_member() -> None:
     result = MemoryQueryResolver().resolve(
-        "我想问王小明Member-A昨天说了什么？",
+        "我想问王小明A-Zha昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=10001, nickname="小明", group_card="Member-A"),
+            GroupMemberIdentity(user_id=10001, nickname="小明", group_card="A-Zha"),
             GroupMemberIdentity(user_id=20001, nickname="王小明", in_scope=False),
         ),
     )
@@ -1573,8 +1573,8 @@ def test_shadow_check_covers_every_matching_alias_of_resolved_member() -> None:
 @pytest.mark.parametrize(
     "query",
     (
-        "我想问小丁丁，小甲昨天说了什么？",
-        "能不能说说小丁丁小甲昨天的事",
+        "我想问加菲猫，阿渣昨天说了什么？",
+        "能不能说说加菲猫阿渣昨天的事",
     ),
 )
 def test_non_overlapping_restricted_alias_before_target_fails_closed(query: str) -> None:
@@ -1583,8 +1583,8 @@ def test_non_overlapping_restricted_alias_before_target_fails_closed(query: str)
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=10001, nickname="小甲"),
-            GroupMemberIdentity(user_id=20001, nickname="小丁丁", in_scope=False),
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+            GroupMemberIdentity(user_id=20001, nickname="加菲猫", in_scope=False),
         ),
     )
 
@@ -1637,9 +1637,9 @@ def test_text_mention_exact_target_alias_wins_over_same_named_external_alias() -
 @pytest.mark.parametrize(
     "query",
     (
-        "小甲的室友消息昨天说了什么？",
-        "小甲的好友服务昨天说了什么？",
-        "小甲的老师大家昨天说了什么？",
+        "阿渣的室友消息昨天说了什么？",
+        "阿渣的好友服务昨天说了什么？",
+        "阿渣的老师大家昨天说了什么？",
     ),
 )
 def test_possessive_relation_rejects_common_or_topic_words(query: str) -> None:
@@ -1647,7 +1647,7 @@ def test_possessive_relation_rejects_common_or_topic_words(query: str) -> None:
         query,
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ()
@@ -1655,10 +1655,10 @@ def test_possessive_relation_rejects_common_or_topic_words(query: str) -> None:
 
 def test_long_possessive_relation_target_fails_closed() -> None:
     result = MemoryQueryResolver().resolve(
-        "小甲的室友这是一个超过旧长度限制的陌生人物名字昨天说了什么？",
+        "阿渣的室友这是一个超过旧长度限制的陌生人物名字昨天说了什么？",
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ()
@@ -1666,11 +1666,11 @@ def test_long_possessive_relation_target_fails_closed() -> None:
 
 def test_cross_group_common_word_alias_overrides_topic_word_exception() -> None:
     result = MemoryQueryResolver().resolve(
-        "小甲说消息昨天发了什么？",
+        "阿渣说消息昨天发了什么？",
         recent_messages=(),
         now=NOW,
         group_members=(
-            GroupMemberIdentity(user_id=10001, nickname="小甲"),
+            GroupMemberIdentity(user_id=10001, nickname="阿渣"),
             GroupMemberIdentity(user_id=20001, nickname="消息", in_scope=False),
         ),
     )
@@ -1680,13 +1680,13 @@ def test_cross_group_common_word_alias_overrides_topic_word_exception() -> None:
 
 def test_text_mention_binds_target_when_same_qq_also_has_external_snapshots() -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲", in_scope=True),
-        GroupMemberIdentity(user_id=10001, nickname="小甲", in_scope=False),
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", in_scope=False),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", in_scope=True),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", in_scope=False),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", in_scope=False),
     )
 
     result = MemoryQueryResolver().resolve(
-        "@小甲 昨天说了什么？",
+        "@阿渣 昨天说了什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -1699,25 +1699,25 @@ def test_text_mention_binds_target_when_same_qq_also_has_external_snapshots() ->
     ("query", "members", "expected_subject"),
     (
         (
-            "小丁丁最喜欢什么动画？",
+            "加菲猫最喜欢什么动画？",
             (
-                GroupMemberIdentity(user_id=10001, nickname="小丁丁"),
+                GroupMemberIdentity(user_id=10001, nickname="加菲猫"),
                 GroupMemberIdentity(user_id=10002, nickname="动画"),
             ),
             ("10001",),
         ),
         (
-            "@10001 小丁丁最喜欢什么动画？",
+            "@10001 加菲猫最喜欢什么动画？",
             (
-                GroupMemberIdentity(user_id=10001, nickname="小丁丁"),
+                GroupMemberIdentity(user_id=10001, nickname="加菲猫"),
                 GroupMemberIdentity(user_id=10002, nickname="动画"),
             ),
             ("10001",),
         ),
         (
-            "小甲昨天的劲爆发言",
+            "阿渣昨天的劲爆发言",
             (
-                GroupMemberIdentity(user_id=10001, nickname="小甲"),
+                GroupMemberIdentity(user_id=10001, nickname="阿渣"),
                 GroupMemberIdentity(user_id=10002, nickname="发言"),
             ),
             ("10001",),
@@ -1785,18 +1785,18 @@ def test_excluded_bot_text_mention_does_not_bind_a_person() -> None:
 def test_direct_nickname_question_fails_closed_for_duplicate_aliases() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "小甲最喜欢什么动画？",
+        "阿渣最喜欢什么动画？",
         recent_messages=(),
         now=NOW,
         group_members=members,
     )
 
-    assert result.retrieval_query == "小甲最喜欢什么动画？"
+    assert result.retrieval_query == "阿渣最喜欢什么动画？"
     assert result.entities == ()
     assert result.speaker_ids == ()
     assert result.subject_ids == ()
@@ -1805,12 +1805,12 @@ def test_direct_nickname_question_fails_closed_for_duplicate_aliases() -> None:
 def test_direct_multi_member_question_fails_closed_for_fact_subjects() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲"),
-        GroupMemberIdentity(user_id=10002, group_card="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣"),
+        GroupMemberIdentity(user_id=10002, group_card="加菲猫"),
     )
 
     result = resolver.resolve(
-        "小甲和小丁丁最喜欢什么动画？",
+        "阿渣和加菲猫最喜欢什么动画？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -1823,7 +1823,7 @@ def test_direct_multi_member_question_fails_closed_for_fact_subjects() -> None:
 
 def test_unknown_person_memory_query_fails_closed_but_topic_query_remains_unbound() -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10001, nickname="小甲"),)
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
 
     ordinary = resolver.resolve(
         "动画有什么推荐？",
@@ -1932,7 +1932,7 @@ def test_general_history_markers_never_degrade_to_recent(query: str) -> None:
 
 def test_first_person_history_binds_requester_and_unknown_speaker_fails_closed() -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10001, nickname="小甲"),)
+    members = (GroupMemberIdentity(user_id=10001, nickname="阿渣"),)
 
     requester = resolver.resolve(
         "我以前说过什么劲爆话题",
@@ -2012,7 +2012,7 @@ def test_first_person_verb_infix_without_requester_stays_unbound() -> None:
         "我喜欢看什么动画？",
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids is None
@@ -2023,7 +2023,7 @@ def test_unknown_person_verb_infix_memory_query_fails_closed() -> None:
         "陌生猫喜欢看什么动画？",
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ()
@@ -2031,10 +2031,10 @@ def test_unknown_person_verb_infix_memory_query_fails_closed() -> None:
 
 def test_member_verb_infix_memory_query_binds_member() -> None:
     result = MemoryQueryResolver().resolve(
-        "小甲喜欢看什么动画？",
+        "阿渣喜欢看什么动画？",
         recent_messages=(),
         now=NOW,
-        group_members=(GroupMemberIdentity(user_id=10001, nickname="小甲"),),
+        group_members=(GroupMemberIdentity(user_id=10001, nickname="阿渣"),),
     )
 
     assert result.subject_ids == ("10001",)
@@ -2044,12 +2044,12 @@ def test_member_verb_infix_memory_query_binds_member() -> None:
 
 def test_english_media_title_with_short_latin_member_aliases_stays_single_subject() -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="", group_card="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="", group_card="加菲猫"),
         GroupMemberIdentity(user_id=10002, nickname="", group_card="To"),
         GroupMemberIdentity(user_id=10003, nickname="", group_card="V"),
     )
     result = MemoryQueryResolver().resolve(
-        "小丁丁喜欢ToLove吗？",
+        "加菲猫喜欢ToLove吗？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2062,11 +2062,11 @@ def test_english_media_title_with_short_latin_member_aliases_stays_single_subjec
 
 def test_standalone_latin_member_alias_still_marks_second_person() -> None:
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="", group_card="小丁丁"),
+        GroupMemberIdentity(user_id=10001, nickname="", group_card="加菲猫"),
         GroupMemberIdentity(user_id=10002, nickname="", group_card="To"),
     )
     result = MemoryQueryResolver().resolve(
-        "小丁丁和To喜欢什么动画？",
+        "加菲猫和To喜欢什么动画？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2358,10 +2358,10 @@ def test_query_plan_binds_requester_and_keeps_group_and_typed_modes() -> None:
 
 def test_named_assessment_without_time_range_uses_relevance() -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="小丁丁"),)
+    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="加菲猫"),)
 
     result = resolver.resolve(
-        "评价小丁丁的性格",
+        "评价加菲猫的性格",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2379,10 +2379,10 @@ def test_named_assessment_without_time_range_uses_relevance() -> None:
 
 def test_named_assessment_with_time_range_keeps_time_bucket_coverage() -> None:
     resolver = MemoryQueryResolver()
-    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="小丁丁"),)
+    members = (GroupMemberIdentity(user_id=10002, nickname="Garfield", group_card="加菲猫"),)
 
     result = resolver.resolve(
-        "评价小丁丁昨天的表现",
+        "评价加菲猫昨天的表现",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2536,15 +2536,15 @@ def test_invalid_or_conflicting_scope_identity_is_rejected() -> None:
 def test_opinion_phrasing_binds_member_deterministically() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=200000002, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=200000002, nickname="A-Zha", group_card="阿渣"),
     )
     for query_text in (
-        "小甲觉得八仙怎么样？",
-        "小甲感觉八仙如何？",
-        "小甲认为八仙咋样？",
-        "小甲怎么看八仙？",
-        "小甲对八仙什么看法？",
-        "小甲对八仙的印象如何？",
+        "阿渣觉得八仙怎么样？",
+        "阿渣感觉八仙如何？",
+        "阿渣认为八仙咋样？",
+        "阿渣怎么看八仙？",
+        "阿渣对八仙什么看法？",
+        "阿渣对八仙的印象如何？",
     ):
         result = resolver.resolve(
             query_text,
@@ -2560,22 +2560,22 @@ def test_opinion_phrasing_binds_member_deterministically() -> None:
 def test_current_plan_decision_relationship_phrasings_bind_member() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=200000002, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=200000002, nickname="A-Zha", group_card="阿渣"),
     )
     for query_text in (
-        "小甲最近在做什么？",
-        "小甲在干嘛？",
-        "小甲决定了什么？",
-        "小甲打算做什么？",
-        "小甲的计划是什么？",
-        "小甲和谁是什么关系？",
-        "小甲是什么样的人？",
-        "小甲是哪里人？",
-        "小甲是做什么的？",
-        "小甲支持哪个足球队？",
-        "小甲支持哪支球队？",
-        "小甲是哪个足球队粉丝？",
-        "小甲看好哪支球队？",
+        "阿渣最近在做什么？",
+        "阿渣在干嘛？",
+        "阿渣决定了什么？",
+        "阿渣打算做什么？",
+        "阿渣的计划是什么？",
+        "阿渣和谁是什么关系？",
+        "阿渣是什么样的人？",
+        "阿渣是哪里人？",
+        "阿渣是做什么的？",
+        "阿渣支持哪个足球队？",
+        "阿渣支持哪支球队？",
+        "阿渣是哪个足球队粉丝？",
+        "阿渣看好哪支球队？",
     ):
         result = resolver.resolve(
             query_text,
@@ -2589,12 +2589,12 @@ def test_current_plan_decision_relationship_phrasings_bind_member() -> None:
 def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
         GroupMemberIdentity(user_id=10002, nickname="张三", group_card=""),
     )
 
     multi = resolver.resolve(
-        "小甲和张三聊过什么？",
+        "阿渣和张三聊过什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2602,7 +2602,7 @@ def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> N
     assert multi.subject_ids == ()
 
     with_other = resolver.resolve(
-        "小甲和别人谁更厉害？",
+        "阿渣和别人谁更厉害？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2610,7 +2610,7 @@ def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> N
     assert with_other.subject_ids == ()
 
     relation_placeholder = resolver.resolve(
-        "小甲和谁是什么关系？",
+        "阿渣和谁是什么关系？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2618,7 +2618,7 @@ def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> N
     assert relation_placeholder.subject_ids == ("10001",)
 
     classmate = resolver.resolve(
-        "小甲的同学说过什么？",
+        "阿渣的同学说过什么？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2626,7 +2626,7 @@ def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> N
     assert classmate.subject_ids == ()
 
     same_name_topic = resolver.resolve(
-        "小甲这部动画怎么样？",
+        "阿渣这部动画怎么样？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2636,15 +2636,15 @@ def test_default_allow_binding_and_evidence_based_multi_subject_rejection() -> N
 
 def test_two_member_assessment_can_resolve_via_rewrite() -> None:
     def rewrite(_query, _recent, _timeout) -> str:
-        return '{"resolved_query":"小丁丁 评价","speaker_ids":["10001"]}'
+        return '{"resolved_query":"加菲猫 评价","speaker_ids":["10001"]}'
 
     resolver = MemoryQueryResolver(rewrite_provider=rewrite)
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="小甲", group_card=""),
-        GroupMemberIdentity(user_id=10002, nickname="小丁丁", group_card=""),
+        GroupMemberIdentity(user_id=10001, nickname="阿渣", group_card=""),
+        GroupMemberIdentity(user_id=10002, nickname="加菲猫", group_card=""),
     )
     result = resolver.resolve(
-        "小甲评价小丁丁怎么样？",
+        "阿渣评价加菲猫怎么样？",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2655,34 +2655,34 @@ def test_two_member_assessment_can_resolve_via_rewrite() -> None:
 
 def test_rewrite_fallback_normalizes_unbound_opinion_query() -> None:
     def rewrite(_query, _recent, _timeout) -> str:
-        return '{"resolved_query":"八仙 评价 小甲"}'
+        return '{"resolved_query":"八仙 评价 阿渣"}'
 
     resolver = MemoryQueryResolver(rewrite_provider=rewrite)
     result = resolver.resolve(
-        "小甲觉得八仙怎么样？",
+        "阿渣觉得八仙怎么样？",
         recent_messages=(),
         now=NOW,
     )
     assert result.rewrite_used is True
-    assert result.retrieval_query == "八仙 评价 小甲"
+    assert result.retrieval_query == "八仙 评价 阿渣"
     assert result.subject_ids is None
 
 
 def test_rewrite_subject_must_be_group_member_and_mentioned() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
     base = ResolvedMemoryQuery(
-        original_query="小甲觉得八仙怎么样？",
-        retrieval_query="八仙 评价 小甲",
+        original_query="阿渣觉得八仙怎么样？",
+        retrieval_query="八仙 评价 阿渣",
         speaker_ids=("10001",),
         subject_ids=("10001",),
     )
     kept = resolver._constrain_rewritten_subject(
         base,
         group_members=members,
-        original="小甲觉得八仙怎么样？",
+        original="阿渣觉得八仙怎么样？",
         recent=(),
     )
     assert kept is not None
@@ -2693,7 +2693,7 @@ def test_rewrite_subject_must_be_group_member_and_mentioned() -> None:
         resolver._constrain_rewritten_subject(
             unknown,
             group_members=members,
-            original="小甲觉得八仙怎么样？",
+            original="阿渣觉得八仙怎么样？",
             recent=(),
         )
         is None
@@ -2713,7 +2713,7 @@ def test_rewrite_subject_must_be_group_member_and_mentioned() -> None:
     recent = (
         Recent(
             "1",
-            "小甲",
+            "阿渣",
             "我喜欢八仙",
             datetime(2026, 7, 22, 23, 50),
             user_id=10001,
@@ -2770,7 +2770,7 @@ def test_ownership_question_binds_requester_and_uses_fact_intent() -> None:
     resolver = MemoryQueryResolver()
 
     result = resolver.resolve(
-        "我和小乙乙两个人到底谁是你的主人",
+        "我和逆蝶蝶两个人到底谁是你的主人",
         recent_messages=(),
         now=NOW,
         requester_id=10001,
@@ -2784,11 +2784,11 @@ def test_ownership_question_binds_requester_and_uses_fact_intent() -> None:
 def test_ownership_question_with_member_alias_still_binds_requester() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=20001, nickname="N-Zha", group_card="小乙乙"),
+        GroupMemberIdentity(user_id=20001, nickname="N-Zha", group_card="逆蝶蝶"),
     )
 
     result = resolver.resolve(
-        "我和小乙乙两个人到底谁是你的主人",
+        "我和逆蝶蝶两个人到底谁是你的主人",
         recent_messages=(),
         now=NOW,
         requester_id=10001,
@@ -2803,11 +2803,11 @@ def test_ownership_question_with_member_alias_still_binds_requester() -> None:
 def test_member_profile_portrait_is_current_fact_intent() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "给出小甲的完整个人画像",
+        "给出阿渣的完整个人画像",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2847,11 +2847,11 @@ def test_current_viewing_question_variants_bind_requester_without_whitelist(
 def test_member_current_viewing_question_is_deterministic_without_rewrite() -> None:
     resolver = MemoryQueryResolver()
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "小甲最近在看什么动画",
+        "阿渣最近在看什么动画",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2897,7 +2897,7 @@ def test_semantic_rewrite_keeps_member_subject_for_member_question() -> None:
     resolver = MemoryQueryResolver(
         rewrite_provider=_rewrite_provider(
             {
-                "resolved_query": "小甲 最近在看 动画",
+                "resolved_query": "阿渣 最近在看 动画",
                 "answer_mode": "current_fact",
                 "subject_role": "member",
                 "speaker_ids": ["10001"],
@@ -2907,11 +2907,11 @@ def test_semantic_rewrite_keeps_member_subject_for_member_question() -> None:
         )
     )
     members = (
-        GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),
+        GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),
     )
 
     result = resolver.resolve(
-        "小甲最近在看什么动画",
+        "阿渣最近在看什么动画",
         recent_messages=(),
         now=NOW,
         group_members=members,
@@ -2978,7 +2978,7 @@ def test_mention_pattern_does_not_capture_at_plus_arbitrary_who() -> None:
     resolver = MemoryQueryResolver()
 
     result = resolver.resolve(
-        "@小町 锐评下群里阿玙和小甲谁对群更有贡献",
+        "@小町 锐评下群里阿玙和阿渣谁对群更有贡献",
         recent_messages=(),
         now=NOW,
         requester_id=10001,
@@ -3160,13 +3160,13 @@ def test_dated_member_question_skips_semantic_rewrite() -> None:
 
     def rewrite(query, recent, timeout_seconds):
         calls["count"] += 1
-        return '{"resolved_query":"昨天 小甲 说了什么"}'
+        return '{"resolved_query":"昨天 阿渣 说了什么"}'
 
     resolver = MemoryQueryResolver(rewrite_provider=rewrite, rewrite_timeout_seconds=0.25)
-    members = (GroupMemberIdentity(user_id=10001, nickname="Member-A", group_card="小甲"),)
+    members = (GroupMemberIdentity(user_id=10001, nickname="A-Zha", group_card="阿渣"),)
 
     result = resolver.resolve(
-        "小甲昨天说了什么",
+        "阿渣昨天说了什么",
         recent_messages=(),
         now=NOW,
         group_members=members,

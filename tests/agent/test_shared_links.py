@@ -128,7 +128,7 @@ def test_group_quote_outside_recent_window_and_cross_group_rejection(sqlite_engi
     from app.agent.contracts import AgentBatch
     router, incoming, _ = make_router(sqlite_engine, tmp_path)
     source = seed(sqlite_engine, message_id='old-share', raw_json={'message': [card()]})
-    for index in range(25):
+    for index in range(31):
         seed(sqlite_engine, message_id=f'recent-{index}')
     with session_scope(sqlite_engine) as session:
         session.get(Message, source).timestamp = incoming.timestamp - timedelta(days=1)
@@ -141,7 +141,7 @@ def test_group_quote_outside_recent_window_and_cross_group_rejection(sqlite_engi
             {'type': 'text', 'data': {'text': '看看这张分享'}}]}
     observation = GroupObservationService(router).build_agent_observation(AgentBatch(GROUP, (incoming,), 'quote-turn'))
     assert source in observation['source_message_ids']
-    assert len(observation['source_message_ids']) == 25
+    assert len(observation['source_message_ids']) == 31
     foreign = seed(sqlite_engine, group_id=GROUP + 1, message_id='foreign-share', raw_json={'message': [card()]})
     with session_scope(sqlite_engine) as session:
         session.query(Message).filter_by(platform_msg_id=incoming.platform_msg_id).one().reply_to_msg_id = 'foreign-share'

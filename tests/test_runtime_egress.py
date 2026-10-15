@@ -13,12 +13,12 @@ SPEC.loader.exec_module(egress)
     ("", False),
     ("XIAOMACHI_HTTP_PROXY=\nXIAOMACHI_HTTPS_PROXY=\n", False),
     ('XIAOMACHI_HTTP_PROXY=""\nDOCKER_HTTP_PROXY=\n', False),
-    ("XIAOMACHI_HTTPS_PROXY=http://127.0.0.1:7897\n", True),
-    ("DOCKER_HTTP_PROXY=http://localhost:7897\n", True),
-    ("XIAOMACHI_HTTP_PROXY=http://other.invalid:7897\n", False),
+    ("XIAOMACHI_HTTPS_PROXY=http://127.0.0.1:18797\n", True),
+    ("DOCKER_HTTP_PROXY=http://localhost:18797\n", True),
+    ("XIAOMACHI_HTTP_PROXY=http://other.invalid:18797\n", False),
     ("XIAOMACHI_HTTP_PROXY=http://localhost:7898\n", False),
     ("XIAOMACHI_HTTP_PROXY=http://localhost:invalid\n", False),
-    ("XIAOMACHI_HTTP_PROXY=http://other.invalid:7897\nDOCKER_HTTP_PROXY=http://localhost:7897\n", False),
+    ("XIAOMACHI_HTTP_PROXY=http://other.invalid:18797\nDOCKER_HTTP_PROXY=http://localhost:18797\n", False),
 ])
 def test_service_is_enabled_only_when_effective_providers_use_it(content, expected):
     assert egress.uses_mihomo(content) is expected

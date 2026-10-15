@@ -86,9 +86,59 @@ class Sender:
             },
         )
 
-    async def send_group_media(self, *, group_id: int, text: str, image_files: tuple[str, ...]) -> tuple[str, ...]:
+    async def send_private_media(self, *, user_id: int, text: str, image_files: tuple[str, ...]) -> tuple[str, ...]:
+        """A single acknowledged caption/image message, without partial sends."""
+        if not 1 <= len(image_files) <= 2 or len(text) > 12000 or '[CQ:' in text:
+            raise ValueError('invalid private media message')
+        segments = [{'type': 'text', 'data': {'text': text}}] if text else []
+        segments.extend({'type': 'image', 'data': {'file': self._image_file_payload(name)}} for name in image_files)
+        receipt = await self._send_once(action='send_private_msg', params={'user_id': user_id, 'message': segments})
+        return (receipt,) if receipt is not None else ()
+
+    async def send_video(self, *, video_file: str, text: str = '', group_id=None, user_id=None) -> tuple[str, ...]:
+        from app.core.video_file import MAX_VIDEO_BYTES
+        if (group_id is None) == (user_id is None) or len(text) > 12000 or '[CQ:' in text:
+            raise ValueError('invalid video message')
+        path = Path(video_file)
+        if path.is_symlink() or not 0 < path.stat().st_size <= MAX_VIDEO_BYTES:
+            raise ValueError('video exceeds send budget')
+        with path.open('rb') as stream:
+            content = stream.read(MAX_VIDEO_BYTES + 1)
+        if not content or len(content) > MAX_VIDEO_BYTES:
+            raise ValueError('video exceeds send budget')
+        segments = [{'type': 'text', 'data': {'text': text}}] if text else []
+        segments.append({'type': 'video', 'data': {'file': 'base64://' + base64.b64encode(content).decode('ascii')}})
+        target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
+        receipt = await self._send_once(action='send_group_msg' if group_id is not None else 'send_private_msg',
+            params={**target, 'message': segments})
+        if receipt is None:
+            raise QQMessageDeliveryUncertainError('QQ video acknowledged without message receipt')
+        return (receipt,)
+
+    async def send_image_bundle(self, *, self_id: int, name: str, text: str, image_files: tuple[str, ...],
+                                group_id: int | None = None, user_id: int | None = None) -> tuple[str, ...]:
+        """Send one merged forward with real bot-authored nodes, one image each."""
+        if ((group_id is None) == (user_id is None) or not 1 <= len(image_files) <= 20
+                or len(text) > 12000 or '[CQ:' in text or type(self_id) is not int or self_id <= 0):
+            raise ValueError('invalid image bundle')
+        if sum(Path(path).stat().st_size for path in image_files) > 32 * 1024 * 1024:
+            raise ValueError('image bundle exceeds send budget')
+        nodes = []
+        for index, path in enumerate(image_files):
+            caption = (text + '\n' if index == 0 and text else '') + f'{index + 1}/{len(image_files)}'
+            content = [{'type': 'text', 'data': {'text': caption}},
+                {'type': 'image', 'data': {'file': self._image_file_payload(path)}}]
+            nodes.append({'type': 'node', 'data': {'uin': str(self_id), 'name': str(name)[:60], 'content': content}})
+        action = 'send_group_forward_msg' if group_id is not None else 'send_private_forward_msg'
+        target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
+        receipt = await self._send_once(action=action, params={**target, 'messages': nodes})
+        if receipt is None:
+            raise QQMessageDeliveryUncertainError('QQ forward acknowledged without message receipt')
+        return (receipt,)
+
+    async def send_group_media(self, *, group_id: int, text: str, image_files: tuple[str, ...], max_text_chars=300) -> tuple[str, ...]:
         """One caption/image message, one acknowledgement and one dispatch marker."""
-        if not 1 <= len(image_files) <= 2 or len(text) > 300 or "[CQ:" in text:
+        if max_text_chars not in {300, 12000} or not 1 <= len(image_files) <= 2 or len(text) > max_text_chars or "[CQ:" in text:
             raise ValueError("invalid group media message")
         segments = [{"type": "text", "data": {"text": text}}] if text else []
         for name in image_files:
@@ -153,7 +203,7 @@ class Sender:
         return response or {}
 
     async def _send_once(self, *, action: str, params: dict) -> str | None:
-        scope = current_group_dispatch(params["group_id"]) if action == "send_group_msg" else None
+        scope = current_group_dispatch(params["group_id"]) if action in {"send_group_msg", 'send_group_forward_msg'} else None
         if scope is not None:
             if not scope.can_send():
                 raise GroupDispatchRevokedError("Group Agent stopped before QQ dispatch")
@@ -194,7 +244,7 @@ class Sender:
         raise RuntimeError(f"{action} failed: status={status or 'unknown'} retcode={retcode} message={message}")
 
     def _is_delivery_uncertain_failure(self, error: Exception, *, action: str) -> bool:
-        if action not in {"send_group_msg", "send_private_msg"}:
+        if action not in {"send_group_msg", "send_private_msg", 'send_group_forward_msg', 'send_private_forward_msg'}:
             return False
         if isinstance(error, asyncio.TimeoutError):
             return True

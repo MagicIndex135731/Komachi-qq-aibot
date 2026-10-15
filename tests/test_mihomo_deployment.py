@@ -32,7 +32,7 @@ def test_rendered_profile_routes_nova_to_hong_kong_and_qq_direct() -> None:
     rendered = MODULE.render_config(source_config())
 
     assert rendered["mode"] == "rule"
-    assert rendered["mixed-port"] == 7897
+    assert rendered["mixed-port"] == 18797
     assert rendered["bind-address"] == "127.0.0.1"
     assert rendered["allow-lan"] is False
     assert rendered["tun"]["enable"] is False
@@ -83,7 +83,7 @@ def test_mihomo_service_is_local_only_and_precedes_stack() -> None:
 
     assert "Before=xiaomachi-stack.service" in unit
     assert "ExecStartPost=" in unit
-    assert "/dev/tcp/127.0.0.1/7897" in unit
+    assert "/dev/tcp/127.0.0.1/18797" in unit
     assert "Restart=on-failure" in unit
     assert "ProtectSystem=strict" in unit
     assert "MIHOMO_SHA256=" in installer

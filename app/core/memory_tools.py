@@ -12,6 +12,7 @@ MEMORY_TOOL_LAYERS = frozenset({"raw", "facts", "summaries", "all"})
 MEMORY_TOOL_CONTENT_LIMIT = 400
 MEMORY_TOOL_LIMIT_MIN = 1
 MEMORY_TOOL_LIMIT_MAX = 20
+DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS = 60.0
 
 
 def memory_tool_schemas() -> list[dict[str, Any]]:

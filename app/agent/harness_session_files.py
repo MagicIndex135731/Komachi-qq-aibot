@@ -54,3 +54,24 @@ def native_session_size(paths: Iterable[Path]) -> int:
         except FileNotFoundError:
             continue
     return size
+
+
+def snapshot_native_session(home, session_id):
+    return {str(path): (native_file_path(path).read_bytes()
+            if native_file_path(path).stat().st_size <= 16 * 1024 * 1024 else None)
+            for path in native_session_logs(home, session_id)}
+
+
+def discard_silent_native_turn(home, session_id, previous):
+    """Only after the SDK has stopped, and only its exact append-only suffix."""
+    root = native_file_path(home).resolve()
+    for path in native_session_logs(home, session_id):
+        target = native_file_path(path)
+        if not target.resolve().is_relative_to(root):
+            raise ValueError('native session escaped its home')
+        before = previous.get(str(path))
+        if str(path) not in previous:
+            target.unlink()
+        elif before is not None and target.read_bytes().startswith(before):
+            with target.open('r+b') as stream:
+                stream.truncate(len(before))

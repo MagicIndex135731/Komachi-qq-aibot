@@ -39,6 +39,17 @@ GROUP, OTHER_GROUP, ACCOUNT, AUTHOR, OTHER_AUTHOR = 900000001, 900000002, 900000
 NOW = datetime(2026, 10, 10, 10, tzinfo=UTC)
 
 
+@pytest.mark.asyncio
+async def test_memory_search_reports_effective_result_limit(context):
+    result=await call_agent_memory_tool(context, 'memory_search', {'query':'星星','layer':'raw','limit':20})
+    assert result.status=='ok'
+    assert result.data['requested_limit']==20 and result.data['result_limit']==5
+    assert result.data['limit_capped'] is True
+    tools=build_service_tools(context)
+    schema=next(t.parameters for t in tools if t.name=='memory_search')
+    assert schema['properties']['limit']['maximum']==5
+
+
 class Guard:
     allowed = True
     def valid(self):
@@ -126,6 +137,48 @@ async def test_initial_recall_uses_existing_v3_pipeline_and_registers_historical
     assert context.router.synthetic_source_id in context.observed_sources
     assert outcome.data["mode"] == "v2"
     assert counts(context) == before
+
+
+@pytest.mark.parametrize("mode", ["preload", "search"])
+async def test_default_deadline_returns_complete_evidence_after_old_two_second_limit(context, mode):
+    context.router.runtime.settings.memory_memory_tool_timeout_seconds = (
+        AppSettings.model_fields["memory_memory_tool_timeout_seconds"].default
+    )
+    original = context.router.memory_orchestrator.build_context
+
+    def slow_read(request):
+        # A successful full pipeline used to be discarded by the 2s deadline.
+        Event().wait(2.1)
+        return original(request)
+
+    context.router.memory_orchestrator.build_context = slow_read
+    before = counts(context)
+    if mode == "preload":
+        outcome = await build_agent_memory(context, addressed=True)
+    else:
+        outcome = await call_agent_memory_tool(context, "memory_search",
+            {"query": "以前星星", "layer": "raw", "member": "synthetic author"})
+    assert outcome.status == "ok"
+    assert "historical-star" in outcome.data["source_message_ids"]
+    assert "我以前喜欢星星" in outcome.data["evidence"]
+    assert context.router.synthetic_source_id in context.observed_sources
+    assert counts(context) == before
+
+
+async def test_deadline_includes_final_revalidation_before_admitting_sources(context, monkeypatch):
+    packet = memory_integration._read(context, query=None, addressed=True)
+    monkeypatch.setattr(memory_integration, "_read", lambda *_args, **_kwargs: packet)
+
+    def slow_validation(*_args, **_kwargs):
+        Event().wait(0.12)
+        return True
+
+    monkeypatch.setattr(memory_integration, "memory_dependencies_valid", slow_validation)
+    context.router.runtime.settings.memory_memory_tool_timeout_seconds = 0.1
+    before = set(context.observed_sources)
+    outcome = await build_agent_memory(context, addressed=True)
+    assert outcome.status == "failed" and outcome.data["error"] == "tool_timeout"
+    assert context.observed_sources == before
 
 
 def _install_recent_packet(context, monkeypatch, *, max_recent_messages=60):
@@ -339,14 +392,18 @@ async def test_cancelled_and_timed_out_retrieval_never_admits_late_evidence(cont
     assert context.observed_sources == before
 
 
-async def test_conversation_quote_keeps_tools_out_of_registry(context):
+async def test_conversation_quote_keeps_definitions_but_blocks_memory_execution(context):
     with session_scope(context.router.engine) as session:
         row = MessageRepository(session).get_by_platform_msg_id("target-query")
         row.plain_text, row.reply_to_msg_id = "继续聊吧", "historical-star"
     outcome = await build_agent_memory(context)
     assert outcome.status == "ok" and outcome.data["memory_search_allowed"] is False
     context.memory_search_allowed = outcome.data["memory_search_allowed"]
-    assert not {"memory_search", "memory_read", "memory_write"}.intersection(tool.name for tool in build_service_tools(context))
+    tools = {tool.name: tool for tool in build_service_tools(context)}
+    assert {'memory_search', 'memory_read'} <= tools.keys()
+    for name in ('memory_search', 'memory_read'):
+        outcome = await tools[name].handler({})
+        assert outcome.status == 'blocked' and outcome.data['error'] == 'memory_search_not_allowed_for_conversation_quote'
 
 
 async def test_initial_impersonated_binding_preserves_requester_and_bot_address_authority(context):

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 def uses_mihomo(content: str) -> bool:
     values: dict[str, str] = {}
-    keys = {"XIAOMACHI_HTTP_PROXY", "XIAOMACHI_HTTPS_PROXY", "DOCKER_HTTP_PROXY", "DOCKER_HTTPS_PROXY"}
+    keys = {"XIAOMACHI_HTTP_PROXY", "XIAOMACHI_HTTPS_PROXY", "DOCKER_HTTP_PROXY", "DOCKER_HTTPS_PROXY", 'WEB_PAGE_PROXY_URL'}
     for line in content.splitlines():
         match = re.match(r"\s*(?:export\s+)?([A-Z_]+)\s*=\s*(.*?)\s*$", line)
         if match and match[1] in keys:
@@ -20,7 +20,15 @@ def uses_mihomo(content: str) -> bool:
             continue
         try:
             parsed = urlsplit(value)
-            if parsed.scheme in {"http", "https", "socks5", "socks5h"} and parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port == 7897:
+            if parsed.scheme in {"http", "https", "socks5", "socks5h"} and parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port == 18797:
+                return True
+        except ValueError:
+            pass
+    page_proxy = values.get('WEB_PAGE_PROXY_URL', '')
+    if page_proxy:
+        try:
+            parsed = urlsplit(page_proxy)
+            if parsed.scheme in {'http', 'https'} and parsed.hostname in {'127.0.0.1', 'localhost', '::1'} and parsed.port == 18797:
                 return True
         except ValueError:
             pass

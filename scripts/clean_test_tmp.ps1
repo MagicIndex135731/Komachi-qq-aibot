@@ -1,12 +1,27 @@
 param(
     [switch]$Force,
     [switch]$Legacy,
+    [string[]]$Name = @(),
+    [string[]]$ExcludeName = @(),
     [string]$ReportPath
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $workRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "data/test-work"))
+foreach ($targetName in @($Name) + @($ExcludeName)) {
+    if ([string]::IsNullOrWhiteSpace($targetName) -or $targetName -in @(".", "..") -or
+        $targetName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw "Cleanup names must be literal direct-child names: $targetName"
+    }
+}
+if ($ReportPath) {
+    $absoluteReport = [IO.Path]::GetFullPath($ReportPath)
+    if (-not $absoluteReport.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+        $absoluteReport.StartsWith($workRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup report must be inside the repository and outside test-work"
+    }
+}
 $targets = @()
 foreach ($parent in @((Join-Path $repoRoot "data"), $workRoot)) {
     if ((Test-Path -LiteralPath $parent) -and
@@ -22,6 +37,9 @@ if ($Legacy) {
         $_.PSIsContainer -and $_.Name -match '^(\.test-tmp.*|\.pytest.*|\.tmp_pytest.*|\.codex_tmp.*|dbg_service_.*|\.artifacts)$'
     })
 }
+$targets = @($targets | Where-Object {
+    ($Name.Count -eq 0 -or $_.Name -in $Name) -and $_.Name -notin $ExcludeName
+})
 $rows = @()
 foreach ($target in $targets) {
     $path = (Resolve-Path -LiteralPath $target.FullName).Path
@@ -51,15 +69,13 @@ $report = [ordered]@{
     recorded_at = [DateTimeOffset]::Now.ToString("o")
     applied = [bool]$Force
     legacy = [bool]$Legacy
+    selected_names = $Name
+    excluded_names = $ExcludeName
     entries = $rows
     bytes = [long](($rows | Measure-Object -Property bytes -Sum).Sum)
     failures = @($rows | Where-Object status -eq "failed").Count
 }
 if ($ReportPath) {
-    $absoluteReport = [IO.Path]::GetFullPath($ReportPath)
-    if (-not $absoluteReport.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Cleanup report must be inside the repository"
-    }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $absoluteReport -Encoding utf8
 }
 Write-Host ("{0}: {1} entries, {2:N1} MiB, {3} failures." -f

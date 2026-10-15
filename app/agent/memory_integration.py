@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 import zlib
 
@@ -30,7 +31,7 @@ from app.core.memory_context_packer import PackedMemoryContext
 from app.core.memory_query_resolver import MemoryQueryResolver
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.memory_tool_executor import MemoryToolExecutor
-from app.core.memory_tools import validate_memory_search_args
+from app.core.memory_tools import DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS, validate_memory_search_args
 from app.core.time_utils import shanghai_aware, stored_as_utc
 from app.runtime.blocking import AgentModelBusyError
 from app.runtime.memory_composition import _evidence_messages_from_rows
@@ -227,7 +228,7 @@ def _request(
                 raise _MemoryReadError("source_unavailable")
             if context.target_user_id is not None and target.user_id != context.target_user_id:
                 raise _MemoryReadError("source_author_mismatch")
-        recent_limit = min(SOURCE_LIMIT, max(1, int(getattr(settings, "memory_recent_snapshot_limit", 60))))
+        recent_limit = min(30, SOURCE_LIMIT, max(1, int(getattr(settings, "memory_recent_snapshot_limit", 60))))
         statement = select(Message).where(Message.group_id == group_id)
         if target is not None:
             statement = statement.where(Message.id <= target.id)
@@ -268,6 +269,8 @@ def _request(
                     - int(getattr(settings, "llm_max_output_tokens", 8192))
                     - int(getattr(settings, "llm_context_safety_margin_tokens", 2048))
                     - int(getattr(settings, "llm_tool_context_reserve_tokens", 0)))
+    if getattr(context, 'available_input_budget', None) is not None:
+        available = min(available, max(1, context.available_input_budget))
     return GroupMemoryContextRequest(
         group_id=group_id, query=str(query or ""), recent_messages=recent,
         quoted_message=quoted_evidence, target_message_id=target_id if not layer else None,
@@ -459,7 +462,8 @@ def _read(context: ServiceToolContext, *, query, addressed, layer="", member=Non
         # line. A historical fact's sources do not imply its raw text was shown.
         recent_source_ids = [sources[message.source_msg_id].id for message in packed.recent_messages]
     return {
-        "evidence": packed.text, "kind": "source_bound_memory_evidence", "mode": result.mode,
+        "evidence": packed.text, "evidence_blocks": list(packed.evidence_blocks),
+        "kind": "source_bound_memory_evidence", "mode": result.mode,
         "source_ids": list(source_ids), "source_message_ids": list(packed.source_msg_ids),
         "recent_source_ids": recent_source_ids,
         "source_timestamps": source_timestamps,
@@ -480,12 +484,16 @@ async def _run_read(context: ServiceToolContext, **kwargs) -> ToolOutcome:
         return ToolOutcome({"error": "memory_out_of_scope"}, "blocked")
     if not getattr(context.router, "_group_memory_enabled", lambda **_: True)(group_id=job.scope_id):
         return ToolOutcome({"error": "memory_disabled"}, "blocked")
-    timeout = max(0.1, float(getattr(context.router.runtime.settings, "memory_memory_tool_timeout_seconds", 2)))
+    timeout = max(0.1, float(getattr(context.router.runtime.settings,
+        "memory_memory_tool_timeout_seconds", DEFAULT_MEMORY_TOOL_TIMEOUT_SECONDS)))
+    started = perf_counter()
     try:
         value = await asyncio.wait_for(context.blocking.run(_read, context, **kwargs), timeout=timeout)
     except asyncio.CancelledError:
         raise
     except TimeoutError:
+        logger.warning("agent_memory_read_timeout group_id=%s layer=%s budget_seconds=%.3f elapsed_ms=%.3f",
+            job.scope_id, kwargs.get("layer") or "preload", timeout, (perf_counter()-started)*1000)
         return ToolOutcome({"error": "tool_timeout"}, "failed")
     except AgentModelBusyError:
         return ToolOutcome({"error": "tool_busy"}, "failed")
@@ -509,12 +517,18 @@ async def _run_read(context: ServiceToolContext, **kwargs) -> ToolOutcome:
         rows = tuple(session.scalars(select(Message).where(Message.group_id == job.scope_id, Message.id.in_(candidate_ids))))
         if len(rows) != len(candidate_ids) or any(not is_usable_memory_source(row, group_id=job.scope_id) for row in rows):
             return ToolOutcome({"error": "source_unavailable"}, "blocked")
+    if perf_counter()-started >= timeout:
+        logger.warning("agent_memory_read_timeout group_id=%s layer=%s budget_seconds=%.3f elapsed_ms=%.3f",
+            job.scope_id, kwargs.get("layer") or "preload", timeout, (perf_counter()-started)*1000)
+        return ToolOutcome({"error": "tool_timeout"}, "failed")
     context.observed_sources.update(candidate_ids)
     context.memory_dependencies.update(dependencies)
     context.guard.require_valid()
     # Revisions are guard/checkpoint metadata, outside the model's token budget.
     evidence = dict(value)
     evidence.pop("memory_dependencies", None)
+    logger.info("agent_memory_read_completed group_id=%s layer=%s budget_seconds=%.3f elapsed_ms=%.3f sources=%s",
+        job.scope_id, kwargs.get("layer") or "preload", timeout, (perf_counter()-started)*1000, len(candidate_ids))
     return ToolOutcome(evidence)
 
 
@@ -533,9 +547,15 @@ async def call_agent_memory_tool(context: ServiceToolContext, name: str, argumen
         if error is not None:
             return ToolOutcome({"error": "invalid_memory_search_arguments"}, "failed")
         member = arguments.get("member")
-        return await _run_read(context, query=arguments["query"].strip(), addressed=False,
+        requested_limit = arguments.get("limit", maximum)
+        result_limit = min(maximum, requested_limit)
+        outcome = await _run_read(context, query=arguments["query"].strip(), addressed=False,
             layer=str(arguments.get("layer") or "all"), member=member.strip() if member else None,
-            limit=min(maximum, arguments.get("limit", maximum)))
+            limit=result_limit)
+        if outcome.status == "ok":
+            return replace(outcome, data={**outcome.data, "requested_limit": requested_limit,
+                "result_limit": result_limit, "limit_capped": result_limit < requested_limit})
+        return outcome
     if name == "memory_read":
         member = arguments.get("member")
         if not isinstance(member, str) or not member.strip():

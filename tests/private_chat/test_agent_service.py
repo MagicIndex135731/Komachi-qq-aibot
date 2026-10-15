@@ -88,8 +88,29 @@ def event(message_id="native-private-one", *, user_id=OWNER, text="聊聊夜空"
             "user_id": user_id, "sender": {"nickname": "synthetic"}, "message": [{"type": "text", "data": {"text": text}}]}, datetime.now(UTC))
 
 
-async def test_native_private_history_bootstraps_once_and_restores_only_after_rotation(sqlite_engine, tmp_path):
-    service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,lambda body,n:sse(number=n))
+async def test_private_can_read_own_qzone_fact_without_public_context_or_owner_control(sqlite_engine, tmp_path):
+    from tests.storage.test_self_activity import effect
+    effect(sqlite_engine, 'independent-private-query', account=ACCOUNT, stamp=datetime.now(UTC))
+    service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
+        lambda body, n: sse('read_self_activity', {}, number=n) if n == 1 else
+        sse('send_private', {'text': '今天已经发过空间了'}, number=n) if n == 2 else sse(number=n))
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('qzone-own-fact', user_id=OTHER, text='今天发空间了吗'))
+    finally:
+        await service.stop()
+    assert sender.texts == [(OTHER, '今天已经发过空间了')]
+    output = next(item for item in requests[1]['input'] if item.get('type') == 'function_call_output')
+    actual = json.loads(output['output'])
+    assert actual['data']['published'] is True and actual['data']['confirmed_count'] == 1
+    assert actual['data']['coverage'] == 'system_publication_receipts_only'
+    assert 'media_task_status' in {tool['name'] for tool in requests[0]['tools']}
+
+
+@pytest.mark.parametrize("rotate_reason", ["context_version", "grok_model", "gemini_model"])
+async def test_native_private_history_bootstraps_once_and_restores_only_after_rotation(sqlite_engine, tmp_path, rotate_reason):
+    service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,
+        lambda body,n:sse('send_private',{'text':'正常回复'},number=n) if n%2 else sse(number=n))
     def observation(body):
         for item in reversed(body['input']):
             content=item.get('content','')
@@ -106,12 +127,38 @@ async def test_native_private_history_bootstraps_once_and_restores_only_after_ro
         assert second['history_in_native_session'] and second['previous_closed_context']==[]
         assert second['daily_session_summary']==''
         scope=f'private:{OWNER}';state=agent.sessions.read(scope)
-        agent.sessions.save(scope,state['items'],{**state['checkpoint'],'context_format_version':0},
-            state['source_message_ids'],expected_revision=state['revision'])
+        if rotate_reason == "grok_model":
+            service.llm_client.model = service.llm_client.responses_model = "grok-4.7"
+        elif rotate_reason == "gemini_model":
+            service.llm_client.model = service.llm_client.responses_model = "gemini-3.8-flash-low"
+        else:
+            agent.sessions.save(scope,state['items'],{**state['checkpoint'],'context_format_version':0},
+                state['source_message_ids'],expected_revision=state['revision'])
         await dispatcher.handle_private_message(event('native-bootstrap-third',text='第三次恢复聊天'))
         third=observation(requests[-1])
         assert not third['history_in_native_session']
         assert [x['content'] for x in third['previous_closed_context'] if x['role']=='user']==['第一次普通聊天','第二次普通聊天']
+    finally:
+        await service.stop()
+
+
+async def test_private_rejected_turn_rotates_without_failure_input_or_summary(sqlite_engine,tmp_path):
+    from tests.agent.test_harness_runtime import image_policy_sse
+    service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,
+        lambda body,n:image_policy_sse() if n==1 else sse('send_private',{'text':'正常回复'},number=n) if n==2 else sse(number=n))
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('rejected-first',text='REJECTED_PRIVATE_INPUT'))
+        first=agent.sessions.read(f'private:{OWNER}')
+        assert first['checkpoint']['last_reason']=='model_image_input_rejected'
+        assert first['items']==[]
+        assert '图片被模型接口拒绝' in sender.texts[0][1]
+        await dispatcher.handle_private_message(event('normal-second',text='今天好吗'))
+        second=agent.sessions.read(f'private:{OWNER}')
+        assert second['checkpoint']['runtime_id']!=first['checkpoint']['runtime_id']
+        assert 'REJECTED_PRIVATE_INPUT' not in json.dumps(requests[1],ensure_ascii=False)
+        assert sender.texts[-1][1]=='正常回复'
+        assert len(sender.texts)==2
     finally:
         await service.stop()
 
@@ -258,8 +305,10 @@ async def test_private_native_web_body_open_find_and_send_are_wired(sqlite_engin
 
 
 async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_tools(sqlite_engine, tmp_path):
+    from app.agent.runtime_trace import TraceReader
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
         lambda body, n: sse("send_private", {"text": "夜空很适合慢慢看"}, number=n) if n == 1 else sse(number=n))
+    agent.settings.agent_monitor_enabled = True
     await service.start()
     try:
         await asyncio.sleep(0.02)
@@ -269,14 +318,57 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         assert sender.texts == [(OWNER, "夜空很适合慢慢看")]
         assert len(requests) == 2
         names = {value["name"] for value in requests[0]["tools"]}
-        assert names == {"read_private_context", "read_message_links", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup"}
+        assert names == {"read_private_context", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'resume_research_task', 'delegate_research_task', 'media_task_status'}
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["receipts"][0]["receipt_id"] == "private-receipt-1"
+        source_id = snapshot["checkpoint"]["reply_source_id"]
+        assert snapshot["checkpoint"]["receipts"][0]["reply_source_id"] == source_id
+        assert snapshot["items"][-2]["source_id"] == snapshot["items"][-1]["reply_source_id"] == source_id
+        reader=TraceReader(tmp_path/'agent_monitor');traces=reader.list_traces()
+        assert len(traces)==1 and traces[0]['surface']=='private' and traces[0]['source_id']==source_id
+        assert traces[0]['scope_id']==OWNER and traces[0]['model_requests']==2
+        assert traces[0]['context_kind']=='private' and traces[0]['context_state']=='new'
+        assert traces[0]['trigger_kind']=='private_message' and traces[0]['trigger_text']==event().plain_text
+        assert reader.list_conversations()[0]['identity_quality']=='logical'
+        assert traces[0]['trigger_reason_code']=='private_message_queued'
+        assert traces[0]['trigger_evidence']['job_id']>0
+        assert any(e['kind']=='tool.completed' and e['data']['receipt_id']=='private-receipt-1'
+            for e in reader.read_trace(traces[0]['trace_id'])['events'])
         with session_scope(sqlite_engine) as session:
             effects = session.query(AgentToolEffect).all()
             assert len(effects) == 1 and effects[0].status == "sent"
     finally:
         await service.stop()
+
+
+async def test_formal_private_delivers_long_answer_and_returns_to_chat_without_code_bulk(sqlite_engine, tmp_path):
+    from app.providers.gemini_search import GeminiSearchClient
+    answer='\n'.join(f'文件{i}：已核对入口，认证模块仍待检查。' for i in range(150))
+    def script(body,n):
+        if n==1:return sse('open_web_page',{'ref_id':'https://example.com/source'},number=n)
+        if n==2:
+            assert 'RAW_REPOSITORY_CODE' in json.dumps(body)
+            return sse('update_research_task',{'progress':'入口已核对','next_step':'检查认证',
+                'findings':['入口已核对，未检查认证'],'status':'active'},number=n)
+        if n==3:return sse('send_private',{'text':answer},number=n)
+        if n==5:
+            return sse('send_private',{'text':'继续聊夜空吧'},number=n)
+        return sse(number=n)
+    service,agent,dispatcher,sender,requests=setup(sqlite_engine,tmp_path,script)
+    service.reply_split_config={'enabled':True,'max_chars':30,'max_messages':3,'separator':'|'}
+    service.web_search_client=GeminiSearchClient(provider='gemini',base_url='',api_key='synthetic',model='synthetic',
+        timeout_seconds=45,address_resolver=lambda *_:['93.184.216.34'],
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda _:httpx.Response(200,
+            headers={'content-type':'text/plain'},text=('RAW_REPOSITORY_CODE\n'*900)))))
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('research-private',text='打开 https://example.com/source 认真审查这个仓库的代码'))
+        await dispatcher.handle_private_message(event('back-to-chat',text='还是聊夜空吧'))
+        assert sender.texts==[(OWNER,answer),(OWNER,'继续聊夜空吧')]
+        assert len(requests)==6
+        assert 'RAW_REPOSITORY_CODE' not in json.dumps(requests[4])
+        assert '入口已核对' in json.dumps(requests[4],ensure_ascii=False)
+    finally:await service.stop()
 
 
 @pytest.mark.parametrize("requested_links", [False, True])
@@ -298,10 +390,10 @@ async def test_private_native_link_policy_preserves_complete_answer_without_empt
         assert len(sender.texts) <= 3
         if requested_links:
             assert "https://example.com/shop" in sent
-            assert "Include only the URLs needed" in requests[0]["input"][0]["content"]
+            assert "Include only the URLs needed" in json.dumps(requests[0], ensure_ascii=False)
         else:
             assert "http" not in sent and "查到的门店页" not in sent
-            assert "Do not include URLs" in requests[0]["input"][0]["content"]
+            assert "Do not include URLs" in json.dumps(requests[0], ensure_ascii=False)
         assert requests[0]["input"][0]["role"] in {"system", "developer"}
         assert "Talk like a real person" in requests[0]["input"][0]["content"]
         assert "Stay grounded" in requests[0]["input"][0]["content"]
@@ -318,14 +410,15 @@ async def test_private_source_date_uses_stored_shanghai_and_current_anchor(sqlit
     from app.core.time_utils import stored_as_utc
     current = datetime(2026, 10, 10, 19, tzinfo=UTC)
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
-        lambda body, n: sse("read_private_context", {}, number=n) if n == 1 else sse(number=n))
+        lambda body, n: sse("read_private_context", {}, number=n) if n == 1 else
+            sse("send_private", {"text":"已核对本轮日期"}, number=n) if n == 2 else sse(number=n))
     agent.clock = lambda: current
     incoming = event(message_id="private-old-date", text="今天看合成动画")
     incoming.timestamp = datetime(2026, 10, 10, 14, tzinfo=UTC)
     await service.start()
     try:
         await dispatcher.handle_private_message(incoming)
-        assert len(requests) == 2
+        assert len(requests) == 3 and sender.texts == [(OWNER, "已核对本轮日期")]
         body = json.dumps(requests, ensure_ascii=False)
         assert '2026-10-11T03:00:00+08:00' in body
         assert '2026-10-10T22:00:00+08:00' in body
@@ -390,22 +483,31 @@ async def test_private_goal_wakeup_uses_persistent_queue_and_next_native_decisio
     def script(body, n):
         requests_by_wake.append(body)
         if n == 1:
-            return sse("schedule_private_wakeup", {"goal": "以后聊观星", "delay_seconds": 2}, number=n)
-        if n == 3:
+            return sse("schedule_private_wakeup", {"goal": "以后聊观星", "delay_seconds": 120}, number=n)
+        if n == 2:
+            return sse("send_private", {"text": "已记下提醒"}, number=n)
+        if n == 4:
             return sse("send_private", {"text": "记得我们想聊的观星吗"}, number=n)
         return sse(number=n)
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, script)
+    agent.settings.agent_monitor_enabled = True
     await service.start()
     try:
         await dispatcher.handle_private_message(event())
-        assert len(requests) == 2 and sender.texts == []
+        assert len(requests) == 3 and sender.texts == [(OWNER, "已记下提醒")]
         with session_scope(sqlite_engine) as session:
             wake = session.query(Job).filter(Job.job_type == agent.job_type, Job.status == "queued").one()
             assert wake.payload_json["kind"] == "wakeup" and wake.payload_json["source_id"] > 0
             wake.run_at = datetime.now(UTC).replace(tzinfo=None)
         await agent._drain_user(OWNER)
-        assert sender.texts == [(OWNER, "记得我们想聊的观星吗")]
-        assert "以后聊观星" in json.dumps(requests[2], ensure_ascii=False)
+        assert sender.texts == [(OWNER, "已记下提醒"), (OWNER, "记得我们想聊的观星吗")]
+        assert "以后聊观星" in json.dumps(requests[3], ensure_ascii=False)
+        from app.agent.runtime_trace import TraceReader
+        traces = TraceReader(tmp_path/'agent_monitor').list_traces()
+        wake_trace = next(t for t in traces if t['trigger_kind']=='private_wakeup')
+        assert wake_trace['trigger_reason_code']=='private_wakeup_due'
+        assert wake_trace['trigger_evidence']['goal']=='以后聊观星'
+        assert wake_trace['trigger_evidence']['due_at']
     finally:
         await service.stop()
 
@@ -433,7 +535,7 @@ async def test_private_agent_rejects_other_user_and_recalled_image_request(sqlit
 
 async def test_private_native_inflight_checkpoint_rotates_before_recovery(sqlite_engine, tmp_path):
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
-        lambda body, n: sse(number=n))
+        lambda body, n: sse("send_private", {"text":"已接续新消息"}, number=n) if n == 1 else sse(number=n))
     original = event("interrupted-private", text="previous canonical source")
     dispatcher._persist_inbound(original)
     with session_scope(sqlite_engine) as session:
@@ -447,7 +549,7 @@ async def test_private_native_inflight_checkpoint_rotates_before_recovery(sqlite
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["runtime_id"] != "interrupted-native-session"
         assert snapshot["checkpoint"]["in_flight"] is False
-        assert len(requests) == 1 and sender.texts == []
+        assert len(requests) == 2 and sender.texts == [(OWNER, "已接续新消息")]
     finally:
         await service.stop()
 
@@ -475,7 +577,7 @@ async def test_private_native_partial_burst_keeps_receipts_and_stops(sqlite_engi
 
 async def test_private_native_receives_canonical_actual_pixels(sqlite_engine, tmp_path):
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
-        lambda body, n: sse(number=n))
+        lambda body, n: sse("send_private", {"text":"合成图片是蓝色"}, number=n) if n == 1 else sse(number=n))
     picture = agent.image_input_root(OWNER) / "unknown" / "private-source.png"
     picture.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (16, 16), "blue").save(picture)
@@ -486,7 +588,7 @@ async def test_private_native_receives_canonical_actual_pixels(sqlite_engine, tm
     await service.start()
     try:
         await dispatcher.handle_private_message(image_event)
-        assert len(requests) == 1 and sender.texts == []
+        assert len(requests) == 2 and sender.texts == [(OWNER, "合成图片是蓝色")]
         blocks = [part for item in requests[0]["input"] for part in item.get("content", []) if isinstance(part, dict)]
         images = [part for part in blocks if part.get("type") == "input_image"]
         assert images and images[0]["image_url"].startswith("data:image/png;base64,")
@@ -497,7 +599,7 @@ async def test_private_native_receives_canonical_actual_pixels(sqlite_engine, tm
 @pytest.mark.parametrize("foreign_scope", ["group", "private_user", "host"])
 async def test_private_native_rejects_foreign_or_host_image_paths(sqlite_engine, tmp_path, foreign_scope):
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path,
-        lambda body, n: sse(number=n))
+        lambda body, n: sse("send_private", {"text":"本轮没有可用图片"}, number=n) if n == 1 else sse(number=n))
     picture = ({"group": tmp_path / "image_cache" / "900000001" / "foreign.png",
         "private_user": agent.image_input_root(OTHER) / "unknown" / "foreign.png",
         "host": tmp_path / "host-image.png"})[foreign_scope]
@@ -510,7 +612,7 @@ async def test_private_native_rejects_foreign_or_host_image_paths(sqlite_engine,
     await service.start()
     try:
         await dispatcher.handle_private_message(image_event)
-        assert len(requests) == 1 and sender.texts == []
+        assert len(requests) == 2 and sender.texts == [(OWNER, "本轮没有可用图片")]
         assert "data:image/" not in json.dumps(requests)
         with session_scope(sqlite_engine) as session:
             source = session.query(Message).filter(Message.platform_msg_id == f"private-inbound-{OWNER}-{image_event.platform_msg_id}").one()
@@ -607,10 +709,12 @@ async def test_private_quoted_share_discovery_and_search_fallback(sqlite_engine,
             found = outputs(body, 'read_private_context')['data']['share_sources']
             if foreign_quote:
                 assert found == []
-                return sse(number=n)
+                return sse('send_private', {'text':'无法读取其他用户的引用卡片'}, number=n)
             assert found[0]['title'] == '合成分享新闻'
             return sse('read_message_links', {'source_id': found[0]['source_id']}, number=n)
         if n == 3:
+            if foreign_quote:
+                return sse(number=n)
             data = outputs(body, 'read_message_links')['data']
             assert data['metadata_only'] and data['trust'] == 'untrusted_shared_content'
             return sse('open_web_page', {'ref_id': data['links'][0]['url']}, number=n)
@@ -643,7 +747,7 @@ async def test_private_quoted_share_discovery_and_search_fallback(sqlite_engine,
     try:
         await dispatcher.handle_private_message(current)
         if foreign_quote:
-            assert len(requests) == 2 and not sender.texts and not web_calls
+            assert len(requests) == 3 and sender.texts == [(OTHER, '无法读取其他用户的引用卡片')] and not web_calls
         else:
             assert len(requests) == 7 and len(web_calls) == 3
             assert sender.texts == [(OTHER, '已查阅补充来源，概要如下')]

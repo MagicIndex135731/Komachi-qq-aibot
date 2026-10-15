@@ -13,7 +13,8 @@ from app.adapters.account_profile import ProfileRejectedError, ProfileUnavailabl
 
 class ToolDispatchBoundary:
     def __init__(self, *, engine, account_id, scope, guard, clock, max_daily=2, cooldown_seconds=60,
-                 interactive_group_send: bool = False, group_send_allowed=None, owner_authority=None):
+                 interactive_group_send: bool = False, group_send_allowed=None, owner_authority=None,
+                 group_interjection_reserve=None):
         if type(interactive_group_send) is not bool:
             raise ValueError("interactive group send authority must be a boolean")
         self.repository = AgentToolEffectRepository(engine, account_id=account_id, clock=clock)
@@ -21,6 +22,7 @@ class ToolDispatchBoundary:
         self.max_daily, self.cooldown_seconds = max_daily, cooldown_seconds
         self.interactive_group_send = interactive_group_send
         self.group_send_allowed = group_send_allowed
+        self.group_interjection_reserve = group_interjection_reserve
         self.owner_authority = owner_authority
         self.current = ContextVar("agent_tool_effect", default=None)
         self.receipts = []
@@ -29,6 +31,8 @@ class ToolDispatchBoundary:
 
     async def invoke(self, tool, arguments, call_id):
         self.require_valid()
+        if tool.authorization is not None and tool.authorization() is not True:
+            return ToolOutcome({'error': 'owner_required'}, 'blocked')
         if tool.effect != "write":
             return await tool.handler(arguments)
         digest = sha256(json.dumps(arguments, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -110,6 +114,9 @@ class ToolDispatchBoundary:
         manual = self.owner_authority is not None
         if chat_send and not direct_reply and not manual and not self.group_send_allowed():
             raise RuntimeError("group chat cadence or policy revoked")
+        if (chat_send and not direct_reply and not manual and self.group_interjection_reserve is not None
+                and not self.group_interjection_reserve()):
+            raise RuntimeError('proactive_speech_budget')
         daily_limit = None if direct_reply or manual else (
             current[1].daily_limit if current is not None and current[1].daily_limit is not None else self.max_daily)
         cooldown = 0 if direct_reply or chat_send or manual or (current and current[1].per_target_daily_limit) else (

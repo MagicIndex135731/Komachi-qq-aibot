@@ -7,15 +7,35 @@ from app.config import AppSettings, load_runtime_config
 
 def test_model_first_output_budget_is_independent_and_configurable(monkeypatch):
     monkeypatch.delenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", raising=False)
-    connection = dict(NAPCAT_WS_URL="ws://synthetic.invalid/ws", LLM_BASE_URL="https://synthetic.invalid/v1",
+    connection = dict(BOT_QQ=900000099, OWNER_QQ=900000101, NAPCAT_WS_URL="ws://synthetic.invalid/ws", LLM_BASE_URL="https://synthetic.invalid/v1",
                       LLM_API_KEY="synthetic")
     settings = AppSettings(_env_file=None, **connection)
     assert settings.agent_model_first_output_timeout_seconds == 90
+    assert settings.agent_monitor_enabled is False
+    monkeypatch.setenv("AGENT_MONITOR_ENABLED", "true")
+    assert AppSettings(_env_file=None, **connection).agent_monitor_enabled is True
     monkeypatch.setenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", "75")
     assert AppSettings(_env_file=None, **connection).agent_model_first_output_timeout_seconds == 75
     monkeypatch.setenv("AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS", "0")
     with pytest.raises(ValueError):
         AppSettings(_env_file=None, **connection)
+
+
+@pytest.mark.parametrize("key,maximum", [
+    ("MEMORY_MEMORY_TOOL_TIMEOUT_SECONDS", 120),
+    ("MEMORY_RETRIEVAL_CHANNEL_TIMEOUT_SECONDS", 60),
+])
+def test_memory_deadlines_accept_overrides_and_reject_unbounded_values(monkeypatch, key, maximum):
+    connection = dict(BOT_QQ=900000099, OWNER_QQ=900000101, NAPCAT_WS_URL="ws://127.0.0.1:1",
+        LLM_BASE_URL="http://127.0.0.1:1", LLM_API_KEY="synthetic")
+    monkeypatch.setenv(key, "0.1")
+    settings = AppSettings(_env_file=None, **connection)
+    field = "memory_memory_tool_timeout_seconds" if key.startswith("MEMORY_MEMORY_TOOL") else "memory_retrieval_channel_timeout_seconds"
+    assert getattr(settings, field) == 0.1
+    for invalid in ("0", "-1", "inf", "nan", str(maximum+1)):
+        monkeypatch.setenv(key, invalid)
+        with pytest.raises(ValueError):
+            AppSettings(_env_file=None, **connection)
 
 
 def test_load_runtime_config_reads_yaml_and_env(tmp_path, monkeypatch) -> None:
@@ -303,7 +323,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_embedding_provider == "local"
     assert settings.memory_embedding_device == "cpu"
     assert settings.memory_embedding_local_files_only is False
-    assert settings.memory_retrieval_channel_timeout_seconds == 4.0
+    assert settings.memory_retrieval_channel_timeout_seconds == 45.0
     assert settings.memory_embedding_model == "BAAI/bge-small-zh-v1.5"
     assert settings.memory_embedding_dimensions == 512
     assert settings.memory_embedding_cache_dir == Path("/workspace/data/models")
@@ -339,7 +359,7 @@ def test_app_settings_exposes_memory_orchestration_defaults(tmp_path, monkeypatc
     assert settings.memory_memory_tools_enabled is False
     assert settings.memory_memory_tool_max_rounds == 2
     assert settings.memory_memory_tool_max_results == 5
-    assert settings.memory_memory_tool_timeout_seconds == 2.0
+    assert settings.memory_memory_tool_timeout_seconds == 60.0
     assert settings.memory_member_fact_supplement_limit == 20
     assert settings.memory_fact_semantic_ranking_enabled is False
     assert settings.memory_fact_semantic_candidates == 60

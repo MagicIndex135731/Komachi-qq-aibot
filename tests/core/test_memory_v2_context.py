@@ -129,8 +129,8 @@ def test_provider_binds_impersonated_subject_for_bot_address_alias() -> None:
             ),
             GroupMemberIdentity(
                 user_id=222,
-                nickname="小甲",
-                group_card="示例长昵称",
+                nickname="阿渣",
+                group_card="足泽满灰交",
                 in_scope=True,
             ),
         ),
@@ -390,9 +390,9 @@ def request(*, group_id: int = 100) -> MemoryV2Request:
 @pytest.mark.parametrize(
     ("question", "source", "retrospective"),
     [
-        ("小丁丁最近在看什么动画", "小丁丁在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
-        ("@比企谷小町 小丁丁最近在看什么动画", "小丁丁在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
-        ("小甲最近在做什么项目", "小甲在做新项目", "从去年开始做旧项目"),
+        ("加菲猫最近在看什么动画", "加菲猫在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
+        ("@比企谷小町 加菲猫最近在看什么动画", "加菲猫在看向日葵马戏团", "从第七集更新时开始追《MyGO》"),
+        ("阿渣最近在做什么项目", "阿渣在做新项目", "从去年开始做旧项目"),
         ("小林最近在学什么课程", "小林在学法语", "以前学过德语"),
     ],
 )
@@ -400,7 +400,7 @@ def test_direct_current_observation_beats_retrospective_event_across_topics(
     question: str, source: str, retrospective: str,
 ) -> None:
     clean_question = question.removeprefix("@比企谷小町 ")
-    alias = clean_question[:3] if clean_question.startswith("小丁丁") else clean_question[:2]
+    alias = clean_question[:3] if clean_question.startswith("加菲猫") else clean_question[:2]
     topic = "动画" if "动画" in question else "项目" if "项目" in question else "课程"
     resolved = ResolvedMemoryQuery(
         original_query=question, retrieval_query=topic, group_id=100,
@@ -439,9 +439,9 @@ def test_direct_current_observation_beats_retrospective_event_across_topics(
 
 def test_question_does_not_displace_a_retrospective_event_fact() -> None:
     resolved = ResolvedMemoryQuery(
-        original_query="小丁丁最近在看什么动画", retrieval_query="动画",
+        original_query="加菲猫最近在看什么动画", retrieval_query="动画",
         group_id=100, subject_ids=("42",), subject_binding="explicit",
-        answer_mode="current_fact", subject_aliases_removed=("小丁丁",),
+        answer_mode="current_fact", subject_aliases_removed=("加菲猫",),
         topic_terms=("动画",),
     )
     direct = FusedRetrievalCandidate(
@@ -455,7 +455,7 @@ def test_question_does_not_displace_a_retrospective_event_fact() -> None:
     segment = EvidenceSegment(
         episode_id="raw:1", document_id="1", fused_score=1.0,
         messages=(EvidenceMessage(
-            "question", "observer", "小丁丁在看什么动画？",
+            "question", "observer", "加菲猫在看什么动画？",
             datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
         ),),
         hit_source_msg_ids=("question",),
@@ -472,17 +472,17 @@ def test_question_does_not_displace_a_retrospective_event_fact() -> None:
 
 def test_current_fact_excludes_target_and_prior_echo_questions_from_evidence() -> None:
     resolved = ResolvedMemoryQuery(
-        original_query="小丁丁最近在看什么动画", retrieval_query="动画",
+        original_query="加菲猫最近在看什么动画", retrieval_query="动画",
         group_id=100, subject_ids=("42",), subject_binding="explicit",
-        answer_mode="current_fact", subject_aliases_removed=("小丁丁",),
+        answer_mode="current_fact", subject_aliases_removed=("加菲猫",),
     )
     base = EvidenceMessage(
-        "direct", "observer", "小丁丁在看向日葵马戏团",
+        "direct", "observer", "加菲猫在看向日葵马戏团",
         datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
     )
     sources = (
-        replace(base, source_msg_id="target", content="@bot 小丁丁最近在看什么动画"),
-        replace(base, source_msg_id="old-question", content="小丁丁最近在看什么动画"),
+        replace(base, source_msg_id="target", content="@bot 加菲猫最近在看什么动画"),
+        replace(base, source_msg_id="old-question", content="加菲猫最近在看什么动画"),
         base,
     )
     segments = tuple(
@@ -573,9 +573,9 @@ def test_member_reply_keeps_safe_cross_speaker_entity_context_only_when_atomic()
 
 def test_direct_observation_keeps_non_retrospective_new_event() -> None:
     resolved = ResolvedMemoryQuery(
-        original_query="小甲最近在做什么项目", retrieval_query="项目",
+        original_query="阿渣最近在做什么项目", retrieval_query="项目",
         group_id=100, subject_ids=("42",), subject_binding="explicit",
-        answer_mode="current_fact", subject_aliases_removed=("小甲",),
+        answer_mode="current_fact", subject_aliases_removed=("阿渣",),
         topic_terms=("项目",),
     )
     candidate = FusedRetrievalCandidate(
@@ -589,7 +589,7 @@ def test_direct_observation_keeps_non_retrospective_new_event() -> None:
     segment = EvidenceSegment(
         episode_id="raw:1", document_id="1", fused_score=1.0,
         messages=(EvidenceMessage(
-            "direct", "observer", "小甲在做新项目",
+            "direct", "observer", "阿渣在做新项目",
             datetime(2026, 9, 13, tzinfo=UTC), group_id=100, user_id=99,
         ),), hit_source_msg_ids=("direct",),
     )
@@ -916,7 +916,7 @@ def test_profile_intent_queries_cap_expansion_candidates() -> None:
             needs_history=False,
             answer_mode="current_fact",
             subject_ids=("100",),
-            original_query="给出小甲的完整个人画像",
+            original_query="给出阿渣的完整个人画像",
         ),
         retriever=TracedRetriever(),
         expander=expander,
@@ -939,7 +939,7 @@ def test_temporal_current_fact_excludes_prior_bot_answers_from_recent_evidence()
             needs_history=True,
             answer_mode="current_fact",
             subject_ids=("20001",),
-            original_query="小甲最近在做什么？",
+            original_query="阿渣最近在做什么？",
         ),
         retriever=Retriever(),
         expander=Expander(),
@@ -952,7 +952,7 @@ def test_temporal_current_fact_excludes_prior_bot_answers_from_recent_evidence()
         user_message,
         source_msg_id="bot-old",
         speaker="bot",
-        content="小甲仍在做旧项目",
+        content="阿渣仍在做旧项目",
         is_bot=True,
     )
 
@@ -968,7 +968,7 @@ def test_non_temporal_query_keeps_prior_bot_messages_for_conversation_continuity
             needs_history=True,
             answer_mode="current_fact",
             subject_ids=("20001",),
-            original_query="小甲喜欢什么？",
+            original_query="阿渣喜欢什么？",
         ),
         retriever=Retriever(),
         expander=Expander(),

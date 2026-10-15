@@ -47,10 +47,10 @@ def _complete(base_url: str, api_key: str, model: str, prompt: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corpus", default="data/personas/member_alpha/persona_v2/corpus.jsonl")
-    parser.add_argument("--persona", default="configs/personas/member_alpha.yaml")
-    parser.add_argument("--live", default="data/personas/member_alpha.live.yaml")
-    parser.add_argument("--target-name", default="小甲")
+    parser.add_argument("--corpus", default="data/personas/azha/persona_v2/corpus.jsonl")
+    parser.add_argument("--persona", default="configs/personas/azha.yaml")
+    parser.add_argument("--live", default="data/personas/azha.live.yaml")
+    parser.add_argument("--target-name", default="阿渣")
     parser.add_argument("--base-url", default="http://127.0.0.1:15721/v1")
     parser.add_argument("--model", default="deepseek-v4-pro")
     parser.add_argument("--api-key", default="PROXY_MANAGED")

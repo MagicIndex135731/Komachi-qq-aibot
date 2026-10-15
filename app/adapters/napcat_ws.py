@@ -143,7 +143,9 @@ class NapCatGateway:
             self._discard_pending_call(echo, future)
             raise NapCatDeliveryUncertainError("NapCat websocket failed while sending request") from exc
         try:
-            return await asyncio.wait_for(future, timeout=self.REQUEST_TIMEOUT_SECONDS)
+            video = (action in {'send_group_msg', 'send_private_msg'} and isinstance(params.get('message'), list)
+                and any(isinstance(item, dict) and item.get('type') == 'video' for item in params['message'][:100]))
+            return await asyncio.wait_for(future, timeout=90.0 if video else self.REQUEST_TIMEOUT_SECONDS)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             self._discard_pending_call(echo, future)
             raise

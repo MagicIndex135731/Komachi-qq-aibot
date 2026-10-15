@@ -221,7 +221,15 @@ async def test_group_native_web_body_open_find_and_send_are_wired(sqlite_engine,
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
         fixture.router.web_search_client = WebSearchClient(provider="wyzlab_alpha", base_url="https://synthetic.invalid/v1",
             api_key="synthetic", timeout_seconds=45, http_client=httpx.Client(transport=httpx.MockTransport(web)))
-        await wake(fixture)
+        source = add_source(sqlite_engine, platform_id='current-web-request', text='请联网查证公开问题')
+        with session_scope(sqlite_engine) as session:
+            session.get(Message, source).raw_json = {'message': [{'type': 'text', 'data': {'text': '请联网查证公开问题'}}]}
+        job = configured_social_jobs(fixture.router.runtime)[0]
+        observed = SocialObservation(job, NOW, '小町', source_message_ids=(source,))
+        guard = SimpleNamespace(action_id='current-web-request', valid=lambda: True,
+            require_valid=lambda: None, on_dispatch=lambda: None)
+        await fixture.executor.run_tools(observed, guard, interactive=True,
+            target_user_id=FRIEND, target_message_id='current-web-request', direct_group_reply=True)
         assert len(writes(fixture)) == 1
         assert len(web_calls) == 3 and len(requests) == 5
         assert "DETAILED_GROUP_EVIDENCE" in json.dumps(requests[1], ensure_ascii=False)
@@ -373,7 +381,8 @@ async def test_pure_qzone_picture_without_pixels_is_not_commented(sqlite_engine,
 
 
 class PolicyGuard:
-    def __init__(self, executor, observation):
+    def __init__(self, executor, observation, *, scheduled=False):
+        self.trace_trigger = {"trigger_reason_code": "intention_due"} if scheduled else {}
         self.executor, self.observation = executor, observation
         self.decision = SocialDecision("run_tools", "synthetic tool turn", source_message_ids=observation.source_message_ids)
         self.action_id = "synthetic-direct-turn"
@@ -441,20 +450,21 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
         observed = SocialObservation(job, NOW, "小町", source_message_ids=(current,))
         if interrupted:
             with pytest.raises(RuntimeError, match="synthetic interruption"):
-                await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed))
+                await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
         else:
-            await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed))
-        first = fixture.executor.sessions.read(job.key)
+            await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
+        first = fixture.executor.sessions.read('background:' + job.key)
         assert first["checkpoint"]["memory_dependencies"] == {"fact:1": "first-revision"}
         assert first["checkpoint"]["intention_memory_dependencies"] == ({} if interrupted else {"fact:1": "first-revision"})
         assert fixture.executor.repository.read_intention(job.key)["working_intention"]["_memory_dependency_receipt"] == {"fact:1": "first-revision"}
         revision[0] = "replacement-revision"
         for _ in range(2):
-            await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed))
+            fixture.clock[0] += timedelta(minutes=31)
+            await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
         assert captured[0][0] != captured[1][0] == captured[2][0]
         assert all(observation_json(prompt)["working_intention"] == {} for _, prompt in captured[1:])
         assert all("依赖旧事实的目标" not in "\n".join(prompt) for _, prompt in captured[1:])
-        assert fixture.executor.sessions.read(job.key)["checkpoint"]["memory_dependencies"] == {}
+        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["memory_dependencies"] == {}
 
 
 @pytest.mark.asyncio
@@ -545,9 +555,9 @@ async def test_harness_current_target_remains_visible_when_memory_is_disabled(
     recent = add_source(sqlite_engine, platform_id="newer-context-only", text="最近的无关消息")
     async with composed(sqlite_engine, tmp_path, ScriptedModel(), runtime="harness") as fixture:
         job = configured_social_jobs(fixture.router.runtime)[0]
-        observed = SocialObservation(job, NOW, "小町", ("另外24条较新消息",), (recent,))
+        observed = SocialObservation(job, NOW, "小町", ("另外30条较新消息",), (recent,))
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed),
-            interactive=True, target_user_id=FRIEND, target_message_id="older-current-request")
+            interactive=True,direct_group_reply=True, target_user_id=FRIEND, target_message_id="older-current-request")
         payload = observation_json(captured[0])
         assert payload["current_target"]["text"] == "请回答这条被批次积压的请求"
         assert payload["current_target"]["source_id"] == source
@@ -579,7 +589,7 @@ async def test_harness_old_conversation_quote_is_pinned_and_revoked_native_conte
         job = configured_social_jobs(fixture.router.runtime)[0]
         observed = SocialObservation(job, NOW, "小町", ("近期窗口没有旧引用",), (source,))
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed),
-            interactive=True, target_user_id=FRIEND, target_message_id="quote-followup")
+            interactive=True,direct_group_reply=True, target_user_id=FRIEND, target_message_id="quote-followup")
         target = observation_json(captured[0][1])["current_target"]
         assert target["quoted_message"]["text"] == "旧引用的独立正文"
         assert target["quoted_message"]["source_id"] == quoted
@@ -587,11 +597,65 @@ async def test_harness_old_conversation_quote_is_pinned_and_revoked_native_conte
         with session_scope(sqlite_engine) as session:
             session.get(Message, quoted).raw_json = {"delivery_state": "deleted"}
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed),
-            interactive=True, target_user_id=FRIEND, target_message_id="quote-followup")
+            interactive=True,direct_group_reply=True, target_user_id=FRIEND, target_message_id="quote-followup")
         assert captured[1][0] != captured[0][0]
         assert "旧引用的独立正文" not in "\n".join(captured[1][1])
         assert observation_json(captured[1][1])["current_target"]["quoted_message_unavailable"] is True
         assert quoted not in fixture.executor.sessions.read(job.key)["source_message_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('text,expected', [('今晚吃什么',0),('这图怎么样',1)])
+async def test_harness_picture_then_followup_selects_only_relevant_pixels(sqlite_engine,tmp_path,monkeypatch,text,expected):
+    from app.agent.tool_agent import ToolTurnResult
+    seen=[]
+    class Harness:
+        def __init__(self,**kwargs):pass
+        async def run(self,prompt,tools,guard,**kwargs):
+            seen.append(len(kwargs['images']))
+            return ToolTurnResult('silent',reason='model_finished')
+    monkeypatch.setattr('app.agent.harness_runtime.HarnessToolAgent',Harness)
+    async with composed(sqlite_engine,tmp_path,ScriptedModel(),runtime='harness') as fixture:
+        cache=fixture.router.runtime.settings.data_dir/'image_cache'/str(GROUP)
+        cache.mkdir(parents=True,exist_ok=True);photo=cache/'photo.png';photo.write_bytes(image_bytes())
+        picture=add_source(sqlite_engine,platform_id='followup-photo',images=({'local_path':str(photo)},))
+        current=add_source(sqlite_engine,platform_id='followup-current',text=text)
+        with session_scope(sqlite_engine) as session:
+            session.get(Message,picture).timestamp=(NOW-timedelta(seconds=10)).replace(tzinfo=None)
+            session.get(Message,current).timestamp=NOW.replace(tzinfo=None)
+        job=configured_social_jobs(fixture.router.runtime)[0]
+        observed=SocialObservation(job,NOW,'小町',(text,),(picture,current))
+        await fixture.executor.run_tools(observed,PolicyGuard(fixture.executor,observed),interactive=True,direct_group_reply=True,
+            target_user_id=FRIEND,target_message_id='followup-current')
+        assert seen==[expected]
+
+
+@pytest.mark.asyncio
+async def test_group_input_rejection_rotates_and_keeps_uncertain_receipt(sqlite_engine,tmp_path,monkeypatch):
+    from app.agent.tool_agent import ToolTurnResult
+    from app.agent.harness_runtime import model_context_format_version
+    seen=[]
+    class Harness:
+        def __init__(self,**kwargs):self.sid=kwargs['session_id']
+        async def run(self,prompt,tools,guard,**kwargs):
+            seen.append((self.sid,prompt))
+            return ToolTurnResult('failed',reason='model_image_input_rejected') if len(seen)==1 else ToolTurnResult('silent',reason='model_finished')
+    monkeypatch.setattr('app.agent.harness_runtime.HarnessToolAgent',Harness)
+    rejected=add_source(sqlite_engine,platform_id='rejected-group-source',text='REJECTED_GROUP_INPUT')
+    async with composed(sqlite_engine,tmp_path,ScriptedModel(),runtime='harness') as fixture:
+        job=configured_social_jobs(fixture.router.runtime)[0]
+        fixture.executor.sessions.save(job.key,[],{'session_id':'old','context_format_version':model_context_format_version(fixture.executor.decision_client),
+            'receipts':[{'call_id':'unknown-old','status':'uncertain','replay_allowed':False}]},(),expected_revision=0)
+        first=SocialObservation(job,NOW,'小町',('REJECTED_GROUP_INPUT',),(rejected,))
+        await fixture.executor.run_tools(first,PolicyGuard(fixture.executor,first),interactive=True,direct_group_reply=True,target_user_id=FRIEND,target_message_id='rejected-group-source')
+        state=fixture.executor.sessions.read(job.key)
+        assert state['items']==[] and not state['checkpoint']['context_reusable']
+        normal=add_source(sqlite_engine,platform_id='normal-group-source',text='普通聊天')
+        second=SocialObservation(job,NOW,'小町',('普通聊天',),(normal,))
+        await fixture.executor.run_tools(second,PolicyGuard(fixture.executor,second),interactive=True,direct_group_reply=True,target_user_id=FRIEND,target_message_id='normal-group-source')
+        assert seen[0][0]!=seen[1][0]
+        assert 'REJECTED_GROUP_INPUT' not in '\n'.join(seen[1][1])
+        assert fixture.executor.sessions.read(job.key)['checkpoint']['receipts'][0]['status']=='uncertain'
 
 
 @pytest.mark.asyncio
@@ -732,7 +796,7 @@ async def test_intention_continues_across_wakes_and_recalled_search_source_revok
 @pytest.mark.asyncio
 async def test_recalled_history_source_during_turn_revokes_external_reply(sqlite_engine, tmp_path):
     old = add_source(sqlite_engine, platform_id="older-than-recent-window", text="旧约定：周五画猫")
-    for index in range(25):
+    for index in range(31):
         add_source(sqlite_engine, platform_id=f"recent-{index}", text="天气不错")
 
     def revoke_then_send(lines, kwargs):
@@ -769,7 +833,7 @@ async def test_generated_artifact_records_the_history_sources_the_agent_actually
 @pytest.mark.asyncio
 async def test_external_group_output_records_a_read_source_outside_recent_window(sqlite_engine, tmp_path):
     old = add_source(sqlite_engine, platform_id="older-read-source", text="旧约定：周五画猫")
-    for index in range(25):
+    for index in range(31):
         add_source(sqlite_engine, platform_id=f"recent-source-{index}", text="天气不错")
     model = ScriptedModel({"tool": "search_history", "arguments": {"query": "旧约定"}},
                           {"tool": "send_group", "arguments": {"text": "记得之前聊过周五画猫", "artifact_ids": []}})
@@ -909,7 +973,7 @@ async def test_generated_image_is_observed_and_sent_in_a_later_wake_with_old_pro
     async with composed(sqlite_engine, tmp_path, model) as fixture:
         await wake(fixture)
         assert writes(fixture) == []
-        for index in range(25):
+        for index in range(31):
             add_source(sqlite_engine, platform_id=f"later-wake-{index}", text="另一个话题")
         await wake(fixture)
         assert len(fixture.image_client.calls) == 1
@@ -1139,27 +1203,37 @@ async def test_native_proactive_send_uses_chat_interval_and_agent_can_be_silent(
     from test_harness_runtime import model_client, responses_sse
     client, requests, _ = model_client(lambda body, number: (
         responses_sse(name="send_group", arguments={"text": f"合成主动回复{number}", "artifact_ids": []}, number=number)
-        if number in (1, 3, 5) else responses_sse(number=number)))
+        if number in (1, 3) else responses_sse(number=number)))
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
                         options={"cooldown_seconds": 1800}) as fixture:
         await fixture.agent.stop()
         fixture.router.runtime.group_policy["groups"][str(GROUP)]["proactive_interval_seconds"] = "120-300"
         statuses = []
         for index in range(4):
-            payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
-                "message_id": f"proactive-cadence-{index}", "user_id": FRIEND, "time": fixture.clock[0].timestamp(),
-                "sender": {"nickname": "synthetic author"},
-                "message": [{"type": "text", "data": {"text": "大家在讨论夜空"}}]}
-            event = parse_group_message_event(payload, bot_qq=BOT, bot_name="小町")
-            fixture.router.ingest_live_group_message(event)
-            batch = AgentBatch(GROUP, (event,), f"proactive-cadence-{index}")
-            result = await fixture.executor.execute_group_turn(event, batch,
-                AgentDecision("reply", event.platform_msg_id, "agent_event"), InteractiveIngressGuard(batch.turn_id))
-            statuses.append(result.status)
-            fixture.clock[0] += timedelta(seconds=0 if index == 1 else 301)
-        assert statuses == ["sent", "sent", "failed", "silent"]
+            events = []
+            for part in range(8):
+                payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
+                    "message_id": f"proactive-cadence-{index}-{part}", "user_id": FRIEND, "time": fixture.clock[0].timestamp(),
+                    "sender": {"nickname": "synthetic author"},
+                    "message": [{"type": "text", "data": {"text": f"大家在讨论夜空 {index}-{part}"}}]}
+                event = parse_group_message_event(payload, bot_qq=BOT, bot_name="小町")
+                fixture.router.ingest_live_group_message(event)
+                events.append(event)
+            batch = AgentBatch(GROUP, tuple(events), f"proactive-cadence-{index}")
+            planner = GroupParticipationPlanner(router=fixture.router, decision_client=client,
+                autonomous_executor=fixture.executor)
+            try:
+                decision = await planner.decide(batch)
+                result = (await fixture.executor.execute_group_turn(event, batch, decision,
+                    InteractiveIngressGuard(batch.turn_id)) if decision.action == 'reply' else
+                    SimpleNamespace(status='silent'))
+                statuses.append(result.status)
+            finally:
+                planner.close()
+            fixture.clock[0] += timedelta(seconds=0 if index == 1 else 601)
+        assert statuses == ["sent", "sent", "silent", "silent"]
         assert len(writes(fixture)) == 2
-        assert len(requests) == 7
+        assert len(requests) == 5
 
 
 @pytest.mark.asyncio
@@ -1185,7 +1259,50 @@ async def test_native_model_failure_notice_once_and_never_after_dispatch(sqlite_
         again.dispatched = already_dispatched
         await fixture.executor.execute_group_turn(event, batch, decision, again)
         assert len(writes(fixture)) == (0 if already_dispatched else 1)
-        assert len(requests) == 6
+        assert len(requests) == (6 if already_dispatched else 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('uncertain', [False, True])
+async def test_post_send_rejection_drops_execution_history_and_recovery_does_not_send_notice(
+        sqlite_engine, tmp_path, monkeypatch, uncertain):
+    from app.agent.harness_runtime import HarnessToolAgent
+    from app.agent.tool_agent import ToolTurnResult
+    from app.agent.autonomous_social import configured_agent_jobs
+    calls=[]
+    async def send_then_reject(agent, prompt, tools, guard, **kwargs):
+        calls.append(prompt)
+        outcome=await agent.invoke_tool(next(t for t in tools if t.name=='send_group'),
+            {'text':'synthetic confirmed reply', 'artifact_ids':[]}, f'synthetic-call-{len(calls)}')
+        return ToolTurnResult(outcome.status, outcome.receipt_id, 'tool:send_group', (
+            {'status':'model_request', 'purpose':'agent', 'outcome':'incomplete'},
+            {'status':'terminal', 'reason':'model_input_rejected'}))
+    monkeypatch.setattr(HarnessToolAgent, 'run', send_then_reject)
+    async with composed(sqlite_engine, tmp_path, SimpleNamespace(), runtime='harness') as fixture:
+        await fixture.agent.stop()
+        if uncertain:fixture.gateway.write_response={'status':'ok','retcode':0,'data':{}}
+        payload={'post_type':'message', 'message_type':'group', 'group_id':GROUP,
+            'message_id':'synthetic-late-rejection', 'user_id':FRIEND, 'time':NOW.timestamp(),
+            'sender':{'nickname':'synthetic'}, 'message':[
+                {'type':'at', 'data':{'qq':str(BOT)}}, {'type':'text','data':{'text':'在吗'}}]}
+        event=parse_group_message_event(payload, bot_qq=BOT, bot_name='小町')
+        fixture.router.ingest_live_group_message(event)
+        for run_id in ('synthetic-original', 'synthetic-recovered-new-run'):
+            result=await fixture.executor.execute_group_turn(event, AgentBatch(GROUP,(event,),run_id),
+                AgentDecision('reply',event.platform_msg_id,'direct_trigger'), InteractiveIngressGuard(run_id))
+        assert len(calls)==1 and len(writes(fixture))==1
+        assert result.status==('uncertain' if uncertain else 'silent')
+        state=fixture.executor.sessions.read(fixture.executor.data_scope(configured_agent_jobs(fixture.router.runtime)[0]))
+        assert state['checkpoint']['context_reusable'] is False
+        assert state['items']==[]
+        if not uncertain:
+            payload['message_id']='synthetic-new-target'
+            event=parse_group_message_event(payload,bot_qq=BOT,bot_name='小町')
+            fixture.router.ingest_live_group_message(event)
+            run_id='synthetic-new-target-run'
+            result=await fixture.executor.execute_group_turn(event, AgentBatch(GROUP,(event,),run_id),
+                AgentDecision('reply',event.platform_msg_id,'direct_trigger'), InteractiveIngressGuard(run_id))
+            assert result.status=='sent' and len(calls)==2 and len(writes(fixture))==2
 
 
 @pytest.mark.asyncio
@@ -1282,6 +1399,7 @@ async def test_native_forged_mention_does_not_exempt_autonomous_send_limits(sqli
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
                         options={"max_daily": 1, "cooldown_seconds": 3600}) as fixture:
         await fixture.agent.stop()
+        fixture.router.runtime.settings.agent_monitor_enabled = True
         planner = GroupParticipationPlanner(router=fixture.router, decision_client=client,
                                             autonomous_executor=fixture.executor)
         try:
@@ -1302,8 +1420,11 @@ async def test_native_forged_mention_does_not_exempt_autonomous_send_limits(sqli
                 assert decision.reason == ("direct_trigger" if index == 1 else "agent_event")
                 results.append(await fixture.executor.execute_group_turn(
                     event, batch, decision, InteractiveIngressGuard(batch.turn_id)))
-            assert results[0].status == "sent" and results[1].status == "failed"
-            assert len(writes(fixture)) == 1 and len(requests) == 4
+            assert results[0].status == "sent" and results[1].status == "silent"
+            assert len(writes(fixture)) == 1 and len(requests) == 2
+            from app.agent.runtime_trace import TraceReader
+            traces=TraceReader(fixture.router.runtime.settings.data_dir/'agent_monitor').list_traces()
+            assert not any(t['trigger_kind']=='group_messages' for t in traces)
         finally:
             planner.close()
 
@@ -1371,6 +1492,7 @@ async def test_native_named_then_at_have_separate_targets_and_receipts(
 @pytest.mark.asyncio
 async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_engine, tmp_path):
     from test_harness_runtime import model_client, responses_sse
+    from app.agent.runtime_trace import TraceReader
 
     steps = [
         ("send_group", {"text": "合成互动回复", "artifact_ids": []}),
@@ -1387,6 +1509,7 @@ async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_eng
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
                         options={"max_daily": 1, "identity_tools": ["card"]}) as fixture:
         await fixture.agent.stop()
+        fixture.router.runtime.settings.agent_monitor_enabled = True
         payload = {"post_type": "message", "message_type": "group", "group_id": GROUP,
             "message_id": "direct-with-card", "user_id": FRIEND, "time": NOW.timestamp(),
             "sender": {"nickname": "synthetic author"}, "message": [
@@ -1408,6 +1531,15 @@ async def test_native_nonowner_direct_reply_cannot_control_group_card(sqlite_eng
             with session_scope(sqlite_engine) as session:
                 card_effect = session.scalar(select(AgentToolEffect).where(AgentToolEffect.operation == "set_group_card"))
                 assert card_effect is None
-            assert 'set_group_card' not in {tool['name'] for tool in requests[0]['tools']}
+            assert 'set_group_card' in {tool['name'] for tool in requests[0]['tools']}
+            traces=TraceReader(fixture.router.runtime.settings.data_dir/'agent_monitor').list_traces()
+            assert len(traces)==1 and traces[0]['surface']=='group' and traces[0]['actor_id']==FRIEND
+            assert traces[0]['status']=='sent' and traces[0]['source_id'] is not None
+            assert traces[0]['context_kind']=='group' and traces[0]['trigger_kind']=='group_direct'
+            assert traces[0]['trigger_reason_code']=='mentioned_bot'
+            assert '明确@' in traces[0]['trigger_reason']
+            assert traces[0]['trigger_evidence']['batch_size']==1
+            assert traces[0]['trigger_evidence']['source_ids']==[traces[0]['source_id']]
+            assert TraceReader(fixture.router.runtime.settings.data_dir/'agent_monitor').list_conversations()[0]['identity_quality']=='logical'
         finally:
             planner.close()

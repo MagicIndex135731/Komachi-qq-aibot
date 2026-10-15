@@ -45,6 +45,30 @@ class Sender:
         return ("synthetic-receipt",)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('state', ['sent', 'uncertain', 'reserved'])
+async def test_reply_recovery_fences_exact_source_and_ignores_unconfirmed_reservations(sqlite_engine, state):
+    router, observation = group_setup(sqlite_engine)
+    executor = SocialExecutor(router=router, sender=Sender(), qzone_adapter=None)
+    with session_scope(sqlite_engine) as session:
+        GroupRepository(session).upsert_group(group_id=observation.job.scope_id, group_name='', enabled=True, speak_enabled=True)
+        UserRepository(session).upsert_user(user_id=900000103, nickname='synthetic', group_card='')
+        ids=[]
+        for index in (1, 2):
+            row=MessageRepository(session).add_group_message(platform_msg_id=f'synthetic-source-{index}',
+                group_id=observation.job.scope_id, user_id=900000103, timestamp=datetime.now(UTC), plain_text='synthetic',
+                raw_json={}, msg_type='text', reply_to_msg_id=None, mentioned_bot=False)
+            session.flush()
+            ids.append(row.id)
+    observation=replace(observation, source_message_ids=tuple(ids))
+    provisional=executor._reserve_group_output(observation, SocialDecision('send_group', 'synthetic reply'),
+        'synthetic-answer', reply_source_id=ids[0])
+    if state!='reserved':executor._finish_group_output(provisional, state=state, receipt='synthetic-receipt' if state=='sent' else None)
+    assert executor.reply_delivery_state(observation.job.scope_id, ids[0]) == (None if state=='reserved' else state)
+    assert executor.reply_delivery_state(observation.job.scope_id, ids[1]) is None
+    assert executor.reply_delivery_state(900000002, ids[0]) is None
+
+
 def group_setup(sqlite_engine):
     config = runtime({"enabled": True, "groups": {"900000001": {"enabled": True, "min_idle_seconds": 0,
                                                                                "quiet_hours": None}}},
@@ -69,6 +93,19 @@ async def test_scheduled_group_send_is_outgoing_with_real_receipt_and_no_fabrica
         assert rows[0].platform_msg_id == "synthetic-receipt"
         assert rows[0].user_id == router.runtime.settings.bot_qq
         assert rows[0].raw_json["social_action_id"] == "synthetic-action"
+
+
+@pytest.mark.asyncio
+async def test_direct_group_long_answer_is_whole_and_autonomous_caption_keeps_its_bound(sqlite_engine):
+    router, observation=group_setup(sqlite_engine)
+    sender=Sender();executor=SocialExecutor(router=router,sender=sender,qzone_adapter=None)
+    executor.policy_check=lambda *args,**kwargs:True
+    reply='核对的文件与触发条件如下。\n' * 100
+    decision=SocialDecision('send_group',reply)
+    assert (await executor._send_group(observation,decision,Guard())).status=='blocked'
+    assert not sender.calls
+    result=await executor._send_group(observation,decision,Guard(),max_text_chars=12000)
+    assert result.status=='sent' and sender.calls[0].text==reply
 
 
 @pytest.mark.asyncio

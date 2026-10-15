@@ -7,12 +7,13 @@ import json
 import re
 
 from app.agent.social_images import allowed_media_url
-from app.core.forward_content import cq_unescape, extract_forward_ids, valid_forward_id
+from app.core.forward_content import cq_unescape, extract_forward_ids, extract_forward_file_names, valid_forward_id
 
 
 MAX_NODES = 1000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_TEXT = 320
+MAX_IMAGE_REFS = 20
 
 
 class ForwardReadError(RuntimeError):
@@ -28,6 +29,7 @@ class ForwardNode:
     image_urls: tuple[str, ...]
     image_count: int
     forward_ids: tuple[str, ...]
+    forward_file_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +65,7 @@ def _node(row) -> ForwardNode:
             fields = dict(part.split("=", 1) for part in match[1].split(",") if "=" in part)
             image_count += 1
             url = cq_unescape(fields.get("url", ""))
-            if allowed_media_url(url) and len(images) < 2:
+            if allowed_media_url(url) and len(images) < MAX_IMAGE_REFS:
                 images.append(url)
     else:
         truncated = len(message) > 256
@@ -79,18 +81,64 @@ def _node(row) -> ForwardNode:
             elif kind == "image":
                 image_count += 1
                 url = data.get("url")
-                if allowed_media_url(url) and len(images) < 2:
+                if allowed_media_url(url) and len(images) < MAX_IMAGE_REFS:
                     images.append(url)
-            elif kind in {"forward", "json", "xml"} and extract_forward_ids([item]):
+            elif kind in {"forward", "json", "xml"} and (extract_forward_ids([item]) or extract_forward_file_names([item])):
                 parts.append("[嵌套合并转发]")
     text = "".join(parts).strip()
     return ForwardNode(text[:MAX_TEXT], truncated or len(text) > MAX_TEXT, _label(author),
-        _label(row.get("time"), 32), tuple(dict.fromkeys(images)), image_count, extract_forward_ids(message))
+        _label(row.get("time"), 32), tuple(dict.fromkeys(images)), image_count, extract_forward_ids(message),
+        extract_forward_file_names(message))
 
 
 class ForwardMessageAdapter:
     def __init__(self, gateway, *, timeout_seconds=20):
         self.gateway, self.timeout_seconds = gateway, timeout_seconds
+        self._bundles = {}
+
+    async def read_embedded(self, container_id: str, file_name: str) -> ForwardResource:
+        from app.adapters import forward_bundle
+        if not valid_forward_id(container_id) or not valid_forward_id(file_name):
+            raise ValueError("forward_handle_invalid")
+        if hasattr(self.gateway, "websocket") and self.gateway.websocket is None:
+            raise ForwardReadError("forward_gateway_unavailable")
+        if container_id not in self._bundles:
+            if len(self._bundles) >= 8:
+                raise ForwardReadError("forward_resource_budget_exhausted")
+            try:
+                response = await asyncio.wait_for(self.gateway.call_api("send_packet",
+                    forward_bundle.read_request(container_id)), self.timeout_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise ForwardReadError("forward_gateway_unavailable") from None
+            if (not isinstance(response, dict) or response.get("status") != "ok"
+                    or type(response.get("retcode")) is not int or response["retcode"] != 0):
+                raise ForwardReadError("forward_embedded_gateway_unsupported")
+            raw = response.get("data")
+            if not isinstance(raw, str) or len(raw) > MAX_RESPONSE_BYTES * 2:
+                raise ForwardReadError("forward_response_budget_exhausted")
+            try:
+                records = forward_bundle.decode_packet(bytes.fromhex(raw))
+            except ValueError as exc:
+                raise ForwardReadError(str(exc) if str(exc).startswith("forward_") else "forward_bundle_malformed") from None
+            if any(s["type"] == "image" and s["data"].get("url") for rows in records.values() for row in rows for s in row["message"]):
+                # Download keys remain internal and are never returned to the model.
+                try:
+                    key_response = await asyncio.wait_for(self.gateway.call_api("get_rkey", {}), min(5, self.timeout_seconds))
+                    rows = key_response.get("data") if isinstance(key_response, dict) and key_response.get("status") == "ok" else []
+                    keys = {r["type"]: r["rkey"] for r in rows[:32] if isinstance(r, dict)
+                            and r.get("type") in (10, 20) and isinstance(r.get("rkey"), str) and len(r["rkey"]) <= 4096} if isinstance(rows, list) else {}
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    keys = {}
+                records = forward_bundle.sign_image_urls(records, keys)
+            self._bundles[container_id] = records
+        rows = self._bundles[container_id].get(file_name)
+        if rows is None:
+            raise ForwardReadError("forward_embedded_not_found")
+        return ForwardResource(tuple(_node(row) for row in rows[:MAX_NODES]), len(rows) > MAX_NODES)
 
     async def read(self, resource_id: str) -> ForwardResource:
         if not valid_forward_id(resource_id):

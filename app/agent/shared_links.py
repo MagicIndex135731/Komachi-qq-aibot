@@ -19,9 +19,17 @@ from app.storage.models import Message
 
 TRUST = 'untrusted_shared_content'
 _APP_KINDS = frozenset({'share', 'json', 'xml'})
-_READ_INTENT = re.compile(r'看(?:看|一下|下)?(?!过|到|见|起来|完|着)|打开(?!过)|读取|读一下|评价|评一评|评论|分析|总结|解读|讲讲|介绍|了解|查查|read|review|summari[sz]e|analyse|analyze|open', re.I)
-_NEGATIVE = re.compile(r'(?:不要|不用|不必|无需|别|不想|不需要|不是(?:让|要|请)(?:你)?).{0,8}(?:看|打开|读|评价|评论|分析|总结|联网|搜索)|(?:do not|don.t)\s+(?:read|open|search|review)', re.I)
-_WEB_INTENT = re.compile(r'联网|上网|网络搜索|网上(?:查|搜)|搜索|检索|搜一下|查一下|查查|查找|查一查|帮我(?:查|搜)|查询|查证|核实|是真的吗|真假|天气|新闻|时事|资讯|股价|汇率|实时|最新(?:消息|版本|价格)|search\s+(?:the\s+)?web|web\s+search|weather|latest\s+(?:news|version)|current\s+(?:news|price)', re.I)
+_READ_INTENT = re.compile(r'看(?:看|一下|下)?(?!过|到|见|起来|完|着)|打开(?!过)|读取|读一下|评价|评一评|评论|分析|总结|解读|讲讲|介绍|了解|查查|(?:扒|拔|下载|提取|保存|获取|搬).{0,20}(?:图|视频)|(?:图|视频).{0,20}(?:扒|拔|下载|提取|保存|获取|搬)|read|review|summari[sz]e|analyse|analyze|open|download|extract', re.I)
+_NEGATIVE = re.compile(r'(?:不要|不用|不必|无需|别|不想|不需要|不是(?:让|要|请)(?:你)?).{0,8}(?:看|打开|读|评价|评论|分析|总结|联网|上网|查|搜|扒|拔|下载|提取|保存|搬|取图|发图)|(?:do not|don.t)\s+(?:read|open|search|review|download|extract)', re.I)
+_WEB_INTENT = re.compile(r'联网|上网|网络搜索|网上(?:查|搜)|搜索|检索|搜一下|查一下|查查|查找|查一查|帮我(?:查|搜)|查询|查证|核实|是真的吗|search\s+(?:the\s+)?web|web\s+search', re.I)
+_QUESTION = re.compile(r'[?？]|什么|怎么|咋|为什么|为何|如何|多少|是否|能否|可否|哪(?:个|种|些|里|儿|位|款|家)|(?:吗|么|呢)[啊呀吧嘛\s。！!]*$|\b(?:what|why|how|when|where|who|which)\b', re.I)
+_REQUEST = re.compile(r'^(?:请|麻烦|劳驾|帮我|能不能|可以)?\s*(?:帮我)?\s*(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|找找)|\b(?:please|could you|can you)\b', re.I)
+_SHARE_REFERENCE = re.compile(r'(?:这[个条张份]?|那[个条张份]?|引用|刚才的?|上面的?)(?:APP)?(?:分享|卡片)', re.I)
+
+WEB_REQUEST_POLICY = ('联网仅用于当前真实用户的提问、资料请求、@或称呼小町时按需查证，不要求用户固定说“联网”。'
+    '主动插话、静默思考、后台巡检及自发唤醒不搜索网页、不打开网页或下载网站媒体；旧历史和持久目标不授予联网许可。'
+    '用户资料子任务和媒体任务仅沿用原请求并复验来源，排队不扩大权限。'
+    'APP分享深读仍须当前真实引用许可，不能借普通检索打开未获准卡片。')
 
 
 def _raw(row):
@@ -87,11 +95,13 @@ class _ShareGrant:
 class ShareReadAccess:
     """Turn-local canonical request capabilities, never inferred from history."""
 
-    def __init__(self, router, *, group_id, trigger_source_ids=(), private_user_id=None, bot_qq=None):
+    def __init__(self, router, *, group_id, trigger_source_ids=(), private_user_id=None, bot_qq=None,
+                 addressed_source_ids=()):
         self.router, self.group_id, self.private_user_id, self.bot_qq = router, group_id, private_user_id, bot_qq
         self._grants = []
         ids = list(dict.fromkeys(item for item in trigger_source_ids
                                 if type(item) is int and 0 < item < 2**63))[:8]
+        addressed = {item for item in addressed_source_ids if type(item) is int and item in ids}
         with session_scope(router.engine) as session:
             for source_id in ids:
                 try:
@@ -100,6 +110,7 @@ class ShareReadAccess:
                         continue
                     raw = _raw(row)
                     text = _authored_text(raw)
+                    request_text = re.sub(r'https?://\S+', '', text)
                     if _NEGATIVE.search(text):
                         continue
                     quoted = self._quoted(session, row)
@@ -112,8 +123,10 @@ class ShareReadAccess:
                         # hard stop above.
                         if self._mentioned(raw, row):
                             self._grants.append(_ShareGrant(row.id, quoted.id, _fingerprint(row), _fingerprint(quoted)))
-                    elif not _app_links(raw) and (_WEB_INTENT.search(text) or
-                            re.search(r'https?://', text) and _READ_INTENT.search(text)):
+                    elif (not _app_links(raw) and not _SHARE_REFERENCE.search(text)
+                            and (row.id in addressed or self._mentioned(raw, row, private=False)
+                                 or _QUESTION.search(request_text) or _REQUEST.search(request_text) or _WEB_INTENT.search(request_text)
+                                 or re.search(r'https?://', text) and _READ_INTENT.search(text))):
                         self._grants.append(_ShareGrant(row.id, None, _fingerprint(row), None))
                 except (ValueError, TypeError, RecursionError):
                     continue
@@ -123,8 +136,8 @@ class ShareReadAccess:
             return row is not None and row.group_id is None and is_usable_memory_source(row, author_id=self.private_user_id)
         return self.group_id is not None and is_usable_memory_source(row, group_id=self.group_id)
 
-    def _mentioned(self, raw, row):
-        if self.private_user_id is not None:
+    def _mentioned(self, raw, row, *, private=True):
+        if private and self.private_user_id is not None:
             return True
         explicit_at = bool(row.mentioned_bot and self.bot_qq is not None and any(
             item.get('type') == 'at' and isinstance(item.get('data'), dict)
@@ -228,21 +241,19 @@ def build_share_access(router, **kwargs):
     return ShareReadAccess(router, **kwargs)
 
 
-def wrap_share_web_tools(tools, access, *, observed_source_ids=(), allow_autonomous_web=False):
+def wrap_share_web_tools(tools, access, *, observed_source_ids=()):
     """Block old-context/direct URL/search bypasses before provider dispatch."""
     wrapped, references = [], {}
     for tool in tools:
         async def checked(args, *, original=tool):
-            autonomous_allowed = allow_autonomous_web() if callable(allow_autonomous_web) else bool(allow_autonomous_web)
-            if not access.web_allowed() and not autonomous_allowed:
+            if not access.web_allowed():
                 return ToolOutcome({'error': 'web_requires_explicit_request',
-                    'guidance': '群聊需真实引用 APP 分享并@小町或提到小町；私聊需引用当前可见卡片。明确说不要看时会停止。普通资料仍需明确要求联网搜索或打开链接。'}, 'blocked')
+                    'guidance': '仅为当前真实用户的提问、资料请求或称呼小町按需联网；主动插话和静默巡检不用联网。APP卡片深读仍需当前引用许可；明确说不要看时停止。'}, 'blocked')
             target = references.get(args.get('ref_id'), args.get('ref_id'))
             if target is not None and not access.known_card_target_allowed(target, observed_source_ids):
                 return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
             outcome = await original.handler(args)
-            autonomous_allowed = allow_autonomous_web() if callable(allow_autonomous_web) else bool(allow_autonomous_web)
-            if not access.web_allowed() and not autonomous_allowed:
+            if not access.web_allowed():
                 return ToolOutcome({'error': 'share_request_revoked'}, 'blocked')
             if isinstance(outcome, ToolOutcome) and isinstance(outcome.data, dict):
                 for source in outcome.data.get('sources', ()):
@@ -322,7 +333,7 @@ def build_share_tools(context, *, access=None) -> tuple[AgentTool, ...]:
             context.guard.require_valid()
             return ToolOutcome({'source_id': source_id, 'trust': TRUST,
                 'links': [asdict(link) for link in links], 'metadata_only': True,
-                'next_step': '用open_web_page读取目标正文；不足时按标题和站点search_web，再打开可信来源。卡片摘要不是全文，不代表已观看视频。'})
+                'next_step': '读正文用open_web_page；打不开或资料不足时按标题/站点search_web补充。提取配图用list_web_images、download_web_images并用send_group/send_private的as_forward=true打包。要小红书视频用download_web_video，将video_artifact_id交给发送工具。卡片和下载不代表看过内容，封面不能当视频。'})
         except (ValueError, TypeError, RecursionError) as exc:
             code = str(exc) if str(exc).startswith('share_') else 'share_source_malformed'
             return ToolOutcome({'error': code}, 'blocked')

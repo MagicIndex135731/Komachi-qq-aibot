@@ -6,6 +6,7 @@ WSL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${WSL_DIR}"
 
 compose_exit=0
+docker rm -f xiaomachi-monitor >/dev/null 2>&1 || true
 if systemctl is-active --quiet xiaomachi-sandbox.service; then
   systemctl stop xiaomachi-sandbox.service || compose_exit=$?
 fi

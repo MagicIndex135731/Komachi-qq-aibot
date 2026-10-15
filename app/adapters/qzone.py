@@ -27,6 +27,7 @@ _MAX_TEXT = 2000
 _MAX_READ_TEXT = 65536
 _MAX_IMAGES = 9
 _MAX_IMAGE_BYTES = 16 * 1024 * 1024
+_MAX_FEED_ROWS = 50
 _MAX_FEED_AUTHORS = 5
 _MAX_FRIENDS = 10000
 _HTML_VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input",
@@ -122,7 +123,7 @@ class QzoneAdapter:
     async def get_feeds(self, count: int = 20, *,
                         allowed_owner_ids: tuple[int, ...] | None = None,
                         require_friends: bool = False) -> tuple[SocialPost, ...]:
-        _integer(count, maximum=50)
+        _integer(count, maximum=_MAX_FEED_ROWS)
         if allowed_owner_ids is not None:
             if not isinstance(allowed_owner_ids, (tuple, list)) or len(allowed_owner_ids) > (_MAX_FRIENDS if require_friends else 100):
                 raise ValueError("Qzone feed author allowlist must be bounded")
@@ -136,7 +137,10 @@ class QzoneAdapter:
         data = await self._read("get_qzone_feeds", {"page_num": 1, "count": count})
         try:
             feeds = data["feeds"]
-            if not isinstance(feeds, list) or len(feeds) > count or type(data["has_more"]) is not bool:
+            # Qzone can add system entries beyond the requested page size;
+            # SnowLuma forwards the whole page. Bound the response separately
+            # and apply count to the verified posts, after filtering.
+            if not isinstance(feeds, list) or len(feeds) > _MAX_FEED_ROWS or type(data["has_more"]) is not bool:
                 raise ValueError("invalid feed list")
             candidates = []
             for feed in feeds:
@@ -186,7 +190,7 @@ class QzoneAdapter:
         if require_friends:
             current = frozenset(await self.get_friend_ids())
             result = [post for post in result if post.owner_id in current]
-        return tuple(result)
+        return tuple(result[:count])
 
     async def publish(self, content: str, visibility: int = 4, images: tuple[str, ...] = (),
                       *, before_dispatch: Callable[[], None] | None = None) -> str | None:

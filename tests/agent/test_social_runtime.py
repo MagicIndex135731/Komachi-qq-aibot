@@ -41,6 +41,9 @@ async def test_idle_account_wakes_persistently_without_any_inbound_event(sqlite_
     sent = []
 
     async def execute(obs, decision, guard):
+        assert guard.trace_trigger['trigger_reason_code']=='schedule_due'
+        assert guard.trace_trigger['trigger_evidence']['job_key']==obs.job.key
+        assert guard.trace_trigger['trigger_evidence']['due_at']==(NOW+timedelta(seconds=10)).isoformat()
         guard.on_dispatch()
         sent.append((obs.job.key, decision.text))
         return SocialResult("sent", "real-receipt")

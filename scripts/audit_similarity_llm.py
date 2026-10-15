@@ -63,7 +63,7 @@ def build_event(*, group_id: int, user_id: int, text: str, bot_qq: int, bot_name
             {"type": "text", "data": {"text": f" {text}"}},
         ],
         "raw_message": f"[CQ:at,qq={bot_qq}] {text}",
-        "sender": {"user_id": user_id, "nickname": "小乙乙", "card": "小乙乙"},
+        "sender": {"user_id": user_id, "nickname": "逆蝶蝶", "card": "逆蝶蝶"},
     }
     return parse_group_message_event(payload, bot_qq=bot_qq, bot_name=bot_name)
 

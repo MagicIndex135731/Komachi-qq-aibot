@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 import hashlib
 import io
 import json
@@ -22,6 +23,8 @@ from app.agent.social_images import (
 )
 from app.core.image_optimizer import optimize_image_bytes
 from app.core.memory_source_guard import is_usable_memory_source
+from app.core.image_turn_resolver import is_image_reference_followup
+from app.core.time_utils import shanghai_aware
 from app.core.message_content import ImageAttachment
 from app.storage.db import session_scope
 from app.storage.models import Message
@@ -30,6 +33,52 @@ from app.storage.models import Message
 logger = logging.getLogger(__name__)
 MAX_SOURCES = 24
 MAX_SOURCE_IDS = 200
+
+
+@dataclass(frozen=True, slots=True)
+class GroupImageSelection:
+    source_ids: tuple[int, ...] = ()
+    reason: str = 'no_image_request'
+
+
+def _has_images(row) -> bool:
+    raw=row.raw_json or {}
+    if isinstance(raw,str): raw=json.loads(raw)
+    return any(isinstance(p,dict) and p.get('type')=='image' for p in raw.get('message',raw.get('raw_message',[])))
+
+
+def select_group_image_sources(engine, group_id, source_message_ids, *, target_source_id=None, now=None):
+    """Resolve current/quoted pixels, or a bounded same-sender pointing request."""
+    with session_scope(engine) as session:
+        if target_source_id is None:
+            # Autonomous observation may inspect a fresh image event, never
+            # pull earlier images from behind a newer unrelated text event.
+            ids=tuple(dict.fromkeys(source_message_ids[:MAX_SOURCE_IDS]))
+            row=session.scalar(select(Message).where(Message.group_id==group_id,Message.id.in_(ids)).order_by(Message.id.desc()).limit(1)) if ids else None
+            if (row is not None and now is not None and is_usable_memory_source(row,group_id=group_id)
+                    and _has_images(row) and timedelta(0)<=shanghai_aware(now)-shanghai_aware(row.timestamp)<=timedelta(minutes=3)):
+                return GroupImageSelection((row.id,),'current_image_event')
+            return GroupImageSelection()
+        target=session.get(Message,target_source_id)
+        if target is None or not is_usable_memory_source(target,group_id=group_id):
+            return GroupImageSelection(reason='image_reference_unavailable')
+        if _has_images(target): return GroupImageSelection((target.id,),'current')
+        if target.reply_to_msg_id:
+            quote=session.scalar(select(Message).where(Message.group_id==group_id,Message.platform_msg_id==target.reply_to_msg_id))
+            if quote is not None and is_usable_memory_source(quote,group_id=group_id) and _has_images(quote):
+                return GroupImageSelection((quote.id,),'quoted')
+            return GroupImageSelection(reason='image_reference_unavailable' if is_image_reference_followup(target.plain_text,bot_names={'小町','比企谷小町'}) else 'no_image_request')
+        if not is_image_reference_followup(target.plain_text,bot_names={'小町','比企谷小町'}):
+            return GroupImageSelection()
+        candidates=session.scalars(select(Message).where(Message.group_id==group_id,Message.user_id==target.user_id,
+            Message.id<target.id).order_by(Message.id.desc()).limit(20))
+        for row in candidates:
+            age=shanghai_aware(target.timestamp)-shanghai_aware(row.timestamp)
+            if not timedelta(0)<=age<=timedelta(minutes=3): continue
+            if not is_usable_memory_source(row,group_id=group_id): continue
+            if _has_images(row): return GroupImageSelection((row.id,),'recent_same_sender')
+            if row.plain_text.strip(): break
+        return GroupImageSelection(reason='image_reference_unavailable')
 
 
 @dataclass(frozen=True, slots=True)

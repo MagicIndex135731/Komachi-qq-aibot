@@ -7,6 +7,7 @@ from app.config import AppSettings
 from app.core.group_image_generation import GroupImageGenerationService
 from app.providers.llm_client import LlmClient, default_auxiliary_reasoning_effort
 from app.providers.web_search import WebSearchClient
+from app.providers.gemini_search import GeminiSearchClient
 from app.storage.db import session_scope
 from app.storage.repositories import UsageRepository
 from urllib.parse import urlparse
@@ -18,34 +19,49 @@ def _uses_wyzlab_alpha_search(settings: AppSettings) -> bool:
 
 
 def build_web_search_client(settings: AppSettings) -> WebSearchClient | None:
+    if getattr(settings, "search_provider", "").strip().lower() == "gemini":
+        return _build_gemini_search_client(settings)
     if _uses_wyzlab_alpha_search(settings):
-        return WebSearchClient(
+        return _with_page_reader(WebSearchClient(
             provider="wyzlab_alpha",
             base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            api_key=(getattr(settings, "llm_web_search_api_key", "") or "").strip() or settings.llm_api_key,
             timeout_seconds=settings.agent_web_search_timeout_seconds,
-            model=settings.llm_model,
+            model=(getattr(settings, "llm_web_search_model", "") or "").strip() or settings.llm_model,
             reasoning_effort=settings.web_search_reasoning_effort,
-        )
+        ), settings)
     if settings.llm_builtin_web_search and settings.llm_text_endpoint == "responses":
         return None
     provider = settings.search_provider.strip().lower()
     if provider != "ddgs" and not settings.search_api_key.strip():
         return None
-    return WebSearchClient(
+    return _with_page_reader(WebSearchClient(
         provider=provider,
         base_url=settings.search_base_url,
         api_key=settings.search_api_key,
         timeout_seconds=settings.search_timeout_seconds,
         region=settings.search_region,
         backend=settings.search_backend,
-        model=settings.llm_model,
-    )
+        model=(getattr(settings, "llm_web_search_model", "") or "").strip() or settings.llm_model,
+        reasoning_effort=settings.web_search_reasoning_effort,
+    ), settings)
+
+
+def _with_page_reader(client, settings):
+    if getattr(settings, 'web_page_proxy_url', ''):
+        # The search service cannot use this machine's loopback proxy.
+        # Route only open_page to the local, credential-free HTTP reader.
+        client.page_reader = GeminiSearchClient(provider='local_page_reader', base_url='', api_key='',
+            model='', timeout_seconds=settings.agent_web_search_timeout_seconds,
+            page_proxy_url=settings.web_page_proxy_url)
+    return client
 
 
 def build_image_reference_search_client(settings: AppSettings) -> WebSearchClient | None:
     """Build external image search independently of chat built-in search."""
     provider = settings.search_provider.strip().lower()
+    if provider == "gemini":
+        return _build_gemini_search_client(settings)
     if provider != "ddgs" and not settings.search_api_key.strip():
         return None
     return WebSearchClient(
@@ -55,7 +71,21 @@ def build_image_reference_search_client(settings: AppSettings) -> WebSearchClien
         timeout_seconds=settings.search_timeout_seconds,
         region=settings.search_region,
         backend=settings.search_backend,
+        model=((getattr(settings, "llm_web_search_model", "") or "").strip() or settings.llm_model)
+        if provider in {"wyzlab", "wyzlab_alpha"} else "",
+        reasoning_effort=settings.web_search_reasoning_effort
+        if provider in {"wyzlab", "wyzlab_alpha"} else "medium",
     )
+
+
+def _build_gemini_search_client(settings: AppSettings) -> GeminiSearchClient | None:
+    if not settings.search_api_key.strip():
+        return None
+    return GeminiSearchClient(provider="gemini", base_url=settings.search_base_url,
+        api_key=settings.search_api_key, timeout_seconds=settings.agent_web_search_timeout_seconds,
+        model=settings.llm_web_search_model.strip() or settings.llm_model,
+        reasoning_effort=settings.web_search_reasoning_effort,
+        page_proxy_url=getattr(settings, 'web_page_proxy_url', ''))
 
 
 def build_usage_recorder(engine):
@@ -276,6 +306,9 @@ def build_group_image_llm_client(
     # Keep Responses as the default, but allow production to select the
     # explicit generations/edits transport without changing chat routing.
     image_transport = getattr(settings, "group_image_transport", "responses")
+    image_edit_model = (getattr(settings, "group_image_edit_model", "") or "").strip()
+    if image_edit_model and (image_transport == "images" or not settings.group_image_responses_model.strip()):
+        raise ValueError("GROUP_IMAGE_EDIT_MODEL requires Responses transport and GROUP_IMAGE_RESPONSES_MODEL")
     if image_transport != "images" and all(
         hasattr(llm_client, attr) for attr in ("base_url", "api_key", "http_client")
     ):
@@ -304,6 +337,7 @@ def build_group_image_llm_client(
             responses_only=True,
             image_responses_model=response_model,
             image_generation_model=image_model if settings.group_image_responses_model.strip() else "",
+            image_edit_model=image_edit_model,
             builtin_web_search=False,
             reasoning_effort=settings.llm_reasoning_effort,
             max_output_tokens=settings.llm_max_output_tokens,
@@ -336,7 +370,7 @@ def build_group_image_llm_client(
         image_generations_endpoint=settings.group_image_generations_endpoint,
         image_edits_endpoint=settings.group_image_edits_endpoint,
         max_output_tokens=settings.llm_max_output_tokens,
-        timeout_seconds=settings.llm_timeout_seconds,
+        timeout_seconds=settings.group_image_timeout_seconds,
         usage_recorder=build_usage_recorder(engine),
     )
 

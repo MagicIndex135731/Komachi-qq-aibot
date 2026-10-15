@@ -107,29 +107,29 @@ def _fact(
 
 def test_preferred_kinds_for_query_intent_mapping() -> None:
     cases = (
-        ("小甲喜欢什么动画？", ("preference",)),
-        ("小甲讨厌什么？", ("taboo", "preference")),
-        ("小甲不喜欢什么？", ("taboo", "preference")),
-        ("小甲有什么梗？", ("running_joke",)),
-        ("小甲和谁是什么关系？", ("relationship",)),
-        ("小甲打算做什么？", ("plan",)),
-        ("小甲决定了什么？", ("decision",)),
-        ("小甲最近在做什么？", ("current",)),
-        ("小甲最近在看什么动画？", ("current", "event")),
-        ("小甲现在在追什么番？", ("current", "event")),
-        ("小甲最近发生了什么？", ("event",)),
+        ("阿渣喜欢什么动画？", ("preference",)),
+        ("阿渣讨厌什么？", ("taboo", "preference")),
+        ("阿渣不喜欢什么？", ("taboo", "preference")),
+        ("阿渣有什么梗？", ("running_joke",)),
+        ("阿渣和谁是什么关系？", ("relationship",)),
+        ("阿渣打算做什么？", ("plan",)),
+        ("阿渣决定了什么？", ("decision",)),
+        ("阿渣最近在做什么？", ("current",)),
+        ("阿渣最近在看什么动画？", ("current", "event")),
+        ("阿渣现在在追什么番？", ("current", "event")),
+        ("阿渣最近发生了什么？", ("event",)),
         (
-            "小甲目前在哪里工作？",
+            "阿渣目前在哪里工作？",
             ("current", "event"),
         ),
-        ("小甲在哪里工作？", ("current", "event")),
-        ("介绍一下小甲", PERSON_PORTRAIT_KINDS),
-        ("小甲是什么样的人？", PERSON_PORTRAIT_KINDS),
-        ("小甲的完整个人画像", PERSON_PORTRAIT_KINDS),
-        ("小甲是哪里人？", ("profile",)),
-        ("小甲是做什么的？", ("profile",)),
-        ("介绍一下小甲最近在做什么", ("current",)),
-        ("介绍一下小甲喜欢什么", ("preference",)),
+        ("阿渣在哪里工作？", ("current", "event")),
+        ("介绍一下阿渣", PERSON_PORTRAIT_KINDS),
+        ("阿渣是什么样的人？", PERSON_PORTRAIT_KINDS),
+        ("阿渣的完整个人画像", PERSON_PORTRAIT_KINDS),
+        ("阿渣是哪里人？", ("profile",)),
+        ("阿渣是做什么的？", ("profile",)),
+        ("介绍一下阿渣最近在做什么", ("current",)),
+        ("介绍一下阿渣喜欢什么", ("preference",)),
         ("今天天气怎么样", ()),
     )
     for query, expected in cases:
@@ -141,30 +141,30 @@ def test_preferred_kinds_for_query_intent_mapping() -> None:
 
 def test_preferred_kinds_for_query_current_fact_fallback() -> None:
     assert preferred_kinds_for_query(
-        query="还记得小甲吗？",
+        query="还记得阿渣吗？",
         answer_mode="current_fact",
     ) == ("preference", "taboo", "profile")
     assert preferred_kinds_for_query(
-        query="还记得小甲吗？",
+        query="还记得阿渣吗？",
         answer_mode="general_history",
     ) == ()
 
 
 def test_fact_kinds_for_query_isolates_dynamic_intents() -> None:
     assert fact_kinds_for_query(
-        query="小甲最近在看什么动画",
+        query="阿渣最近在看什么动画",
         answer_mode="current_fact",
     ) == ("current", "event")
     assert fact_kinds_for_query(
-        query="小甲接下来有什么计划",
+        query="阿渣接下来有什么计划",
         answer_mode="current_fact",
     ) == ("plan", "decision")
     assert fact_kinds_for_query(
-        query="小甲喜欢什么动画",
+        query="阿渣喜欢什么动画",
         answer_mode="current_fact",
     ) == ("preference",)
     assert fact_kinds_for_query(
-        query="介绍一下小甲",
+        query="介绍一下阿渣",
         answer_mode="current_fact",
     ) == PERSON_PORTRAIT_KINDS
 
@@ -209,11 +209,11 @@ def test_reverse_order_plural_viewing_policy_stays_narrow() -> None:
 
 
 def test_composite_portrait_query_is_distinct_from_single_attribute_query() -> None:
-    assert is_composite_portrait_query("给出小甲的完整个人画像")
-    assert is_composite_portrait_query("介绍一下小甲")
-    assert is_composite_portrait_query("小甲是什么样的人")
-    assert not is_composite_portrait_query("小甲是哪里人")
-    assert not is_composite_portrait_query("小甲是做什么的")
+    assert is_composite_portrait_query("给出阿渣的完整个人画像")
+    assert is_composite_portrait_query("介绍一下阿渣")
+    assert is_composite_portrait_query("阿渣是什么样的人")
+    assert not is_composite_portrait_query("阿渣是哪里人")
+    assert not is_composite_portrait_query("阿渣是做什么的")
 
 
 def test_select_diverse_portrait_facts_keeps_each_available_section() -> None:
@@ -235,11 +235,11 @@ def test_select_diverse_portrait_facts_keeps_each_available_section() -> None:
 
 def test_memory_query_features_extract_entities_and_cjk_grams() -> None:
     features = memory_query_features(
-        query="小甲喜欢什么动画？",
-        entities=("小甲",),
+        query="阿渣喜欢什么动画？",
+        entities=("阿渣",),
         topic_terms=("动画",),
     )
-    assert "小甲" in features
+    assert "阿渣" in features
     assert "动画" in features
     assert "喜欢" in features
     assert "什么" in features
@@ -247,7 +247,7 @@ def test_memory_query_features_extract_entities_and_cjk_grams() -> None:
 
 def test_memory_query_features_expands_current_viewing_synonyms() -> None:
     features = memory_query_features(
-        query="小甲最近在看什么动画？",
+        query="阿渣最近在看什么动画？",
         topic_terms=("动画",),
     )
 
@@ -256,27 +256,27 @@ def test_memory_query_features_expands_current_viewing_synonyms() -> None:
 
 def test_filter_member_query_features_drops_alias_echoes() -> None:
     features = memory_query_features(
-        query="小甲喜欢什么动画？",
-        entities=("小甲",),
+        query="阿渣喜欢什么动画？",
+        entities=("阿渣",),
         topic_terms=("动画",),
     )
     filtered = filter_member_query_features(
         features,
-        aliases=("小甲",),
+        aliases=("阿渣",),
     )
     assert "动画" in filtered
     assert "喜欢" in filtered
-    assert all("小甲" not in feature for feature in filtered)
+    assert all("阿渣" not in feature for feature in filtered)
 
 
 def test_rank_member_facts_puts_relevant_facts_first() -> None:
     unrelated = _fact(1, "用户表示自己在做前后端", importance=4, confidence=0.9)
     relevant = _fact(2, "用户表示自己一直在看海贼王动画", importance=2, confidence=0.8)
     features = memory_query_features(
-        query="小甲喜欢什么动画？",
+        query="阿渣喜欢什么动画？",
         topic_terms=("动画",),
     )
-    features = filter_member_query_features(features, aliases=("小甲",))
+    features = filter_member_query_features(features, aliases=("阿渣",))
     ranked = rank_member_facts(
         (unrelated, relevant),
         query_features=features,
@@ -302,30 +302,30 @@ def test_rank_member_facts_respects_limit_and_tie_break() -> None:
 def test_rank_member_facts_prefers_kind_before_importance() -> None:
     unrelated_current = _fact(
         1,
-        "小甲在做前后端",
+        "阿渣在做前后端",
         importance=5,
         confidence=0.9,
         memory_kind="current",
     )
     unrelated_preference = _fact(
         2,
-        "小甲一直在看海贼王",
+        "阿渣一直在看海贼王",
         importance=2,
         confidence=0.8,
         memory_kind="preference",
     )
     matched_preference = _fact(
         3,
-        "小甲喜欢看动画",
+        "阿渣喜欢看动画",
         importance=1,
         confidence=0.7,
         memory_kind="preference",
     )
     features = memory_query_features(
-        query="小甲喜欢什么动画？",
+        query="阿渣喜欢什么动画？",
         topic_terms=("动画",),
     )
-    features = filter_member_query_features(features, aliases=("小甲",))
+    features = filter_member_query_features(features, aliases=("阿渣",))
     ranked = rank_member_facts(
         (unrelated_current, unrelated_preference, matched_preference),
         query_features=features,
@@ -368,18 +368,18 @@ def test_rank_member_facts_recency_breaks_ties() -> None:
 
 def test_temporal_recency_required_detects_recent_intent() -> None:
     temporal_queries = (
-        "小甲最近有什么计划",
-        "小丙现在在忙什么",
-        "小甲目前在哪里工作",
-        "小甲近期决定了什么",
-        "小甲刚刚和谁建立了关系",
+        "阿渣最近有什么计划",
+        "茔草现在在忙什么",
+        "阿渣目前在哪里工作",
+        "阿渣近期决定了什么",
+        "阿渣刚刚和谁建立了关系",
         "最近聊过什么",
-        "小甲接下来有什么计划",
-        "小甲打算做什么",
+        "阿渣接下来有什么计划",
+        "阿渣打算做什么",
     )
     assert all(temporal_recency_required(query=query) for query in temporal_queries)
-    assert not temporal_recency_required(query="小甲喜欢什么动画")
-    assert not temporal_recency_required(query="介绍一下小甲")
+    assert not temporal_recency_required(query="阿渣喜欢什么动画")
+    assert not temporal_recency_required(query="介绍一下阿渣")
 
 
 def test_rank_member_facts_recency_boost_prefers_fresh_facts() -> None:
@@ -397,7 +397,7 @@ def test_rank_member_facts_recency_boost_prefers_fresh_facts() -> None:
         confidence=0.9,
         valid_from=datetime(2026, 3, 1, tzinfo=UTC),
     )
-    features = memory_query_features(query="小甲最近有什么计划")
+    features = memory_query_features(query="阿渣最近有什么计划")
     ranked = rank_member_facts(
         (stale, recent),
         query_features=features,
@@ -437,10 +437,10 @@ def test_recent_viewing_ranking_prefers_fresh_equivalent_activity() -> None:
         memory_kind="preference",
         last_seen_at=datetime(2026, 7, 21, tzinfo=UTC),
     )
-    query = "小甲最近在看什么动画？"
+    query = "阿渣最近在看什么动画？"
     features = filter_member_query_features(
         memory_query_features(query=query, topic_terms=("动画",)),
-        aliases=("小甲",),
+        aliases=("阿渣",),
     )
 
     ranked = rank_member_facts(

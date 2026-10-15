@@ -13,6 +13,8 @@ import yaml
 
 
 DEFAULT_HK_PATTERN = r"(?:香港|Hong\s*Kong|(?:^|\W)HK(?:\W|$)|🇭🇰)"
+RATE_ONE_PATTERN = r'(?:[x×✕]\s*1(?:\.0+)?(?![\d.])|(?<![\d.])1(?:\.0+)?\s*[x×✕]|倍率\s*[:：]?\s*1(?:\.0+)?(?![\d.])|(?<![\d.])1(?:\.0+)?\s*倍(?!率))'
+PAGE_GROUP = 'XIAOMACHI-WEB-HK-X1'
 NOVA_GROUP = "XIAOMACHI-NOVA-HK"
 NOVA_HOST = "ai.novacode.top"
 
@@ -67,7 +69,7 @@ def render_config(
     rendered = dict(source)
     rendered.update(
         {
-            "mixed-port": 7897,
+            "mixed-port": 18797,
             "mode": "rule",
             "allow-lan": False,
             "bind-address": "127.0.0.1",
@@ -118,15 +120,40 @@ def render_config(
     return rendered
 
 
+def render_page_config(source: dict[str, Any], *, unmarked_rate_one: bool = False) -> dict[str, Any]:
+    """A dedicated listener: only explicitly proxied page clients reach it."""
+    proxies = source.get('proxies')
+    if not isinstance(proxies, list):
+        raise ValueError('subscription has no proxy list')
+    hong_kong = re.compile(DEFAULT_HK_PATTERN, re.IGNORECASE)
+    rate_one = re.compile(RATE_ONE_PATTERN, re.IGNORECASE)
+    any_rate = re.compile(r'(?:[x×✕]\s*\d|\d(?:\.\d+)?\s*[x×✕]|倍率|\d\s*倍)', re.IGNORECASE)
+    selected = [dict(item) for item in proxies if isinstance(item, dict)
+                and isinstance(item.get('name'), str) and hong_kong.search(item['name'])
+                and (rate_one.search(item['name']) or unmarked_rate_one and not any_rate.search(item['name']))]
+    if not selected:
+        raise ValueError('subscription has no Hong Kong rate-x1 nodes')
+    return {'mixed-port': 18797, 'mode': 'rule', 'allow-lan': False,
+            'bind-address': '127.0.0.1', 'external-controller': '127.0.0.1:19090',
+            'secret': secrets.token_urlsafe(24), 'log-level': 'warning', 'tun': {'enable': False},
+            'proxies': selected, 'proxy-groups': [{'name': PAGE_GROUP, 'type': 'url-test',
+                'proxies': [item['name'] for item in selected], 'url': 'https://cp.cloudflare.com/generate_204',
+                'interval': 300, 'tolerance': 0, 'lazy': False, 'timeout': 5000}],
+            'rules': ['MATCH,' + PAGE_GROUP]}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--hk-pattern", default=DEFAULT_HK_PATTERN)
     parser.add_argument("--nova-host", default=NOVA_HOST)
+    parser.add_argument('--page-only', action='store_true')
+    parser.add_argument('--unmarked-rate-one', action='store_true',
+                        help='Explicit operator convention: unlabeled nodes have rate x1')
     args = parser.parse_args()
 
-    rendered = render_config(
+    rendered = render_page_config(_load_mapping(args.source), unmarked_rate_one=args.unmarked_rate_one) if args.page_only else render_config(
         _load_mapping(args.source),
         hk_pattern=args.hk_pattern,
         nova_host=args.nova_host,

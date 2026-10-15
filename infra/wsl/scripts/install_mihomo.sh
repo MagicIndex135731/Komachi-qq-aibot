@@ -77,4 +77,4 @@ systemctl daemon-reload
 systemctl enable xiaomachi-mihomo.service >/dev/null
 systemctl restart xiaomachi-mihomo.service
 systemctl is-active --quiet xiaomachi-mihomo.service
-echo "mihomo_install=ok version=${MIHOMO_VERSION} listen=127.0.0.1:7897"
+echo "mihomo_install=ok version=${MIHOMO_VERSION} listen=127.0.0.1:18797"

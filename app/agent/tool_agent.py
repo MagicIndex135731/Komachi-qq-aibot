@@ -39,6 +39,7 @@ class AgentTool:
     operation_daily_limit: int | None = None
     shared_cooldown_seconds: float = 0
     max_writes_per_wake: int | None = None
+    authorization: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +143,10 @@ class AutonomousToolAgent:
                 if set(call) != {"tool", "arguments"} or tool is None or not validate_arguments(args, tool.parameters):
                     trace.append({"step": step, "tool": name if isinstance(name, str) and name in by_name else "unknown", "status": "invalid_tool"})
                     feedback.append({"error": "tool_or_arguments_not_allowed"})
+                    continue
+                if tool.authorization is not None and tool.authorization() is not True:
+                    feedback.append({'tool': name, 'result': {'error': 'owner_required'}})
+                    trace.append({'step': step, 'tool': name, 'status': 'blocked'})
                     continue
                 if tool.effect == "image":
                     if image_calls >= self.max_image_calls or self.before_call and not self.before_call("image"):

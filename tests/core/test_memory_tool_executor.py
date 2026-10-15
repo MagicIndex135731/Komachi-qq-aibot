@@ -129,7 +129,7 @@ def test_memory_tools_do_not_replay_recalled_fact_sources(sqlite_engine):
         MessageRepository(session).mark_group_message_deleted(group_id=100, platform_msg_id="tool-source")
     executor = _executor(sqlite_engine)
     assert "冰美式" not in executor.execute("memory_search", {"query": "冰美式", "layer": "facts"})
-    assert "冰美式" not in executor.execute("memory_read", {"member": "小甲"})
+    assert "冰美式" not in executor.execute("memory_read", {"member": "阿渣"})
 
 
 @pytest.mark.parametrize("state", ["reserved", "blocked", "uncertain", "deleted"])
@@ -251,7 +251,7 @@ def _seed(engine) -> None:
                 speak_enabled=True,
             )
         users = UserRepository(session)
-        users.upsert_user(user_id=20001, nickname="Member-A", group_card="小甲")
+        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
         users.upsert_user(user_id=99, nickname="Questioner", group_card="提问者")
         users.upsert_user(user_id=20002, nickname="Other", group_card="别人")
         messages = MessageRepository(session)
@@ -260,8 +260,8 @@ def _seed(engine) -> None:
             group_id=100,
             user_id=20001,
             timestamp=observed_at,
-            plain_text="小甲喜欢喝冰美式",
-            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
+            plain_text="阿渣喜欢喝冰美式",
+            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -271,7 +271,7 @@ def _seed(engine) -> None:
             group_id=100,
             user_id=99,
             timestamp=observed_at + timedelta(minutes=1),
-            plain_text="小甲以前说过喜欢喝什么？",
+            plain_text="阿渣以前说过喜欢喝什么？",
             raw_json={"sender": {"nickname": "Questioner", "card": "提问者"}},
             msg_type="text",
             reply_to_msg_id=None,
@@ -308,7 +308,7 @@ def _seed(engine) -> None:
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="小甲喜欢喝冰美式",
+            content="阿渣喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="tool-source",
@@ -325,7 +325,7 @@ def _seed(engine) -> None:
             source_id=str(memory.id),
             start_at=observed_at,
             end_at=observed_at,
-            content="小甲喜欢喝冰美式",
+            content="阿渣喜欢喝冰美式",
             metadata_json={"subject_id": "20001", "kind": "preference"},
             content_hash="hash-tool-memory",
             source_message_ids=[int(fact_source.id)],
@@ -337,7 +337,7 @@ def _seed(engine) -> None:
             summary_key="episode:tool:test",
             start_at=observed_at,
             end_at=observed_at + timedelta(hours=1),
-            content="小甲动画偏好总结",
+            content="阿渣动画偏好总结",
             source_count=1,
             source_start_msg_id="tool-source",
             source_end_msg_id="tool-source",
@@ -351,7 +351,7 @@ def _executor(engine, *, recent_source_ids=("tool-source", "tool-query")):
         current_user_id=99,
         now=datetime(2026, 7, 23, 12, 0, tzinfo=UTC),
         recent_source_msg_ids=recent_source_ids,
-        member_names={"小甲": 20001, "提问者": 99, "20001": 20001, "99": 99},
+        member_names={"阿渣": 20001, "提问者": 99, "20001": 20001, "99": 99},
         timeout_seconds=2.0,
         max_results=5,
     )
@@ -363,7 +363,7 @@ def test_memory_search_facts_returns_scoped_fact(sqlite_engine) -> None:
         "memory_search",
         {"query": "冰美式", "layer": "facts"},
     )
-    assert "小甲喜欢喝冰美式" in output
+    assert "阿渣喜欢喝冰美式" in output
     assert "tool-source" in output
 
 
@@ -373,7 +373,7 @@ def test_memory_search_raw_returns_raw_message(sqlite_engine) -> None:
         "memory_search",
         {"query": "冰美式", "layer": "raw"},
     )
-    assert "小甲喜欢喝冰美式" in output
+    assert "阿渣喜欢喝冰美式" in output
     assert "tool-source" in output
 
 
@@ -383,16 +383,16 @@ def test_memory_search_summaries_returns_summary(sqlite_engine) -> None:
         "memory_search",
         {"query": "偏好", "layer": "summaries"},
     )
-    assert "小甲动画偏好总结" in output
+    assert "阿渣动画偏好总结" in output
 
 
 def test_memory_search_member_filter_and_unresolved(sqlite_engine) -> None:
     _seed(sqlite_engine)
     output = _executor(sqlite_engine).execute(
         "memory_search",
-        {"query": "冰美式", "layer": "facts", "member": "小甲"},
+        {"query": "冰美式", "layer": "facts", "member": "阿渣"},
     )
-    assert "小甲喜欢喝冰美式" in output
+    assert "阿渣喜欢喝冰美式" in output
     unresolved = _executor(sqlite_engine).execute(
         "memory_search",
         {"query": "冰美式", "member": "不存在的人"},
@@ -407,14 +407,14 @@ def test_memory_search_empty_member_string_is_unrestricted(sqlite_engine) -> Non
             "memory_search",
             {"query": "冰美式", "layer": "facts", "member": member},
         )
-        assert "小甲喜欢喝冰美式" in output
+        assert "阿渣喜欢喝冰美式" in output
         assert "member_unresolved" not in output
 
 
 def test_memory_read_returns_profile_and_recent_count(sqlite_engine) -> None:
     _seed(sqlite_engine)
-    output = _executor(sqlite_engine).execute("memory_read", {"member": "小甲"})
-    assert "小甲喜欢喝冰美式" in output
+    output = _executor(sqlite_engine).execute("memory_read", {"member": "阿渣"})
+    assert "阿渣喜欢喝冰美式" in output
     assert "recent messages: 1" in output
 
 
@@ -425,11 +425,11 @@ def test_memory_read_returns_a_diverse_stable_portrait(sqlite_engine) -> None:
         memories = MemoryRepository(session)
         for index, (kind, content) in enumerate(
             (
-                ("profile", "小甲长期从事软件开发"),
-                ("fact", "小甲养了一只猫"),
-                ("taboo", "小甲不接受剧透"),
-                ("relationship", "小甲是提问者的朋友"),
-                ("current", "小甲最近在看某部动画"),
+                ("profile", "阿渣长期从事软件开发"),
+                ("fact", "阿渣养了一只猫"),
+                ("taboo", "阿渣不接受剧透"),
+                ("relationship", "阿渣是提问者的朋友"),
+                ("current", "阿渣最近在看某部动画"),
             ),
             start=1,
         ):
@@ -446,7 +446,7 @@ def test_memory_read_returns_a_diverse_stable_portrait(sqlite_engine) -> None:
                 valid_from=observed_at + timedelta(seconds=index),
             )
 
-    output = _executor(sqlite_engine).execute("memory_read", {"member": "小甲"})
+    output = _executor(sqlite_engine).execute("memory_read", {"member": "阿渣"})
 
     for kind in ("profile", "fact", "preference", "taboo", "relationship"):
         assert f"{kind} (source:" in output

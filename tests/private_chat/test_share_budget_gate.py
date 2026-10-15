@@ -134,13 +134,15 @@ async def test_owner_persistent_wakeup_cannot_search_quoted_card_without_read_re
     holder = {}
     def model(body, number):
         if number == 1:
-            return sse('schedule_private_wakeup', {'goal': '以后聊这张分享', 'delay_seconds': 2}, number=number)
-        if number == 3:
-            return sse('search_web', {'query': '合成分享标题'}, number=number)
+            return sse('schedule_private_wakeup', {'goal': '以后聊这张分享', 'delay_seconds': 120}, number=number)
+        if number == 2:
+            return sse('send_private', {'text': '已记下提醒'}, number=number)
         if number == 4:
+            return sse('search_web', {'query': '合成分享标题'}, number=number)
+        if number == 5:
             assert output(body, 'search_web')['status'] == 'blocked'
             return sse('read_message_links', {'source_id': holder['card_source']}, number=number)
-        if number == 5:
+        if number == 6:
             assert output(body, 'read_message_links')['status'] == 'blocked'
             return sse('send_private', {'text': '记得这张分享，未要求读取正文'}, number=number)
         return sse(number=number)
@@ -156,7 +158,8 @@ async def test_owner_persistent_wakeup_cannot_search_quoted_card_without_read_re
     await service.start()
     try:
         await dispatcher.handle_private_message(current)
-        assert len(requests) == 2 and not web_calls and not sender.texts
+        assert len(requests) == 3 and not web_calls
+        assert sender.texts == [(OWNER, '已记下提醒')]
         with session_scope(sqlite_engine) as db:
             wake = db.query(Job).filter(Job.job_type == agent.job_type, Job.status == 'queued').one()
             assert wake.payload_json['kind'] == 'wakeup'
@@ -165,7 +168,37 @@ async def test_owner_persistent_wakeup_cannot_search_quoted_card_without_read_re
             assert request.reply_to_msg_id == 'budget-card' and request.msg_type == 'text'
             wake.run_at = datetime.now(UTC).replace(tzinfo=None)
         await agent._drain_user(OWNER)
+        assert len(requests) == 7 and not web_calls
+        assert sender.texts == [(OWNER, '已记下提醒'), (OWNER, '记得这张分享，未要求读取正文')]
+    finally:
+        await service.stop()
+
+
+async def test_owner_wakeup_cannot_reuse_old_question_or_delegate_to_network(sqlite_engine, tmp_path):
+    def model(body, number):
+        if number == 1:
+            return sse('schedule_private_wakeup', {'goal': '以后看看天气', 'delay_seconds': 120}, number=number)
+        if number == 2:
+            return sse('send_private', {'text': '已安排提醒'}, number=number)
+        if number == 4:
+            return sse('search_web', {'query': '今天上海天气'}, number=number)
+        if number == 5:
+            assert output(body, 'search_web')['status'] == 'blocked'
+            return sse('delegate_research_task', {'goal': '调查天气', 'deliverable': '摘要', 'reason': '合成测试'}, number=number)
+        if number == 6:
+            assert output(body, 'delegate_research_task')['data']['error'] == 'delegation_requires_current_user_request'
+        return sse(number=number)
+    service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, model)
+    web_calls = install_web(service)
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('owner-weather-question', user_id=OWNER, text='今天上海天气怎么样，以后提醒我'))
+        with session_scope(sqlite_engine) as db:
+            wake = db.query(Job).filter(Job.job_type == agent.job_type, Job.status == 'queued').one()
+            wake.run_at = datetime.now(UTC).replace(tzinfo=None)
+        await agent._drain_user(OWNER)
         assert len(requests) == 6 and not web_calls
-        assert sender.texts == [(OWNER, '记得这张分享，未要求读取正文')]
+        with session_scope(sqlite_engine) as db:
+            assert db.query(Job).filter(Job.job_type == 'delegated_research').count() == 0
     finally:
         await service.stop()

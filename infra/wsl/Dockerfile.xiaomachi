@@ -26,6 +26,10 @@ RUN apt-get update \
     && python -m pip uninstall -y fastembed onnxruntime \
     && python -m pip install -r requirements.xiaomachi-gpu.txt
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY app ./app
 COPY configs ./configs
 COPY scripts ./scripts

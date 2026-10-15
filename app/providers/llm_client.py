@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -30,8 +31,26 @@ logger = logging.getLogger(__name__)
 
 
 def default_auxiliary_reasoning_effort(model: str) -> str:
-    """Sol 6.1 auxiliary jobs use low; retain other models' existing defaults."""
-    return "low" if model.strip().lower() == "gpt-6.1-sol" else "medium"
+    """Keep small auxiliary calls within the supported low reasoning budget."""
+    normalized = model.strip().lower()
+    return "low" if (normalized == "gpt-6.1-sol" or normalized.startswith("grok-")
+                     or _GEMINI_FLASH_ALIAS.fullmatch(normalized)) else "medium"
+
+
+_GEMINI_FLASH_ALIAS = re.compile(r"gemini-3\.8-flash(?:-(?:low|medium|high|tiered))?")
+
+
+def resolve_reasoning_model(model: str, effort: str) -> str:
+    """Select the tested Gemini aliases instead of relying on an accepted field."""
+    normalized = model.strip().lower()
+    if not _GEMINI_FLASH_ALIAS.fullmatch(normalized):
+        return model
+    selected = (effort or "").strip().lower()
+    if not selected:
+        return normalized
+    if selected not in {"low", "medium", "high"}:
+        raise ValueError("Gemini 3.8 Flash reasoning effort must be low, medium, high, or empty")
+    return "gemini-3.8-flash-" + selected
 
 
 INSTRUCTION_PREFIXES = (
@@ -120,6 +139,7 @@ class LlmClient:
         responses_only: bool = False,
         image_responses_model: str | None = None,
         image_generation_model: str | None = None,
+        image_edit_model: str | None = None,
         compat_model: str | None = None,
         image_generations_endpoint: str = "/images/generations",
         image_edits_endpoint: str = "/images/edits",
@@ -142,14 +162,17 @@ class LlmClient:
             raise ValueError("request_max_attempts must be an integer between 1 and 10")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.model = model
-        self.fallback_model = (fallback_model or "").strip()
-        self.vision_model = (vision_model or "").strip()
-        self.responses_model = (responses_model or "").strip()
+        self.model = resolve_reasoning_model(model, reasoning_effort)
+        self.fallback_model = resolve_reasoning_model((fallback_model or "").strip(), reasoning_effort)
+        self.vision_model = resolve_reasoning_model((vision_model or "").strip(), reasoning_effort)
+        self.responses_model = resolve_reasoning_model((responses_model or "").strip(), reasoning_effort)
         self.responses_only = bool(responses_only)
-        self.image_responses_model = (image_responses_model or "").strip()
+        self.image_responses_model = resolve_reasoning_model((image_responses_model or "").strip(), reasoning_effort)
         self.image_generation_model = (image_generation_model or "").strip()
-        self.compat_model = (compat_model or model).strip() or model
+        self.image_edit_model = (image_edit_model or "").strip()
+        if self.image_edit_model and not (self.image_responses_model and self.image_generation_model):
+            raise ValueError("image_edit_model requires explicit Responses main and generation models")
+        self.compat_model = resolve_reasoning_model((compat_model or model).strip() or model, reasoning_effort)
         self.image_generations_endpoint = self._normalize_endpoint(
             image_generations_endpoint,
             default="/images/generations",
@@ -346,6 +369,11 @@ class LlmClient:
                 payload["tool_choice"] = {"type": "web_search"}
         return payload
 
+    def resolved_image_model(self, *, edit: bool = False) -> str:
+        """Actual configured image workload model, also used for artifact provenance."""
+        return (self.image_edit_model if edit and self.image_edit_model else
+                self.image_generation_model or self.image_responses_model or self.compat_model)
+
     def _build_responses_image_payload(
         self,
         *,
@@ -376,7 +404,7 @@ class LlmClient:
                     content["detail"] = "high"
         image_tool: dict[str, Any] = {"type": "image_generation"}
         if self.image_generation_model:
-            image_tool["model"] = self.image_generation_model
+            image_tool["model"] = self.resolved_image_model(edit=bool(images))
         normalized_size = str(size or "").strip()
         if normalized_size and normalized_size != "auto":
             image_tool["size"] = normalized_size
@@ -643,7 +671,9 @@ class LlmClient:
             return f"{name}{extension}"
         return f"image-{index}{extension}"
 
-    def _load_edit_input_images(self, images: list[ImageAttachment]) -> list[tuple[str, tuple[str, bytes, str]]]:
+    def _load_edit_input_images(
+        self, images: list[ImageAttachment], *, reference_subjects: list[str] | None = None,
+    ) -> list[tuple[str, tuple[str, bytes, str]]]:
         multipart_images: list[tuple[str, tuple[str, bytes, str]]] = []
         for index, image in enumerate(images, start=1):
             local_path = (image.local_path or "").strip()
@@ -668,6 +698,8 @@ class LlmClient:
                             ),
                         )
                     )
+                    if reference_subjects is not None:
+                        reference_subjects.append((image.reference_subject or "").strip())
                     continue
 
             candidate_urls = [image.url.strip()]
@@ -717,6 +749,8 @@ class LlmClient:
                     ),
                 )
             )
+            if reference_subjects is not None:
+                reference_subjects.append((image.reference_subject or "").strip())
         return multipart_images
 
     def _extract_responses_text(self, payload: dict[str, Any]) -> str | None:
@@ -791,14 +825,14 @@ class LlmClient:
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
-            if isinstance(content, str):
+            if isinstance(content, str) and content.strip():
                 return content
             if isinstance(content, list):
                 for item in content:
                     if not isinstance(item, dict):
                         continue
                     text = item.get("text")
-                    if isinstance(text, str):
+                    if isinstance(text, str) and text.strip():
                         return text
         return None
 
@@ -1038,10 +1072,14 @@ class LlmClient:
         seen_call_ids: set[str] = set()
         reasoning_items: list[dict[str, Any]] = []
         seen_reasoning_keys: set[str] = set()
+        function_items: dict[str, dict[str, Any]] = {}
+        argument_events: list[dict[str, Any]] = []
 
         def append_function_call(item: dict[str, Any]) -> None:
             if not isinstance(item, dict) or item.get("type") != "function_call":
                 return
+            if isinstance(item.get("id"), str):
+                function_items[item["id"]] = item
             call_id = str(item.get("call_id") or "")
             name = str(item.get("name") or "").strip()
             if not call_id or not name or call_id in seen_call_ids:
@@ -1089,6 +1127,8 @@ class LlmClient:
                 raise error
             item = payload.get("item")
             if isinstance(item, dict):
+                if item.get("type") == "function_call" and isinstance(item.get("id"), str):
+                    function_items[item["id"]] = item
                 key = payload.get("output_index", item.get("id", 0))
                 if isinstance(item.get("id"), str):
                     item_keys[item["id"]] = key
@@ -1129,14 +1169,17 @@ class LlmClient:
                 )
                 append_function_call(payload.get("item"))
             if payload_type == "response.function_call_arguments.done":
-                append_function_call(
-                    {
-                        "type": "function_call",
-                        "call_id": payload.get("item_id") or payload.get("call_id"),
-                        "name": payload.get("name"),
-                        "arguments": payload.get("arguments"),
-                    }
-                )
+                # item_id identifies the response item, not the tool call.
+                # Resolve after all frames so a relay can send arguments before
+                # the item frame without executing the same call twice.
+                argument_events.append(payload)
+
+        for event in argument_events:
+            item = function_items.get(event.get("item_id"), {})
+            append_function_call({"type": "function_call",
+                "call_id": item.get("call_id") or event.get("call_id") or event.get("item_id"),
+                "name": item.get("name") or event.get("name"),
+                "arguments": event.get("arguments", item.get("arguments"))})
 
         keys = list(dict.fromkeys([*pieces, *done_texts]))
         final_keys = [key for key in keys if phases.get(key) == "final_answer"]
@@ -1621,7 +1664,63 @@ class LlmClient:
             raise last_error
         raise ValueError("responses request failed after retries") from last_error
 
+    def prepare_responses_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Preserve application instruction authority on Grok's role vocabulary.
+
+        This is transport-only: native/stored history retains its original
+        roles, and non-Grok models keep their existing request shape.
+        """
+        if not str(payload.get("model") or self.responses_model).strip().lower().startswith("grok-"):
+            return payload
+        items = payload.get("input")
+        if not isinstance(items, list):
+            return payload
+        instructions = [payload["instructions"]] if payload.get("instructions") else []
+        retained = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("role") not in {"developer", "system"}:
+                retained.append(item)
+                continue
+            content = item.get("content", "")
+            if isinstance(content, str):
+                instructions.append(content)
+            elif isinstance(content, list) and all(isinstance(part, dict) and
+                    part.get("type") in {"text", "input_text"} for part in content):
+                instructions.append("\n".join(str(part.get("text") or "") for part in content))
+            else:
+                # Preserve unfamiliar non-text content rather than dropping it.
+                retained.append({**item, "role": "system"})
+        # This relay's instructions field replaces system-role input. Merge
+        # trusted application rules here so the clock cannot displace persona,
+        # action/sending rules or current source-checked guidance.
+        prepared = ({**payload, "instructions": "\n\n".join(instructions), "input": retained}
+                    if len(retained) != len(items) else payload)
+        tools = prepared.get("tools")
+        if isinstance(tools, list):
+            # Grok rejects even unused tools when a schema integer bound is
+            # beyond the exact JSON/JavaScript integer range. Native SDK
+            # serialization rounds INT64_MAX above its signed range. Omit
+            # only those transport bounds; execution still validates against
+            # the original application schema before invoking any handler.
+            normalized = [{**tool, "parameters": self._grok_function_schema(tool["parameters"])}
+                          if isinstance(tool, dict) and tool.get("type") == "function"
+                          and isinstance(tool.get("parameters"), dict) else tool for tool in tools]
+            if normalized != tools:
+                prepared = {**prepared, "tools": normalized}
+        return prepared
+
+    @staticmethod
+    def _grok_function_schema(value: Any) -> Any:
+        if isinstance(value, list):
+            return [LlmClient._grok_function_schema(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {key: LlmClient._grok_function_schema(item) for key, item in value.items()
+                if not (value.get("type") == "integer" and key in {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}
+                        and isinstance(item, (int, float)) and not isinstance(item, bool) and abs(item) > 9007199254740991)}
+
     def _read_responses_text_response(self, *, payload: dict[str, Any]) -> tuple[httpx.Response, str]:
+        payload = self.prepare_responses_payload(payload)
         request_kwargs = {"headers": {"Authorization": f"Bearer {self.api_key}"}, "json": payload}
         self._require_request_authority()
         if not hasattr(self.http_client, "stream"):
@@ -2488,9 +2587,17 @@ class LlmClient:
             self._record_usage(responses_result.usage)
             return responses_result.result
 
-        files = self._load_edit_input_images(images)
+        reference_subjects: list[str] = []
+        files = self._load_edit_input_images(images, reference_subjects=reference_subjects)
         if not files:
             raise ValueError("image edit request did not include a usable input image")
+
+        if any(reference_subjects):
+            # Multipart fields retain upload order. Describe only references
+            # that loaded successfully, so a missing image cannot shift roles.
+            labels = [f"Reference image {index}: {json.dumps(subject, ensure_ascii=False)}"
+                      for index, subject in enumerate(reference_subjects, start=1) if subject]
+            prompt = "\n".join([*labels, "Final image instruction:", prompt])
 
         data = build_image_edit_data(
             model=model,

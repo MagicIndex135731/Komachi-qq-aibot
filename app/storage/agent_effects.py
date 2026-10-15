@@ -1,19 +1,19 @@
 """Durable per-tool external-effect fencing, separate from wake envelopes."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date as calendar_date, datetime, timedelta
 from hashlib import sha256
 import json
 import math
 import re
 
-from sqlalchemy import DateTime, Index, Integer, JSON, String, or_, select, func
+from sqlalchemy import DateTime, Index, Integer, JSON, String, case, or_, select, func, union_all
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.time_utils import ASIA_SHANGHAI
 from app.storage.autonomous_agent import AutonomousRepository
 from app.storage.models import Base, Message
-from app.storage.social_agent import utc_naive
+from app.storage.social_agent import SocialActionRecord, utc_naive
 
 
 class AgentToolEffect(Base):
@@ -158,6 +158,69 @@ class AgentToolEffectRepository:
                 AgentToolEffect.account_id == self.account_id, AgentToolEffect.scope == scope
             ).order_by(AgentToolEffect.updated_at.desc(), AgentToolEffect.action_id).limit(limit)
             return tuple(self._snapshot(row) for row in session.scalars(query))
+
+    def self_publications(self, *, date: str | None = None) -> dict:
+        """Only this account's actual publication receipts, never wake prose.
+
+        Counts cover the selected Shanghai day; record details are bounded.
+        Absence covers this system's writes, not manual activity on QQ.
+        """
+        from app.storage.db import session_scope
+        now = self.clock().astimezone(ASIA_SHANGHAI)
+        if date is None or date == 'today':
+            day = now.date()
+        else:
+            if not isinstance(date, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date):
+                raise ValueError('invalid self activity date')
+            day = calendar_date.fromisoformat(date)
+            if day > now.date():
+                raise ValueError('self activity date is in the future')
+        start = datetime.combine(day, datetime.min.time(), ASIA_SHANGHAI)
+        end = start + timedelta(days=1)
+
+        def state(status, dispatched, receipt_valid):
+            return case(
+                ((status == 'sent') & dispatched.is_not(None) & receipt_valid, 'confirmed'),
+                (status.in_(('sent', 'dispatching', 'uncertain')), 'unknown'),
+                (status.in_(('failed', 'blocked')), 'failed'),
+                else_='pending')
+
+        effect = AgentToolEffect
+        actual_receipt = func.json_extract(effect.receipt, '$')
+        effect_at = func.coalesce(effect.dispatched_at, effect.created_at)
+        effects = select(effect.action_id.label('action_id'), effect_at.label('at'),
+            actual_receipt.label('receipt_id'), state(effect.status, effect.dispatched_at,
+                (func.json_type(effect.receipt) == 'text') & (func.length(func.trim(actual_receipt)) > 0)).label('state'))
+        effects = effects.where(effect.account_id == self.account_id, effect.operation == 'publish_qzone',
+            effect.scope.in_(('public:qzone_publish', 'owner:public:qzone_publish', 'qzone_publish', 'public')),
+            effect_at >= utc_naive(start), effect_at < utc_naive(end))
+
+        old = SocialActionRecord
+        old_at = func.coalesce(old.dispatched_at, old.created_at)
+        # A tool wake can have a sent envelope: only its fenced tool is a fact.
+        has_tool = select(effect.action_id).where(effect.account_id == self.account_id,
+            effect.operation == 'publish_qzone', effect.run_id == old.action_id).exists()
+        legacy = select(old.action_id.label('action_id'), old_at.label('at'),
+            old.receipt_id.label('receipt_id'), state(old.status, old.dispatched_at,
+                func.length(func.trim(old.receipt_id)) > 0).label('state')).where(
+            old.account_id == self.account_id, old.scope_id == self.account_id,
+            old.kind == 'qzone_publish', old.action == 'publish_qzone', ~has_tool,
+            old_at >= utc_naive(start), old_at < utc_naive(end))
+        publications = union_all(effects, legacy).subquery()
+        with session_scope(self.engine) as session:
+            counts = dict(session.execute(select(publications.c.state, func.count()).group_by(publications.c.state)).all())
+            rows = session.execute(select(publications).order_by(
+                publications.c.at.desc(), publications.c.action_id).limit(64)).all()
+        confirmed, unknown = counts.get('confirmed', 0), counts.get('unknown', 0)
+        return {'kind': 'own_qzone_publication_receipts', 'date': day.isoformat(), 'timezone': 'Asia/Shanghai',
+            'as_of': now.isoformat(), 'coverage': 'system_publication_receipts_only',
+            'published': True if confirmed else None if unknown else False,
+            'confirmed_count': confirmed, 'unknown_count': unknown,
+            'failed_count': counts.get('failed', 0), 'pending_count': counts.get('pending', 0),
+            'records_truncated': sum(counts.values()) > len(rows),
+            'records': [{'action_id': row.action_id, 'status': row.state,
+                'at': row.at.replace(tzinfo=UTC).astimezone(ASIA_SHANGHAI).isoformat(),
+                'receipt_id': row.receipt_id if row.state == 'confirmed' else None} for row in rows]}
 
     def _day_start(self) -> datetime:
         return utc_naive(self.clock().astimezone(ASIA_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0))

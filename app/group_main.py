@@ -392,6 +392,9 @@ async def run() -> None:
     runtime = load_runtime_config(settings)
     heartbeat = RuntimeHeartbeat(heartbeat_file=settings.log_dir / "group.heartbeat.json")
     await heartbeat.start()
+    from app.core.downloaded_media import DownloadedMediaJanitor
+    media_janitor = DownloadedMediaJanitor(settings)
+    await media_janitor.start()
     engine = None
     group_image_service = None
     memory_compaction_service = None
@@ -406,6 +409,8 @@ async def run() -> None:
     group_image_started = False
     owner_action_worker = None
     owner_notice_worker = None
+    delegated_research_worker = None
+    media_worker = None
     try:
         engine = await asyncio.to_thread(build_engine, settings.sqlite_path)
         logging.info("startup_step build_engine done")
@@ -579,6 +584,7 @@ async def run() -> None:
                     model_concurrency=settings.group_agent_max_concurrent_turns,
                     decision_timeout_seconds=settings.group_agent_decision_timeout_seconds,
                     execution_timeout_seconds=settings.group_agent_turn_timeout_seconds,
+                    task_execution_timeout_seconds=settings.agent_task_turn_timeout_seconds,
                 ),
             )
             await group_agent.start()
@@ -605,6 +611,11 @@ async def run() -> None:
         if settings.agent_runtime == 'harness':
             executor = getattr(social_planner, 'executor', None) if social_planner is not None else None
             executor = executor or getattr(participation_planner, 'autonomous_executor', None)
+            if executor is not None and hasattr(executor, 'research_jobs'):
+                delegated_research_worker = executor.research_jobs
+                await delegated_research_worker.start()
+                media_worker = executor.media_jobs
+                await media_worker.start()
             if executor is not None and hasattr(executor, 'execute_owner_action'):
                 from app.agent.owner_actions import OwnerActionService, OwnerActionWorker, OwnerNoticeWorker
                 owner_service = OwnerActionService(engine, runtime=runtime)
@@ -703,6 +714,10 @@ async def run() -> None:
         logging.info(create_runtime_banner(bot_qq=settings.bot_qq, model=f"{settings.llm_model} [group]"))
         await gateway.connect_and_consume(handle_payload, on_connect=backfill_group_history_on_connect)
     finally:
+        if delegated_research_worker is not None:
+            await delegated_research_worker.stop()
+        if media_worker is not None:
+            await media_worker.stop()
         if owner_action_worker is not None:
             await owner_action_worker.stop()
         if owner_notice_worker is not None:
@@ -734,6 +749,7 @@ async def run() -> None:
         if memory_compaction_service is not None:
             await memory_compaction_service.stop()
         await heartbeat.stop()
+        await media_janitor.stop()
 
 
 def main() -> int:

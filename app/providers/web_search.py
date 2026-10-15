@@ -161,6 +161,7 @@ class WebSearchClient:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.http_client = http_client or httpx.Client(timeout=timeout_seconds)
+        self.page_reader = None
         self.ddgs_factory = ddgs_factory
         self.region = region
         self.backend = backend
@@ -171,17 +172,19 @@ class WebSearchClient:
 
     @property
     def supports_page_tools(self) -> bool:
-        return self.provider in {"wyzlab", "wyzlab_alpha"}
+        return self.page_reader is not None or self.provider in {"wyzlab", "wyzlab_alpha"}
 
     def search_report(self, query: str, max_results: int = 8) -> WebSearchReport:
         if not 1 <= max_results <= 20:
             raise ValueError("search result limit must be between 1 and 20")
-        if not self.supports_page_tools:
+        if self.provider not in {'wyzlab', 'wyzlab_alpha'}:
             return WebSearchReport(self.search(query, max_results=max_results), "")
         return self._alpha_report({"search_query": [{"q": query}]},
             instruction=f"搜索公开资料，最多收集{max_results}条相关来源：{query}", max_results=max_results)
 
     def open_page(self, url: str, *, lineno: int = 0) -> WebSearchReport:
+        if self.page_reader is not None:
+            return self.page_reader.open_page(url, lineno=lineno)
         if not self.supports_page_tools:
             raise WebSearchProviderError("page_tools_unavailable")
         deadline = time.monotonic() + self.timeout_seconds
@@ -198,7 +201,9 @@ class WebSearchClient:
                 content, 'bilibili_public_metadata')
 
     def find_page(self, url: str, *, pattern: str) -> WebSearchReport:
-        if not self.supports_page_tools:
+        if self.page_reader is not None and self.provider not in {'wyzlab', 'wyzlab_alpha'}:
+            return self.page_reader.find_page(url, pattern=pattern)
+        if self.provider not in {'wyzlab', 'wyzlab_alpha'}:
             raise WebSearchProviderError("page_tools_unavailable")
         return self._alpha_report({"find": [{"ref_id": url, "pattern": pattern}]}, instruction="查找公开网页中的内容", max_results=20)
 

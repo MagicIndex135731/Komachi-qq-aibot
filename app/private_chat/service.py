@@ -349,6 +349,9 @@ class PrivateChatService:
         context: str,
         receipt_callback=None,
         before_dispatch=None,
+        image_files=(),
+        as_forward=False,
+        video_file=None,
     ) -> tuple[bool, str | None]:
         if not self._reserve_private_outbound_reply(user_id=user_id, reply_text=text, context=context):
             logger.info("private_reply_dedup_skip context=%s user_id=%s", context, user_id)
@@ -356,7 +359,16 @@ class PrivateChatService:
         try:
             if before_dispatch is not None:
                 before_dispatch()
-            receipts = await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text))
+            if video_file:
+                receipts = await self.sender.send_video(user_id=user_id, text=text, video_file=video_file)
+            elif as_forward:
+                receipts = await self.sender.send_image_bundle(user_id=user_id, self_id=self._private_sender_user_id(),
+                    name=self.assistant_name, text=text, image_files=image_files)
+            else:
+                receipts = (await self.sender.send_private_media(user_id=user_id, text=text, image_files=image_files)
+                    if image_files else await self.sender.send_private_text(OutboundPrivateMessage(user_id=user_id, text=text)))
+            if (image_files or video_file) and not receipts:
+                raise QQMessageDeliveryUncertainError('missing_private_media_receipt')
             if receipt_callback is not None:
                 receipt_callback(receipts)
             self._mark_private_outbound_reply_sent(user_id=user_id, reply_text=text, context=context)
@@ -388,6 +400,10 @@ class PrivateChatService:
         context: str,
         receipt_callback=None,
         before_dispatch=None,
+        long_form=False,
+        image_files=(),
+        as_forward=False,
+        video_file=None,
     ) -> tuple[bool, str | None]:
         """Send one chat reply, split into a short burst when configured.
 
@@ -397,8 +413,12 @@ class PrivateChatService:
         key, so reply de-duplication still covers the whole burst.
         """
 
-        burst = self.reply_split_config
-        segments = split_burst_reply(text, burst)
+        if image_files or video_file:
+            return await self._deliver_private_text(user_id=user_id, text=text, context=context,
+                receipt_callback=receipt_callback, before_dispatch=before_dispatch, image_files=image_files,
+                as_forward=as_forward, **({'video_file': video_file} if video_file else {}))
+        burst = {'enabled': False} if long_form else self.reply_split_config
+        segments = [text.strip()] if long_form else split_burst_reply(text, burst)
         # Same window as the group delivery path, from the shared helper.
         delay_min, delay_max = burst_delays(burst, segment_count=len(segments))
         for index, segment in enumerate(segments):

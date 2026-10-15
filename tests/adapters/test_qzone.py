@@ -173,6 +173,34 @@ async def test_feed_key_requires_exact_match_in_actual_owner_post_list_and_dedup
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 5, 20])
+@pytest.mark.parametrize("system_row", [False, True])
+async def test_feed_page_can_exceed_requested_count_but_verified_results_stay_bounded(count, system_row):
+    feeds = [{"uin": OWNER, "nickname": "合成", "time": STAMP, "appid": 311,
+              "key": f"synthetic-{i}", "html": ""} for i in range(count + 1)]
+    if system_row:
+        feeds[0] = {**feeds[0], "appid": 6600, "uin": 0}
+    gateway = Gateway([ok({"feeds": feeds, "has_more": False}),
+                       ok({"total": count + 1, "msglist": [row(tid=f"synthetic-{i}") for i in range(count + 1)]})])
+
+    posts = await QzoneAdapter(gateway).get_feeds(count=count, allowed_owner_ids=(OWNER,))
+
+    first = 1 if system_row else 0
+    assert [p.post_id for p in posts] == [f"synthetic-{i}" for i in range(first, first + count)]
+    assert gateway.calls == [("get_qzone_feeds", {"page_num": 1, "count": count}),
+                             ("get_qzone_msg_list", {"target_uin": OWNER, "pos": 0, "num": 100})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeds,has_more", [([{}] * 51, False), ([], 0), (None, False)])
+async def test_extra_feed_tolerance_keeps_absolute_page_limit_and_shape_validation(feeds, has_more):
+    gateway = Gateway([ok({"feeds": feeds, "has_more": has_more})])
+    with pytest.raises(QzoneProtocolError):
+        await QzoneAdapter(gateway).get_feeds(count=5)
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_feed_system_row_without_author_does_not_block_verified_friend_post():
     # SnowLuma normalizes absent authors to zero on non-mood feed entries.
     system = {"uin": 0, "nickname": "", "time": STAMP, "appid": 4,
