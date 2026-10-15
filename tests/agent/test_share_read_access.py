@@ -190,6 +190,21 @@ async def test_search_reference_to_unrequested_card_does_not_bypass_guard(sqlite
     assert result.data['error'] == 'share_requires_quoted_request' and not calls
 
 
+async def test_current_search_reference_is_resolved_for_media_tools(sqlite_engine):
+    _, _, access = setup_access(sqlite_engine, text='把刚才作者的照片发给我', mention=False, quote=False)
+    calls = []
+    async def search(args):
+        return ToolOutcome({'sources': [{'ref_id': 'current-source', 'source': 'https://example.org/article'}]})
+    async def media(args):
+        calls.append(args)
+        return ToolOutcome({'images': []})
+    registry = {t.name: t for t in wrap_share_web_tools((
+        AgentTool('search_web', 'search', {}, search), AgentTool('list_web_images', 'images', {}, media)), access)}
+    await registry['search_web'].handler({'query': '作者照片'})
+    await registry['list_web_images'].handler({'ref_id': 'current-source'})
+    assert calls == [{'ref_id': 'https://example.org/article'}]
+
+
 def test_old_quoted_request_never_grants_new_turn(sqlite_engine):
     source, _, old = setup_access(sqlite_engine)
     assert old.authorized_source_ids() == (source,)
@@ -227,6 +242,8 @@ def test_explicit_ordinary_web_request_keeps_read_permission(sqlite_engine, text
     '请去作者主页找找最近发的图',
     '可以先找一下公开的照片再发给我',
     '给我把作者最近的视频搬运过来',
+    '那把这个十月十三号的图片发给我',
+    '把刚才那个作者的照片下载过来',
 ])
 def test_directed_request_accepts_location_and_object_before_action(sqlite_engine, private, text):
     _, _, access = setup_access(sqlite_engine, text=text, mention=False, quote=False, private=private)

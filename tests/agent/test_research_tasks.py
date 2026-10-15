@@ -115,3 +115,54 @@ async def test_archive_reads_share_the_live_web_content_budget(tmp_path):
     read=next(tool for tool in task.tools(Guard()) if tool.name=='read_research_evidence')
     result=await read.handler({'evidence_id':ref,'max_chars':32000})
     assert result.status=='blocked' and 'budget' in result.data['error']
+
+
+@pytest.mark.parametrize('scope', ['group:900000001', 'private:900000101'])
+def test_read_old_evidence_with_explicit_task_preserves_current_goal(tmp_path, scope):
+    old = workspace(tmp_path, scope=scope, text='之前的查询')
+    ref = old.save_evidence({'content': '已检索的原始证据', 'content_kind': 'grounded_answer'})
+    current = ResearchTaskWorkspace(tmp_path, scope=scope, actor_id=old.actor_id, source_id=124,
+        request='那把之前找到的照片发给我', valid_source=lambda _: True)
+    identity, context = current.task_id, current.context_scope
+    result = current.read_evidence(ref, task_id=old.task_id)
+    assert result['task_id'] == old.task_id and result['content'] == '已检索的原始证据'
+    assert result['content_kind'] == 'grounded_answer'
+    assert current.task_id == identity and current.context_scope == context and not current.formal
+    assert current.request == '那把之前找到的照片发给我'
+
+
+@pytest.mark.parametrize('boundary', ['actor', 'scope', 'revoked', 'dependency', 'expired', 'path'])
+def test_explicit_evidence_task_selection_preserves_isolation_and_validity(tmp_path, boundary):
+    now = [100.0]
+    valid = [True]
+    old = ResearchTaskWorkspace(tmp_path, scope='private:900000101', actor_id=900000101,
+        source_id=123, request='旧查询', valid_source=lambda _: True, clock=lambda: now[0],
+        dependency_snapshot=lambda: {'sources': [123]}, valid_dependencies=lambda _: True)
+    ref = old.save_evidence({'content': 'PRIVATE SOURCE'})
+    current = ResearchTaskWorkspace(tmp_path,
+        scope='private:900000102' if boundary == 'scope' else old.scope,
+        actor_id=900000102 if boundary == 'actor' else old.actor_id,
+        source_id=124, request='当前请求', clock=lambda: now[0],
+        valid_source=lambda value: value != 123 or valid[0],
+        valid_dependencies=lambda _: boundary != 'dependency')
+    if boundary == 'revoked': valid[0] = False
+    if boundary == 'expired': now[0] += 8 * 86400
+    with pytest.raises(ValueError):
+        current.read_evidence(ref, task_id='../checkpoint' if boundary == 'path' else old.task_id)
+
+
+async def test_cross_task_read_uses_current_turn_budget_and_actionable_missing_feedback(tmp_path):
+    class Guard:
+        def require_valid(self): pass
+    old = workspace(tmp_path)
+    ref = old.save_evidence({'content': 'x' * 30000})
+    current = ResearchTaskWorkspace(tmp_path, scope=old.scope, actor_id=old.actor_id, source_id=124,
+        request='当前请求', valid_source=lambda _: True)
+    read = next(t for t in current.tools(Guard()) if t.name == 'read_research_evidence')
+    missing = await read.handler({'evidence_id': ref})
+    assert missing.data['error'] == 'task_evidence_unavailable' and 'task_id' in missing.data['guidance']
+    first = await read.handler({'evidence_id': ref, 'task_id': old.task_id, 'max_chars': 32000})
+    assert first.status == 'ok' and current.archived_read_chars > 30000 and not old.archived_read_chars
+    current.web_result_chars = 48000
+    blocked = await read.handler({'evidence_id': ref, 'task_id': old.task_id})
+    assert blocked.status == 'blocked' and 'budget' in blocked.data['error']

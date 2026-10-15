@@ -30,6 +30,8 @@ def test_open_page_has_its_own_transport_and_accepts_github_tree_json():
         return httpx.Response(200, text='direct find text', headers={'content-type':'text/plain'})
     def page(request):
         pages.append(request)
+        if request.url.host != 'api.github.com':
+            return httpx.Response(200, text='page find text', headers={'content-type':'text/plain'})
         assert request.headers['accept']=='application/vnd.github+json'
         return httpx.Response(200,json={'sha':'synthetic', 'tree':[{'path':'src/server.ts','type':'blob','size':50}]})
     client=GeminiSearchClient(provider='gemini',base_url='https://relay.example/v1',api_key='SYNTHETIC_PRIVATE_KEY',
@@ -38,8 +40,8 @@ def test_open_page_has_its_own_transport_and_accepts_github_tree_json():
     client.search_report('test')
     assert 'src/server.ts' in client.open_page('https://api.github.com/repos/example/repo/git/trees/main').content
     client.open_page('https://api.github.com/repos/example/repo/git/trees/main',lineno=1)
-    client.find_page('https://example.com/other',pattern='direct')
-    assert len(pages)==1 and len(direct)==2
+    assert 'page find text' in client.find_page('https://example.com/other',pattern='page find').content
+    assert len(pages)==2 and len(direct)==1
     assert all('x-goog-api-key' not in r.headers for r in pages)
 
 
@@ -95,6 +97,26 @@ def test_direct_page_read_and_find_use_actual_body_without_provider_credentials(
     assert c.supports_page_tools and 'needle actual body' in report.content and 'L0:' in report.content
     assert 'needle' in found.content and 'Total lines:' in found.content
     assert all('authorization' not in r.headers and 'x-goog-api-key' not in r.headers for r in requests)
+
+
+def test_page_reader_keeps_bounded_public_article_links_without_fetching_them():
+    calls = []
+    html = '''<html><nav><a href="https://noise.example.com">menu</a></nav>
+        <article><p>这是一篇有原文依据的新闻，报道时间不一定是原帖时间。</p>
+        <blockquote><a href="https://x.com/synthetic/status/900000000000000001">原帖日期</a></blockquote>
+        <a href="/original?x=1&amp;y=2">原始页面</a>
+        <a href="http://127.0.0.1/private">本地</a><a href="javascript:alert(1)">脚本</a>
+        <script>https://hidden.example.com/script</script></article></html>'''
+    c = make(lambda r: calls.append(r) or httpx.Response(200,
+        headers={'content-type': 'text/html'}, text=html))
+    with c.http_client:
+        report = c.open_page('https://example.com/news')
+        found = c.find_page('https://example.com/news', pattern='x.com/synthetic/status')
+    assert 'https://x.com/synthetic/status/900000000000000001' in report.content
+    assert 'https://example.com/original?x=1&y=2' in report.content
+    assert 'x.com/synthetic/status' in found.content
+    assert all(value not in report.content for value in ('127.0.0.1', 'javascript:', 'hidden.example.com', 'noise.example.com'))
+    assert len(calls) == 1
 
 
 def test_raw_github_source_preserves_blank_and_long_line_locations():

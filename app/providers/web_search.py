@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import unescape
+from html.parser import HTMLParser
 from math import ceil
 from pathlib import Path
 import re
@@ -591,6 +592,40 @@ class WebSearchClient:
                 break
             cleaned = next_cleaned
         return cleaned
+
+    def _extract_html_page_links(self, html_text: str, *, base_url: str) -> list[str]:
+        """Expose bounded article hrefs as data without fetching any target."""
+        from app.core.url_policy import public_web_url
+        fragments = self._candidate_html_fragments(self._strip_noise_blocks(
+            HTML_COMMENT_PATTERN.sub(' ', HTML_SCRIPTLIKE_PATTERN.sub(' ', html_text))))
+        fragment = max(fragments, key=lambda value: self._score_text_lines(
+            self._extract_meaningful_lines(value)), default='')
+        links, seen = [], set()
+        class Links(HTMLParser):
+            href, label = '', ''
+            def handle_starttag(inner, tag, attrs):
+                if tag == 'a':
+                    inner.href, inner.label = dict(attrs).get('href') or '', ''
+            def handle_data(inner, data):
+                if inner.href: inner.label = (inner.label + ' ' + data)[:200]
+            def handle_endtag(inner, tag):
+                if tag != 'a': return
+                href, label = inner.href, inner.label
+                inner.href, inner.label = '', ''
+                if not href or href.startswith('#') or len(href) > 2000 or len(links) >= 64: return
+                try: target = public_web_url(urljoin(base_url, href))
+                except (ValueError, TypeError): return
+                if target not in seen:
+                    seen.add(target)
+                    links.append((target, self._normalize_text(label)[:90]))
+        Links().feed(fragment)
+        links.sort(key=lambda item: urlparse(item[0]).hostname == urlparse(base_url).hostname)
+        lines, size = [], 0
+        for target, label in links[:24]:
+            line = f'[网页链接，尚未读取] {label} {target}'
+            if size + len(line) > 6000: break
+            lines.append(line); size += len(line)
+        return lines
 
     def _candidate_html_fragments(self, html_text: str) -> list[str]:
         fragments: list[str] = []

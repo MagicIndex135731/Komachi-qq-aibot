@@ -51,6 +51,8 @@ def evidence_descriptor(name, arguments, outcome):
     if outcome.status in {'failed','blocked','uncertain'}:
         code=error if isinstance(error,str) and len(error)<120 else outcome.status
         failure={'code':code,'category':('unknown_effect' if outcome.status=='uncertain' else
+            'local_lookup' if code in {'task_evidence_unavailable','task_checkpoint_unavailable',
+                                      'invalid_task_id','invalid_task_evidence','invalid_resource_page'} else
             'authority' if code in {'owner_required','web_requires_explicit_request','share_request_revoked',
                                    'share_requires_quoted_request','memory_out_of_scope'} else
             'capacity' if any(v in code for v in ('budget','capacity','limit','cache_busy')) else

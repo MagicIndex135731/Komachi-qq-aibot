@@ -26,7 +26,7 @@ _QUESTION = re.compile(r'[?？]|什么|怎么|咋|为什么|为何|如何|多少
 # Directed requests can put a site, an object and sequencing before the verb
 # ("帮我去站点把作者最新的图片下载给我"). Match that bounded clause,
 # rather than requiring the action to immediately follow the polite prefix.
-_REQUEST = re.compile(r'^\s*(?:(?:请|麻烦|劳驾|帮我|能不能|可以|给我)[^。！？!?；;\n]{0,100}?)?(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|搬运|找一下|找找|我要看|我想看|想看|给我看|发我|发给我|来点|来张)|\b(?:please|could you|can you|show me|send me|I want to see)\b', re.I)
+_REQUEST = re.compile(r'^\s*(?:(?:请|麻烦|劳驾|帮我|能不能|可以|给我|(?:那|那么|再|然后)?把)[^。！？!?；;\n]{0,100}?)?(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|搬运|找一下|找找|我要看|我想看|想看|给我看|发我|发给我|来点|来张)|\b(?:please|could you|can you|show me|send me|I want to see)\b', re.I)
 _SHARE_REFERENCE = re.compile(r'(?:这[个条张份]?|那[个条张份]?|引用|刚才的?|上面的?)(?:APP)?(?:分享|卡片)', re.I)
 
 WEB_REQUEST_POLICY = ('联网仅用于当前真实用户的提问、资料请求、@或称呼小町时按需查证，不要求用户固定说“联网”。'
@@ -267,7 +267,10 @@ def wrap_share_web_tools(tools, access, *, observed_source_ids=()):
             target = references.get(args.get('ref_id'), args.get('ref_id'))
             if target is not None and not access.known_card_target_allowed(target, observed_source_ids):
                 return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
-            outcome = await original.handler(args)
+            # The reference table is shared with media tools too. Their
+            # providers accept URLs, while the model sees search ref_ids.
+            resolved = {**args, 'ref_id': target} if target is not None else args
+            outcome = await original.handler(resolved)
             if not access.web_allowed():
                 return ToolOutcome({'error': 'share_request_revoked'}, 'blocked')
             if isinstance(outcome, ToolOutcome) and isinstance(outcome.data, dict):

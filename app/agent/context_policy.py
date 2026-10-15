@@ -271,7 +271,7 @@ class RequestContextPolicy:
                         kept['sources'] = [{key: str(source[key])[:2000] for key in ('source', 'ref_id', 'title', 'date')
                             if key in source} for source in kept['sources'][:12] if isinstance(source, dict)]
                     kept.update(content='', archived_external_evidence=True,
-                        guidance='前轮网页正文保存在对应任务证据中；需要原文时read_research_evidence或重新打开URL。旧ref_id不授予本轮访问。')
+                        guidance='前轮正文保存在原task_id/evidence_id；read_research_evidence同时传二者可只读重取，不切换当前目标。也可按当前请求重新打开URL。旧ref_id不授予本轮访问。')
                     value['data'] = kept
                 elif data.get('trust') == 'untrusted_external_sources' and data.get('content'):
                     fingerprint = hashlib.sha256(json.dumps([data.get('content'), data.get('sources')],

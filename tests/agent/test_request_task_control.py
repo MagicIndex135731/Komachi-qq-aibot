@@ -60,6 +60,20 @@ def test_blocked_completion_requires_real_attempt_and_never_proves_absence(tmp_p
     assert goal.can_stop
 
 
+@pytest.mark.parametrize('stage', ['blocked', 'partial'])
+def test_missing_archived_evidence_is_recoverable_before_any_external_attempt(tmp_path, stage):
+    goal = control(tmp_path, '那把这个十月十三号的图片发给我')
+    delta = goal.observe('read_research_evidence', {'evidence_id': 'a' * 24},
+        ToolOutcome({'error': 'task_evidence_unavailable'}, 'blocked'), 'old-ref')
+    assert delta['failure']['category'] == 'local_lookup'
+    result = goal.preflight('send_private', {'text': '没有单帖链接，所以拿不到', 'task_status': stage})
+    assert result is not None and 'recoverable_lookup_not_task_blocker' in result.data['missing']
+    goal.observe('search_web', {'query': '真实目标'},
+        ToolOutcome({'error': 'web_http_503'}, 'failed'), 'actual-network-attempt')
+    assert goal.preflight('send_private', {'text': '本次实际搜索返回503，暂时受阻',
+                                         'task_status': 'blocked'}) is None
+
+
 def test_only_observed_artifacts_and_actual_receipts_finish_media_goal(tmp_path):
     goal=control(tmp_path)
     forged={'text':'图','artifact_ids':['art-forged']}

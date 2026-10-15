@@ -309,6 +309,8 @@ class GeminiSearchClient(WebSearchClient):
         else:
             lines = [part for line in content.splitlines() if line.strip() for part in
                 (line[i:i + 240] for i in range(0, len(line), 240))]
+        if html:
+            lines.extend(self._extract_html_page_links(body, base_url=url))
         if not lines:
             raise WebSearchProviderError("web_page_empty")
         result = (title, url, lines, 'raw_source' if raw_source else 'web_page')
@@ -330,7 +332,7 @@ class GeminiSearchClient(WebSearchClient):
         return self._page_report(title, target, lines, max(0, lineno), kind)
 
     def find_page(self, url: str, *, pattern: str) -> WebSearchReport:
-        title, target, lines, kind = self._page_lines(url, time.monotonic() + self.timeout_seconds)
+        title, target, lines, kind = self._page_lines(url, time.monotonic() + self.timeout_seconds, client=self.page_http_client)
         searchable = [line.split('] ', 1)[1] for line in lines] if kind == 'raw_source' else lines
         index = next((i for i, line in enumerate(searchable) if pattern.casefold() in line.casefold()), None)
         report = self._page_report(title, target, lines, max(0, (index or 0) - 3), kind)

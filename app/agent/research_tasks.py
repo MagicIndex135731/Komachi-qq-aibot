@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import copy
 from pathlib import Path
 import re
 import time
@@ -338,15 +339,20 @@ class ResearchTaskWorkspace:
         if active and active.get('task_id') == self.task_id:
             self._write(self.root / 'active.json', state)
 
+    def _select_read_task(self, task_id=None):
+        """Read a named requester-local checkpoint without changing this goal."""
+        self._check()
+        if task_id is None or task_id == self.task_id:
+            return self
+        selected = copy(self)
+        selected.resume(task_id)
+        return selected
+
     def resource_page(self, task_id=None, *, offset=0, limit=20):
         if type(offset) is not int or not 0 <= offset <= 10000 or type(limit) is not int or not 1 <= limit <= 20:
             raise ValueError('invalid_resource_page')
-        from copy import copy
         from app.core.url_policy import public_web_url
-        selected = self
-        if task_id and task_id != self.task_id:
-            selected = copy(self)
-            selected.resume(task_id)
+        selected = self._select_read_task(task_id)
         state = selected.summary()
         selected._check(state)
         resources = {}
@@ -408,18 +414,19 @@ class ResearchTaskWorkspace:
             self._write(self.root / 'active.json', state)
         return ref
 
-    def read_evidence(self, ref, *, offset=0, max_chars=16000):
+    def read_evidence(self, ref, *, task_id=None, offset=0, max_chars=16000):
         if (not isinstance(ref, str) or not re.fullmatch(r'[a-f0-9]{24}', ref)
                 or type(offset) is not int or not 0 <= offset <= 100000
                 or type(max_chars) is not int or not 1 <= max_chars <= 32000):
             raise ValueError('invalid_task_evidence')
-        self._check(self.summary())
-        item = self._load(self._file('evidence-' + ref + '.json'))
+        selected = self._select_read_task(task_id)
+        selected._check(selected.summary())
+        item = selected._load(selected._file('evidence-' + ref + '.json'))
         if item is None:
             raise ValueError('task_evidence_unavailable')
-        self._check(item)
+        selected._check(item)
         data = item['data']; text = data.get('content', '')
-        return {'task_id': self.task_id, 'evidence_id': ref, 'sources': data.get('sources', []),
+        return {'task_id': selected.task_id, 'evidence_id': ref, 'sources': data.get('sources', []),
                 'content': text[offset:offset + max_chars], 'trust': 'untrusted_external_sources',
                 'content_kind': data.get('content_kind', 'archived_web_evidence'),
                 'next_offset': offset + max_chars if offset + max_chars < len(text) else None,
@@ -454,6 +461,7 @@ class ResearchTaskWorkspace:
                         return ToolOutcome({'error': 'task_content_budget_exhausted',
                             'guidance': '本轮原文预算已用完；保存覆盖、缺口和下一步，按已有证据交付阶段结果。'}, 'blocked')
                     data = self.read_evidence(args['evidence_id'], offset=args.get('offset', 0),
+                                              task_id=args.get('task_id'),
                                               max_chars=min(args.get('max_chars', 16000), max(1, remaining - 1800)))
                     size = len(json.dumps(data, ensure_ascii=False))
                     if size > remaining:
@@ -461,8 +469,15 @@ class ResearchTaskWorkspace:
                     self.archived_read_chars += size
                 guard.require_valid()
                 return ToolOutcome(data)
-            except (ValueError, OSError):
-                return ToolOutcome({'error': 'task_evidence_unavailable'}, 'blocked')
+            except (ValueError, OSError) as exc:
+                code = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+                    'invalid_task_id', 'invalid_task_evidence', 'invalid_resource_page',
+                    'task_checkpoint_unavailable', 'task_source_unavailable',
+                    'task_memory_dependency_unavailable'} else 'task_evidence_unavailable'
+                return ToolOutcome({'error': code, 'task_id': args.get('task_id', self.task_id),
+                    'guidance': '证据按task_id与evidence_id定位；跨轮读取请同时传原结果的task_id，'
+                        '不必切换当前目标。查无旧证据不代表网站或下载不可用；可按当前请求重新搜索/打开来源。'
+                        '来源撤回、过期或依赖失效的旧内容不能恢复。'}, 'blocked')
         return (
             AgentTool('begin_research_task', '多步骤工作保存目标、交付要求和剩余项，可组合任何获准工具；资料任务扩容网页预算，不增加权限。普通闲聊和单步请求无需建任务',
                       schema({'goal': text(2000), 'deliverable': text(1000),
@@ -478,8 +493,8 @@ class ResearchTaskWorkspace:
                       schema({}), lambda args: invoke('read', args)),
             AgentTool('resume_research_task', '主模型明确选择本提问者的旧任务；复验来源、依赖及有效期，不自动切换主会话',
                       schema({'task_id': text(24)}, ('task_id',)), lambda args: invoke('resume', args)),
-            AgentTool('read_research_evidence', '按evidence_id分段重读本任务真实网页证据，不能读取其他群或用户任务',
-                schema({'evidence_id': text(24), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 100000},
+            AgentTool('read_research_evidence', '按evidence_id分段重读网页证据；跨轮同时传原结果task_id，只读同提问者旧任务而不切换当前目标，不能读取其他群或用户任务',
+                schema({'evidence_id': text(24), 'task_id': text(24), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 100000},
                        'max_chars': {'type': 'integer', 'minimum': 1, 'maximum': 32000}}, ('evidence_id',)),
                 lambda args: invoke('evidence', args)),
             AgentTool('read_research_resources', '分页读取当前提问者任务的全部已发现来源URL和证据ID；子任务摘要只给索引，用此工具续读再组合后续工具',
