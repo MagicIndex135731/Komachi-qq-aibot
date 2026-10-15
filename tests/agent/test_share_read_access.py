@@ -220,6 +220,29 @@ def test_explicit_ordinary_web_request_keeps_read_permission(sqlite_engine, text
     assert access.authorized_source_ids() == () and access.web_allowed()
 
 
+@pytest.mark.parametrize('private', [False, True])
+@pytest.mark.parametrize('text', [
+    '帮我去x扒一些linye最新的cos视频或图片',
+    '麻烦你到官网把最新的活动照片下载给我',
+    '请去作者主页找找最近发的图',
+    '可以先找一下公开的照片再发给我',
+    '给我把作者最近的视频搬运过来',
+])
+def test_directed_request_accepts_location_and_object_before_action(sqlite_engine, private, text):
+    _, _, access = setup_access(sqlite_engine, text=text, mention=False, quote=False, private=private)
+    assert access.web_allowed() and access.authorized_source_ids() == ()
+
+
+@pytest.mark.parametrize('text', [
+    '帮我去x聊聊，不要下载图片',
+    '昨天去x扒了一些照片',
+    '有人说帮我去x扒一些照片',
+])
+def test_request_wording_in_cancel_or_narrative_does_not_grant_lookup(sqlite_engine, text):
+    _, _, access = setup_access(sqlite_engine, text=text, mention=False, quote=False, private=True)
+    assert not access.web_allowed()
+
+
 def test_ordinary_context_contains_short_title_without_url_or_card_directives():
     raw = {'message': [card(), {'type': 'text', 'data': {'text': '一起讨论'}}]}
     text = share_context_text(raw, '[分享卡片：合成标题] 卡片摘要 https://example.com/article')

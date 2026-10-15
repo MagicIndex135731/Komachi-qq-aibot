@@ -57,7 +57,7 @@ async def test_group_request_and_patrol_use_same_manifest_but_enforce_network_ga
         web.http_client.close()
 
 
-@pytest.mark.parametrize('question', [False, True])
+@pytest.mark.parametrize('question', [False, True, 'natural_request'])
 async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous_flag(sqlite_engine, tmp_path, monkeypatch, question):
     from app.agent.delegated_research import child_inputs
     from app.agent.media_tasks import execute_web_media
@@ -69,7 +69,9 @@ async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous
     payload.update(task_key='synthetic-child', autonomous_web=True, operation='download_web_images', arguments={})
     with session_scope(sqlite_engine) as session:
         row = session.get(Message, payload['source_id'])
-        row.raw_json = {'message': [{'type': 'text', 'data': {'text': '合成角色强吗' if question else '今天上课比较晚'}}]}
+        text = ('帮我去x扒一些synthetic最新的cos视频或图片' if question == 'natural_request'
+                else '合成角色强吗' if question else '今天上课比较晚')
+        row.raw_json = {'message': [{'type': 'text', 'data': {'text': text}}]}
     settings = SimpleNamespace(data_dir=tmp_path, bot_qq=payload['account_id'])
     guard = SimpleNamespace(sources=set(payload['sources']), source_message_ids=tuple(payload['sources']),
         require_valid=lambda: None, valid_source=lambda *a, **k: True,
@@ -81,7 +83,7 @@ async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous
     client = Client()
     _, tools = child_inputs(payload, guard, settings=settings, engine=sqlite_engine, web_client=client, runner=Runner())
     result = await next(t for t in tools if t.name == 'search_web').handler({'query': '合成角色'})
-    assert (result.status == 'ok') == question and bool(client.calls) == question
+    assert (result.status == 'ok') == bool(question) and bool(client.calls) == bool(question)
     media_calls = []
     async def download(args):
         media_calls.append(args)
@@ -89,4 +91,4 @@ async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous
     monkeypatch.setattr('app.agent.web_images.build_web_image_tools', lambda *a, **k:
         (AgentTool('download_web_images', 'download', {'type': 'object'}, download),))
     result = await execute_web_media(payload, guard, engine=sqlite_engine, settings=settings, web_client=None, runner=Runner())
-    assert (result['status'] == 'ok') == question and bool(media_calls) == question
+    assert (result['status'] == 'ok') == bool(question) and bool(media_calls) == bool(question)

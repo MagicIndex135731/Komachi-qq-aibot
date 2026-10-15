@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 
 import pytest
 
@@ -17,6 +18,71 @@ from test_twitter_media_tools import URL, provider
 from test_web_image_delivery import output
 from test_web_video_delivery import mp4
 from tests.private_chat.test_agent_service import OTHER, event, setup, sse
+
+
+@pytest.mark.parametrize('owner', [False, True])
+async def test_private_natural_media_request_searches_without_url_then_downloads_and_delivers(
+        sqlite_engine, tmp_path, monkeypatch, mp4, owner):
+    import httpx
+    from app.agent.request_task import TASK_POLICY
+    from tests.private_chat.test_agent_service import OWNER
+
+    media_requests = provider(monkeypatch, video=mp4)
+    web_calls, delivery_calls = [], []
+    def search(request):
+        web_calls.append(request)
+        return httpx.Response(200, json={
+            'output': '作者的公开帖子 ' + URL,
+            'results': [{'type': 'text_result', 'title': '合成作者公开媒体',
+                         'url': URL, 'ref_id': 'synthetic-post', 'snippet': '公开媒体帖子'}]})
+    web = WebSearchClient(provider='wyzlab_alpha', base_url='https://synthetic.invalid/v1',
+        api_key='synthetic', timeout_seconds=10,
+        http_client=httpx.Client(transport=httpx.MockTransport(search)))
+    def script(body, n):
+        if n == 1:
+            return sse('send_private', {'text': '以前未核实就说推特媒体拿不到'}, number=n)
+        if n == 2:
+            current = observation(body, 'Private observation JSON:\n')
+            assert current['authority']['web_allowed'] is True
+            assert '历史回复里' in TASK_POLICY
+            return sse('search_web', {'query': 'synthetic 最新公开照片'}, number=n)
+        if n == 3:
+            found = output(body)
+            assert found['evidence_level'] == 'search_summary' and URL in json.dumps(found)
+            return sse('download_twitter_media', {'ref_id': URL, 'delivery_mode': 'auto'}, number=n)
+        if n == 4:
+            assert output(body)['status'] == 'queued'
+            return sse('send_private', {'text': '正在下载，完成后交付', 'task_status': 'progress'}, number=n)
+        raise AssertionError('Unnecessary model request after queued delivery')
+    class Gateway:
+        async def call_api(self, action, params):
+            delivery_calls.append((action, params))
+            return {'status': 'ok', 'retcode': 0,
+                    'data': {'message_id': 'synthetic-confirmed-' + str(len(delivery_calls))}}
+    service, agent, dispatcher, _, requests = setup(sqlite_engine, tmp_path, script)
+    service.sender, service.web_search_client = Sender(Gateway()), web
+    actor = OWNER if owner else OTHER
+    await service.start()
+    try:
+        await dispatcher.handle_private_message(event('earlier-chat', user_id=actor, text='聊聊旧话题'))
+        await dispatcher.handle_private_message(event('natural-media-request', user_id=actor,
+            text='帮我去x扒一些synthetic最新的cos视频或图片'))
+        assert len(web_calls) == 1, [list(item['name'] for item in body.get('tools', [])) for body in requests]
+        assert len(requests) == 4
+        async with asyncio.timeout(20):
+            while not any(action.endswith('forward_msg') for action, _ in delivery_calls):
+                await asyncio.sleep(.05)
+        forwards = [params for action, params in delivery_calls if action.endswith('forward_msg')]
+        assert len(forwards) == 1 and len(web_calls) == 1 and len(media_requests) == 4
+        nodes = forwards[0]['messages']
+        media = [part for node in nodes for part in node['data']['content']
+                 if part['type'] in {'image', 'video'}]
+        assert [part['type'] for part in media] == ['image', 'video', 'video']
+        assert base64.b64decode(media[0]['data']['file'][9:]) == image_bytes()
+        assert len(requests) == 4
+    finally:
+        await service.stop()
+        web.http_client.close()
 
 
 @pytest.mark.parametrize('surface',['group','private'])
