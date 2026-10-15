@@ -14,6 +14,22 @@ class NapCatDeliveryUncertainError(ConnectionError):
     """A send frame may have reached NapCat before the websocket failed."""
 
 
+def _contains_outbound_video(params):
+    pending = [params.get('message'), params.get('messages')]
+    checked = 0
+    while pending and checked < 1000:
+        value = pending.pop()
+        checked += 1
+        if isinstance(value, list):
+            pending.extend(value[:100])
+        elif isinstance(value, dict):
+            if value.get('type') == 'video':
+                return True
+            if value.get('type') == 'node' and isinstance(value.get('data'), dict):
+                pending.append(value['data'].get('content'))
+    return False
+
+
 class NapCatGateway:
     REQUEST_TIMEOUT_SECONDS = 20.0
 
@@ -143,8 +159,7 @@ class NapCatGateway:
             self._discard_pending_call(echo, future)
             raise NapCatDeliveryUncertainError("NapCat websocket failed while sending request") from exc
         try:
-            video = (action in {'send_group_msg', 'send_private_msg'} and isinstance(params.get('message'), list)
-                and any(isinstance(item, dict) and item.get('type') == 'video' for item in params['message'][:100]))
+            video = action in {'send_group_msg','send_private_msg','send_group_forward_msg','send_private_forward_msg'} and _contains_outbound_video(params)
             return await asyncio.wait_for(future, timeout=90.0 if video else self.REQUEST_TIMEOUT_SECONDS)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             self._discard_pending_call(echo, future)

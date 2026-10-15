@@ -364,7 +364,8 @@ class PrivateChatService:
                 receipts = await self.sender.send_media_bundle(user_id=user_id, self_id=self._private_sender_user_id(),
                     name=self.assistant_name, text=text, media_files=media_files)
             elif video_file:
-                receipts = await self.sender.send_video(user_id=user_id, text=text, video_file=video_file)
+                receipts = await self.sender.send_video(user_id=user_id, text=text, video_file=video_file,
+                    self_id=self._private_sender_user_id(), name=self.assistant_name)
             elif as_forward:
                 receipts = await self.sender.send_image_bundle(user_id=user_id, self_id=self._private_sender_user_id(),
                     name=self.assistant_name, text=text, image_files=image_files)

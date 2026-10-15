@@ -81,8 +81,13 @@ async def test_native_video_download_scope_send_and_unknown_receipt(sqlite_engin
                 fixture.router.web_search_client=web
                 original=fixture.gateway.call_api
                 async def gateway(action,params):
-                    if action=='send_group_msg' and uncertain:
-                        fixture.gateway.calls.append((action,params));raise QQMessageDeliveryUncertainError('lost ack')
+                    if action=='send_group_forward_msg':
+                        fixture.gateway.calls.append((action,params))
+                        for node in params['messages']:
+                            content=node['data']['content']
+                            if any(item['type']=='video' for item in content):assert len(content)==1
+                        if uncertain:raise QQMessageDeliveryUncertainError('lost ack')
+                        return {'status':'ok','retcode':0,'data':{'message_id':'video-group-receipt'}}
                     return await original(action,params)
                 fixture.gateway.call_api=gateway
                 await requested_group_media(fixture)
@@ -104,7 +109,7 @@ async def test_native_video_download_scope_send_and_unknown_receipt(sqlite_engin
                 calls=[]
                 async def call_api(self,action,params):
                     self.calls.append((action,params))
-                    if uncertain and isinstance(params.get('message'),list):raise QQMessageDeliveryUncertainError('lost ack')
+                    if uncertain and isinstance(params.get('message',params.get('messages')),list):raise QQMessageDeliveryUncertainError('lost ack')
                     return {'status':'ok','retcode':0,'data':{'message_id':'video-private-receipt'}}
             gateway=Gateway();service.sender=Sender(gateway);service.web_search_client=web
             incoming=event('video-request',user_id=OTHER,text='把这个小红书视频扒下来发我')
@@ -114,13 +119,14 @@ async def test_native_video_download_scope_send_and_unknown_receipt(sqlite_engin
                 await dispatcher.handle_private_message(incoming)
                 await dispatcher.handle_private_message(incoming)
                 for _ in range(160):
-                    if any(isinstance(params.get('message'),list) for _,params in gateway.calls):break
+                    if any(isinstance(params.get('message',params.get('messages')),list) for _,params in gateway.calls):break
                     import asyncio
                     await asyncio.sleep(0.1)
                 assert len(gateway.calls)==2
-                params=next(params for _,params in gateway.calls if isinstance(params.get('message'),list))
+                params=next(params for _,params in gateway.calls if isinstance(params.get('message',params.get('messages')),list))
             finally:await agent.stop()
-        video=next(item for item in params['message'] if item['type']=='video')
+        segments=params.get('message') or [item for node in params['messages'] for item in node['data']['content']]
+        video=next(item for item in segments if item['type']=='video')
         assert base64.b64decode(video['data']['file'][9:])==mp4 and len(requests)==2
         with session_scope(sqlite_engine) as session:
             effects=list(session.scalars(select(AgentToolEffect).where(AgentToolEffect.operation=='send_'+surface)))

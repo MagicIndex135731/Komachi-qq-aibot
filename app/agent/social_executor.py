@@ -250,9 +250,13 @@ class SocialExecutor:
         elif video_file:
             with session_scope(self.router.engine) as session:
                 row = MessageRepository(session).get_by_platform_msg_id(provisional_id)
-                row.msg_type = 'video'
-                row.raw_json = {**row.raw_json, 'message': [{'type': 'text', 'data': {'text': decision.text}},
-                    {'type': 'video', 'data': {'local_path': str(video_file), 'origin': 'web_page_video'}}]}
+                video = {'type': 'video', 'data': {'local_path': str(video_file), 'origin': 'web_page_video'}}
+                row.msg_type = 'forward' if decision.text else 'video'
+                row.raw_json = {**row.raw_json, 'message': ([
+                    {'type': 'node', 'data': {'uin': str(self.router.runtime.settings.bot_qq),
+                        'content': [{'type': 'text', 'data': {'text': decision.text}}]}},
+                    {'type': 'node', 'data': {'uin': str(self.router.runtime.settings.bot_qq), 'content': [video]}}]
+                    if decision.text else [video])}
         scope = GroupDispatchScope(observation.job.scope_id,
                                    lambda: guard.valid() and self.policy_check(observation, decision,
                                                                             reserved_action_id=guard.action_id),
@@ -266,7 +270,8 @@ class SocialExecutor:
                         text=decision.text, media_files=media_files)
                 elif video_file:
                     receipts = await self.sender.send_video(group_id=observation.job.scope_id,
-                        text=decision.text, video_file=str(video_file))
+                        text=decision.text, video_file=str(video_file), self_id=self.router.runtime.settings.bot_qq,
+                        name=self.router.runtime.persona.get('name', '小町'))
                 elif as_forward:
                     receipts = await self.sender.send_image_bundle(group_id=observation.job.scope_id,
                         self_id=self.router.runtime.settings.bot_qq, name=self.router.runtime.persona.get('name', '小町'),
@@ -288,4 +293,6 @@ class SocialExecutor:
             state = "uncertain" if scope.dispatched and not scope.failed else "deleted"
             self._finish_group_output(provisional_id, state=state)
             logger.warning("social_group_send_failed error_type=%s state=%s", type(exc).__name__, state)
-            return SocialResult("uncertain" if state == "uncertain" else "failed", reason="group_send_failed")
+            from app.adapters.sender import QQMessageRejectedError
+            reason = exc.code if isinstance(exc, QQMessageRejectedError) else 'group_send_failed'
+            return SocialResult("uncertain" if state == "uncertain" else "failed", reason=reason)

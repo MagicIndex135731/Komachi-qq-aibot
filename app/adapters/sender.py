@@ -16,6 +16,13 @@ class QQMessageDeliveryUncertainError(RuntimeError):
     """The send request may have been accepted, so repeating it is unsafe."""
 
 
+class QQMessageRejectedError(RuntimeError):
+    """The gateway explicitly rejected a send; expose a bounded safe category."""
+    def __init__(self, code='qq_send_rejected'):
+        self.code = code
+        super().__init__(code)
+
+
 @dataclass(slots=True)
 class OutboundMessage:
     group_id: int
@@ -95,11 +102,16 @@ class Sender:
         receipt = await self._send_once(action='send_private_msg', params={'user_id': user_id, 'message': segments})
         return (receipt,) if receipt is not None else ()
 
-    async def send_video(self, *, video_file: str, text: str = '', group_id=None, user_id=None) -> tuple[str, ...]:
+    async def send_video(self, *, video_file: str, text: str = '', group_id=None, user_id=None,
+                         self_id=None, name='小町') -> tuple[str, ...]:
         if (group_id is None) == (user_id is None) or len(text) > 12000 or '[CQ:' in text:
             raise ValueError('invalid video message')
-        segments = [{'type': 'text', 'data': {'text': text}}] if text else []
-        segments.append({'type': 'video', 'data': {'file': self._video_file_payload(video_file)}})
+        if text:
+            # A QQ video cannot share a message with a caption. Keep both in
+            # separate forward nodes, within one acknowledged external action.
+            return await self.send_media_bundle(self_id=self_id, name=name, text=text,
+                media_files=(('video', video_file),), group_id=group_id, user_id=user_id)
+        segments = [{'type': 'video', 'data': {'file': self._video_file_payload(video_file)}}]
         target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
         receipt = await self._send_once(action='send_group_msg' if group_id is not None else 'send_private_msg',
             params={**target, 'message': segments})
@@ -129,11 +141,13 @@ class Sender:
         if sum(Path(path).stat().st_size for _, path in media_files) > 128 * 1024 * 1024:
             raise ValueError('media bundle exceeds send budget')
         nodes = []
-        for index, (kind, path) in enumerate(media_files):
-            caption = (text + '\n' if index == 0 and text else '') + f'{index + 1}/{len(media_files)}'
+        if text:
+            nodes.append({'type': 'node', 'data': {'uin': str(self_id), 'name': str(name)[:60],
+                'content': [{'type': 'text', 'data': {'text': text}}]}})
+        for kind, path in media_files:
             payload = self._image_file_payload(path) if kind == 'image' else self._video_file_payload(path)
             nodes.append({'type': 'node', 'data': {'uin': str(self_id), 'name': str(name)[:60],
-                'content': [{'type': 'text', 'data': {'text': caption}}, {'type': kind, 'data': {'file': payload}}]}})
+                'content': [{'type': kind, 'data': {'file': payload}}]}})
         target = {'group_id': group_id} if group_id is not None else {'user_id': user_id}
         receipt = await self._send_once(action='send_group_forward_msg' if group_id is not None else 'send_private_forward_msg',
             params={**target, 'messages': nodes})
@@ -261,17 +275,30 @@ class Sender:
         return receipt
 
     def _require_ok(self, response: dict | None, *, action: str) -> None:
-        payload = response or {}
+        payload = response if isinstance(response, dict) else {}
         status = str(payload.get("status", "")).strip().lower()
         retcode = payload.get("retcode", 0)
-        if status == "ok" and int(retcode or 0) == 0:
+        try:
+            numeric_retcode = int(retcode) if retcode is not None else None
+        except (TypeError, ValueError, OverflowError):
+            numeric_retcode = None
+        if status == "ok" and numeric_retcode == 0:
             return
         message = str(payload.get("message") or payload.get("wording") or "").strip()
+        if action in {'send_group_msg','send_private_msg','send_group_forward_msg','send_private_forward_msg'}:
+            if self._is_delivery_uncertain_failure(RuntimeError(message), action=action):
+                raise QQMessageDeliveryUncertainError('qq_send_result_unknown')
+            if status in {'failed', 'error'} or numeric_retcode is not None and numeric_retcode != 0:
+                raise QQMessageRejectedError('qq_video_requires_standalone_message'
+                    if 'video' in message and 'only segment' in message else 'qq_send_rejected')
+            raise QQMessageDeliveryUncertainError('invalid_qq_send_response')
         raise RuntimeError(f"{action} failed: status={status or 'unknown'} retcode={retcode} message={message}")
 
     def _is_delivery_uncertain_failure(self, error: Exception, *, action: str) -> bool:
         if action not in {"send_group_msg", "send_private_msg", 'send_group_forward_msg', 'send_private_forward_msg'}:
             return False
+        if isinstance(error, QQMessageDeliveryUncertainError):
+            return True
         if isinstance(error, asyncio.TimeoutError):
             return True
         if isinstance(error, ConnectionError):

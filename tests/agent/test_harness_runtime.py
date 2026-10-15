@@ -64,6 +64,35 @@ def bridge_factory():
         client.http_client.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome',['rejected','uncertain','other_failure'])
+async def test_budget_keeps_only_one_text_failure_notice_after_explicit_rejection(bridge_factory,outcome):
+    bridge,_,_=bridge_factory(lambda *_:responses_sse(),require_reply=True)
+    calls=[]
+    async def send(args):
+        calls.append(args)
+        if len(calls)<=2:
+            return ToolOutcome({'error':'qq_send_rejected' if outcome=='rejected' else 'arbitrary_failure'},
+                'uncertain' if outcome=='uncertain' else 'failed')
+        return ToolOutcome({},'sent','notice-receipt')
+    bridge.tools={'send_group':tool('send_group',send,effect='write',properties={
+        'text':{'type':'string'},'artifact_ids':{'type':'array','items':{'type':'string'}}},required=('text',))}
+    for n in range(2):
+        if bridge.stop_reason:break
+        await bridge.call_tool({'name':'send_group','arguments':{'text':str(n)},'call_id':f'reject-{n}'})
+    if outcome=='uncertain':
+        assert bridge.stop_reason=='unknown_external_write' and bridge.failure_notice_calls==0
+        return
+    # A bonus notice cannot carry any media or become an extra retry.
+    denied=await bridge.call_tool({'name':'send_group','arguments':{'text':'媒体重试','artifact_ids':['art-forged']},'call_id':'retry-media'})
+    assert denied['status']=='blocked'
+    notice=await bridge.call_tool({'name':'send_group','arguments':{'text':'本次视频发送失败'},'call_id':'failure-notice'})
+    assert notice['status']==('sent' if outcome=='rejected' else 'blocked')
+    assert bridge.failure_notice_calls==(1 if outcome=='rejected' else 0)
+    again=await bridge.call_tool({'name':'send_group','arguments':{'text':'再次说明'},'call_id':'extra-notice'})
+    assert again['status']=='blocked'
+
+
 def request_body(protocol="openai-responses"):
     return {"model": "offline-agent", "tools": [],
         "input" if protocol == "openai-responses" else "messages": [

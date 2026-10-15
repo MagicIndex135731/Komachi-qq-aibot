@@ -984,7 +984,11 @@ class AutonomousSocialExecutor:
                     workspace.record_delivery(args['text'], result.status)
                 except (ValueError, OSError):
                     logger.warning('research_delivery_checkpoint_unavailable')
-            return ToolOutcome({"result": result.status}, result.status, result.receipt_id)
+            details = {"result": result.status}
+            if result.status != 'sent':
+                details.update(error=result.reason or 'group_send_failed',
+                    guidance='依据实际错误说明失败，不猜测平台风控或服务器故障。明确拒绝表示本次未送达；未知结果不得自动重发。')
+            return ToolOutcome(details, result.status, result.receipt_id)
 
         async def nickname(args):
             guard.require_valid()

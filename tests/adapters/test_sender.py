@@ -8,6 +8,7 @@ from app.adapters.sender import (
     OutboundMessage,
     OutboundPrivateMessage,
     QQMessageDeliveryUncertainError,
+    QQMessageRejectedError,
     Sender,
     _extract_avatar_file,
     extract_group_card,
@@ -158,12 +159,11 @@ def test_sender_raises_when_gateway_reports_failed_status(tmp_path) -> None:
     image_file = tmp_path / "synthetic.png"
     image_file.write_bytes(b"isolated image fixture")
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(QQMessageRejectedError) as exc_info:
         asyncio.run(sender.send_group_image(group_id=10001, image_file=str(image_file)))
 
-    assert not isinstance(exc_info.value, QQMessageDeliveryUncertainError)
-    assert "retcode=1200" in str(exc_info.value)
-    assert "rich media transfer failed" in str(exc_info.value)
+    assert exc_info.value.code == "qq_send_rejected"
+    assert str(exc_info.value) == "qq_send_rejected"
 
 
 @pytest.mark.parametrize("surface", ["group", "private", "media"])
@@ -205,7 +205,7 @@ def test_sender_does_not_retry_group_text_when_gateway_reports_ambiguous_timeout
     gateway = RetryableFailOnceGateway()
     sender = Sender(gateway)
 
-    with pytest.raises(QQMessageDeliveryUncertainError, match="NodeIKernelMsgService/sendMsg"):
+    with pytest.raises(QQMessageDeliveryUncertainError, match="qq_send_result_unknown"):
         asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text="long report")))
 
     assert gateway.calls == [
@@ -294,7 +294,7 @@ def test_sender_does_not_chunk_after_ambiguous_long_message_failure() -> None:
         ]
     )
 
-    with pytest.raises(QQMessageDeliveryUncertainError, match="NodeIKernelMsgService/sendMsg"):
+    with pytest.raises(QQMessageDeliveryUncertainError, match="qq_send_result_unknown"):
         asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text=long_text)))
 
     assert gateway.calls == [
@@ -320,7 +320,7 @@ def test_sender_treats_wait_for_self_echo_timeout_as_uncertain_without_retry() -
     sender = Sender(gateway)
     long_text = "sensitive answer " * 30
 
-    with pytest.raises(QQMessageDeliveryUncertainError, match="waitForSelfEcho timeout"):
+    with pytest.raises(QQMessageDeliveryUncertainError, match="qq_send_result_unknown"):
         asyncio.run(sender.send_group_text(OutboundMessage(group_id=10001, text=long_text)))
 
     assert gateway.calls == [

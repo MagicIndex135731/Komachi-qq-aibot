@@ -291,6 +291,8 @@ class _Bridge:
         self.trace: list[dict[str, Any]] = []
         self.observer = AgentTrace(None, context={}, session_key="disabled")
         self.model_calls = self.image_calls = self.write_calls = 0
+        self.failure_notice_calls = 0
+        self.last_rejected_write = False
         self.compaction_calls = 0
         self.memory_reads = 0
         self.delivery_recovery = False
@@ -355,6 +357,7 @@ class _Bridge:
             return ""
         state = {"source_id": self.owner.reply_source_id, "send_tool": self.delivery_tool(),
             "current_turn_write_calls": self.write_calls,
+            "current_turn_failure_notice_calls": self.failure_notice_calls,
             "current_turn_receipt_status": self.last_write.status if self.last_write else "not_dispatched",
             "delivery_recovery": self.delivery_recovery}
         return ("Current delivery target JSON: " + json.dumps(state, ensure_ascii=False) +
@@ -532,7 +535,15 @@ class _Bridge:
                 return {"status": "blocked", "data": {"error": "delivery_recovery_only",
                     "next_action": "Deliver once with the current send tool, then finish."}}
             if tool.effect == "write" and self.write_calls >= self.owner.max_external_writes:
-                return {"status": "blocked", "data": {"error": "write_budget_exhausted"}}
+                # Keep attempts bounded, but don't make a confirmed rejection
+                # consume the user's only possible failure explanation.
+                text_only = (name == self.delivery_tool() and isinstance(args.get('text'), str)
+                    and 0 < len(args['text']) <= 300 and not args.get('artifact_ids')
+                    and not args.get('video_artifact_id') and not args.get('media_artifact_ids')
+                    and not args.get('as_forward'))
+                if not (text_only and self.last_rejected_write and self.failure_notice_calls == 0):
+                    return {"status": "blocked", "data": {"error": "write_budget_exhausted"}}
+                self.failure_notice_calls += 1
             if tool.effect == "image":
                 if self.image_calls >= self.owner.max_image_calls or self.owner.before_call and not self.owner.before_call("image"):
                     return {"status": "blocked", "data": {"error": "image_budget_exhausted"}}
@@ -561,6 +572,8 @@ class _Bridge:
             self.trace.append({"tool": name, "call_id": call_id, "status": outcome.status, "receipt_id": outcome.receipt_id})
             self._seen_calls[call_id] = {"signature": signature, "result": result}
             if tool.effect == "write":
+                self.last_rejected_write = (outcome.status == 'failed' and outcome.data.get('error')
+                    in {'qq_send_rejected','qq_video_requires_standalone_message'})
                 if outcome.status == "ok":
                     outcome = ToolOutcome(outcome.data, "uncertain", outcome.receipt_id)
                     result["status"] = "uncertain"

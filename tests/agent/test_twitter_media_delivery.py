@@ -46,6 +46,10 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         def __init__(self):self.calls=[]
         async def call_api(self,action,params):
             self.calls.append((action,params))
+            for node in params.get('messages',()):
+                content=node['data']['content']
+                if any(item['type']=='video' for item in content):
+                    assert len(content)==1, 'SnowLuma requires standalone video nodes'
             if uncertain and action.endswith('forward_msg'):
                 raise QQMessageDeliveryUncertainError('synthetic lost ack')
             return {'status':'ok','retcode':0,'data':{'message_id':'synthetic-receipt-'+str(len(self.calls))}}
@@ -88,8 +92,10 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         forwards=[params for action,params in gateway.calls if action.endswith('forward_msg')]
         assert len(forwards)==1 and len(requests)==4
         nodes=forwards[0]['messages']
-        assert [node['data']['content'][1]['type'] for node in nodes]==['image','video','video']
-        assert [base64.b64decode(node['data']['content'][1]['data']['file'][9:]) for node in nodes]==[image_bytes(),mp4,mp4]
+        assert nodes[0]['data']['content']==[{'type':'text','data':{'text':'原帖共3项媒体'}}]
+        media=[item for node in nodes for item in node['data']['content'] if item['type'] in {'image','video'}]
+        assert [item['type'] for item in media]==['image','video','video']
+        assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4,mp4]
         with session_scope(sqlite_engine) as session:
             effects=list(session.scalars(select(AgentToolEffect).where(AgentToolEffect.operation=='send_'+surface)))
             assert effects[-1].status==('uncertain' if uncertain else 'sent')
