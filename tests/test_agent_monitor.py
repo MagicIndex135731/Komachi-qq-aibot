@@ -104,3 +104,28 @@ def test_usage_footer_api_is_local_read_only_and_keeps_unknowns(server,tmp_path)
     assert exc.value.code==405
     with pytest.raises(urllib.error.HTTPError) as exc:request(server,'/api/conversations/invalid/metrics')
     assert exc.value.code==400
+
+
+def test_api_links_worker_without_a_fake_model_conversation_or_usage(server,tmp_path):
+    from app.agent.runtime_trace import AgentTrace, current_trace_context, observe_with
+    parent=AgentTrace(tmp_path,context={'surface':'private','scope_id':900000101,'context_kind':'private'},
+        session_key='synthetic-main',conversation_key='synthetic-main')
+    with observe_with(parent):lineage=current_trace_context()
+    child=AgentTrace(tmp_path,context={**lineage,'surface':'private','scope_id':900000101,
+        'context_kind':'media_task','execution_kind':'background_tool','job_id':1,'operation':'download_web_video'},
+        session_key='synthetic-worker',conversation_key='synthetic-worker')
+    child.event('job.phase.started',{'phase':'running','job_id':1})
+    child.finish('ok','synthetic');child.close();parent.finish('silent','synthetic');parent.close()
+    with request(server,'/api/conversations') as r:conversations=json.load(r)['conversations']
+    assert len(conversations)==1 and conversations[0]['task_count']==1
+    c=conversations[0]
+    assert len(c['turns'])==1 and c['task_traces'][0]['trace_id']==child.trace_id
+    with request(server,'/api/conversations/'+c['conversation_id']+'/metrics') as r:
+        assert json.load(r)['usage']['request_count']==0
+    with request(server,'/api/traces/'+child.trace_id) as r:
+        assert any(e['kind']=='job.phase.started' for e in json.load(r)['events'])
+    with request(server,'/api/controls') as r:token=json.load(r)['deletion_token']
+    with request(server,'/api/conversations/'+c['conversation_id'],headers={'X-Monitor-Token':token},method='DELETE') as r:
+        assert json.load(r)['deleted_turns']==2
+    with pytest.raises(urllib.error.HTTPError) as exc:request(server,'/api/traces/'+child.trace_id)
+    assert exc.value.code==404

@@ -166,11 +166,13 @@ class AutonomousSocialExecutor:
         self.research_runner = BoundedBlockingRunner(2)
         self.research_jobs = ResearchDelegationQueue(router.engine, account_id=router.runtime.settings.bot_qq,
             surface='group', execute=self._execute_research, deliver=self._return_research,
+            trace_root=router.runtime.settings.data_dir / 'agent_monitor' if getattr(router.runtime.settings, 'agent_monitor_enabled', False) else None,
             authorized=self._research_authorized, clock=lambda: self.clock(),
             task_workspace_root=router.runtime.settings.data_dir / 'research_tasks')
         from app.agent.media_tasks import MediaTaskQueue
         self.media_jobs = MediaTaskQueue(router.engine, account_id=router.runtime.settings.bot_qq,
             surface='group', execute=self._execute_media, deliver=self._return_media,
+            trace_root=router.runtime.settings.data_dir / 'agent_monitor' if getattr(router.runtime.settings, 'agent_monitor_enabled', False) else None,
             available=lambda: getattr(getattr(self.qzone, 'gateway', None), 'websocket', True) is not None,
             authorized=self._research_authorized, clock=lambda: self.clock(),
             task_workspace_root=router.runtime.settings.data_dir / 'research_tasks')

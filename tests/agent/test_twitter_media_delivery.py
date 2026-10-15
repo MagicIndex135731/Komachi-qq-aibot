@@ -18,6 +18,7 @@ from test_twitter_media_tools import URL, provider
 from test_web_image_delivery import output
 from test_web_video_delivery import mp4
 from tests.private_chat.test_agent_service import OTHER, event, setup, sse
+from app.agent.runtime_trace import TraceReader
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
@@ -150,6 +151,7 @@ async def test_private_natural_media_request_searches_without_url_then_downloads
 @pytest.mark.parametrize('uncertain',[False,True])
 @pytest.mark.parametrize('delivery_mode',['review','auto'])
 async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlite_engine,tmp_path,monkeypatch,mp4,surface,uncertain,delivery_mode,record_property):
+    monitor_root=tmp_path/'agent_monitor'
     requests=provider(monkeypatch,video=mp4)
     web=WebSearchClient(provider='ddgs',base_url='',api_key='',timeout_seconds=10)
     sent_result=[]
@@ -192,7 +194,10 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
             client,_,_=model_client(script)
             async with composed(sqlite_engine,tmp_path,client,runtime='harness') as fixture:
                 fixture.executor.sender=Sender(gateway);fixture.router.web_search_client=web
+                fixture.router.runtime.settings.agent_monitor_enabled=True
+                monitor_root=fixture.router.runtime.settings.data_dir/'agent_monitor'
                 queue=fixture.executor.media_jobs;queue.running=True
+                queue.trace_root=monitor_root
                 job=configured_social_jobs(fixture.router.runtime)[0]
                 source=add_source(sqlite_engine,platform_id='x-download-request',text='小町请下载这个推文全部图片和视频 '+URL)
                 class DirectGuard:
@@ -212,12 +217,15 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
                 return sse(cmd[0],cmd[1],number=n) if cmd else sse(number=n)
             service,agent,dispatcher,_,_=setup(sqlite_engine,tmp_path,script)
             service.sender=Sender(gateway);service.web_search_client=web
+            agent.settings.agent_monitor_enabled=True
+            agent.media_jobs.trace_root=tmp_path/'agent_monitor'
             await service.start()
             try:
                 incoming=event('x-download-request',user_id=OTHER,text='请下载这个推文全部图片和视频 '+URL)
                 await dispatcher.handle_private_message(incoming)
                 async with asyncio.timeout(20):
                     while not any(action.endswith('forward_msg') for action,_ in gateway.calls):await asyncio.sleep(.05)
+                    while agent._active:await asyncio.sleep(.05)
             finally:await service.stop()
         forwards=[params for action,params in gateway.calls if action.endswith('forward_msg')]
         assert len(forwards)==1 and len(requests)==4
@@ -236,4 +244,15 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         with session_scope(sqlite_engine) as session:
             effects=list(session.scalars(select(AgentToolEffect).where(AgentToolEffect.operation=='send_'+surface)))
             assert effects[-1].status==('uncertain' if uncertain else 'sent')
+        reader=TraceReader(monitor_root)
+        main=next(c for c in reader.list_conversations() if c['context_kind']==surface)
+        assert main['task_count']==1 and len(main['task_traces'])>=2
+        children=main['task_traces']
+        origin=next(m for m in main['turns'] if m['trigger_kind'] in {'group_direct','private_message'})
+        assert all(m['workflow_id']==origin['trace_id'] and m['model_requests']==0 for m in children)
+        assert any(e['kind']=='tool.started' and e['data']['name']=='download_twitter_media'
+            for m in children for e in reader.read_trace(m['trace_id'])['events'])
+        delivery=next(m for m in (children if delivery_mode=='auto' else main['turns'])
+            if m.get('execution_kind')=='tool_delivery' or m.get('trigger_kind')=='media_result')
+        assert delivery['parent_trace_id'] and delivery['job_id']
     finally:web.http_client.close()

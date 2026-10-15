@@ -15,7 +15,7 @@
  <div id="detail" class="detail" hidden>
   <header class="conversation-header"><div><div id="scope-label" class="eyebrow"></div><h2 id="conversation-title"></h2><p id="conversation-subtitle"></p></div><div class="header-actions"><span id="conversation-status" class="chip"></span><button id="delete-selected" class="quiet danger">删除记录</button><button id="open-input" class="quiet">模型输入</button></div></header>
   <div class="conversation-info"><span id="identity-note"></span><label><input id="follow" type="checkbox" checked>跟随最新过程</label></div>
-  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><div id="turn-list"></div><div id="tail"></div></div></div>
+  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><div id="turn-list"></div><section id="orphan-tasks" hidden><p class="muted small">关联后台任务 · 父回合在更早页面或已过期</p><div id="orphan-task-list"></div></section><div id="tail"></div></div></div>
   <footer class="main-footer usage-footer" aria-label="当前会话上下文和用量">
    <div class="usage-grid">
     <div class="usage-context" title="最近主模型请求的输入量；实报优先，尚无实报时使用估算。总量是当前配置的窗口，不是累计消耗。"><span>最近请求输入 / 配置窗口</span><strong id="context-usage">未知 / 未知</strong><progress id="context-progress" max="1" value="0" aria-label="上下文占用比例"></progress><small id="context-source">等待请求</small></div>
@@ -36,7 +36,7 @@
 </aside>
 </div>
 <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title">
- <form method="dialog"><h2 id="delete-title">删除这段会话的监控记录？</h2><p id="delete-description"></p><p class="muted">只删除已采集的监控记录，不清空聊天或记忆，也不停止正在执行的任务。后续新回合会重新出现在列表中。</p><div class="dialog-actions"><button value="cancel" class="quiet" autofocus>取消</button><button value="delete" class="quiet danger">确认删除</button></div></form>
+ <form method="dialog"><h2 id="delete-title">删除这段会话的监控记录？</h2><p id="delete-description"></p><p class="muted">删除已采集的会话及关联后台过程记录，不清空聊天或记忆，也不停止正在执行的任务。后续新回合会重新出现在列表中。</p><div class="dialog-actions"><button value="cancel" class="quiet" autofocus>取消</button><button value="delete" class="quiet danger">确认删除</button></div></form>
 </dialog>
 <script src="/app.js" defer></script>
 </body></html>

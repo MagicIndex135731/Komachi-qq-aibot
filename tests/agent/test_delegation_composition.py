@@ -84,6 +84,7 @@ async def test_private_background_child_allows_new_chat_and_returns_to_same_main
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, script)
     web = service.web_search_client = web_client(entered, release)
     agent.settings.agent_monitor_enabled = True
+    agent.research_jobs.trace_root = tmp_path / 'agent_monitor'
     await service.start()
     try:
         await dispatcher.handle_private_message(event('main-complex', user_id=OTHER, text='请联网核对这些合成文件 https://example.com/source'))
@@ -102,6 +103,13 @@ async def test_private_background_child_allows_new_chat_and_returns_to_same_main
         assert child['parent_context_scope'] == f'private:{OTHER}'
         assert child['delegation_reason'] == DELEGATE['reason']
         assert len([trace for trace in traces if trace['context_kind'] == 'private']) == 3
+        reader = TraceReader(tmp_path / 'agent_monitor')
+        main = next(c for c in reader.list_conversations() if c['context_kind'] == 'private')
+        assert main['task_count'] == 1
+        assert child['trace_id'] in {m['trace_id'] for m in main['task_traces']}
+        origin = next(m for m in main['turns'] if m.get('trigger_text', '').startswith('请联网'))
+        assert child['workflow_id'] == origin['trace_id'] and child['parent_trace_id'] != origin['trace_id']
+        assert all('_trace_parent' not in json.dumps(body) and 'workflow_conversation_id' not in json.dumps(body) for body in requests)
     finally:
         release.set()
         await service.stop()
@@ -120,6 +128,7 @@ async def test_group_background_child_returns_to_same_main_after_new_message(sql
             fixture.router.web_search_client = web
             fixture.router.runtime.settings.agent_monitor_enabled = True
             queue = fixture.executor.research_jobs
+            queue.trace_root = fixture.router.runtime.settings.data_dir / 'agent_monitor'
             queue.running = True
             job = configured_social_jobs(fixture.router.runtime)[0]
             async def main(message_id, text):
@@ -154,6 +163,13 @@ async def test_group_background_child_returns_to_same_main_after_new_message(sql
                 traces = TraceReader(fixture.router.runtime.settings.data_dir / 'agent_monitor').list_traces()
                 assert next(trace for trace in traces if trace['context_kind'] == 'research')['parent_context_scope'] == f'group:{GROUP}'
                 assert any(trace['trigger_kind'] == 'research_result' for trace in traces)
+                reader = TraceReader(fixture.router.runtime.settings.data_dir / 'agent_monitor')
+                main = next(c for c in reader.list_conversations() if c['context_kind'] == 'group')
+                child_meta = next(m for m in main['task_traces'] if m['context_kind'] == 'research')
+                origin = next(m for m in main['turns'] if '合成文件' in m.get('trigger_text', ''))
+                assert child_meta['workflow_id'] == origin['trace_id']
+                returned = next(m for m in main['turns'] if m['trigger_kind'] == 'research_result')
+                assert returned['job_id'] == child_meta['job_id'] and returned['parent_trace_id']
             finally:
                 release.set()
                 await asyncio.gather(child, return_exceptions=True)

@@ -141,3 +141,61 @@ def test_observed_context_transition_does_not_change_checkpoint():
     result=context_observation('research:group:900000001:task',previous_id='one',current_id='one',
         checkpoint={},history_present=True,restored_count=0)
     assert result['context_state']=='continued' and result['context_kind']=='research'
+
+
+def test_workflow_links_workers_and_child_model_without_changing_main_context_or_usage(tmp_path):
+    from app.agent.runtime_trace import current_trace_context, observe_with
+    from app.monitor.metrics import ConversationMetrics
+    parent = AgentTrace(tmp_path, context={'surface':'private', 'scope_id':900000101,
+        'context_kind':'private'}, session_key='main-native', conversation_key='main-conversation')
+    assert current_trace_context() == {}
+    with observe_with(parent, call_id='synthetic-call'):
+        lineage = current_trace_context()
+    assert current_trace_context() == {} and lineage['parent_trace_id'] == parent.trace_id
+    worker = AgentTrace(tmp_path, context={**lineage, 'surface':'private', 'scope_id':900000101,
+        'job_id':12, 'execution_kind':'delegation_job', 'context_kind':'research_job'},
+        session_key='job', conversation_key='job:12')
+    with observe_with(worker):
+        child = AgentTrace(tmp_path, context={**current_trace_context(), 'surface':'private',
+            'scope_id':900000101, 'context_kind':'research'}, session_key='child-native', conversation_key='child')
+    child.request('m01-a01', {'input':['child-only']}, {}, purpose='agent')
+    child.event('model.finished', {'request_id':'m01-a01', 'input_tokens':100,
+        'cached_input_tokens':0, 'output_tokens':20})
+    for trace in (parent, worker, child):
+        trace.finish('ok', 'synthetic'); trace.close()
+    reader = TraceReader(tmp_path)
+    main = reader.read_conversation(lineage['workflow_conversation_id'])
+    assert main['turn_count'] == 1 and main['native_session_count'] == 1 and main['task_count'] == 1
+    assert {t['trace_id'] for t in main['task_traces']} == {worker.trace_id, child.trace_id}
+    assert len(reader.list_conversations()) == 2  # main and real research, no fake worker chat
+    assert ConversationMetrics(reader).read(main['conversation_id'])['usage']['request_count'] == 0
+    assert reader.read_trace(parent.trace_id)['events'][-1]['kind'] == 'turn.completed'
+    assert not list(parent.path.glob('request-*.json'))
+    assert reader.read_request(child.trace_id, 'm01-a01')['body']['input'] == ['child-only']
+    from app.monitor.records import MonitorRecords
+    deleted = MonitorRecords(reader).delete_conversation(main['conversation_id'])
+    assert deleted['deleted_turns'] == 3 and reader.list_traces() == []
+
+
+def test_worker_ancestry_never_guesses_scope_and_survives_expired_parent(tmp_path):
+    from app.agent.runtime_trace import current_trace_context, observe_with
+    parent = AgentTrace(tmp_path, context={'surface':'group', 'scope_id':900000001},
+        session_key='main', conversation_key='main')
+    with observe_with(parent):lineage = current_trace_context()
+    foreign = AgentTrace(tmp_path, context={**lineage, 'surface':'group', 'scope_id':900000002,
+        'execution_kind':'background_tool', 'context_kind':'media_task', 'job_id':1},
+        session_key='foreign', conversation_key='foreign-job')
+    for trace in (parent, foreign):trace.finish('ok', 'done');trace.close()
+    reader = TraceReader(tmp_path)
+    assert reader.read_conversation(lineage['workflow_conversation_id'])['task_count'] == 0
+    assert len(reader.list_conversations()) == 2
+    from app.monitor.records import MonitorRecords
+    MonitorRecords(reader).delete_traces([parent.trace_id])
+    assert reader.list_conversations()[0]['turns'][0]['trace_id'] == foreign.trace_id
+
+
+def test_malformed_observation_ancestry_does_not_break_legacy_listing(tmp_path):
+    trace = AgentTrace(tmp_path, context={'workflow_conversation_id':{},'execution_kind':[], 'job_id':{}},
+        session_key='legacy')
+    trace.finish('ok','synthetic');trace.close()
+    assert TraceReader(tmp_path).list_conversations()[0]['task_count'] == 0

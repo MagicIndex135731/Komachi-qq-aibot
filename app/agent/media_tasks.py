@@ -219,7 +219,7 @@ def media_previews(result, store, guard, settings):
 async def deliver_download(payload, guard, *, engine, settings, runner, send, clock, conversation_key):
     """Deliver only an explicitly queued download, through the existing ledger."""
     from app.agent.media_delivery import resolve_media_bundle
-    from app.agent.runtime_trace import AgentTrace
+    from app.agent.runtime_trace import AgentTrace, current_trace_context
     from app.agent.tool_dispatch import ToolDispatchBoundary
     guard.require_valid()
     if payload.get('delivery_mode')!='auto' or payload['operation'] not in MEDIA_OPERATIONS-{'generate_image'}:
@@ -253,10 +253,12 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
         return await send(boundary, files if args.get('media') else (), args['text'])
     tool = AgentTool(operation,'交付原请求已授权的下载结果',{},handler,effect='write')
     observer = AgentTrace(settings.data_dir/'agent_monitor' if getattr(settings,'agent_monitor_enabled',False) else None,
-        context={**guard.trace_trigger,'context_kind':payload['surface'],'surface':payload['surface'],
+        context={**current_trace_context(), **guard.trace_trigger,
+            'execution_kind':'tool_delivery', 'context_kind':'media_task','surface':payload['surface'],
             'context_scope':payload['scope'],'scope_id':payload['scope_id'],'actor_id':payload['actor_id'],
             'source_id':payload['source_id'],'trigger_kind':'media_delivery','request_preview':'下载结果直接交付'},
-        session_key=str(conversation_key)+':media-delivery',conversation_key=str(conversation_key))
+        session_key=str(conversation_key)+':media-delivery',
+        conversation_key=f"job:{payload['account_id']}:{guard.job_id}")
     try:
         async def dispatch(args,call_id):
             observer.event('tool.started',{'name':operation,'call_id':call_id,'effect':'write','arguments':args})

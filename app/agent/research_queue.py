@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.memory_source_guard import is_usable_memory_source
+from app.agent.runtime_trace import AgentTrace, current_trace_context, execution_event, observe_with
 from app.storage.db import session_scope
 from app.storage.models import Job, Message
 
@@ -119,11 +120,12 @@ class ResearchDelegationQueue:
     guard_type = ResearchJobGuard
 
     def __init__(self, engine, *, account_id, surface, execute, deliver, authorized, clock=None,
-                 task_workspace_root=None):
+                 task_workspace_root=None, trace_root=None):
         self.engine, self.account_id, self.surface = engine, account_id, surface
         self.execute, self.deliver, self.authorized = execute, deliver, authorized
         self.clock = clock or (lambda: datetime.now(UTC))
         self.task_workspace_root = task_workspace_root
+        self.trace_root = trace_root
         self.owner, self.running, self.worker = uuid4().hex, False, None
         self.wake = asyncio.Event()
 
@@ -164,13 +166,18 @@ class ResearchDelegationQueue:
                 active = [item for item in waiting if item.status in ACTIVE_STATES]
                 state = 'pending' if len(active) >= 16 or sum(own(item) for item in active) >= 4 else 'queued'
                 row = Job(job_type=self.job_type, job_key=key, status=state, run_at=now,
-                          max_attempts=self.max_execution_attempts, payload_json={**payload, 'created_at': self.clock().timestamp()})
+                          max_attempts=self.max_execution_attempts, payload_json={**payload,
+                              '_trace_parent': current_trace_context(), 'created_at': self.clock().timestamp()})
                 session.add(row)
                 session.flush()
             result = {'status': 'queued', 'task_id': row.payload_json['task_id'], 'job_id': row.id,
                       'execution_status': row.status,
                       'delivery': 'background_result_returns_to_main', 'guidance': '排队不代表完成；主对话可继续处理新消息。'}
         self.wake.set()
+        execution_event('job.queued', {'job_id': result['job_id'], 'task_id': result['task_id'],
+            'status': result['execution_status'], 'operation': payload.get('operation'),
+            'execution_kind': 'background_tool' if self.job_type == 'agent_media_operation' else 'delegation_job',
+            'delivery_mode': payload.get('delivery_mode', 'review')})
         return result
 
     async def start(self):
@@ -262,7 +269,7 @@ class ResearchDelegationQueue:
                 from app.agent.research_tasks import ResearchTaskWorkspace
                 check = ResearchJobGuard(self, job_id, completed_payload, phase)
                 if not self.authorized(completed_payload):
-                    return
+                    return status
                 task = ResearchTaskWorkspace(self.task_workspace_root, scope=completed_payload['scope'],
                     actor_id=completed_payload['actor_id'], source_id=completed_payload['source_id'],
                     request=completed_payload.get('goal', ''), valid_source=check.valid_source,
@@ -271,6 +278,7 @@ class ResearchDelegationQueue:
                 task.record_job_result(job_id, status)
             except (ValueError, OSError, RuntimeError):
                 logger.warning('agent_task_checkpoint_unavailable job_id=%s', job_id)
+        return status if completed_payload is not None else None
 
     async def tick(self):
         claimed = self.claim()
@@ -278,24 +286,58 @@ class ResearchDelegationQueue:
             return False
         job_id, payload, phase = claimed
         guard = self.guard_type(self, job_id, payload, phase)
+        media = self.job_type == 'agent_media_operation'
+        lineage = payload.get('_trace_parent')
+        observer = AgentTrace(self.trace_root, context={
+            **(lineage if isinstance(lineage, dict) else {}),
+            'surface': self.surface, 'scope_id': payload['scope_id'], 'actor_id': payload['actor_id'],
+            'source_id': payload['source_id'], 'context_scope': payload['scope'],
+            'context_kind': 'media_task' if media else 'research_job',
+            'execution_kind': 'background_tool' if media else 'delegation_job',
+            'job_id': job_id, 'task_id': payload['task_id'], 'job_phase': phase,
+            'operation': payload.get('operation'), 'delivery_mode': payload.get('delivery_mode', 'review'),
+            'request_preview': payload.get('operation') or payload.get('goal', '')[:180],
+            'trigger_kind': 'background_execution', 'trigger_reason': '执行原请求已持久排队的后台任务；交付以实际回执为准。'},
+            session_key=f'job:{self.account_id}:{job_id}:{phase}',
+            conversation_key=f'job:{self.account_id}:{job_id}')
+        settled, reason = None, 'job_state_changed'
+        observer.event('job.phase.started', {'job_id': job_id, 'phase': phase,
+            'operation': payload.get('operation'), 'delivery_mode': payload.get('delivery_mode', 'review')})
         try:
-            guard.require_valid()
-            if phase == 'running':
-                result = await asyncio.wait_for(self.execute(payload, guard), timeout=330)
+            with observe_with(observer):
                 guard.require_valid()
-                self.finish(job_id, phase, status='result_ready', payload={**payload, **guard.snapshot(), 'result': result})
-            else:
-                result = await asyncio.wait_for(self.deliver(payload, guard), timeout=650)
-                guard.require_valid()
-                self.finish(job_id, phase, status=result if result in {'completed', 'uncertain', 'failed', 'blocked'} else 'failed')
+                if phase == 'running':
+                    if media:
+                        observer.event('tool.started', {'name': payload['operation'], 'call_id': 'media-execute',
+                            'effect': 'image' if payload['operation'] == 'generate_image' else 'read',
+                            'arguments': payload['arguments']})
+                    result = await asyncio.wait_for(self.execute(payload, guard), timeout=330)
+                    if media:
+                        observer.event('tool.completed', {'name': payload['operation'], 'call_id': 'media-execute',
+                            'status': result.get('status', 'unknown'), 'data': result.get('data', {})})
+                    guard.require_valid()
+                    settled = self.finish(job_id, phase, status='result_ready', payload={**payload, **guard.snapshot(), 'result': result})
+                else:
+                    result = await asyncio.wait_for(self.deliver(payload, guard), timeout=650)
+                    guard.require_valid()
+                    settled = self.finish(job_id, phase, status=result if result in {'completed', 'uncertain', 'failed', 'blocked'} else 'failed')
+                reason = 'background_result_ready' if phase == 'running' else 'background_delivery_finished'
         except asyncio.CancelledError:
             # Reads may be safely resumed at most once; delivery may already
             # have happened and must never be automatically replayed.
-            self.finish(job_id, phase, status=self.interrupted_execution_status if phase == 'running' else 'uncertain', reason='worker_stopped')
+            settled = self.finish(job_id, phase, status=self.interrupted_execution_status if phase == 'running' else 'uncertain', reason='worker_stopped')
+            reason = 'worker_stopped'
             raise
         except Exception as exc:
-            self.finish(job_id, phase, status='uncertain' if guard.dispatched else 'blocked', reason=type(exc).__name__)
+            settled = self.finish(job_id, phase, status='uncertain' if guard.dispatched else 'blocked', reason=type(exc).__name__)
+            reason = type(exc).__name__
             logger.warning('delegated_research_job_failed surface=%s error_type=%s', self.surface, type(exc).__name__)
+        finally:
+            observer.event('job.phase.completed', {'job_id': job_id, 'phase': phase,
+                'status': settled or 'interrupted', 'reason': reason,
+                'delivery_mode': payload.get('delivery_mode', 'review')})
+            observer.finish('ok' if settled in {'result_ready', 'completed'} else settled or 'interrupted', reason)
+            await asyncio.to_thread(observer.close)
         return True
 
     async def _run(self):

@@ -70,7 +70,8 @@ class MonitorRecords:
     def delete_conversation(self, conversation_id):
         with self.lock:
             conversation = self.reader.read_conversation(conversation_id)
-            return self.delete_traces([meta['trace_id'] for meta in conversation['turns']])
+            return self.delete_traces([meta['trace_id'] for meta in
+                (*conversation['turns'], *conversation.get('task_traces', ()))])
 
     def delete_before(self, cutoff):
         if type(cutoff) not in (float, int) or not 0 < cutoff <= time.time():

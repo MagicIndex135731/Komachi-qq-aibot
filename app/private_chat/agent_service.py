@@ -85,12 +85,14 @@ class PrivateHarnessService:
         self._model_lock = asyncio.Lock()
         self.research_jobs = ResearchDelegationQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_research, deliver=self._return_research, clock=lambda: self.clock(),
+            trace_root=self.settings.data_dir / 'agent_monitor' if getattr(self.settings, 'agent_monitor_enabled', False) else None,
             task_workspace_root=self.settings.data_dir / 'research_tasks',
             authorized=lambda payload: self.running and self.allowed(payload['actor_id'])
                 and (self.gateway is None or self.gateway.websocket is not None))
         from app.agent.media_tasks import MediaTaskQueue
         self.media_jobs = MediaTaskQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_media, deliver=self._return_media, clock=lambda: self.clock(),
+            trace_root=self.settings.data_dir / 'agent_monitor' if getattr(self.settings, 'agent_monitor_enabled', False) else None,
             task_workspace_root=self.settings.data_dir / 'research_tasks',
             available=lambda: self.gateway is None or self.gateway.websocket is not None,
             authorized=lambda payload: self.running and self.allowed(payload['actor_id'])
@@ -140,10 +142,12 @@ class PrivateHarnessService:
             conversation_key=self.sessions.session_path(payload['scope']).parent/'harness')
 
     async def _return_research(self, payload, guard):
+        from app.agent.runtime_trace import current_trace_context
         guard.require_valid()
         result = self._enqueue(user_id=payload['actor_id'], source_id=payload['source_id'],
             private_scope=payload['private_scope'], kind='research_result', goal=payload['goal'],
             key='research-result:' + str(guard.job_id), before_commit=guard.require_valid,
+            trace_lineage=current_trace_context(),
             delegated_result={**payload['result'], 'parent_task_id': payload.get('parent_task_id'),
                 'returned_job_id': guard.job_id}, dependencies=guard.snapshot())
         self._wake.set()
@@ -201,7 +205,7 @@ class PrivateHarnessService:
         return True
 
     def _enqueue(self, *, user_id, source_id, private_scope, kind="message", goal="", delay_seconds=0, key=None,
-                 before_commit=None, delegated_result=None, dependencies=None):
+                 before_commit=None, delegated_result=None, dependencies=None, trace_lineage=None):
         if kind=='wakeup' and user_id!=self.service.owner_qq:
             return {'error':'owner_required'}
         if not self.allowed(user_id) or not self._valid_source(source_id, user_id):
@@ -220,7 +224,8 @@ class PrivateHarnessService:
                 job_key=job_key, run_at=now + timedelta(seconds=delay_seconds),
                 status="queued", payload_json={"account_id": self.account_id, "user_id": user_id,
                     "source_id": source_id, "private_scope": private_scope, "kind": kind, "goal": goal,
-                    **({'delegated_result': delegated_result, 'dependencies': dependencies} if delegated_result is not None else {})})
+                    **({'delegated_result': delegated_result, 'dependencies': dependencies,
+                        '_trace_parent': trace_lineage or {}} if delegated_result is not None else {})})
             return {"task_id": row.id, "status": row.status, "run_at": row.run_at.isoformat(), "kind": kind}
 
     async def start(self):
@@ -879,7 +884,8 @@ class PrivateHarnessService:
                     "daily_session_summary": self.service._session_summary(session_id=daily_id)[:4000] if bootstrap_context else ''}, ensure_ascii=False)]
             agent = self.runtime_factory(decision_client=self.service.llm_client, max_steps=32, max_external_writes=self.settings.agent_max_external_writes,
                 trace_root=(self.settings.data_dir / "agent_monitor" if getattr(self.settings, "agent_monitor_enabled", False) else None),
-                trace_context={**trace_context_state, **trace_trigger, "surface": "private", "scope_id": user_id, "actor_id": user_id,
+                trace_context={**(payload.get('_trace_parent') or {}), **trace_context_state, **trace_trigger,
+                    "surface": "private", "scope_id": user_id, "actor_id": user_id,
                     "source_id": source_id, "request_preview": event.plain_text[:180],
                     'trigger_kind': 'private_message' if payload['kind'] == 'message' else 'media_result'
                         if (payload.get('delegated_result') or {}).get('kind') == 'media_result'

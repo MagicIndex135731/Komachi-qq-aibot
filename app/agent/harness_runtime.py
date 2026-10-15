@@ -32,7 +32,7 @@ from app.agent.model_observation import request_context_counts, usage_token_metr
 from app.agent.context_policy import RequestContextPolicy, estimate_request_tokens, estimate_text_tokens, compact_memory_packet, compact_memory_prompt
 from app.agent.context_recovery import application_turn_marker
 from app.agent.model_stream import ModelStreamBudget
-from app.agent.runtime_trace import AgentTrace
+from app.agent.runtime_trace import AgentTrace, current_trace_context, observe_with
 from app.runtime.blocking import BoundedBlockingRunner
 from app.core.time_utils import CONVERSATION_TIME_POLICY, conversation_time_context
 
@@ -157,7 +157,7 @@ class HarnessToolAgent:
         bridge = _Bridge(self, by_name, guard, asyncio.get_running_loop(), resources,
                          invoke_tool or self.invoke_tool)
         bridge.control = control
-        bridge.observer = AgentTrace(self.trace_root, context={**self.trace_context,
+        bridge.observer = AgentTrace(self.trace_root, context={**current_trace_context(), **self.trace_context,
             "model": bridge.model, "protocol": bridge.protocol,
             "context_window_tokens": self.context_policy.context_window},
             session_key=str(home) + ":" + str(session_id or self.session_id or "xiaomachi"),
@@ -640,7 +640,8 @@ class _Bridge:
         self.observer.event("tool.started", {**info, "arguments": body.get("arguments")})
         was_seen = isinstance(call_id, str) and call_id in self._seen_calls
         try:
-            result = await self._call_tool(body)
+            with observe_with(self.observer, call_id=call_id):
+                result = await self._call_tool(body)
             if (self.control is not None and tool is not None
                     and validate_arguments(body.get('arguments'), tool.parameters)
                     and not was_seen and not result.get('duplicate') and not result.get('task_progress')

@@ -7,6 +7,8 @@ Bounded asynchronous writes may be dropped; they never control a model/tool run.
 from __future__ import annotations
 
 from itertools import islice
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import logging
@@ -31,6 +33,49 @@ _SECRETS = {"authorization", "api_key", "apikey", "access_token", "password", "s
 _PRIVATE_REASONING = {"encrypted_content", "reasoning_content", "reasoning_text", "thinking", "thought_signature", "signature"}
 _ASSIGNMENT = re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|password|authorization|secret|cookie)\b[\"']?\s*[:=]\s*[\"']?)([^\s\"',;}]+)")
 _URL_SECRET = re.compile(r"(?i)([?&](?:token|key|api_key|access_token|rkey|secret|password)=)[^&#\s\"']+")
+_ACTIVE_TRACE = ContextVar('agent_private_observation', default=None)
+BACKGROUND_EXECUTION = frozenset({'background_tool', 'delegation_job', 'tool_delivery'})
+
+
+def _background_execution(meta: dict) -> bool:
+    kind = meta.get('execution_kind')
+    return isinstance(kind, str) and kind in BACKGROUND_EXECUTION
+
+
+@contextmanager
+def observe_with(trace, *, call_id=None):
+    """Link real execution without adding trace data to model input or authority."""
+    token = _ACTIVE_TRACE.set((trace, call_id))
+    try:
+        yield
+    finally:
+        _ACTIVE_TRACE.reset(token)
+
+
+def current_trace_context() -> dict:
+    active = _ACTIVE_TRACE.get()
+    if not active or not active[0].enabled or active[0].closed:
+        return {}
+    trace, call_id = active
+    meta = trace.meta
+    result = {'parent_trace_id': trace.trace_id,
+        'workflow_id': meta.get('workflow_id') or trace.trace_id}
+    conversation = meta.get('workflow_conversation_id')
+    if not conversation and meta.get('conversation_key'):
+        conversation = 'c-' + meta['conversation_key']
+    if isinstance(conversation, str) and CONVERSATION_ID.fullmatch(conversation):
+        result['workflow_conversation_id'] = conversation
+    if type(meta.get('job_id')) is int:
+        result['job_id'] = meta['job_id']
+    if isinstance(call_id, str):
+        result['parent_tool_call_id'] = call_id[:500]
+    return result
+
+
+def execution_event(kind: str, data: dict) -> None:
+    active = _ACTIVE_TRACE.get()
+    if active:
+        active[0].event(kind, data)
 
 
 def _text(value: str) -> str:
@@ -440,7 +485,9 @@ class TraceReader:
 
     def list_conversations(self, *, limit=100):
         groups = {}
-        for meta in self.list_traces(limit=500):
+        trace_groups = {}
+        traces = self.list_traces(limit=500)
+        for meta in traces:
             logical = meta.get('conversation_key')
             identity = logical if isinstance(logical, str) and re.fullmatch('[a-f0-9]{24}', logical) else None
             quality = 'logical' if identity else 'native_only'
@@ -448,6 +495,7 @@ class TraceReader:
             if not identity:
                 identity = native if isinstance(native, str) and re.fullmatch('[a-f0-9]{24}', native) else meta['trace_id'][:24]
             key = ('c-' if quality == 'logical' else 's-') + identity
+            trace_groups[meta['trace_id']] = key
             groups.setdefault(key, {'conversation_id': key, 'identity_quality': quality, 'turns': []})['turns'].append(meta)
         results = []
         for group in groups.values():
@@ -457,9 +505,37 @@ class TraceReader:
                 scope_id=last.get('scope_id'), actor_id=last.get('actor_id'), context_kind=last.get('context_kind', 'unknown'),
                 context_scope=last.get('context_scope'),
                 status=last.get('status'), updated_at=max(t.get('updated_at', 0) for t in turns),
-                native_session_count=len({t.get('session_key', t['trace_id']) for t in turns}),
+                native_session_count=len({t.get('session_key', t['trace_id']) for t in turns
+                    if not _background_execution(t)}),
                 request_preview=last.get('request_preview'), model=last.get('model'))
             results.append(group)
+        by_id = {group['conversation_id']: group for group in results}
+        hidden = set()
+        for meta in traces:
+            parent_id = meta.get('workflow_conversation_id')
+            parent = by_id.get(parent_id) if isinstance(parent_id, str) else None
+            is_worker = _background_execution(meta)
+            if parent and (is_worker or meta.get('context_kind') == 'research'):
+                # Require the same real scope, never infer ancestry from a
+                # timestamp, preview, native path, or an equal-looking title.
+                if (parent.get('surface'), parent.get('scope_id')) != (meta.get('surface'), meta.get('scope_id')):
+                    continue
+                own_id = trace_groups[meta['trace_id']]
+                if own_id == parent['conversation_id']:
+                    continue
+                parent.setdefault('task_traces', []).append(meta)
+                if is_worker:
+                    hidden.add(own_id)
+        # Workers do not have a native model session. Keep them beneath their
+        # parent; if that parent expired/deleted, retain an honest orphan view.
+        results = [group for group in results if group['conversation_id'] not in hidden]
+        for group in results:
+            children = group.get('task_traces', [])
+            children.sort(key=lambda item: (item.get('started_at', 0), item['trace_id']))
+            group['task_count'] = len({item['job_id'] if type(item.get('job_id')) is int and item['job_id'] > 0
+                else item['trace_id'] for item in children})
+            if children:
+                group['updated_at'] = max(group['updated_at'], *(item.get('updated_at', 0) for item in children))
         return sorted(results, key=lambda g: g['updated_at'], reverse=True)[:min(100, max(1, limit))]
 
     def read_conversation(self, conversation_id: str):
