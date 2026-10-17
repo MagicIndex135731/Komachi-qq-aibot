@@ -24,6 +24,14 @@ strip_optional_env_quotes() {
 
 xiaomachi_proxy="$(sed -n 's/^[[:space:]]*XIAOMACHI_HTTPS_PROXY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
 page_proxy="$(sed -n 's/^[[:space:]]*WEB_PAGE_PROXY_URL[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+crawler_session="$(sed -n 's/^[[:space:]]*X_CRAWLER_SESSION_FILE[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+crawler_proxy="$(sed -n 's/^[[:space:]]*X_CRAWLER_PROXY_URL[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d '\r')"
+[[ -n "${crawler_session}" ]] || crawler_proxy=""
+[[ -z "${crawler_session}" || -n "${crawler_proxy}" ]] || crawler_proxy="http://127.0.0.1:18797"
+if [[ "${crawler_proxy}" == "http://127.0.0.1:18797" ]]; then
+  systemctl is-active --quiet xiaomachi-mihomo.service || { echo "X crawler proxy is unavailable."; exit 1; }
+  echo "Mihomo X route: service=active loopback_only=true"
+fi
 if [[ "${page_proxy}" == "http://127.0.0.1:18797" ]]; then
   systemctl is-active --quiet xiaomachi-mihomo.service || { echo "Web page proxy is unavailable."; exit 1; }
   echo "Mihomo page route: service=active loopback_only=true"

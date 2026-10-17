@@ -12,7 +12,7 @@ from tests.agent.test_autonomous_social import add_source, NOW, BOT, GROUP
 
 
 def executor(engine):
-    router = SimpleNamespace(engine=engine, runtime=SimpleNamespace(settings=SimpleNamespace(bot_qq=BOT)),
+    router = SimpleNamespace(engine=engine, runtime=SimpleNamespace(settings=SimpleNamespace(bot_qq=BOT), group_policy={}),
         _group_policy_int=lambda **kw: kw['default'])
     service = object.__new__(AutonomousSocialExecutor)
     service.router, service.clock, service.runtime_mode = router, lambda: NOW, 'harness'
@@ -41,12 +41,13 @@ async def test_single_messages_only_wake_after_eight_new_sources(sqlite_engine,m
     for index in range(8):
         ids.append(add_source(sqlite_engine, platform_id=f'synthetic-{index}', text=f'讨论内容 {index}'))
         await service.run_tools(observed(ids), guard([ids[-1]]), interactive=True)
-        assert judge.await_count == int(index == 7)
-        assert service._run_tools.await_count == 0
+        assert judge.await_count == 0
+        assert service._run_tools.await_count == int(index == 7)
     # New arrivals cannot immediately trigger another silent judgment.
     next_id = add_source(sqlite_engine, platform_id='synthetic-next', text='新的话题')
     await service.run_tools(observed([*ids, next_id]), guard([next_id]), interactive=True)
-    assert judge.await_count == 1
+    assert judge.await_count == 0
+    assert service._run_tools.await_count == 1
 
 
 async def test_direct_request_and_result_delivery_bypass_proactive_budget(sqlite_engine):
@@ -68,7 +69,8 @@ def test_recent_observation_is_thirty_and_preserves_canonical_ids(sqlite_engine)
         assert [row.id for row in rows] == ids[-30:]
 
 
-async def test_due_goal_survives_local_quota_deferral(sqlite_engine):
+@pytest.mark.parametrize('deferral', ['proactive_admission:proactive_model_limit', 'patrol_superseded'])
+async def test_due_goal_survives_local_quota_deferral(sqlite_engine, deferral):
     from app.agent.social_runtime import SocialRuntime
     from app.agent.social_contracts import SocialDecision, SocialResult, SocialRuntimeOptions
     from app.storage.autonomous_agent import AutonomousRepository
@@ -82,7 +84,7 @@ async def test_due_goal_survives_local_quota_deferral(sqlite_engine):
     async def decide(observation):
         return SocialDecision('run_tools', 'synthetic due goal')
     async def execute(*args):
-        return SocialResult('silent', reason='proactive_admission:proactive_model_limit')
+        return SocialResult('blocked' if deferral == 'patrol_superseded' else 'silent', reason=deferral)
     runtime = SocialRuntime(engine=sqlite_engine, account_id=BOT, jobs=lambda: (job,),
         observe=observe, decide=decide, execute=execute, policy_check=lambda *_: True,
         clock=lambda: NOW, intention_repository=notes, scope_for_job=lambda _: scope,

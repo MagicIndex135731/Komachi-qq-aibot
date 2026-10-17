@@ -36,6 +36,8 @@ qzone:
     shared_cooldown_seconds: 3600
   publish:
     enabled: false
+    # False disables autonomous patrol publication; explicit owner commands remain available.
+    autonomous_enabled: true
     autonomous_tools: true
     allow_images: true
     interval_seconds: 7200

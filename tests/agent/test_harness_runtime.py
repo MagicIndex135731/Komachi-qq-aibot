@@ -37,6 +37,27 @@ class ModelHandler:
         pass
 
 
+async def test_native_argument_feedback_repairs_alias_count_before_handler(tmp_path):
+    effects=[]
+    def script(body,n):
+        if n==1:return responses_sse(name='search_subject',arguments={'aliases':['a','b','c','d']},number=n)
+        if n==2:
+            payload=json.dumps(body,ensure_ascii=False)
+            assert 'invalid_arguments' in payload and 'maxItems' in payload and 'handler_executed' in payload
+            return responses_sse(name='search_subject',arguments={'aliases':['a','b','c']},number=n)
+        return responses_sse(number=n)
+    client,requests,_=model_client(script)
+    async def handle(args):effects.append(args);return ToolOutcome({'count':1})
+    offered=AgentTool('search_subject','Search using up to three aliases',{'type':'object',
+        'properties':{'aliases':{'type':'array','minItems':1,'maxItems':3,'items':{'type':'string'}}},
+        'required':['aliases'],'additionalProperties':False},handle)
+    agent=HarnessToolAgent(decision_client=client,session_home=tmp_path/'home',max_steps=4)
+    try:
+        await agent.run(['Synthetic search request'],(offered,),Guard())
+        assert effects==[{'aliases':['a','b','c']}] and len(requests)==3
+    finally:agent.close();client.http_client.close()
+
+
 @pytest.fixture
 def bridge_factory():
     from app.agent.harness_runtime import _Bridge
@@ -977,6 +998,7 @@ async def test_real_harness_persists_and_restores_session_after_process_restart(
         agent.close();client.http_client.close()
     conversation = reader.list_conversations()[0]
     assert conversation['turn_count'] == 3 and conversation['native_session_count'] == 2
+    assert len(reader.list_conversations()) == 1
     assert 'wake one' not in json.dumps(requests[2])
 
 

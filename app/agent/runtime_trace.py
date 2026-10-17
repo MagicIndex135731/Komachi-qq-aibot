@@ -39,7 +39,36 @@ BACKGROUND_EXECUTION = frozenset({'background_tool', 'delegation_job', 'tool_del
 
 def _background_execution(meta: dict) -> bool:
     kind = meta.get('execution_kind')
-    return isinstance(kind, str) and kind in BACKGROUND_EXECUTION
+    return (isinstance(kind, str) and kind in BACKGROUND_EXECUTION or
+        meta.get('trigger_kind') == 'media_delivery' and meta.get('model_requests') == 0)
+
+
+def _conversation_identity(meta):
+    logical = meta.get('conversation_key')
+    if isinstance(logical, str) and re.fullmatch('[a-f0-9]{24}', logical):
+        if meta.get('context_lifetime') == 'ephemeral':
+            # A fresh judge is never a continuation of a persistent owner,
+            # even if an old producer used the same logical entry key.
+            return 'c-' + hashlib.sha256(('ephemeral:' + logical).encode()).hexdigest()[:24], 'ephemeral'
+        return 'c-' + logical, 'logical'
+    native = meta.get('context_session_key')
+    if meta.get('context_lifetime') != 'ephemeral' and isinstance(native, str) and re.fullmatch('[a-f0-9]{24}', native):
+        return 'c-' + native, 'native_context'
+    native = meta.get('session_key')
+    return 's-' + (native if isinstance(native, str) and re.fullmatch('[a-f0-9]{24}', native)
+                   else meta['trace_id'][:24]), 'native_only'
+
+
+def _view_meta(meta):
+    # This named entry point has always used a fresh, tool-free SDK home.
+    # Legacy records predate the explicit lifetime field; their native IDs
+    # identify individual judgments, not twenty persistent conversations.
+    if meta.get('trigger_kind') == 'participation_judge' and not meta.get('context_lifetime'):
+        return {**meta, 'context_lifetime':'ephemeral', 'context_state':'new',
+            'context_reason':'ephemeral_judgment', 'context_identity_legacy':True}
+    if _background_execution(meta) and not meta.get('execution_kind'):
+        return {**meta, 'execution_kind':'tool_delivery'}
+    return meta
 
 
 @contextmanager
@@ -61,8 +90,8 @@ def current_trace_context() -> dict:
     result = {'parent_trace_id': trace.trace_id,
         'workflow_id': meta.get('workflow_id') or trace.trace_id}
     conversation = meta.get('workflow_conversation_id')
-    if not conversation and meta.get('conversation_key'):
-        conversation = 'c-' + meta['conversation_key']
+    if not conversation:
+        conversation = _conversation_identity(meta)[0]
     if isinstance(conversation, str) and CONVERSATION_ID.fullmatch(conversation):
         result['workflow_conversation_id'] = conversation
     if type(meta.get('job_id')) is int:
@@ -436,6 +465,17 @@ class AgentTrace:
                     self.meta.update(status=key, finished_at=time.time())
                     self._append("turn.completed", {"status": key, **data})
                 else:
+                    if key == 'model.finished':
+                        for field in ('provider_response_id', 'provider_previous_response_id', 'provider_chain_id',
+                                      'continuation_mode', 'continuation_reason', 'prompt_cache_key_id'):
+                            if data.get(field) is not None:
+                                self.meta[field] = data[field]
+                        chain = data.get('provider_chain_id')
+                        if isinstance(chain, str):
+                            self.meta['provider_chain_ids'] = list(dict.fromkeys([
+                                *self.meta.get('provider_chain_ids', []), chain]))[-32:]
+                    elif key == 'context.retention':
+                        self.meta['context_retention'] = data
                     self._append(key, data)
                 _atomic(self.path / "meta.json", self.meta)
                 if operation == "finish":
@@ -486,15 +526,10 @@ class TraceReader:
     def list_conversations(self, *, limit=100):
         groups = {}
         trace_groups = {}
-        traces = self.list_traces(limit=500)
+        traces = [_view_meta(meta) for meta in self.list_traces(limit=500)]
+        by_trace = {meta['trace_id']:meta for meta in traces}
         for meta in traces:
-            logical = meta.get('conversation_key')
-            identity = logical if isinstance(logical, str) and re.fullmatch('[a-f0-9]{24}', logical) else None
-            quality = 'logical' if identity else 'native_only'
-            native = meta.get('session_key')
-            if not identity:
-                identity = native if isinstance(native, str) and re.fullmatch('[a-f0-9]{24}', native) else meta['trace_id'][:24]
-            key = ('c-' if quality == 'logical' else 's-') + identity
+            key, quality = _conversation_identity(meta)
             trace_groups[meta['trace_id']] = key
             groups.setdefault(key, {'conversation_id': key, 'identity_quality': quality, 'turns': []})['turns'].append(meta)
         results = []
@@ -505,14 +540,35 @@ class TraceReader:
                 scope_id=last.get('scope_id'), actor_id=last.get('actor_id'), context_kind=last.get('context_kind', 'unknown'),
                 context_scope=last.get('context_scope'),
                 status=last.get('status'), updated_at=max(t.get('updated_at', 0) for t in turns),
-                native_session_count=len({t.get('session_key', t['trace_id']) for t in turns
-                    if not _background_execution(t)}),
+                native_session_count=len({t.get('context_session_key') or t.get('session_key', t['trace_id']) for t in turns
+                    if not _background_execution(t) and t.get('context_lifetime') != 'ephemeral'}),
+                ephemeral_execution_count=sum(t.get('context_lifetime') == 'ephemeral' for t in turns),
+                context_session_key=last.get('context_session_key'),
+                provider_chain_ids=list(dict.fromkeys(chain for t in turns
+                    for chain in (t.get('provider_chain_ids') if isinstance(t.get('provider_chain_ids'), list) else [])
+                    if isinstance(chain, str)))[:64],
                 request_preview=last.get('request_preview'), model=last.get('model'))
             results.append(group)
         by_id = {group['conversation_id']: group for group in results}
+        # Retain old native-context URLs and persisted worker ancestry after
+        # changing the sidebar to stable owner identities. Ambiguous aliases
+        # must never cross logical owners or broaden a deletion selection.
+        aliases = {}
+        for meta in traces:
+            native = meta.get('context_session_key')
+            if meta.get('context_lifetime') != 'ephemeral' and isinstance(native, str) and re.fullmatch('[a-f0-9]{24}', native):
+                aliases.setdefault('c-' + native, set()).add(trace_groups[meta['trace_id']])
+        for alias, owners in aliases.items():
+            if len(owners) == 1 and alias not in by_id:
+                group = by_id[next(iter(owners))]
+                group.setdefault('conversation_aliases', []).append(alias)
+                by_id[alias] = group
         hidden = set()
         for meta in traces:
-            parent_id = meta.get('workflow_conversation_id')
+            parent_id = trace_groups.get(meta.get('parent_trace_id')) if isinstance(meta.get('parent_trace_id'), str) else None
+            if _background_execution(by_trace.get(meta.get('parent_trace_id'), {}) if isinstance(meta.get('parent_trace_id'), str) else {}):
+                parent_id = meta.get('workflow_conversation_id') or parent_id
+            parent_id = parent_id or meta.get('workflow_conversation_id')
             parent = by_id.get(parent_id) if isinstance(parent_id, str) else None
             is_worker = _background_execution(meta)
             if parent and (is_worker or meta.get('context_kind') == 'research'):
@@ -542,7 +598,7 @@ class TraceReader:
         if not isinstance(conversation_id, str) or not CONVERSATION_ID.fullmatch(conversation_id):
             raise ValueError('conversation_id_invalid')
         for group in self.list_conversations():
-            if group['conversation_id'] == conversation_id:
+            if group['conversation_id'] == conversation_id or conversation_id in group.get('conversation_aliases', ()):
                 return group
         raise FileNotFoundError('conversation_not_found')
 

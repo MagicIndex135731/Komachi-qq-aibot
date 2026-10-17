@@ -39,6 +39,19 @@ shared_groups_config="${shared_config_dir}/groups.local.yaml"
 previous_release="$(readlink -f "${INSTALL_ROOT}/current" 2>/dev/null || true)"
 previous_image_id="$(docker inspect xiaomachi-bot --format '{{.Image}}' 2>/dev/null || true)"
 if [[ -n "${previous_image_id}" ]]; then
+  if ! docker image inspect "${previous_image_id}" >/dev/null 2>&1; then
+    # A running container can outlive image metadata removed by an operator.
+    # Recovery uses an explicitly verified old-release image, never :local
+    # which may already point at the new candidate.
+    recovery_image="${XIAOMACHI_ROLLBACK_IMAGE_ID:-}"
+    if [[ ! "${recovery_image}" =~ ^sha256:[a-f0-9]{64}$ ]] \
+        || ! docker image inspect "${recovery_image}" >/dev/null 2>&1; then
+      echo "Current image metadata is missing; provide a verified old-release XIAOMACHI_ROLLBACK_IMAGE_ID before upgrading." >&2
+      exit 1
+    fi
+    previous_image_id="${recovery_image}"
+    echo "Using explicitly verified old-release image for rollback." >&2
+  fi
   docker image tag "${previous_image_id}" "xiaomachi-bot:rollback-${release_id,,}"
 fi
 memory_audit_timer_was_enabled=false
@@ -154,6 +167,7 @@ fi
 tar -C "${SOURCE_ROOT}" \
   --exclude='configs/groups.local.yaml' \
   --exclude='infra/wsl/.env' \
+  --exclude='infra/wsl/private-secrets' \
   --exclude='infra/wsl/runtime' \
   -cf - \
   app configs infra/wsl scripts .dockerignore pyproject.toml README.md LICENSE \
@@ -202,6 +216,8 @@ fi
 touch "${shared_dir}/.runtime-imported"
 
 ln -s "${shared_dir}/.env" "${release_dir}/infra/wsl/.env"
+install -d -m 0700 "${shared_dir}/private-secrets"
+ln -s "${shared_dir}/private-secrets" "${release_dir}/infra/wsl/private-secrets"
 ln -s "${shared_runtime}" "${release_dir}/infra/wsl/runtime"
 
 if [[ ! -x "${shared_dir}/venv/bin/python" ]]; then
@@ -244,6 +260,7 @@ fi
 # Build and validate the immutable application image before stopping an
 # already-running release.  This keeps upgrade downtime short and prevents a
 # broken build from replacing the current symlink.
+docker volume create xiaomachi-xhs-session >/dev/null
 docker compose -f "${release_dir}/infra/wsl/$(platform_compose_name "${release_dir}/infra/wsl")" build xiaomachi
 
 # Validate actual candidate behavior, not only a successful image build. An
@@ -300,6 +317,11 @@ if [[ "${mihomo_required}" == true ]]; then
 else
   systemctl disable --now xiaomachi-mihomo.service >/dev/null 2>&1 || true
 fi
+# X acquisition runs inside application containers. Retire automatic browser
+# services without touching the operator's manual login service or profile.
+systemctl disable --now xiaomachi-x-browser.service >/dev/null 2>&1 || true
+rm -f -- "${SYSTEMD_DIR}/xiaomachi-x-browser.service"
+systemctl daemon-reload
 if [[ -n "${previous_release}" ]]; then
   # An upgrade must retain LLBot's session and container identity.  The stack
   # unit's ExecStop is intentionally a full manual shutdown, so do not stop it

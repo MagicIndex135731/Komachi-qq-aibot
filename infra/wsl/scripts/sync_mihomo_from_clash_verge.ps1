@@ -2,7 +2,8 @@
 param(
     [string]$Distro = "Ubuntu_Migrated",
     [string]$Source = "",
-    [string]$InstallRoot = "/opt/xiaomachi"
+    [string]$InstallRoot = "/opt/xiaomachi",
+    [switch]$UnmarkedRateOne
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +20,10 @@ function ConvertTo-WslMountPath([string]$WindowsPath) {
 }
 
 if (-not $Source) {
-    $Source = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml"
+    $clashDirectory = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"
+    $Source = & python (Join-Path $PSScriptRoot "render_mihomo_config.py") `
+        --print-ikuuu-source --clash-directory $clashDirectory
+    if ($LASTEXITCODE -ne 0) { throw "Cannot identify one ikuuu subscription; specify its Source explicitly." }
 }
 if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
     throw "Clash Verge merged profile not found: $Source"
@@ -30,8 +34,9 @@ $rendered = Join-Path $cacheDir "mihomo-config.yaml"
 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 
 try {
-    & python (Join-Path $PSScriptRoot "render_mihomo_config.py") `
-        --source $Source --output $rendered
+    $renderArguments = @('--source', $Source, '--output', $rendered, '--page-only')
+    if ($UnmarkedRateOne) { $renderArguments += '--unmarked-rate-one' }
+    & python (Join-Path $PSScriptRoot "render_mihomo_config.py") @renderArguments
     if ($LASTEXITCODE -ne 0) { throw "Mihomo profile rendering failed." }
 
     $wslRendered = ConvertTo-WslMountPath $rendered
@@ -47,6 +52,9 @@ try {
         "geosite.dat" = "GeoSite.dat"
     }
     $sourceDir = Split-Path -Parent $Source
+    if ((Split-Path -Leaf $sourceDir) -eq 'profiles') {
+        $sourceDir = Split-Path -Parent $sourceDir
+    }
     foreach ($entry in $assetMap.GetEnumerator()) {
         $asset = Join-Path $sourceDir $entry.Key
         if (Test-Path -LiteralPath $asset -PathType Leaf) {

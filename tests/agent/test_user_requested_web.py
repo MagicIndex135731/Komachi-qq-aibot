@@ -26,6 +26,8 @@ async def test_group_request_and_patrol_use_same_manifest_but_enforce_network_ga
 
         async def run(self, prompt, tools, guard, **kwargs):
             registry = {t.name: t for t in tools}
+            assert len(tools) + 2 <= 64  # Reserve RequestTaskControl tools.
+            assert 'inspect_web_resources' in registry
             if 'search_web' in registry:
                 results.append(await registry['search_web'].handler({'query': 'synthetic factual lookup'}))
             return ToolTurnResult('silent', reason='model_finished')
@@ -57,7 +59,7 @@ async def test_group_request_and_patrol_use_same_manifest_but_enforce_network_ga
         web.http_client.close()
 
 
-@pytest.mark.parametrize('question', [False, True, 'natural_request'])
+@pytest.mark.parametrize('question', [False, True, 'natural_request','continued_find_request'])
 async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous_flag(sqlite_engine, tmp_path, monkeypatch, question):
     from app.agent.delegated_research import child_inputs
     from app.agent.media_tasks import execute_web_media
@@ -70,6 +72,7 @@ async def test_child_and_media_rebuild_request_gate_and_ignore_legacy_autonomous
     with session_scope(sqlite_engine) as session:
         row = session.get(Message, payload['source_id'])
         text = ('帮我去x扒一些synthetic最新的cos视频或图片' if question == 'natural_request'
+                else '继续帮我去X找一些关于synthetic的cos视频或图片' if question=='continued_find_request'
                 else '合成角色强吗' if question else '今天上课比较晚')
         row.raw_json = {'message': [{'type': 'text', 'data': {'text': text}}]}
     settings = SimpleNamespace(data_dir=tmp_path, bot_qq=payload['account_id'])

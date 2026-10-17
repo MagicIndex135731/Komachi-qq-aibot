@@ -80,6 +80,15 @@ def test_terminal_native_frame_closes_without_waiting_for_eof():
     with c.http_client:assert c.search_report('test').results
 
 
+@pytest.mark.parametrize('finish',['SAFETY','BLOCKLIST','PROHIBITED_CONTENT'])
+def test_explicit_native_search_rejection_is_not_malformed_response(finish):
+    calls=[]
+    c=make(lambda r:calls.append(r) or httpx.Response(200,content=native_frames(finish=finish)))
+    with c.http_client,pytest.raises(WebSearchProviderError,match='^web_search_content_rejected$'):
+        c.search_report('public topic')
+    assert len(calls)==1
+
+
 def test_web_response_is_byte_bounded():
     c=make(lambda _:httpx.Response(200,content=b'x'*(2*1024*1024+1)))
     with c.http_client,pytest.raises(WebSearchProviderError,match='too_large'):c.search_report('test')

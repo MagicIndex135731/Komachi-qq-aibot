@@ -18,6 +18,7 @@ class ProactiveLimits:
     minimum_messages: int = 8
     interval_seconds: int = 300
     max_backoff_seconds: int = 1800
+    max_wait_seconds: int = 900
     hourly_models: int = 6
     hourly_speeches: int = 3
     speech_cooldown_seconds: int = 600
@@ -50,7 +51,8 @@ class ProactiveRepository:
     def _window(self, row):
         cutoff = self.clock().timestamp() - 3600
         value = row.window or {}
-        return {'models': [v for v in value.get('models', []) if v > cutoff],
+        return {'pending_since': value.get('pending_since'),
+                'models': [v for v in value.get('models', []) if v > cutoff],
                 'speeches': [v for v in value.get('speeches', []) if v['at'] > cutoff]}
 
     def claim(self, group_id, *, candidates, bootstrap_cursor, max_source_id,
@@ -65,7 +67,15 @@ class ProactiveRepository:
                 session.add(row)
             window = self._window(row)
             count = len({value for source_id, value in candidates if source_id > row.evaluated_source_id})
-            interval = min(limits.max_backoff_seconds, limits.interval_seconds * 2 ** min(row.silent_count, 3))
+            # Silence is not a preference or a penalty on the next topic.
+            interval = limits.interval_seconds
+            if count and window['pending_since'] is None:
+                window['pending_since'] = self.clock().timestamp()
+            if not count:
+                window['pending_since'] = None
+            waited = (self.clock().timestamp() - window['pending_since']
+                if window['pending_since'] is not None else 0)
+            row.window = window
             metrics = {'observation_new_messages': count, 'observation_cursor': row.evaluated_source_id,
                 'observation_interval_seconds': interval, 'proactive_model_requests_hour': len(window['models']),
                 'proactive_speeches_hour': len(window['speeches']), 'proactive_model_limit': limits.hourly_models,
@@ -77,7 +87,8 @@ class ProactiveRepository:
                     self.clock().timestamp() - window['speeches'][-1]['at'] < limits.speech_cooldown_seconds else
                 'observation_backoff' if not due_goal and row.last_attempt_at and
                     (now - row.last_attempt_at).total_seconds() < interval else
-                'insufficient_new_messages' if count < limits.minimum_messages and not due_goal else '')
+                'insufficient_new_messages' if not due_goal and (not count or
+                    count < limits.minimum_messages and waited < limits.max_wait_seconds) else '')
             if reason:
                 return None, reason, metrics
             token = uuid4().hex
@@ -118,5 +129,6 @@ class ProactiveRepository:
             spoken = any(v['run'] == permit['token'] for v in self._window(row)['speeches'])
             if status in {'silent', 'sent', 'uncertain'} or spoken:
                 row.evaluated_source_id = max(row.evaluated_source_id, permit['max_source_id'])
-                row.silent_count = 0 if spoken else min(3, row.silent_count + 1)
+                row.silent_count = 0  # Legacy column retained for safe rollback.
+                row.window = {**self._window(row), 'pending_since': None}
             row.lease_token, row.lease_until = '', None

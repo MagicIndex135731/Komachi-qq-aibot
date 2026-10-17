@@ -1,4 +1,4 @@
-"""Regressions for rejected old task admission and independent scheduled turns."""
+"""Rejected old tasks stay isolated; scheduled turns belong to their owner."""
 import json
 
 import pytest
@@ -52,12 +52,16 @@ async def test_rejected_old_task_does_not_poison_direct_turn(sqlite_engine, tmp_
 
 
 @pytest.mark.asyncio
-async def test_patrol_checkpoint_and_native_home_are_separate_from_main(sqlite_engine, tmp_path, monkeypatch):
+async def test_patrol_checkpoint_and_native_home_belong_to_main(sqlite_engine, tmp_path, monkeypatch):
     captured = []
 
     class Harness:
         def __init__(self, **kwargs):
             captured.append(kwargs)
+            from test_autonomous_social import _mock_native_session
+            self.session_id = _mock_native_session(kwargs)
+            self.context_retention = {'retain_history': not kwargs['idle_patrol'],
+                'reason': 'idle_history_discarded' if kwargs['idle_patrol'] else 'active_context_retained'}
 
         async def run(self, prompt, tools, guard, **kwargs):
             guard.require_valid()
@@ -72,12 +76,14 @@ async def test_patrol_checkpoint_and_native_home_are_separate_from_main(sqlite_e
             interactive=True, direct_group_reply=True, target_user_id=FRIEND, target_message_id='main-then-patrol')
         main = fixture.executor.sessions.read(job.key)
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
-        assert fixture.executor.sessions.read(job.key) == main
+        after = fixture.executor.sessions.read(job.key)
+        assert after['revision'] > main['revision']
+        assert after['items'] == main['items']  # The empty patrol adds no history.
         background = fixture.executor.sessions.read('background:' + job.key)
-        assert background['revision'] > 0
-        assert captured[0]['session_home'] != captured[1]['session_home']
-        assert captured[0]['session_id'] != captured[1]['session_id']
-        assert captured[1]['trace_context']['context_kind'] == 'background_group'
+        assert background['revision'] == 0
+        assert captured[0]['session_home'] == captured[1]['session_home']
+        assert captured[0]['session_id'] == captured[1]['session_id']
+        assert captured[1]['trace_context']['context_kind'] == 'group'
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed),
             interactive=True, direct_group_reply=True, target_user_id=FRIEND, target_message_id='main-then-patrol')
         assert captured[2]['session_home'] == captured[0]['session_home']
@@ -85,7 +91,7 @@ async def test_patrol_checkpoint_and_native_home_are_separate_from_main(sqlite_e
 
 
 @pytest.mark.asyncio
-async def test_main_can_query_public_action_after_independent_patrol(sqlite_engine, tmp_path, monkeypatch):
+async def test_main_can_query_public_action_after_owner_patrol(sqlite_engine, tmp_path, monkeypatch):
     from tests.storage.test_self_activity import effect
     results = []
 
@@ -110,7 +116,7 @@ async def test_main_can_query_public_action_after_independent_patrol(sqlite_engi
         # A different execution context finishes a real public tool effect.
         effect(sqlite_engine, 'independent-public-write', stamp=NOW)
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
-        assert fixture.executor.sessions.read(job.key) == main
+        assert fixture.executor.sessions.read(job.key)['revision'] > main['revision']
         await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed),
             interactive=True, direct_group_reply=True, target_user_id=FRIEND, target_message_id='own-activity-query')
         assert results[0]['published'] is False

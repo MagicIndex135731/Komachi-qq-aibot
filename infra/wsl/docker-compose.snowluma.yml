@@ -72,6 +72,8 @@ services:
       - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,snowluma,xiaomachi,host.docker.internal}}
     volumes:
       - xiaomachi_data:/workspace/data
+      - ./private-secrets:/run/xiaomachi-secrets:ro
+      - xiaomachi_xhs_session:/workspace/data/xhs-crawler
     depends_on:
       snowluma:
         condition: service_started
@@ -101,12 +103,17 @@ services:
       - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,snowluma,xiaomachi,host.docker.internal}}
     volumes:
       - xiaomachi_data:/workspace/data
+      - ./private-secrets:/run/xiaomachi-secrets:ro
+      - xiaomachi_xhs_session:/workspace/data/xhs-crawler
     depends_on:
       snowluma:
         condition: service_started
     command: ["python", "-m", "app.private_main"]
 
 volumes:
+  xiaomachi_xhs_session:
+    external: true
+    name: xiaomachi-xhs-session
   snowluma_data:
     name: xiaomachi-snowluma-data
   snowluma_client_config:

@@ -44,6 +44,20 @@ class Client:
         return self.open_page(url)
 
 
+async def test_search_content_rejection_remains_explicit_and_is_not_retried():
+    from app.providers.web_search import WebSearchProviderError
+    class Rejected(Client):
+        def search_report(self,query,max_results):
+            self.calls.append(query)
+            raise WebSearchProviderError('web_search_content_rejected')
+    client=Rejected();current=tools(client)
+    first=await current['search_web'].handler({'query':'public topic'})
+    second=await current['search_web'].handler({'query':'changed topic'})
+    assert first.data['error']==second.data['error']=='web_search_content_rejected'
+    assert '上游' in first.data['guidance'] and '拒绝' in first.data['guidance']
+    assert second.data['cached_failure_in_turn'] and len(client.calls)==1
+
+
 def tools(client=None, guard=None, **settings):
     return {tool.name: tool for tool in build_web_tools(client or Client(), settings=SimpleNamespace(**settings),
         runner=Runner(), guard=guard or Guard())}
@@ -115,7 +129,8 @@ async def test_formal_budget_expands_calls_and_page_window_with_recoverable_evid
         assert (await current['search_web'].handler({'query':str(number)})).status=='ok'
     page=await current['open_web_page'].handler({'ref_id':'https://example.com/page','max_chars':32000})
     assert 16000 < len(json.dumps(page.data,ensure_ascii=False)) <= 32000
-    assert task.read_evidence(page.data['evidence_id'],max_chars=32000)['content']==page.data['content']
+    archived = task.read_evidence(page.data['evidence_id'], max_chars=32000)['content']
+    assert archived.startswith(page.data['content']) and len(archived) >= len(page.data['content'])
     reuse=await current['open_web_page'].handler({'ref_id':'https://example.com/page','max_chars':32000})
     assert reuse.data['content']=='' and reuse.data['evidence_id']==page.data['evidence_id']
     assert len(client.calls)==11

@@ -20,6 +20,8 @@ from app.adapters.sender import Sender
 from app.agent.artifacts import AutonomousArtifactStore
 from app.agent.social_contracts import SocialDecision, SocialObservation, SocialPost
 from app.agent.contracts import AgentBatch, AgentDecision
+
+
 from app.agent.participation import GroupParticipationPlanner
 from app.adapters.onebot_models import parse_group_message_event
 from app.agent.social_policy import configured_social_jobs
@@ -34,6 +36,16 @@ from app.storage.db import session_scope
 from app.storage.models import Message
 from app.storage.repositories import GroupRepository, MessageRepository, UserRepository
 from app.storage.social_agent import SocialActionRecord
+
+
+def _mock_native_session(options):
+    """These composition fakes stand in for an SDK that persists a native log."""
+    from app.agent.harness_session_files import native_file_path
+    identifier = options['session_id']
+    log = native_file_path(options['session_home']/'sessions/synthetic'/identifier/'session.v3.jsonl')
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text('{}\n')
+    return identifier
 
 
 BOT = 900000101
@@ -179,6 +191,11 @@ async def composed(engine, tmp_path, model, *, kind="group", options=None, image
     planner.executor.sessions.clock = lambda: clock[0]
     fixture = SimpleNamespace(agent=agent, planner=planner, executor=planner.executor, router=router,
                               gateway=gateway, model=model, image_client=image_client, clock=clock)
+    from unittest.mock import patch
+    # Snapshot creation and validation must share the fixture's clock, including
+    # wakes. Otherwise the fixed sample date expires against wall-clock time.
+    snapshot_clock = patch('app.agent.context_dependencies.datetime', SimpleNamespace(now=lambda tz: clock[0]))
+    snapshot_clock.start()
     try:
         await agent.start()
         agent.set_connected(True)
@@ -187,6 +204,7 @@ async def composed(engine, tmp_path, model, *, kind="group", options=None, image
     finally:
         await agent.stop()
         planner.close()
+        snapshot_clock.stop()
 
 
 async def wake(fixture):
@@ -421,7 +439,7 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
 
     class Harness:
         def __init__(self, **kwargs):
-            self.session_id = kwargs["session_id"]
+            self.session_id = _mock_native_session(kwargs)
 
         async def run(self, prompt, tools, guard, **kwargs):
             guard.require_valid()
@@ -453,7 +471,7 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
                 await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
         else:
             await fixture.executor.run_tools(observed, PolicyGuard(fixture.executor, observed, scheduled=True))
-        first = fixture.executor.sessions.read('background:' + job.key)
+        first = fixture.executor.sessions.read(job.key)
         assert first["checkpoint"]["memory_dependencies"] == {"fact:1": 'a' * 64}
         assert first["checkpoint"]["intention_memory_dependencies"] == ({} if interrupted else {"fact:1": 'a' * 64})
         assert fixture.executor.repository.read_intention(job.key)["working_intention"]["_memory_dependency_receipt"] == {"fact:1": 'a' * 64}
@@ -464,7 +482,7 @@ async def test_harness_fact_revision_rotates_native_and_suppresses_stale_intenti
         assert captured[0][0] != captured[1][0] == captured[2][0]
         assert all(observation_json(prompt)["working_intention"] == {} for _, prompt in captured[1:])
         assert all("依赖旧事实的目标" not in "\n".join(prompt) for _, prompt in captured[1:])
-        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["memory_dependencies"] == {}
+        assert fixture.executor.sessions.read(job.key)["checkpoint"]["memory_dependencies"] == {}
 
 
 @pytest.mark.asyncio
@@ -478,7 +496,7 @@ async def test_harness_prepares_full_memory_and_persona_sources_and_rotates_chan
 
     class Harness:
         def __init__(self, **kwargs):
-            self.session_id = kwargs["session_id"]
+            self.session_id = _mock_native_session(kwargs)
 
         async def run(self, prompt, tools, guard, **kwargs):
             guard.require_valid()
@@ -573,7 +591,7 @@ async def test_harness_old_conversation_quote_is_pinned_and_revoked_native_conte
 
     class Harness:
         def __init__(self, **kwargs):
-            self.session_id = kwargs["session_id"]
+            self.session_id = _mock_native_session(kwargs)
 
         async def run(self, prompt, tools, guard, **kwargs):
             guard.require_valid()
@@ -1202,14 +1220,10 @@ class InteractiveIngressGuard:
 async def test_native_proactive_send_uses_chat_interval_and_agent_can_be_silent(sqlite_engine, tmp_path):
     from test_harness_runtime import model_client, responses_sse
     from test_delegation_composition import observation
-    judgments=[]
     def model(body,number):
-        if not body['tools']:
-            packet=observation(body,'Group observation JSON:\n')
-            judgments.append(True)
-            return responses_sse(text=json.dumps({'decision':'participate' if len(judgments)<=2 else 'silent',
-                'source_id':packet['messages'][-1]['id'],'reason':'natural_hook'}),number=number)
-        return responses_sse(name='send_group',arguments={'text':f'合成主动回复{number}','artifact_ids':[]},number=number)
+        assert body['tools']  # The persona owner makes this decision itself.
+        return (responses_sse(name='send_group',arguments={'text':f'合成主动回复{number}','artifact_ids':[]},number=number)
+            if number <= 2 else responses_sse(number=number))
     client, requests, _ = model_client(model)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness",
                         options={"cooldown_seconds": 1800}) as fixture:
@@ -1240,7 +1254,7 @@ async def test_native_proactive_send_uses_chat_interval_and_agent_can_be_silent(
             fixture.clock[0] += timedelta(seconds=0 if index == 1 else 601)
         assert statuses == ["sent", "sent", "silent", "silent"]
         assert len(writes(fixture)) == 2
-        assert len(requests) == 5
+        assert len(requests) == 3
 
 
 @pytest.mark.asyncio

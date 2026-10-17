@@ -165,7 +165,10 @@ class SocialPlanner:
             ).order_by(Message.id.desc()).limit(1)).first()
             if latest is not None and not is_usable_memory_source(latest, group_id=job.scope_id):
                 return replace(observation, suppressed_reason="latest_source_unavailable")
-            recent = [row for row in messages.list_recent_group_messages(group_id=job.scope_id, limit=30) if is_usable_memory_source(row, group_id=job.scope_id)]
+            from app.config import group_recent_context_limit
+            recent = [row for row in messages.list_recent_group_messages(
+                group_id=job.scope_id, limit=group_recent_context_limit(router.runtime, job.scope_id))
+                if is_usable_memory_source(row, group_id=job.scope_id)]
             if latest is not None and latest.id not in {row.id for row in recent}:
                 recent.append(latest)
             instant = router._normalize_timestamp(now)

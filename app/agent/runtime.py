@@ -74,7 +74,7 @@ class AgentDispatchGuard:
 
 
 class GroupAgentRuntime:
-    """One durable conversation consumer per group, with finite model turns.
+    """One durable inbox consumer per group, with bounded concurrent turns.
 
     decide/execute must use bounded providers. The callbacks own persona and
     memory policy; this service owns inbox ordering, cancellation, dispatch
@@ -323,8 +323,30 @@ class GroupAgentRuntime:
         )
 
     async def _consume_group(self, group_id: int) -> None:
+        active = set()
+        try:
+            await self._consume_turns(group_id, active)
+        finally:
+            for task in active:
+                task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+
+    async def _consume_turns(self, group_id: int, active: set) -> None:
         wake = self._wake[group_id]
         while self.running:
+            completed = {task for task in active if task.done()}
+            for task in completed:
+                task.result()
+            active.difference_update(completed)
+            if len(active) >= 3 or not self.repository.has_pending(group_id) and active:
+                wake.clear()
+                arrival = asyncio.create_task(wake.wait())
+                try:
+                    await asyncio.wait((*active, arrival), return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    arrival.cancel()
+                    await asyncio.gather(arrival, return_exceptions=True)
+                continue
             if not self.connected:
                 await self._connection_event.wait()
                 continue
@@ -358,7 +380,8 @@ class GroupAgentRuntime:
                 self, group_id=group_id, turn_id=batch.turn_id, epoch=claimed.session.epoch,
                 working_note_source_message_ids=claimed.session.working_note_source_message_ids,
             )
-            await self._run_turn(batch, guard)
+            active.add(asyncio.create_task(self._run_turn(batch, guard), name=batch.turn_id))
+            await asyncio.sleep(0)
             self._worker_failures[group_id] = 0
             self._worker_paused.discard(group_id)
             self._worker_reset_used.discard(group_id)

@@ -299,7 +299,7 @@ def test_router_sanitizes_impersonation_context_lines(sqlite_engine) -> None:
 
     scrubbed = router._sanitize_impersonation_lines(
         [
-            "阿渣（小町扮演）: 主人，来了",
+            "小甲（小町扮演）: 主人，来了",
             "测试小町: 大人您稍等",
             "路人: 谁是你的主人",
             "测试君: 大人您稍等",

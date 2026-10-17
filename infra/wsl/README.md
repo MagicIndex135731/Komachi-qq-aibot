@@ -45,6 +45,10 @@ Copy-Item configs/groups.yaml configs/groups.local.yaml
 
 启用自主空间须同时在源目录 `infra/wsl/.env` 设置 `SOCIAL_AGENT_ENABLED=true`，并在私有 `configs/social.local.yaml` 开启总策略和相应 `qzone.publish` / `qzone.comment`。环境项缺失按关闭处理；仅策略开启、群聊能回复或 heartbeat 正常，不能证明空间巡检已运行。修改后 rebuild；检查实际空间任务和未来巡检时间，额度是上限，Agent仍可沉默。
 
+近期公开评论记录上线后自动保存；迁移旧记录前先用SQLite在线backup备份并验证integrity_check，再在群容器执行 `python -B -m scripts.backfill_public_social_activity` 预览，加 `--apply` 导入。仅读取当前公开主体原生工具事件并匹配效果账本，不使用监控或群私历史，不发送QQ动作；重复导入幂等，过期或无法核对的评论不猜测补入。
+
+记录保留14天、每账号最多512条，公开巡检与主人公开委派共享按需查询，不预装进每轮上下文。回滚旧应用代码可忽略新增记录表；不要用迁移前数据库覆盖上线后的新消息。行为记录与群长期记忆的分工见[记忆指南](../../docs/MEMORY.md#近期公开社交记录)。
+
 新数据库先设置 `MEMORY_RAW_V3_ENABLED=false`，按 [记忆与索引流程](../../docs/MEMORY.md) 完成准备/评测/激活。可先开启按群记忆基础流程、分层工具和本地 embedding；这不等于 raw V3 已有合格活动代际。
 
 完整基础编排使用 `MEMORY_ORCHESTRATION_V2_ENABLED=true`。Memory V3 发布与回滚的唯一命令来源为 [记忆指南](../../docs/MEMORY.md#raw-v3-准备评测激活与回滚)，不能跳过其质量门。
@@ -155,11 +159,17 @@ docker logs --tail 80 xiaomachi-private
 
 Linux 等价入口为 `bash infra/wsl/scripts/install_linux_runtime.sh`；更新 Compose 服务 `xiaomachi` 与 `xiaomachi-private`，不重启当前 QQ 接入容器。
 
+若现役容器仍运行但旧镜像元数据已被清理，installer会要求显式的`XIAOMACHI_ROLLBACK_IMAGE_ID`，不以可能指向候选版本的local标签作为旧镜像。先从current旧release重建并核对应用/配置/脚本哈希，再传入该镜像sha256执行installer；数据卷及当前运行容器保持原状。
+
 这里的 **rebuild 是应用镜像发布，不是驱动安装**：它把当前工作区的 `app/`、`configs/` 和运行脚本复制到新 release，再执行 `docker compose build xiaomachi`。Dockerfile 的 CUDA 基础镜像只在本机没有可复用层、或构建器需要重新解析标签时才会访问镜像仓库；宿主 NVIDIA 驱动、CUDA 运行时、SnowLuma/LLBot/NapCat 容器和数据卷不会因为 rebuild 被重新安装。`start` 只复用现有镜像，因此不会让已修改的代码自动生效。当前发布入口没有把应用文件热加载到运行容器内，修改人格 YAML 或 Python 代码仍应走受控 rebuild；若基础镜像仓库暂时不可用，应先保留现役容器并恢复网络/缓存，再发布应用层变更。
 
 构建/激活失败会尝试恢复之前的 release 和镜像；保留最近一个发布目录及回滚镜像。脚本不是数据库回滚工具，不会撤销已经执行的 QQ 行为。恢复失败时检查 current、容器 image ID 和健康后再操作，不重复执行未知状态的外部动作。
 
+仅改应用源码且需冻结依赖时，可从已核验的现役镜像SHA构建增量层；保存临时Dockerfile、源码哈希、依赖清单及回滚镜像，正式Dockerfile保留完整构建。候选基于最新release，只带本次已验收差异；已有未验工作区改动不得顺带上线。
+
 只执行 start/stop 不会同步源码变化。修改生产 `shared/.env` 后容器须重新创建，单纯重启进程不会更新创建时的环境。正常维护优先修改源目录私有配置并 rebuild。
+
+GitHub公开提交和本机运行镜像是两个版本身份。发布源码前应核对候选自身的测试与配置模板；同步仓库不会自动切换当前release，私有群策略、登录会话及数据库也不属于公开发布包。
 
 ### 模型套餐快捷切换
 
@@ -204,7 +214,7 @@ docker exec xiaomachi-bot python -m scripts.backup_memory_v2 \
 
 ## 8. GPU 与模型缓存
 
-网页独立出口：项目固定使用WSL回环18797，7897留给Windows用户代理；配置生成、客户端白名单、systemd就绪及启动/健康检查须同步，回退也不得重启旧7897配置。将私有订阅YAML放在 `/opt/xiaomachi/shared/mihomo/`（目录0700、文件0600），用 `render_mihomo_config.py --source <私有文件> --output <候选文件> --page-only` 只保留香港x1节点并创建url-test组，每300秒测延迟、容差0、关闭TUN/LAN。未标倍率仅在确认运营商默认x1约定时加 `--unmarked-rate-one`；这与明确标x1应区分。先 `mihomo -t -d /opt/xiaomachi/shared/mihomo -f <候选文件>` 校验，再保存旧配置并激活服务。只设置 `WEB_PAGE_PROXY_URL=http://127.0.0.1:18797`，不设置全局HTTP/HTTPS代理；主模型/搜索/find/QQ维持原出口。环境与订阅不进入Git，启动/status复验服务。模型套餐切换保留该非套餐字段。页面代理失败会如实返回失败，不静默换出口。
+网页独立出口：WSL回环18797，7897留给Windows；当前只用ikuuu日本x1节点。默认同步入口从Clash的profiles.yaml定位唯一名含ikuuu的订阅，不修改本机配置。私有YAML放 `/opt/xiaomachi/shared/mihomo/`（目录0700、文件0600），用 `render_mihomo_config.py --source <ikuuu私有文件> --output <候选文件> --page-only` 创建 `XIAOMACHI-WEB-JP-X1` url-test组，每300秒测延迟、容差0、关闭TUN/LAN；不继承其他国家节点、选择组、provider或监听端口。无日本节点或存在外部dialer依赖时拒绝生成。确认同一运营商未标倍率默认x1后才加 `--unmarked-rate-one`（同步脚本对应 `-UnmarkedRateOne`），明确其他倍率仍排除。先 `mihomo -t -d /opt/xiaomachi/shared/mihomo -f <候选文件>` 校验，再私密备份旧配置、原子替换并重启服务。只设置 `WEB_PAGE_PROXY_URL=http://127.0.0.1:18797`，主模型/搜索/find/QQ维持原出口，不设置全局代理；失败不静默换出口。重启后复验日本实际出口及页面代理链。环境与订阅不进入Git，模型套餐切换保留该非套餐字段。
 
 基础镜像包含 CUDA/cuDNN 和 fastembed-gpu，但 GPU 设备是可选。无 NVIDIA 设置 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`，用 CPU；启用需 Windows NVIDIA 驱动、WSL GPU 支持和 NVIDIA Container Toolkit/CDI。
 
@@ -219,9 +229,25 @@ GPU overlay 文件为 `docker-compose.gpu.yml`，挂载 CDI 设备 `nvidia.com/g
 
 ## 9. 可选代理
 
+Windows HY2故障守候：在仓库运行 `python -B -X utf8 scripts/watch_hy2.py start`，接受Windows UAC后通过按需计划任务 `Xiaomachi-HY2Watch` 隐藏运行，避免交互会话结束影响进程；无开机/登录触发器。用同脚本 `status` 查看，`stop` 请求保存并停止。启动先做独立抓包自检，再正式守候；仅新鲜心跳的 `state=armed` 且 `packet_capture=true` 表示已开始，超过90秒显示 `stale`，此时不能推断底层PktMon已停止，需核对会话路径再保全ETL。最长72小时，不跨重启恢复；当前不是HY2订阅时等待，不自动切换。PktMon按原HY2服务器IP过滤、普通包截断128字节（含头部）、64MiB循环文件；有既存抓包/过滤器则拒绝接管。仅新HY2组错误在30秒内累计2条触发，保存Windows/WSL/API快照和有限直连/当前代理/独立HY2核心对照，再保留60秒后自动停止。私有结果在 `data/hy2-watch/<启动时间>/`：ETL、pcapng、trigger及summary JSON；最近一小时状态/警告有界保存。`failed/cleanup_required`需按错误处理；无真实故障时自检不代表自然故障已捕获。不开全局代理、不改MTU/路由或重启QQ，所有证据禁止公开提交。
+
 上游可直连就留空 `XIAOMACHI_HTTP_PROXY`、`XIAOMACHI_HTTPS_PROXY`。QQ/OneBot 与应用模型代理分离；安装器通过 `runtime_egress.py` 判断是否启用 Mihomo，默认不要求代理服务。
 
 需要代理时，使用提供的 `install_mihomo.sh`、`sync_mihomo_from_clash_verge.ps1` 和 `render_mihomo_config.py` 准备本机配置，再验证 `xiaomachi-mihomo.service` 与实际上游可达性。代理订阅/节点/Token 都是私有数据；不要复制到公开示例。
+
+X登录由账号本人在可信浏览器中人工完成。公开安装器不提供人工登录桌面，也不自动导出浏览器Cookie；部署者自行管理受保护的登录环境，再按下文配置私有会话。旧部署若保留`xiaomachi-x-login-manual.service`及`/opt/xiaomachi/browser-login/profile`，应将其作为独立私有设施维护，限定本机访问并保留profile，不视为公开安装的必需组件。
+
+小红书采集：Go构建阶段将xiaohongshu-mcp固定提交的只读动作编译为`/usr/local/bin/xhs-readonly`，Chrome随小町镜像预置；不在宿主安装Go/Chrome/爬虫，不开独立采集服务。专用Docker卷`xiaomachi-xhs-session`仅挂载到群私应用的`/workspace/data/xhs-crawler`保存会话（目录0700、session.json 0600），常规rebuild保留。元数据和CDN直连，不继承X或模型代理。
+
+运维人员可通过`printf '%s' '{"action":"login"}' | docker exec -i xiaomachi-bot xhs-readonly`取扫码入口；二维码写入上述目录的`login-qr.png`，本人用App扫码并确认，最多等240秒。仅复制临时QR图用于本机展示，不读取或复制session.json。`{"action":"status"}`同入口只返回登录布尔状态；模型工具不提供login/status。登录态成功后`search_xhs_posts`、原帖核验及图集/视频下载自动使用，无需新增.env字段。无会话的指定原帖保留公开解析；搜索明确报告需人工登录。挑战/权限/限流停止，不能换出口撞站。上限与未验边界见[小红书合同](../../docs/DEVELOPMENT.md#小红书容器采集合同)。
+
+X采集在小町容器内运行，镜像固定安装gallery-dl==1.32.16和twscrape==0.20.1，前者主源、后者一次有界备选；不再部署自动浏览器工具或18810网关，安装器停用旧xiaomachi-x-browser服务，人工入口和profile保留。
+
+结构化主题搜索由模型提供时间、媒体类型及latest/top；双类型分路共用现有预算，缺失类型如实返回。仅用户明确数字才加互动门槛；关键词不足可按主体补召回，再按原帖正文核验原主题。详情见[工具清单](../../docs/TOOLS.md)，认证/限流后本轮工具停止重查，不能用备库绕过。
+
+WSL私密文件 `/opt/xiaomachi/shared/private-secrets/x-session.json` 只含用户授权的X `auth_token`、`ct0`，目录0700、文件0600。通过受保护的本地输入更新该JSON，禁止将值放到命令历史/报告/仓库；过期、挑战或限流时停止并让用户人工刷新会话。群私应用通过 `./private-secrets:/run/xiaomachi-secrets:ro` 只读挂载，QQ平台及监控不挂载。安装器将release目录链接到shared，构建上下文排除私密目录。
+
+私有 `.env` 设置 `X_CRAWLER_SESSION_FILE=/run/xiaomachi-secrets/x-session.json`、`X_CRAWLER_PROXY_URL=http://127.0.0.1:18797` 后常规rebuild。host网络让容器直接使用WSL的独立日本代理；元数据及X媒体下载使用该出口，不改变聊天接口的代理配置。`list_x_posts/search_x_posts/inspect_web_resources/download_twitter_media`自动接入；无任意命令、浏览器或文件读取模型工具。清空会话路径再rebuild可关闭登录态采集，单帖/账号保留公开来源，主题搜索明确不可用。超时、身份与公开性校验及扩站见[开发合同](../../docs/DEVELOPMENT.md#x爬虫采集合同)。
 
 Docker 下载依赖使用 `DOCKER_HTTP_PROXY` / `DOCKER_HTTPS_PROXY`，应用运行用 `XIAOMACHI_*`。host 网络下 `127.0.0.1` 指向 WSL 主机；Windows 本地代理并不自动成为 WSL 的同一端口。改变出口后需重新创建应用并核对模型请求。
 
@@ -256,11 +282,11 @@ systemctl enable --now xiaomachi-sandbox
 
 在私有 `infra/wsl/.env` 设置 `AGENT_MONITOR_ENABLED=true` 并 rebuild，两应用采集从新回合开始。安装/启动会加载可选 `docker-compose.monitor.yml`，独立查看容器根文件系统只读，仅可写挂载数据卷的 `agent_monitor` 子目录且不加载机器人 `.env`。启动脚本先确保该目录存在；Docker需支持卷 `subpath`。浏览器打开 [Agent现场](http://127.0.0.1:8765/)，也可双击根目录 `open-agent-monitor.cmd`；中文别名位于 `infra/wsl/windows/打开Agent监控网页.bat`（使用默认浏览器）。
 
-一键入口先绕过系统代理检查Windows本机健康、页面和会话API；若WSL回环8765存在但Windows localhost转发失联，启动隐藏的Windows查看器，通过 `\\wsl.localhost\Ubuntu_Migrated\...` 处理同一Docker数据卷中的 `agent_monitor`，不复制聊天记录或加载机器人 `.env`。入口核对卷子挂载；兼容旧版整卷只读挂载。两端都只监听回环8765，重复打开复用健康服务，不使用7897、不修改防火墙或重启QQ/WSL。入口需本机Python；可用 `XIAOMACHI_MONITOR_PYTHON` 指定已安装的python.exe，默认检测PATH与本机Conda目录。日志在 `data/agent-monitor-launcher/viewer.log`；关闭浏览器不停止查看器。升级删除功能时需重启已运行的旧版Windows查看进程；重启Windows后再次双击入口即可恢复。
+一键入口先绕过系统代理检查Windows本机健康、页面和会话API；若WSL回环8765存在但Windows localhost转发失联，启动隐藏的Windows查看器，通过 `\\wsl.localhost\Ubuntu_Migrated\...` 处理同一Docker数据卷中的 `agent_monitor`，不复制聊天记录或加载机器人 `.env`。入口核对卷子挂载；兼容旧版整卷只读挂载。WSL仍监听回环8765；Windows优先复用8765，若该端口被系统保留或占用，则由系统分配可用的回环端口。实际端口保存在 `data/agent-monitor-launcher/viewer.json`，入口先验证健康、页面与会话API再复用，并自动打开实际地址；请双击入口，不要固定收藏8765。仅监听本机，不使用7897、不修改系统保留端口或防火墙，也不重启QQ/WSL。入口需本机Python；可用 `XIAOMACHI_MONITOR_PYTHON` 指定已安装的python.exe，默认检测PATH与本机Conda目录。日志在 `data/agent-monitor-launcher/viewer.log`；关闭浏览器不停止查看器。升级删除功能时需重启已运行的旧版Windows查看进程；重启Windows后再次双击入口即可恢复。
 
 左侧选择会话，右侧连续查看触发消息、公开思考摘要/状态、模型请求、工具行动和发送回执。「为什么开始行动」显示@/回复、消息批次、到期目标或后台任务的实际原因；可展开查看来源、队列/任务号和到期时间。回合之间明确标记执行上下文延续或失败后重建；独立审查/委派任务单列。点击每步「查看本次输入」打开实际请求抽屉，按顺序展开历史并对比同一执行会话的上一请求；多次重试标注同一步的不同尝试。支持群/私筛选、加载更早回合、暂停更新和跟随最新过程。旧记录缺少逻辑关联时显示未知，不补采或推定；上游未提供公开摘要时仅显示进度，不显示隐藏思维链。
 
-底部固定显示最近主请求输入/配置窗口、最近缓存率、会话加权缓存率及累计输入/输出/请求数。单位是token；配置窗口不等于日志KiB。窗口占用以最近请求实报优先，没有实报才标估算；累计仅限当前保留记录，缺失不按0计算，缓存已包含在输入。上下文重建后不沿用旧执行段占用；旧记录未采集窗口时使用已核验的当前配置参考并标明；参考24小时过期，无有效参考才显示未知，新增请求以实际捕获值优先。切换会话同步更新，暂停更新也暂停统计；查看网页不调用模型。
+底部固定显示最近完整输入/配置窗口、累计消耗、新增输入、输出、缓存命中、创建、加权命中率及请求数。新增输入扣除缓存；累计消耗按同请求的含缓存输入＋输出，缓存不重复相加，创建未单独报告显示N/A。单位是token而非费用；配置窗口不等于日志KiB。窗口占用仍含缓存，实报优先，无实报才标估算；累计仅限当前保留记录，缺失不按0计算，覆盖不足标部分。上下文重建后不沿用旧执行段占用；旧记录未采集窗口时使用已核验的当前配置参考并标明；参考24小时过期，无有效参考才显示未知，新增请求以实际捕获值优先。切换会话同步更新，暂停更新也暂停统计；查看网页不调用模型。
 
 媒体队列和委派研究任务会在原请求下显示关联任务，展开可看执行和回传阶段、实际工具结果及交付回执。研究任务内部的模型输入可单独打开，子模型用量在各次请求中显示，不混入主会话统计。后台工具不创建模型子对话，没有对话缓存率；绘图服务调用另计。结果回传完成不等于QQ已送达；复用已有回执时明确标注未再次发送。任务回传轮和研究会话提供「查看父请求」入口；父回合在更早页面或已过期时，任务保留在下方。旧记录从新版本开始才有父子关联，不回填猜测。
 
@@ -274,6 +300,8 @@ curl --noproxy '*' http://127.0.0.1:8765/health
 ```
 
 源码独立预览可用 `python -B -m app.monitor.server --root data/agent_monitor --port 8765`。必须通过本机回环访问；服务拒绝非本机Host和跨站Origin，不应增加LAN绑定/公网转发。页面显示私有聊天和脱敏请求，勿将记录目录复制到公开报告。内容/存储上限与故障隔离合同见 [架构观测说明](../../docs/ARCHITECTURE.md#本机-agent-观测)。保留清理在下一次采集时执行，页面关闭不会停止机器人或采集。
+
+新记录按本地上下文分组，轮换另开段；群参与判断每次独立，纯工具归入父请求。页面区分本地上下文、上游响应续接链和缓存路由键；当前自定义上游在`AGENT_RESPONSES_CONTINUATION=auto`下使用本地完整重放，不声称拥有上游conversation。空巡检不追加历史，有实际研究/创作进展则保留；重置及恢复原因见各回合。
 
 停用时设置 `AGENT_MONITOR_ENABLED=false` 并 rebuild，采集关闭且查看容器移除；已有私有记录仍在数据卷中。普通stop也移除查看容器，正常start根据开关恢复；查看器不可用不阻断群私聊天。回滚到旧release时只重建旧版应用并移除不支持的查看器，不切换QQ桥接。
 

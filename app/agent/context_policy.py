@@ -34,10 +34,15 @@ def serious_request_policy() -> str:
         '每轮至多委派一次，排队后继续处理主对话；后台结果回传时核验摘要并统一回复，不把排队说成完成。'
         '子任务的原始资料保留在独立上下文，不自动把整批原文装回主对话。'
         '执行分工：单次搜索/网页/历史/记忆/单图预览直接读取；多页调研与资料比较交给只读子任务。'
+        '媒体请求先理解主体、来源限制、日期、数量和类型；关于某人不等于本人账号，只有明确限定本人发帖才只查本人。'
+        '开放搜集用set_task_goal记录media_selection，一些/若干最低2份，可期望3至5份；排除已收到的素材不等于排除整个造型或同来源新图。图片或视频可任选，和/都要尽量兼顾。'
+        '已有URL可读取；X限定账号用list_x_posts，主题媒体用search_x_posts；小红书用search_xhs_posts找笔记，再核验日期和正文。候选以原帖正文、日期、类型判断，不能仅凭搜索命中判断相关。'
+        'inspect_web_resources核对实际作者、原帖日期与资源角色；近期发布不等于素材最近拍摄，未知不能冒充。列表覆盖缺口如实说明。'
+        '程序可完成的核验/下载不再委派模型；不默认使用浏览器。原文按证据句柄续读，失败无新证据不重复调用。'
         '生图、批量图片和视频下载由确定性后台执行，不另开模型；返回任务编号即停止重复提交，等待结果或查状态。'
         '排队时可简短告知处理进度并继续聊天，完成后只接收结论、来源和实际产物；下载/生图成功仍须发送回执。'
         '用户仅要求下载后发送时，下载工具选择delivery_mode=auto，可给delivery_text；程序会按原请求打包交付，不能再手动重复发送。'
-        '需要识别、分析、筛选或挑选媒体才使用delivery_mode=review并在结果回传后处理；生图保留原有回传方式。'
+        '按人物/主题搜集媒体使用delivery_mode=review，在当前主回合查询结果后按原帖正文筛选；默认不逐份看图，仅歧义时少量确认静态图片，视频和动图不预览、不抽帧。不足继续其他来源，不确定时跳过或说明，不声称看过视频/听过音频。生图保留原有回传方式。'
         '主人跨域空间、好友内容、账号管理和耗时计算使用request_owner_action；日常对话不接收后台巡检的原始过程。'
         '不要按关键词或继续字样直接委派；继续旧任务须读取任务摘要，再明确给出task_id。'
         'begin_research_task只扩容当前资料预算，update_research_task保存进展，不创建独立执行。'
@@ -227,6 +232,7 @@ class RequestContextPolicy:
             threshold_ratio=float(getattr(settings, 'agent_context_compaction_threshold_ratio', 0.62)),
             retain_tokens=int(getattr(settings, 'agent_context_retain_tokens', 32000)),
             summary_tokens=int(getattr(settings, 'agent_context_summary_tokens', 8192)),
+            history_tokens=int(getattr(settings, 'agent_context_history_tokens', 24000)),
             soft_input_tokens=int(getattr(settings, 'agent_context_soft_input_tokens', 96000)),
             target_input_tokens=int(getattr(settings, 'agent_context_target_input_tokens', 64000)),
             hard_input_tokens=int(getattr(settings, 'agent_context_hard_input_tokens', 160000)))
@@ -263,7 +269,8 @@ class RequestContextPolicy:
                 data = value.get('data') if isinstance(value, dict) else None
                 if not isinstance(data, dict):
                     continue
-                if (data.get('trust') == 'untrusted_external_sources' and
+                stable_summary = (data.get('context_retention') == 'compact_v1' and len(raw) <= 12000)
+                if (data.get('trust') == 'untrusted_external_sources' and not stable_summary and
                         entry.get('call_id', entry.get('tool_call_id')) not in current_call_ids and
                         not (current_turn_id and data.get('context_turn_id') == current_turn_id)):
                     kept = {k: data[k] for k in ('sources', 'trust', 'content_kind', 'task_id', 'evidence_id') if k in data}

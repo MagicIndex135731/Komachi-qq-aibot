@@ -54,19 +54,19 @@ class _FakeEmbeddingProvider:
 def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engine) -> None:
     viewing = _seed_document(
         sqlite_engine, group_id=100, user_id=201, platform_msg_id="viewing",
-        content="加菲猫在看向日葵马戏团", document_kind="raw_message_v3",
+        content="小丁丁在看向日葵马戏团", document_kind="raw_message_v3",
     )
     work = _seed_document(
         sqlite_engine, group_id=100, user_id=202, platform_msg_id="work",
-        content="加菲猫在咖啡店工作", document_kind="raw_message_v3",
+        content="小丁丁在咖啡店工作", document_kind="raw_message_v3",
     )
     _seed_document(
         sqlite_engine, group_id=200, user_id=203, platform_msg_id="cross-group",
-        content="加菲猫在咖啡店工作", document_kind="raw_message_v3",
+        content="小丁丁在咖啡店工作", document_kind="raw_message_v3",
     )
     _seed_document(
         sqlite_engine, group_id=100, user_id=204,
-        platform_msg_id="bot-reply-remembered", content="加菲猫在看一部动画",
+        platform_msg_id="bot-reply-remembered", content="小丁丁在看一部动画",
         document_kind="raw_message_v3",
     )
     self_activity = _seed_document(
@@ -85,26 +85,26 @@ def test_member_reference_recalls_cross_speaker_facts_across_topics(sqlite_engin
             resolved_query=ResolvedMemoryQuery(
                 original_query=question, retrieval_query=question,
                 group_id=100, subject_ids=("300",), subject_binding="explicit",
-                subject_aliases_removed=("加菲猫",), answer_mode="current_fact",
+                subject_aliases_removed=("小丁丁",), answer_mode="current_fact",
                 reference_query=question.removeprefix("@比企谷小町 "),
             ),
             limit=10,
         )
 
-    assert [hit.document_id for hit in recall("加菲猫最近在看什么动画")][:1] == [viewing]
-    assert [hit.document_id for hit in recall("加菲猫在哪里工作")][:1] == [work]
-    assert {hit.document_id for hit in recall("加菲猫最近如何")} == {
+    assert [hit.document_id for hit in recall("小丁丁最近在看什么动画")][:1] == [viewing]
+    assert [hit.document_id for hit in recall("小丁丁在哪里工作")][:1] == [work]
+    assert {hit.document_id for hit in recall("小丁丁最近如何")} == {
         viewing, work, self_activity, self_activity_two,
     }
-    assert self_activity in {hit.document_id for hit in recall("加菲猫最近在看什么动画")}
-    multi_hits = {hit.document_id for hit in recall("加菲猫最近在看哪些动画")}
+    assert self_activity in {hit.document_id for hit in recall("小丁丁最近在看什么动画")}
+    multi_hits = {hit.document_id for hit in recall("小丁丁最近在看哪些动画")}
     assert {self_activity, self_activity_two} <= multi_hits
     _seed_document(
         sqlite_engine, group_id=100, user_id=205,
-        platform_msg_id="question-echo", content="@比企谷小町 加菲猫最近在看什么动画",
+        platform_msg_id="question-echo", content="@比企谷小町 小丁丁最近在看什么动画",
         document_kind="raw_message_v3",
     )
-    assert [hit.document_id for hit in recall("@比企谷小町 加菲猫最近在看什么动画")][:1] == [viewing]
+    assert [hit.document_id for hit in recall("@比企谷小町 小丁丁最近在看什么动画")][:1] == [viewing]
 
     impersonated_hits = channels["member_reference"](
         group_id=100,
@@ -204,7 +204,7 @@ def test_fts_and_vector_channels_use_topic_query_not_subject_bearing_question(
         embedding_provider=embedding,
     )
     resolved = ResolvedMemoryQuery(
-        original_query="阿渣如何评价八仙动画？",
+        original_query="小甲如何评价八仙动画？",
         retrieval_query="八仙动画",
         topic_query="八仙动画",
         topic_terms=("八仙动画", "八仙"),
@@ -231,8 +231,8 @@ def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractor
         )
         UserRepository(session).upsert_user(
             user_id=20001,
-            nickname="A-Zha",
-            group_card="阿渣",
+            nickname="Member-A",
+            group_card="小甲",
         )
         messages = MessageRepository(session)
         documents = RetrievalDocumentRepository(session)
@@ -254,7 +254,7 @@ def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractor
                 message_id=row.id,
             ) is not None
         source = messages.add_group_message(
-            platform_msg_id="bazha-source",
+            platform_msg_id="bmember_alpha-source",
             group_id=100,
             user_id=20001,
             timestamp=datetime(2026, 8, 2, 20, 0, tzinfo=UTC),
@@ -270,7 +270,7 @@ def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractor
             message_id=source.id,
         ) is not None
         second_source = messages.add_group_message(
-            platform_msg_id="bazha-source-2",
+            platform_msg_id="bmember_alpha-source-2",
             group_id=100,
             user_id=20001,
             timestamp=datetime(2026, 8, 2, 20, 1, tzinfo=UTC),
@@ -315,7 +315,7 @@ def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractor
     )["bm25"](
         group_id=100,
         resolved_query=ResolvedMemoryQuery(
-            original_query="阿渣如何评价八仙动画？",
+            original_query="小甲如何评价八仙动画？",
             retrieval_query="八仙动画",
             topic_query="八仙动画",
             topic_terms=("八仙动画", "八仙"),
@@ -333,7 +333,7 @@ def test_topic_core_term_recalls_raw_source_among_hundreds_of_subject_distractor
         for hit in hits
         for source_id in hit.source_msg_ids
     }
-    assert {"bazha-source", "bazha-source-2"} <= source_ids
+    assert {"bmember_alpha-source", "bmember_alpha-source-2"} <= source_ids
     assert "cross-group-eight-source" not in source_ids
 
 
@@ -500,8 +500,8 @@ def test_empty_topic_skips_fts_and_vector_without_embedding_or_repository_call(
         embedding_provider=embedding,
     )
     resolved = ResolvedMemoryQuery(
-        original_query="如何评价阿渣？",
-        retrieval_query="如何评价阿渣？",
+        original_query="如何评价小甲？",
+        retrieval_query="如何评价小甲？",
         topic_query=None,
         topic_extraction="none",
         subject_ids=("10001",),
@@ -530,12 +530,12 @@ def test_entity_channel_uses_bound_speaker_id_without_global_alias_expansion(sql
     with session_scope(sqlite_engine) as session:
         UserRepository(session).upsert_user(
             user_id=20002,
-            nickname="阿渣",
+            nickname="小甲",
             group_card="",
         )
         hits = RetrievalDocumentRepository(session).search_group_documents_entity_hits(
             group_id=10001,
-            entities=("阿渣",),
+            entities=("小甲",),
             speaker_ids=("20001",),
             limit=10,
         )
@@ -646,16 +646,16 @@ def test_subject_filter_applies_to_all_memory_document_channels_without_removing
             speak_enabled=True,
         )
         users = UserRepository(session)
-        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
-        users.upsert_user(user_id=20002, nickname="Garfield", group_card="加菲猫")
+        users.upsert_user(user_id=20001, nickname="Member-A", group_card="小甲")
+        users.upsert_user(user_id=20002, nickname="Garfield", group_card="小丁丁")
         messages = MessageRepository(session)
         target_message = messages.add_group_message(
             platform_msg_id="subject-target-source",
             group_id=10001,
             user_id=20001,
             timestamp=observed_at,
-            plain_text="共同检索词：阿渣喜欢动画。",
-            raw_json={"sender": {"nickname": "A-Zha", "card": "阿渣"}},
+            plain_text="共同检索词：小甲喜欢动画。",
+            raw_json={"sender": {"nickname": "Member-A", "card": "小甲"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -665,8 +665,8 @@ def test_subject_filter_applies_to_all_memory_document_channels_without_removing
             group_id=10001,
             user_id=20002,
             timestamp=observed_at,
-            plain_text="共同检索词：加菲猫喜欢动画。",
-            raw_json={"sender": {"nickname": "Garfield", "card": "加菲猫"}},
+            plain_text="共同检索词：小丁丁喜欢动画。",
+            raw_json={"sender": {"nickname": "Garfield", "card": "小丁丁"}},
             msg_type="text",
             reply_to_msg_id=None,
             mentioned_bot=False,
@@ -702,7 +702,7 @@ def test_subject_filter_applies_to_all_memory_document_channels_without_removing
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="共同检索词：阿渣最喜欢动画。",
+            content="共同检索词：小甲最喜欢动画。",
             importance=4,
             confidence=0.9,
             source_msg_id="subject-target-source",
@@ -714,7 +714,7 @@ def test_subject_filter_applies_to_all_memory_document_channels_without_removing
             subject_type="user",
             subject_id="20002",
             memory_kind="preference",
-            content="共同检索词：加菲猫最喜欢动画。",
+            content="共同检索词：小丁丁最喜欢动画。",
             importance=4,
             confidence=0.9,
             source_msg_id="subject-other-source",
@@ -1330,7 +1330,7 @@ def test_layered_raw_v3_enables_fact_channel_and_expands_document_kinds(
     )
     assert "fact" in channels
     resolved = ResolvedMemoryQuery(
-        original_query="阿渣喜欢什么动画",
+        original_query="小甲喜欢什么动画",
         retrieval_query="动画",
         topic_query="动画",
         topic_terms=("动画",),
@@ -1380,7 +1380,7 @@ def test_layered_off_raw_v3_keeps_existing_raw_only_behavior(monkeypatch) -> Non
     channels["bm25"](
         group_id=100,
         resolved_query=ResolvedMemoryQuery(
-            original_query="阿渣喜欢什么动画",
+            original_query="小甲喜欢什么动画",
             retrieval_query="动画",
             topic_query="动画",
             topic_terms=("动画",),
@@ -1404,7 +1404,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
                 enabled=True,
                 speak_enabled=True,
             )
-        users.upsert_user(user_id=20001, nickname="A-Zha", group_card="阿渣")
+        users.upsert_user(user_id=20001, nickname="Member-A", group_card="小甲")
         users.upsert_user(user_id=20002, nickname="Other", group_card="其他人")
 
         def seed_message(
@@ -1430,13 +1430,13 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             group_id=100,
             user_id=20001,
             platform_msg_id="layered-source-100",
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
         )
         cross_source_200 = seed_message(
             group_id=200,
             user_id=20001,
             platform_msg_id="layered-cross-200",
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
         )
         session.flush()
         for row in (source_100, cross_source_200):
@@ -1452,7 +1452,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="layered-source-100",
@@ -1465,7 +1465,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             subject_type="user",
             subject_id="20001",
             memory_kind="preference",
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
             importance=4,
             confidence=0.9,
             source_msg_id="layered-cross-200",
@@ -1482,7 +1482,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             source_id=str(memory_100.id),
             start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
             end_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
             metadata_json={"subject_id": "20001", "kind": "preference"},
             content_hash="hash-memory-100",
             source_message_ids=[int(source_100.id)],
@@ -1497,7 +1497,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             source_id=str(memory_200.id),
             start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
             end_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
-            content="阿渣喜欢喝冰美式",
+            content="小甲喜欢喝冰美式",
             metadata_json={"subject_id": "20001", "kind": "preference"},
             content_hash="hash-memory-200",
             source_message_ids=[int(cross_source_200.id)],
@@ -1509,7 +1509,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             summary_key="episode:1:test",
             start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
             end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
-            content="阿渣动画偏好总结",
+            content="小甲动画偏好总结",
             source_count=1,
             source_start_msg_id="layered-source-100",
             source_end_msg_id="layered-source-100",
@@ -1525,7 +1525,7 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
             source_id=str(summary.id),
             start_at=datetime(2026, 7, 23, 8, 0, tzinfo=UTC),
             end_at=datetime(2026, 7, 23, 9, 0, tzinfo=UTC),
-            content="阿渣动画偏好总结",
+            content="小甲动画偏好总结",
             metadata_json={"episode_id": 1},
             content_hash="hash-summary-100",
             source_message_ids=[int(source_100.id)],
@@ -1537,10 +1537,10 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
         layered_memory_enabled=True,
     )
     resolved = ResolvedMemoryQuery(
-        original_query="阿渣喜欢什么",
-        retrieval_query="阿渣",
-        topic_query="阿渣",
-        topic_terms=("阿渣",),
+        original_query="小甲喜欢什么",
+        retrieval_query="小甲",
+        topic_query="小甲",
+        topic_terms=("小甲",),
         topic_extraction="deterministic",
         subject_ids=None,
         needs_history=True,
@@ -1568,10 +1568,10 @@ def test_layered_raw_v3_bm25_scopes_memory_and_summary_documents(sqlite_engine) 
     assert all(hit.document_kind != "memory" for hit in ambiguous_hits)
 
     bound = ResolvedMemoryQuery(
-        original_query="阿渣喜欢什么",
-        retrieval_query="阿渣",
-        topic_query="阿渣",
-        topic_terms=("阿渣",),
+        original_query="小甲喜欢什么",
+        retrieval_query="小甲",
+        topic_query="小甲",
+        topic_terms=("小甲",),
         topic_extraction="deterministic",
         subject_ids=("20001",),
         needs_history=True,

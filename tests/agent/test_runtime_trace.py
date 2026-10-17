@@ -7,6 +7,84 @@ import pytest
 from app.agent.runtime_trace import AgentTrace, TraceReader, sanitize
 
 
+def test_owner_groups_rotations_but_keeps_ephemeral_judgments_distinct(tmp_path):
+    for native, lifetime in [('a','persistent'), ('a','persistent'), ('b','persistent'), ('c','ephemeral'), ('d','ephemeral')]:
+        trace = AgentTrace(tmp_path, context={'surface':'group','scope_id':900000001,
+            'context_session_key':native*24, 'context_lifetime':lifetime},
+            session_key=native, conversation_key='same-group')
+        trace.finish('silent','model_finished'); trace.close()
+    groups = TraceReader(tmp_path).list_conversations()
+    assert len(groups) == 2
+    ephemeral = next(g for g in groups if g['identity_quality'] == 'ephemeral')
+    assert ephemeral['turn_count'] == 2 and ephemeral['native_session_count'] == 0
+    assert ephemeral['ephemeral_execution_count'] == 2
+    owner = next(g for g in groups if g['identity_quality'] == 'logical')
+    assert owner['turn_count'] == 3 and owner['native_session_count'] == 2
+    assert len(owner['conversation_aliases']) == 2
+    assert TraceReader(tmp_path).read_conversation('c-'+'a'*24)['conversation_id'] == owner['conversation_id']
+
+
+def test_legacy_judge_route_does_not_count_each_temporary_execution_as_persistent_context(tmp_path):
+    for number in range(3):
+        trace=AgentTrace(tmp_path,context={'surface':'group','scope_id':900000001,
+            'context_kind':'background_group','trigger_kind':'participation_judge'},
+            session_key='temporary-'+str(number),conversation_key='same-judgment-entry')
+        trace.finish('silent','model_finished');trace.close()
+    group=TraceReader(tmp_path).list_conversations()[0]
+    assert group['identity_quality']=='ephemeral' and group['turn_count']==3
+    assert group['native_session_count']==0 and group['ephemeral_execution_count']==3
+    assert all(t['context_identity_legacy'] for t in group['turns'])
+
+
+def test_real_parent_trace_links_after_native_grouping_and_provider_metadata(tmp_path):
+    from app.agent.runtime_trace import current_trace_context, observe_with
+    parent = AgentTrace(tmp_path, context={'surface':'private','scope_id':900000101,
+        'context_session_key':'e'*24, 'context_lifetime':'persistent'},
+        session_key='native', conversation_key='logical')
+    with observe_with(parent):
+        lineage = current_trace_context()
+    parent.event('model.finished', {'request_id':'m01-a01','provider_response_id':'resp_two',
+        'provider_previous_response_id':'resp_one','provider_chain_id':'resp_one',
+        'prompt_cache_key_id':'f'*24, 'continuation_mode':'incremental'})
+    parent.event('context.retention', {'retain_history':True,'reason':'useful_work_retained'})
+    parent.finish('silent','model_finished'); parent.close()
+    assert lineage['workflow_conversation_id'] == 'c-'+parent.meta['conversation_key']
+    worker = AgentTrace(tmp_path, context={**lineage,'surface':'private','scope_id':900000101,
+        'trigger_kind':'media_delivery','job_id':12}, session_key='tool-only', conversation_key='worker')
+    worker.finish('sent','delivered'); worker.close()
+    groups = TraceReader(tmp_path).list_conversations()
+    assert len(groups) == 1 and groups[0]['task_count'] == 1
+    assert groups[0]['native_session_count'] == 1
+    assert groups[0]['provider_chain_ids'] == ['resp_one']
+    assert groups[0]['turns'][0]['context_retention']['retain_history']
+
+
+def test_old_native_parent_link_resolves_after_owner_rotation_and_expiry(tmp_path):
+    from app.monitor.metrics import ConversationMetrics
+    from app.monitor.records import MonitorRecords
+    old = AgentTrace(tmp_path, context={'surface':'group','scope_id':900000001,
+        'context_session_key':'a'*24}, session_key='old', conversation_key='owner-one')
+    old.finish('ok','done');old.close()
+    current = AgentTrace(tmp_path, context={'surface':'group','scope_id':900000001,
+        'context_session_key':'b'*24}, session_key='new', conversation_key='owner-one')
+    current.finish('ok','done');current.close()
+    worker = AgentTrace(tmp_path, context={'surface':'group','scope_id':900000001,
+        'execution_kind':'background_tool','job_id':12,
+        'parent_trace_id':'f'*32, 'workflow_conversation_id':'c-'+'a'*24},
+        session_key='worker', conversation_key='worker')
+    worker.finish('ok','done');worker.close()
+    foreign = AgentTrace(tmp_path, context={'surface':'group','scope_id':900000002,
+        'context_session_key':'c'*24}, session_key='foreign', conversation_key='owner-two')
+    foreign.finish('ok','done');foreign.close()
+    reader = TraceReader(tmp_path)
+    assert len(reader.list_conversations()) == 2
+    owner = reader.read_conversation('c-'+'a'*24)
+    assert owner['turn_count'] == 2 and owner['task_count'] == 1
+    assert ConversationMetrics(reader).read(owner['conversation_id'])['usage']['request_count'] == 0
+    assert MonitorRecords(reader).delete_conversation(owner['conversation_id'])['deleted_turns'] == 3
+    assert reader.list_conversations()[0]['turns'][0]['trace_id'] == foreign.trace_id
+
+
 def test_trace_redacts_credentials_images_and_hidden_reasoning():
     result = sanitize({'authorization':'Bearer sensitive', 'api_key':'sensitive',
         'messages':[{'role':'assistant','reasoning_content':'hidden private analysis','content':'API_KEY=secret-value'},

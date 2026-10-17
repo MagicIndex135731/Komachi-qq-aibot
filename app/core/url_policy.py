@@ -29,10 +29,20 @@ def public_web_url(value: str) -> str:
 def media_resource_url(value: str) -> bool:
     """A locator hint for ordering/progress, never permission or media proof."""
     try:
-        path = urlsplit(public_web_url(value)).path
+        parts = urlsplit(public_web_url(value))
+        path = parts.path
     except (ValueError, TypeError, AttributeError):
         return False
-    return '/status/' in path or path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.mp4', '.gif'))
+    post = {
+        'bilibili.com': r'/video/(?:BV\w+|av\d+)/?', 'www.bilibili.com': r'/video/(?:BV\w+|av\d+)/?',
+        'xiaohongshu.com': r'/(?:explore|discovery/item)/[a-f0-9]{24}/?',
+        'www.xiaohongshu.com': r'/(?:explore|discovery/item)/[a-f0-9]{24}/?',
+        'douyin.com': r'/video/\d+/?', 'www.douyin.com': r'/video/\d+/?',
+        'fantia.jp': r'/posts/\d+/?', 'www.fantia.jp': r'/posts/\d+/?',
+        'bgm.tv': r'/subject/\d+/?', 'bangumi.tv': r'/subject/\d+/?', 'chii.in': r'/subject/\d+/?',
+    }.get(parts.hostname)
+    return (bool(post and re.fullmatch(post, path)) or '/status/' in path
+            or path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.mp4', '.gif')))
 
 
 _EXPLICIT_URL_REQUEST = re.compile(

@@ -175,3 +175,24 @@ async def test_group_media_provider_wait_does_not_hold_main_lock_or_start_model(
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
+
+
+def test_long_media_result_preserves_handles_and_partial_status():
+    from app.agent.media_tasks import media_result
+    ids=['art-'+str(i).zfill(32) for i in range(20)]
+    result=media_result(ToolOutcome({'artifact_ids':ids,'post':{'text':'x'*20000},
+        'all_requested_downloaded':False,'failures':[{'index':21,'error':'size_limit'}]}),
+        {'operation':'download_web_images','task_id':'synthetic'})
+    assert result['status']=='ok' and result['data']['artifact_ids']==ids
+    assert result['data']['all_requested_downloaded'] is False
+    assert len(json.dumps(result))<12000
+
+
+def test_long_media_sources_compact_without_dropping_ready_handles():
+    from app.agent.media_tasks import media_result
+    media=[{'artifact_id':'art-'+str(i).zfill(32),'logical_media_id':'media-'+str(i),
+        'source_ref':'https://example.com/'+str(i)+'?'+'x'*1900,'status':'ready'} for i in range(20)]
+    result=media_result(ToolOutcome({'media_artifact_ids':[i['artifact_id'] for i in media],
+        'media':media,'post':{'text':'x'*16000}}),{'operation':'download_web_images','task_id':'synthetic'})
+    assert len(json.dumps(result))<12000
+    assert len(result['data']['media_artifact_ids'])==20 and result['status']=='ok'

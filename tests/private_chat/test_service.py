@@ -1413,7 +1413,7 @@ async def test_private_chat_puts_the_quoted_message_text_in_the_prompt(sqlite_en
             get_msg_responses={
                 "q-quoted-text": {
                     "message": [{"type": "text", "data": {"text": "形式主义大国"}}],
-                    "sender": {"nickname": "群友", "card": "阿渣"},
+                    "sender": {"nickname": "群友", "card": "小甲"},
                     "user_id": 20002,
                 }
             }
@@ -1440,7 +1440,7 @@ async def test_private_chat_puts_the_quoted_message_text_in_the_prompt(sqlite_en
 
     assert handled is True
     prompt = "\n".join(llm_client.prompts[0])
-    assert "Quoted message: 阿渣（QQ昵称：群友）: 形式主义大国" in prompt
+    assert "Quoted message: 小甲（QQ昵称：群友）: 形式主义大国" in prompt
     assert "sender of the quoted message" in prompt
 
 
@@ -1608,7 +1608,7 @@ async def test_private_chat_keeps_builtin_search_open_without_a_search_model(
     """Without ``LLM_WEB_SEARCH_MODEL`` any turn may search, like the group."""
 
     sender = FakeSender()
-    llm_client = BuiltinSearchLlmClient(reply_text="阿渣喜欢看动画。")
+    llm_client = BuiltinSearchLlmClient(reply_text="小甲喜欢看动画。")
     service = build_service(
         sqlite_engine,
         tmp_path,
@@ -1621,7 +1621,7 @@ async def test_private_chat_keeps_builtin_search_open_without_a_search_model(
         make_private_event(
             message_id="p-chat-builtin-unscoped",
             user_id=10001,
-            text="阿渣喜欢什么动画",
+            text="小甲喜欢什么动画",
         )
     )
 
@@ -1764,14 +1764,14 @@ async def test_private_reference_drawing_searches_images_with_the_planner(sqlite
     reference_search = FakeImageReferenceSearchClient(
         results=[
             ImageAttachment(
-                url="https://img.example.test/azha-reference.png",
-                file_id="azha-reference.png",
+                url="https://img.example.test/member_alpha-reference.png",
+                file_id="member_alpha-reference.png",
             )
         ]
     )
     planner = FakeReferencePlanner(
         '{"should_search": true, "references": ['
-        '{"subject": "阿渣", "queries": ["阿渣 人设图"]}]}'
+        '{"subject": "小甲", "queries": ["小甲 人设图"]}]}'
     )
     service = build_service(
         sqlite_engine,
@@ -1794,7 +1794,7 @@ async def test_private_reference_drawing_searches_images_with_the_planner(sqlite
         task = tasks.add_task(
             session_id=dev_session.id,
             requested_by_qq=10001,
-            raw_request_text="参考阿渣的人设图生成一张",
+            raw_request_text="参考小甲的人设图生成一张",
             intent_type="private_chat",
         )
         dev_task_id = task.id
@@ -1803,8 +1803,8 @@ async def test_private_reference_drawing_searches_images_with_the_planner(sqlite
         PrivateImageGenerationRequest(
             user_id=10001,
             trigger_message_id="p-reference-image",
-            prompt="参考阿渣的人设图生成一张",
-            web_search_query="阿渣",
+            prompt="参考小甲的人设图生成一张",
+            web_search_query="小甲",
             dev_task_id=dev_task_id,
         )
     )
@@ -1813,8 +1813,8 @@ async def test_private_reference_drawing_searches_images_with_the_planner(sqlite
 
     assert result.accepted is True
     assert len(planner.prompts) == 1
-    assert reference_search.image_queries == [("阿渣 人设图", 2)]
+    assert reference_search.image_queries == [("小甲 人设图", 2)]
     assert [image.url for image in image_llm.edit_calls[0]["images"]] == [
-        "https://img.example.test/azha-reference.png"
+        "https://img.example.test/member_alpha-reference.png"
     ]
     assert sender.private_image_sent and sender.private_image_sent[0]["user_id"] == 10001

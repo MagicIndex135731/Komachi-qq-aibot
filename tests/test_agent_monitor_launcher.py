@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import importlib.util
 import json
+import errno
 
 import pytest
 
@@ -13,9 +14,9 @@ SPEC.loader.exec_module(launcher)
 
 
 def test_existing_viewer_does_not_spawn_or_read_docker(monkeypatch):
-    monkeypatch.setattr(launcher, 'viewer_ready', lambda: True)
+    monkeypatch.setattr(launcher, 'viewer_ready', lambda *args: True)
     run = Mock(); spawn = Mock()
-    assert launcher.ensure_viewer(run=run, spawn=spawn) == 'existing'
+    assert launcher.ensure_viewer(run=run, spawn=spawn) == launcher.URL
     run.assert_not_called(); spawn.assert_not_called()
 
 
@@ -25,7 +26,11 @@ def test_fallback_uses_read_only_volume_and_hidden_native_process(tmp_path, monk
     monkeypatch.setattr(launcher, 'resolve_data_root', lambda **_: data)
     monkeypatch.setattr(launcher, 'RUNTIME', tmp_path / 'runtime')
     spawn = Mock()
-    assert launcher.ensure_viewer(spawn=spawn) == 'windows'
+    def start(*args, **kwargs):
+        (launcher.RUNTIME / 'viewer.json').write_text('{"port":54321}', encoding='utf8')
+        return Mock()
+    spawn.side_effect = start
+    assert launcher.ensure_viewer(spawn=spawn) == 'http://127.0.0.1:54321/'
     args, kwargs = spawn.call_args
     command = args[0]
     assert '--serve' in command and str(data) in command
@@ -57,10 +62,86 @@ def test_serve_keeps_existing_loopback_server_contract(tmp_path, monkeypatch):
     fake = Mock()
     create = Mock(return_value=fake)
     monkeypatch.setattr(server, 'create_server', create)
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path / 'runtime')
+    fake.server_port = 8765
     launcher.serve(tmp_path)
     create.assert_called_once_with(tmp_path, port=8765)
     fake.serve_forever.assert_called_once()
     fake.server_close.assert_called_once()
+
+
+@pytest.mark.parametrize('error', [PermissionError(errno.EACCES, 'reserved'), OSError(errno.EADDRINUSE, 'occupied')])
+def test_reserved_or_busy_port_uses_system_assigned_port(tmp_path, monkeypatch, error):
+    from app.monitor import server
+    fake = Mock(server_port=54321)
+    create = Mock(side_effect=[error, fake])
+    monkeypatch.setattr(server, 'create_server', create)
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path / 'runtime')
+    launcher.serve(tmp_path)
+    assert [call.kwargs['port'] for call in create.call_args_list] == [8765, 0]
+    assert json.loads((launcher.RUNTIME / 'viewer.json').read_text()) == {'port': 54321}
+    fake.serve_forever.assert_called_once()
+    fake.server_close.assert_called_once()
+
+
+def test_saved_viewer_is_health_checked_and_reused(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path)
+    (tmp_path / 'viewer.json').write_text('{"port":54321}')
+    probe = Mock(side_effect=[False, True])
+    monkeypatch.setattr(launcher, 'viewer_ready', probe)
+    run = Mock(); spawn = Mock()
+    assert launcher.ensure_viewer(run=run, spawn=spawn) == 'http://127.0.0.1:54321/'
+    assert probe.call_args.args == ('http://127.0.0.1:54321/',)
+    run.assert_not_called(); spawn.assert_not_called()
+
+
+@pytest.mark.parametrize('state', ['bad json', '[]', '{"port":true}', '{"port":7897}', '{"port":80}', '{"port":65536}', '{"port":"54321"}'])
+def test_invalid_saved_port_is_ignored(tmp_path, monkeypatch, state):
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path)
+    (tmp_path / 'viewer.json').write_text(state)
+    assert launcher.saved_viewer_url() is None
+
+
+def test_other_startup_errors_do_not_retry_or_publish_state(tmp_path, monkeypatch):
+    from app.monitor import server
+    create = Mock(side_effect=OSError('synthetic records failure'))
+    monkeypatch.setattr(server, 'create_server', create)
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path)
+    with pytest.raises(OSError):
+        launcher.serve(tmp_path)
+    assert create.call_count == 1
+    assert not (tmp_path / 'viewer.json').exists()
+
+
+def test_dead_child_reports_failure_without_waiting(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path)
+    monkeypatch.setattr(launcher, 'viewer_ready', lambda *args: False)
+    monkeypatch.setattr(launcher, 'resolve_data_root', lambda **kwargs: tmp_path)
+    sleep = Mock(); monkeypatch.setattr(launcher.time, 'sleep', sleep)
+    with pytest.raises(RuntimeError, match='viewer.log'):
+        launcher.ensure_viewer(spawn=Mock(return_value=Mock(poll=Mock(return_value=1))))
+    sleep.assert_not_called()
+
+
+def test_stale_state_does_not_prevent_recovery_and_wait_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, 'RUNTIME', tmp_path)
+    (tmp_path / 'viewer.json').write_text('{"port":54321}')
+    monkeypatch.setattr(launcher, 'viewer_ready', lambda *args: False)
+    monkeypatch.setattr(launcher, 'resolve_data_root', lambda **kwargs: tmp_path)
+    sleep = Mock(); monkeypatch.setattr(launcher.time, 'sleep', sleep)
+    spawn = Mock(return_value=Mock(poll=Mock(return_value=None)))
+    with pytest.raises(RuntimeError, match='viewer.log'):
+        launcher.ensure_viewer(spawn=spawn)
+    assert spawn.call_count == 1 and sleep.call_count == 30
+
+
+def test_browser_opens_selected_port(monkeypatch, capsys):
+    monkeypatch.setattr(launcher.sys, 'argv', ['open_agent_monitor.py'])
+    monkeypatch.setattr(launcher, 'ensure_viewer', lambda: 'http://127.0.0.1:54321/')
+    open_browser = Mock(); monkeypatch.setattr(launcher.webbrowser, 'open', open_browser)
+    assert launcher.main() == 0
+    open_browser.assert_called_once_with('http://127.0.0.1:54321/')
+    assert 'http://127.0.0.1:54321/' in capsys.readouterr().out
 
 
 def test_health_probe_bypasses_proxy_and_checks_live_records(monkeypatch):

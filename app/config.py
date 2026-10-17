@@ -23,6 +23,7 @@ class AppSettings(BaseSettings):
 
     group_agent_enabled: bool = Field(default=True, alias="GROUP_AGENT_ENABLED")
     agent_runtime: Literal["harness", "legacy"] = Field(default="harness", alias="AGENT_RUNTIME")
+    agent_responses_continuation: Literal["off", "auto", "on"] = Field(default="auto", alias="AGENT_RESPONSES_CONTINUATION")
     agent_max_external_writes: int = Field(default=2, ge=1, le=8, alias="AGENT_MAX_EXTERNAL_WRITES")
     group_agent_batch_quiet_seconds: float = Field(default=1.0, ge=0, le=30, alias="GROUP_AGENT_BATCH_QUIET_SECONDS")
     group_agent_batch_max_seconds: float = Field(default=3.0, gt=0, le=60, alias="GROUP_AGENT_BATCH_MAX_SECONDS")
@@ -109,6 +110,8 @@ class AppSettings(BaseSettings):
     agent_task_turn_timeout_seconds: float = Field(default=600, ge=180, le=900, alias="AGENT_TASK_TURN_TIMEOUT_SECONDS")
     agent_web_task_max_chars: int = Field(default=96000, ge=48000, le=128000, alias="AGENT_WEB_TASK_MAX_CHARS")
     web_page_proxy_url: str = Field(default="", alias="WEB_PAGE_PROXY_URL")
+    x_crawler_session_file: str = Field(default="", alias="X_CRAWLER_SESSION_FILE", repr=False)
+    x_crawler_proxy_url: str = Field(default="http://127.0.0.1:18797", alias="X_CRAWLER_PROXY_URL")
     download_media_retention_hours: float = Field(default=24, ge=1, le=168, alias='DOWNLOAD_MEDIA_RETENTION_HOURS')
     download_media_cache_max_mib: int = Field(default=512, ge=128, le=8192, alias='DOWNLOAD_MEDIA_CACHE_MAX_MIB')
     agent_context_compaction_enabled: bool = Field(default=True, alias="AGENT_CONTEXT_COMPACTION_ENABLED")
@@ -504,6 +507,20 @@ class RuntimeConfig:
     safety: dict[str, Any]
     personas: dict[str, dict[str, Any]] = field(default_factory=dict)
     social_policy: dict[str, Any] = field(default_factory=dict)
+
+
+def group_recent_context_limit(runtime: RuntimeConfig, group_id: int) -> int:
+    """Per-group automatic message window, bounded by the Agent's 30-row cap."""
+    defaults = runtime.group_policy.get("default_group_behavior", {})
+    group = runtime.group_policy.get("groups", {}).get(str(group_id), {})
+    value = group.get("recent_context_limit", defaults.get("recent_context_limit"))
+    if isinstance(value, bool):
+        return 30
+    try:
+        limit = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 30
+    return min(limit, 30) if limit > 0 else 30
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

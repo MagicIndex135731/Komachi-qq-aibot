@@ -403,7 +403,7 @@ def filter_member_query_features(
 
     The member's nickname/card appears in most of that member's facts, so it
     carries no relevance signal. Any feature containing an alias (including
-    CJK bigrams such as "阿渣喜") is removed.
+    CJK bigrams such as "小甲喜") is removed.
     """
     normalized_aliases = tuple(
         dict.fromkeys(

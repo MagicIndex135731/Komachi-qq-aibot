@@ -1,6 +1,6 @@
 """History-driven persona distillation helpers.
 
-Pure, testable extraction logic used by ``scripts/distill_azha_persona.py``.
+Pure, testable extraction logic used by ``scripts/distill_member_alpha_persona.py``.
 The generated persona file and sample transcripts stay local-only; they are
 derived from private chat history and must never be committed.
 """
@@ -215,8 +215,8 @@ def compute_relationship_map(
                 "user_id": member_id,
                 "member": latest_label.get(member_id, str(member_id)),
                 "interactions": 0,
-                "azha_replied_to": 0,
-                "replies_to_azha": 0,
+                "member_alpha_replied_to": 0,
+                "replies_to_member_alpha": 0,
                 "examples": [],
                 "mention_examples": [],
             }
@@ -231,7 +231,7 @@ def compute_relationship_map(
         quoted_user = int(quoted.get("user_id") or 0)
         if row_user == target_user_id and quoted_user not in excluded:
             other = member_state(quoted_user)
-            other["azha_replied_to"] += 1
+            other["member_alpha_replied_to"] += 1
             other["interactions"] += 1
             row_text = str(row.get("text") or row.get("plain_text") or "").strip()
             if (
@@ -247,12 +247,12 @@ def compute_relationship_map(
                         {
                             "other": speaker_label(quoted),
                             "other_text": quoted_text,
-                            "azha_text": row_text,
+                            "member_alpha_text": row_text,
                         }
                     )
         elif quoted_user == target_user_id and row_user not in excluded:
             other = member_state(row_user)
-            other["replies_to_azha"] += 1
+            other["replies_to_member_alpha"] += 1
             other["interactions"] += 1
 
     for row in stream:
@@ -309,7 +309,7 @@ def build_profile_prompt(
         "- self_concept: 400-800 字第一人称自我认知：我怎么看自己、怎么看群里这些人、什么话题我会接、什么情绪我怎么反应\n"
         "- speech_habits: 15-30 条，每条都指向真人可验证的口头禅、断句、接话方式、情绪表达、抬杠/自嘲/附和风格；能写具体词就写具体词\n"
         "- style_avoid: 8-15 条禁区，尤其覆盖：客服腔、解释腔、AI 腔、正式书面语、长篇大论、客套\n"
-        "- relationships: 按互动数据逐人列出他对每个群友的关系，每项含 member/relation/how_azha_talks/address_terms/notes；有语料依据才写，没依据的不写\n"
+        "- relationships: 按互动数据逐人列出他对每个群友的关系，每项含 member/relation/how_member_alpha_talks/address_terms/notes；有语料依据才写，没依据的不写\n"
         "- external_relations: 他反复提及/关注/评价的**群外人物**（虚拟主播、球星、up主、角色等），每项含 name（名字）/who（这个人的身份）/relation（他与这个人的关系，如铁粉/黑粉/路人）/attitude（他的真实态度，用他的原话风格概括）/evidence（1-2 条他本人的原句）；他高频转发、玩梗、维护的对象要写全\n"
         "- address_rules: 3-8 条他的称呼习惯（他怎么叫别人），并明确列出他绝不会用的称呼（如'主人''亲'这类与他不符的称呼）\n"
         "示例原句由程序确定性选取，你不需要输出 example_lines。\n"
@@ -472,7 +472,7 @@ def build_merged_profile_prompt(
         "- self_concept: 400-800 字第一人称自我认知\n"
         "- speech_habits: 20-35 条，合并各阶段的习惯，每条都指向可验证的口头禅、断句、接话方式、情绪表达、抬杠/自嘲/附和风格；能写具体词就写具体词\n"
         "- style_avoid: 8-15 条禁区（客服腔、解释腔、AI 腔、正式书面语、长篇大论、客套）\n"
-        "- relationships: 按互动数据逐人列出，每项含 member/relation/how_azha_talks/address_terms/notes\n"
+        "- relationships: 按互动数据逐人列出，每项含 member/relation/how_member_alpha_talks/address_terms/notes\n"
         "- external_relations: 他反复提及/关注/评价的群外人物（虚拟主播、球星、up主、角色等），含 name/who/relation/attitude/evidence\n"
         "- address_rules: 3-8 条他的称呼习惯，并明确列出他绝不会用的称呼（如'主人''亲'）\n"
         "示例原句由程序确定性选取，你不需要输出 example_lines。\n"

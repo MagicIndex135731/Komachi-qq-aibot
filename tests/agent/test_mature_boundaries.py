@@ -87,7 +87,7 @@ async def test_real_runtime_rotates_prior_session_at_source_budget_or_interrupti
     new_source = add_source(sqlite_engine, platform_id="rotation-current", text="synthetic new event")
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
         job = next(job for job in configured_social_jobs(fixture.router.runtime) if job.kind == "group")
-        scope = f"background:group:{GROUP}"
+        scope = f"group:{GROUP}"
         old_identity = "synthetic-old-session"
         checkpoint = {"session_id": old_identity, "session_path": str(fixture.executor.sessions.session_path(scope))}
         if rotation_reason == "in_flight":
@@ -126,7 +126,7 @@ async def test_production_group_long_native_checkpoint_resumes_without_rotating(
         fixture.executor.sessions.session_root = long_session_home(tmp_path) / "agent_sessions"
         job = next(job for job in configured_social_jobs(fixture.router.runtime) if job.kind == "group")
         observation = SocialObservation(job, FIXTURE_NOW, "synthetic persona", source_message_ids=(source,))
-        scope = f"background:group:{GROUP}"
+        scope = f"group:{GROUP}"
         identity = None
         for _ in range(2):
             from types import SimpleNamespace

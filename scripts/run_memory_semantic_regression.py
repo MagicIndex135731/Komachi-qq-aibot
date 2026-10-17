@@ -9,7 +9,7 @@ Usage:
   python scripts/run_memory_semantic_regression.py \
     --database /path/to/snapshot.db \
     --group-id 10001 --user-id 20001 --member-user-id 20002 \
-    --member-alias 阿渣 \
+    --member-alias 小甲 \
     --output report.json
 """
 

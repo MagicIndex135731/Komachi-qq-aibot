@@ -6,7 +6,7 @@ import json
 import threading
 import time
 
-from app.agent.runtime_trace import ITEM_ID, MAX_EVENT_BYTES, MAX_TURN_BYTES
+from app.agent.runtime_trace import ITEM_ID, MAX_EVENT_BYTES, MAX_TURN_BYTES, _background_execution
 
 
 def token(value):
@@ -88,9 +88,9 @@ class ConversationMetrics:
     def read(self, conversation_id):
         conversation = self.reader.read_conversation(conversation_id)
         turns = conversation['turns']
-        latest_meta = turns[-1]
+        latest_meta = next((meta for meta in reversed(turns) if not _background_execution(meta)), turns[-1])
         current_session = latest_meta.get('session_key')
-        inputs, outputs, cache_inputs, cache_counts = [], [], [], []
+        inputs, outputs, cache_inputs, cache_counts, totals = [], [], [], [], []
         requests = 0
         latest = None
         complete = True
@@ -107,6 +107,10 @@ class ConversationMetrics:
                         inputs.append(inp)
                     if out is not None:
                         outputs.append(out)
+                    if inp is not None and out is not None:
+                        # This adapter's input already includes cache reads.
+                        # Pair within one request; never add cached tokens again.
+                        totals.append(inp+out)
                     if inp is not None and cached is not None and cached <= inp:
                         cache_inputs.append(inp);cache_counts.append(cached)
                     if (latest is None and meta.get('session_key') == current_session
@@ -147,8 +151,12 @@ class ConversationMetrics:
                     pass
             usage = {'request_count':requests, 'input_tokens':sum(inputs) if inputs else None,
                 'output_tokens':sum(outputs) if outputs else None,
+                'real_total_tokens':sum(totals) if totals else None,
+                'total_known_requests':len(totals),
                 'cached_input_tokens':sum(cache_counts) if cache_counts else None,
                 'uncached_input_tokens':sum(cache_inputs) - sum(cache_counts) if cache_inputs else None,
+                'cache_creation_tokens':None, 'cache_creation_status':'not_reported_separately',
+                'input_token_semantics':'includes_cache',
                 'uncached_known_requests':len(cache_counts),
                 'cache_ratio':sum(cache_counts)/sum(cache_inputs) if sum(cache_inputs) else None,
                 'input_known_requests':len(inputs), 'output_known_requests':len(outputs),

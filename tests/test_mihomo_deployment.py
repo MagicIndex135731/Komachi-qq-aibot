@@ -28,7 +28,7 @@ def source_config() -> dict[str, object]:
     }
 
 
-def test_rendered_profile_routes_nova_to_hong_kong_and_qq_direct() -> None:
+def test_rendered_profile_routes_only_japan_and_qq_direct() -> None:
     rendered = MODULE.render_config(source_config())
 
     assert rendered["mode"] == "rule"
@@ -39,15 +39,17 @@ def test_rendered_profile_routes_nova_to_hong_kong_and_qq_direct() -> None:
     group = rendered["proxy-groups"][0]
     assert group["name"] == MODULE.NOVA_GROUP
     assert group["type"] == "url-test"
-    assert group["proxies"] == ["🇭🇰 香港Y01"]
+    assert group["proxies"] == ["🇯🇵 日本Y01"]
+    assert [p['name'] for p in rendered['proxies']] == ["🇯🇵 日本Y01"]
+    assert len(rendered['proxy-groups']) == 1
     assert rendered["rules"][0] == f"DOMAIN,{MODULE.NOVA_HOST},{MODULE.NOVA_GROUP}"
     assert rendered["rules"].count("DOMAIN-SUFFIX,qq.com,DIRECT") == 1
     assert rendered["rules"].count("DOMAIN-SUFFIX,deepseek.com,DIRECT") == 1
     assert rendered["rules"].index("DOMAIN-SUFFIX,deepseek.com,DIRECT") < rendered[
         "rules"
-    ].index("MATCH,选择节点")
+    ].index(f"MATCH,{MODULE.NOVA_GROUP}")
     assert "DOMAIN-SUFFIX,qq.com,选择节点" not in rendered["rules"]
-    assert rendered["rules"][-1] == "MATCH,选择节点"
+    assert rendered["rules"][-1] == f"MATCH,{MODULE.NOVA_GROUP}"
 
 
 def test_deepseek_direct_rule_survives_rerender_without_duplication() -> None:
@@ -64,12 +66,40 @@ def test_deepseek_direct_rule_survives_rerender_without_duplication() -> None:
     assert rendered["rules"].count("DOMAIN-SUFFIX,qq.com,DIRECT") == 1
 
 
-def test_rendered_profile_fails_closed_without_hong_kong_nodes() -> None:
+def test_rendered_profile_fails_closed_without_japan_nodes() -> None:
     source = source_config()
-    source["proxies"] = [{"name": "日本Y01", "type": "ss"}]
+    source["proxies"] = [{"name": "香港Y01", "type": "ss"}]
 
-    with pytest.raises(ValueError, match="no Hong Kong"):
+    with pytest.raises(ValueError, match="no Japan"):
         MODULE.render_config(source)
+
+
+def test_source_listeners_and_provider_fallbacks_are_not_inherited() -> None:
+    source = source_config()
+    source.update({'port': 7897, 'socks-port': 7898,
+                   'proxy-providers': {'foreign': {'url': 'https://example.invalid/sub'}}})
+    rendered = MODULE.render_config(source)
+    assert not {'port', 'socks-port', 'proxy-providers'} & rendered.keys()
+
+
+def test_default_sync_source_is_named_ikuuu_profile(tmp_path) -> None:
+    (tmp_path / 'profiles').mkdir()
+    (tmp_path / 'profiles' / 'subscription.yaml').write_text('proxies: []', encoding='utf-8')
+    (tmp_path / 'profiles.yaml').write_text(
+        'items:\n- name: ikuuu\n  file: subscription.yaml\n- name: other\n  file: other.yaml\n',
+        encoding='utf-8')
+    assert MODULE.resolve_ikuuu_source(tmp_path) == tmp_path / 'profiles' / 'subscription.yaml'
+
+
+def test_ikuuu_discovery_fails_on_ambiguity_and_path_escape(tmp_path) -> None:
+    metadata = tmp_path / 'profiles.yaml'
+    metadata.write_text('items:\n- name: ikuuu\n- name: ikuuu backup\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='exactly one'):
+        MODULE.resolve_ikuuu_source(tmp_path)
+    (tmp_path / 'outside.yaml').write_text('proxies: []', encoding='utf-8')
+    metadata.write_text('items:\n- name: ikuuu\n  file: ../outside.yaml\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='inside profiles'):
+        MODULE.resolve_ikuuu_source(tmp_path)
 
 
 def test_mihomo_service_is_local_only_and_precedes_stack() -> None:
@@ -92,7 +122,7 @@ def test_mihomo_service_is_local_only_and_precedes_stack() -> None:
     assert '"${tester}" -t' in installer
     assert 'mv -f "${CONFIG_CANDIDATE}" "${CONFIG_PATH}"' in installer
     assert "systemctl restart xiaomachi-mihomo.service" in installer
-    assert "clash-verge.yaml" in sync
+    assert '--print-ikuuu-source' in sync and '--page-only' in sync
     assert "config.yaml.next" in sync
     assert '"Country.mmdb" = "Country.mmdb"' in sync
     assert '"geosite.dat" = "GeoSite.dat"' in sync

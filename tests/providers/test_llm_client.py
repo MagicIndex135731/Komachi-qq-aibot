@@ -324,10 +324,10 @@ def test_generate_text_with_tools_executes_and_returns_final_text() -> None:
 
     def executor(name, arguments):
         executed.append((name, arguments))
-        return "阿渣喜欢喝冰美式"
+        return "小甲喜欢喝冰美式"
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣喜欢喝什么？"],
+        ["Target message: 小甲喜欢喝什么？"],
         tools=MEMORY_TOOLS,
         tool_executor=executor,
         max_tool_rounds=2,
@@ -344,7 +344,7 @@ def test_generate_text_with_tools_executes_and_returns_final_text() -> None:
         {
             "type": "function_call_output",
             "call_id": "call_1",
-            "output": "阿渣喜欢喝冰美式",
+            "output": "小甲喜欢喝冰美式",
         }
     ]
 
@@ -558,9 +558,9 @@ def test_generate_text_with_tools_replays_reasoning_items_before_function_items(
     )
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣喜欢喝什么？"],
+        ["Target message: 小甲喜欢喝什么？"],
         tools=MEMORY_TOOLS,
-        tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+        tool_executor=lambda _name, _args: "小甲喜欢冰美式",
     )
 
     assert text == "最终回答"
@@ -622,7 +622,7 @@ def test_generate_text_with_tools_keeps_parallel_call_block_contiguous() -> None
         return f"hit for {arguments['query']}"
 
     text = client.generate_text_with_tools(
-        ["Target message: 阿渣最近怎么样？"],
+        ["Target message: 小甲最近怎么样？"],
         tools=MEMORY_TOOLS,
         tool_executor=executor,
     )
@@ -697,9 +697,9 @@ def test_generate_text_with_tools_degrades_to_plain_when_tool_round_is_rejected(
 
     with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
         text = client.generate_text_with_tools(
-            ["Target message: 阿渣喜欢喝什么？"],
+            ["Target message: 小甲喜欢喝什么？"],
             tools=MEMORY_TOOLS,
-            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+            tool_executor=lambda _name, _args: "小甲喜欢冰美式",
             max_tool_rounds=2,
         )
 
@@ -764,9 +764,9 @@ def test_generate_text_with_tools_degrades_when_fallback_model_round_is_rejected
 
     with caplog.at_level(logging.WARNING, logger="app.providers.llm_client"):
         text = client.generate_text_with_tools(
-            ["Target message: 阿渣喜欢喝什么？"],
+            ["Target message: 小甲喜欢喝什么？"],
             tools=MEMORY_TOOLS,
-            tool_executor=lambda _name, _args: "阿渣喜欢冰美式",
+            tool_executor=lambda _name, _args: "小甲喜欢冰美式",
         )
 
     assert text == "降级后的回答"

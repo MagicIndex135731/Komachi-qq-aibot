@@ -147,6 +147,15 @@ class AgentToolEffectRepository:
 
     get = read
 
+    def media_delivery_claims(self, scope: str, run_id: str):
+        """Read legacy bundle fences for this account and canonical request."""
+        from app.storage.db import session_scope
+        with session_scope(self.engine) as session:
+            rows=session.scalars(select(AgentToolEffect).where(AgentToolEffect.account_id==self.account_id,
+                AgentToolEffect.scope==scope,AgentToolEffect.run_id==run_id,
+                AgentToolEffect.operation=='media_delivery_once').limit(64))
+            return tuple(self._snapshot(row) for row in rows)
+
     def recent(self, scope: str, *, limit: int = 16) -> tuple[dict, ...]:
         """Return scoped real effect metadata for a resumed/rotated session."""
         from app.storage.db import session_scope

@@ -16,14 +16,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.adapters.onebot_models import PrivateMessageEvent
 from app.agent.harness_runtime import HarnessToolAgent, CONTEXT_FORMAT_VERSION, model_context_format_version
 from app.agent.harness_session_files import native_session_logs, native_session_size
-from app.agent.context_policy import RequestContextPolicy, serious_request_policy
-from app.agent.context_recovery import safe_closed_items, should_rotate_context, context_reusable, failure_notice_text
+from app.agent.context_policy import serious_request_policy
+from app.agent.conversation_context import context_policy, select_native_context
+from app.agent.context_recovery import safe_closed_items, context_reusable, failure_notice_text
 from app.agent.research_tasks import ResearchTaskWorkspace
 from app.agent.delegated_research import (DelegationBudget, delegation_tool,
                                         child_inputs, run_delegated_research, selected_task_sources)
@@ -55,6 +56,27 @@ def _text(maximum=500):
     return {"type": "string", "minLength": 1, "maxLength": maximum}
 
 
+def _completed_media_request(checkpoint, source_id):
+    """Only a confirmed, fully completed original request settles late returns."""
+    return any(receipt.get('reply_source_id') == source_id
+        and receipt.get('operation') == 'send_private' and receipt.get('status') == 'sent'
+        and receipt.get('receipt_id') and receipt.get('media_goal_completed') is True
+        for receipt in checkpoint.get('receipts', []) if isinstance(receipt, dict))
+
+
+def _mark_completed_media_request(receipts, source_id, result):
+    state = result.task_status
+    if (result.status != 'sent' or not result.receipt_id or state.get('source_id') != source_id
+            or state.get('delivery') != 'media' or state.get('status') != 'completed'
+            or state.get('completion_gaps') != []):
+        return
+    for receipt in receipts:
+        if (receipt.get('reply_source_id') == source_id and receipt.get('operation') == 'send_private'
+                and receipt.get('status') == 'sent' and receipt.get('media') is True
+                and receipt.get('receipt_id') == result.receipt_id):
+            receipt['media_goal_completed'] = True
+
+
 class PrivateHarnessService:
     job_type = "private_agent_turn"
 
@@ -73,8 +95,8 @@ class PrivateHarnessService:
             session_root=settings.data_dir / "agent_sessions", clock=self.clock, max_items=40, max_characters=24000)
         self.costs = AutonomousRepository(self.engine, account_id=self.account_id, clock=self.clock)
         # A native runtime thread remains occupied while its tools execute.
-        self.runtime_runner, self.tool_runner = BoundedBlockingRunner(1), BoundedBlockingRunner(2)
-        self.research_runner = BoundedBlockingRunner(2)
+        self.runtime_runner, self.tool_runner = BoundedBlockingRunner(4), BoundedBlockingRunner(4)
+        self.research_runner = BoundedBlockingRunner(6)
         self.running = False
         self._owner = uuid4().hex
         self._loop = None
@@ -82,7 +104,8 @@ class PrivateHarnessService:
         self._locks = {}
         self._active = {}
         self._active_sources = {}
-        self._model_lock = asyncio.Lock()
+        self._active_users = {}
+        self._model_lock = asyncio.Semaphore(4)
         self.research_jobs = ResearchDelegationQueue(self.engine, account_id=self.account_id, surface='private',
             execute=self._execute_research, deliver=self._return_research, clock=lambda: self.clock(),
             trace_root=self.settings.data_dir / 'agent_monitor' if getattr(self.settings, 'agent_monitor_enabled', False) else None,
@@ -274,7 +297,7 @@ class PrivateHarnessService:
                         Job.run_at <= now).order_by(Job.run_at, Job.id).limit(40)))
                     users = tuple(dict.fromkeys(row.payload_json["user_id"] for row in rows))
                 for user_id in users:
-                    await self._drain_user(user_id)
+                    await self._drain_user(user_id, wait=False)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -290,9 +313,12 @@ class PrivateHarnessService:
         with self._transaction() as session:
             running = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self._prefix(user_id)), Job.status == "running")))
+            live = sum(bool(row.lease_until and row.lease_until > now) for row in running)
+            if live >= 3:
+                return None
             for row in running:
                 if row.lease_until and row.lease_until > now:
-                    return None
+                    continue
                 dispatched = tuple(session.scalars(select(AgentToolEffect).where(AgentToolEffect.account_id == self.account_id,
                     AgentToolEffect.scope.in_((f"private:{user_id}", f"owner:private:{user_id}")), AgentToolEffect.run_id == f"private-job:{row.id}",
                     AgentToolEffect.status.in_(("dispatching", "uncertain", "sent")))))
@@ -308,9 +334,16 @@ class PrivateHarnessService:
                     if item.payload_json.get('kind')=='wakeup':
                         item.status,item.last_error_code='blocked','owner_required'
                 session.flush()
-            row = session.scalars(select(Job).where(Job.job_type == self.job_type,
+            query = select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self._prefix(user_id)), Job.status == "queued", Job.run_at <= now)
-                .order_by(Job.run_at, Job.id).limit(1)).first()
+            busy_sources = [item.payload_json['source_id'] for item in running if item.status == 'running'
+                and item.lease_until and item.lease_until > now and item.payload_json.get('kind') != 'research_result']
+            if busy_sources:
+                # A queued result is ready for the foreground status tool;
+                # starting a second model on that same request races its send.
+                query = query.where(or_(Job.payload_json['kind'].as_string() != 'research_result',
+                    Job.payload_json['source_id'].as_integer().not_in(busy_sources)))
+            row = session.scalars(query.order_by(Job.run_at, Job.id).limit(1)).first()
             if row is None:
                 return None
             if row.attempt_count >= row.max_attempts:
@@ -319,28 +352,37 @@ class PrivateHarnessService:
             row.attempt_count += 1
             row.status, row.locked_by, row.locked_at = "running", self._owner, now
             row.lease_until = now + timedelta(seconds=300)
-            return row.id, dict(row.payload_json)
+            return row.id, {**row.payload_json, '_parallel_context':bool(live)}
 
-    async def _drain_user(self, user_id):
+    async def _drain_user(self, user_id, *, wait=True):
         lock = self._locks.setdefault(user_id, asyncio.Lock())
+        launched = []
         async with lock:
-            while self.running:
+            # Leave excess jobs queued, without a running lease that could
+            # expire while another long request holds the model capacity.
+            while self.running and len(self._active) < 4:
                 claimed = self._claim(user_id)
                 if claimed is None:
-                    return
+                    break
                 task = asyncio.create_task(self._execute(*claimed))
-                self._active[user_id] = task
-                self._active_sources[user_id] = claimed[1]['source_id']
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    # Cancelling one user's reset turn must not kill the shared
-                    # scheduler or discard their next already-queued message.
-                    if asyncio.current_task().cancelling():
-                        raise
-                finally:
-                    self._active.pop(user_id, None)
-                    self._active_sources.pop(user_id, None)
+                job_id = claimed[0]
+                self._active[job_id] = task
+                self._active_users[job_id] = user_id
+                self._active_sources[job_id] = claimed[1]['source_id']
+                launched.append(task)
+                task.add_done_callback(lambda done, key=job_id:self._job_done(key, done))
+        if wait:
+            waiting = launched or [task for key, task in self._active.items() if self._active_users.get(key) == user_id]
+            if waiting:
+                await asyncio.gather(*waiting, return_exceptions=True)
+
+    def _job_done(self, job_id, task):
+        self._active.pop(job_id, None)
+        self._active_users.pop(job_id, None)
+        self._active_sources.pop(job_id, None)
+        if not task.cancelled():
+            task.exception()
+        self._wake.set()
 
     def _finish(self, job_id, status, reason):
         with self._transaction() as session:
@@ -366,10 +408,10 @@ class PrivateHarnessService:
                 if before_source_id is not None and (row.payload_json or {}).get('source_id', 0) > before_source_id:
                     continue
                 row.status, row.last_error_code = "cancelled", "private_user_cancelled"
-        task = self._active.get(user_id)
-        if (task is not None and task is not asyncio.current_task()
-                and (before_source_id is None or self._active_sources.get(user_id, 0) <= before_source_id)):
-            task.cancel()
+        for job_id, task in tuple(self._active.items()):
+            if (self._active_users.get(job_id) == user_id and task is not asyncio.current_task()
+                    and (before_source_id is None or self._active_sources.get(job_id, 0) <= before_source_id)):
+                task.cancel()
 
     async def _execute(self, job_id, payload):
         user_id, source_id = payload["user_id"], payload["source_id"]
@@ -493,6 +535,11 @@ class PrivateHarnessService:
                         self.sessions.clear_if_source(session_scope_key, prior_source)
                         break
             previous = self.sessions.read(session_scope_key)
+            media_return = (payload['kind'] == 'research_result'
+                and (payload.get('delegated_result') or {}).get('kind') == 'media_result')
+            if media_return and _completed_media_request(previous['checkpoint'], source_id):
+                status, reason = 'completed', 'original_media_request_already_completed'
+                return
             sources = list(dict.fromkeys([source_id, *quoted_source_ids, *referenced_source_ids]))
             retained_sources.update(previous.get('context_source_message_ids', previous['source_message_ids']))
             snapshot_cache = {}
@@ -515,19 +562,23 @@ class PrivateHarnessService:
             runtime_id = previous["checkpoint"].get("runtime_id") or uuid4().hex
             context_version = model_context_format_version(self.service.llm_client)
             home = self.sessions.session_path(session_scope_key).parent / "harness"
-            native_logs = native_session_logs(home, runtime_id)
-            if (previous["checkpoint"].get("in_flight")
-                    or should_rotate_context(previous['checkpoint'])
-                    or native_session_size(native_logs) > 8 * 1024 * 1024
-                    or previous['checkpoint'].get('context_format_version') != context_version):
+            owner_home = home
+            parallel_context = payload.get('_parallel_context', False)
+            parallel_home = None
+            if parallel_context:
+                import tempfile
+                home.parent.mkdir(parents=True, exist_ok=True)
+                parallel_home = tempfile.TemporaryDirectory(prefix='parallel-', dir=home.parent)
+                home = Path(parallel_home.name)
                 runtime_id = uuid4().hex
-            bootstrap_context = not native_logs or runtime_id != previous['checkpoint'].get('runtime_id')
-            from app.agent.runtime_trace import context_observation
-            trace_context_state = context_observation(session_scope_key,
-                previous_id=previous['checkpoint'].get('runtime_id'), current_id=runtime_id,
-                checkpoint=previous['checkpoint'], history_present=bool(native_logs),
-                restored_count=len(safe_closed_items(previous['items'])) if bootstrap_context else 0,
-                format_version=context_version)
+            native_logs = native_session_logs(home, runtime_id)
+            native_context = select_native_context(session_scope_key, {} if parallel_context else previous['checkpoint'],
+                version=context_version, history_present=bool(native_logs), history_bytes=native_session_size(native_logs),
+                restored_items=len(safe_closed_items(previous['items'])), id_field='runtime_id')
+            runtime_id, bootstrap_context = native_context.session_id, native_context.restore
+            trace_context_state = native_context.metadata
+            if parallel_context:
+                trace_context_state = {**trace_context_state, 'context_reason':'parallel_snapshot', 'context_lifetime':'snapshot'}
             output_texts, receipts = [], list(previous["checkpoint"].get("receipts", []))
             current_dispatch = None
             from app.agent.artifacts import AutonomousArtifactStore
@@ -544,6 +595,7 @@ class PrivateHarnessService:
                     'sources': list(known_sources), 'memory': {}, 'operation': operation, 'arguments': args,
                     'context_snapshot': freeze_context(),
                     'parent_task_id': workspace.task_id if workspace.formal else None,
+                    'request_budget':workspace.media_budget.reference() if getattr(workspace,'media_budget',None) else None,
                     'candidates': candidates or {},
                     'private_scope': payload['private_scope'], 'goal': '完成媒体下载并交付真实产物'},
                     parent_turn='source:' + str(source_id), before_commit=guard.require_valid)
@@ -676,6 +728,30 @@ class PrivateHarnessService:
                         "image_message_ids": data.get("image_receipt_ids", []), "notice_message_ids": data.get("notice_receipt_ids", []),
                         "actual_pixels_attached": bool(images)}, images=images)
 
+            async def read_artifact(args):
+                guard.require_valid()
+                identifier=args['artifact_id']
+                from app.core.downloaded_media import DownloadedMediaCache
+                try:
+                    cache=DownloadedMediaCache.for_store(store,self.settings)
+                    await self.tool_runner.run(cache.pin,(identifier,))
+                    path=await self.tool_runner.run(store.get,identifier)
+                    if path is None:
+                        return ToolOutcome({'error':'private_image_artifact_unavailable'},'blocked')
+                    dependencies=await self.tool_runner.run(store.provenance,identifier)
+                    if (len(set(known_sources)|set(dependencies))>200
+                            or any(not valid_task_source(source) for source in dependencies)):
+                        return ToolOutcome({'error':'private_image_artifact_source_revoked'},'blocked')
+                    if path.suffix not in {'.png','.jpg','.webp','.gif'}:
+                        return ToolOutcome({'error':'private_artifact_not_image'},'blocked')
+                    known_sources[:]=list(dict.fromkeys([*known_sources,*dependencies]))
+                    guard.require_valid()
+                    return ToolOutcome({'artifact_id':identifier,'kind':'image','pixels_attached':True},
+                        images=(ImageAttachment(url='',local_path=str(path),reference_subject='当前用户已保存的实际图片；按请求筛选主体'),))
+                except (ValueError,OSError):
+                    guard.require_valid()
+                    return ToolOutcome({'error':'private_image_artifact_unavailable'},'blocked')
+
             async def context(args):
                 guard.require_valid()
                 from app.agent.group_forward import observed_forward_sources
@@ -726,6 +802,8 @@ class PrivateHarnessService:
             from app.agent.request_task import delivery_properties
             send_schema['properties'].update(delivery_properties())
             tools = [AgentTool("read_private_context", "读取当前用户的日常上下文和实际图片", _schema(), context),
+                AgentTool('read_artifact','必要时少量确认当前用户合法静态图片；主题媒体以原帖正文判断，不逐份看图，不预览视频/动图。仅artifact_id，不接受路径，不跨用户或撤回来源',
+                    _schema(artifact_id=_text(64)),read_artifact),
                 AgentTool("send_private", "向当前用户发送聊天或结果；图片普通最多2张，as_forward=true最多20张。media_artifact_ids配合as_forward=true按原顺序打包图片/视频，不与artifact_ids/video_artifact_id混用；video_artifact_id只发单视频。按真实回执判断成功", send_schema, send, "write"),
                 AgentTool("generate_private_image", "通过既有私聊绘图服务异步画图；排队不是生成或发送成功", _schema(prompt=_text(2000), use_current_images={"type": "boolean"}), draw, "image"),
                 AgentTool("private_image_status", "读取当前用户绘图任务的真实状态", _schema(task_id={"type": "integer", "minimum": 1, "maximum": 2**63 - 1}), image_status),
@@ -765,9 +843,10 @@ class PrivateHarnessService:
                 tools.extend(build_forward_tools(forward_context,self.gateway))
 
             async def invoke(tool, args, call_id):
-                from app.agent.media_delivery import send_media_once
+                from app.agent.media_delivery import send_media_once,artifact_delivery_identities
                 return await send_media_once(self.effects, scope=scope, source_id=source_id,
                     operation=tool.name, arguments=args, require_valid=guard.require_valid,
+                    media_identity=lambda i:artifact_delivery_identities(store,i),
                     invoke=lambda: invoke_effect(tool, args, call_id))
 
             async def invoke_effect(tool, args, call_id):
@@ -804,7 +883,9 @@ class PrivateHarnessService:
                 final = "sent" if result.status == "ok" and tool.name == "generate_private_image" else result.status
                 self.effects.finish(effect_id, final, receipt={"data": result.data, "receipt_id": result.receipt_id}, reason=tool.name)
                 receipts.append({"call_id": call_id, "status": final, "receipt_id": result.receipt_id,
-                    "effect_id": effect_id, "replay_allowed": False, "reply_source_id": source_id})
+                    "effect_id": effect_id, "replay_allowed": False, "reply_source_id": source_id,
+                    "operation": tool.name, "media": bool(args.get('artifact_ids')
+                        or args.get('media_artifact_ids') or args.get('video_artifact_id'))})
                 return result
 
             tools.extend(workspace.tools(guard))
@@ -845,6 +926,7 @@ class PrivateHarnessService:
                     'sources': list(child_sources), 'memory': {}, 'goal': args['goal'], 'reason': args['reason'],
                     'context_snapshot': freeze_context(),
                     'parent_task_id': workspace.task_id if workspace.formal else None,
+                    'request_budget':workspace.media_budget.reference() if getattr(workspace,'media_budget',None) else None,
                     'deliverable': args['deliverable'], 'task_id': child.task_id, 'task_key': f'delegate:{job_id}',
                     'resume_task_id': args.get('task_id'), 'private_scope': payload['private_scope']},
                     parent_turn=job_id, before_commit=guard.require_valid)
@@ -883,6 +965,8 @@ class PrivateHarnessService:
                     "history_in_native_session": not bootstrap_context,
                     "daily_session_summary": self.service._session_summary(session_id=daily_id)[:4000] if bootstrap_context else ''}, ensure_ascii=False)]
             agent = self.runtime_factory(decision_client=self.service.llm_client, max_steps=32, max_external_writes=self.settings.agent_max_external_writes,
+                trace_conversation_key=str(owner_home),
+                cache_namespace=f'owner:{self.account_id}:{scope}',
                 trace_root=(self.settings.data_dir / "agent_monitor" if getattr(self.settings, "agent_monitor_enabled", False) else None),
                 trace_context={**(payload.get('_trace_parent') or {}), **trace_context_state, **trace_trigger,
                     "surface": "private", "scope_id": user_id, "actor_id": user_id,
@@ -892,7 +976,8 @@ class PrivateHarnessService:
                         else 'research_result' if payload['kind'] == 'research_result' else 'private_wakeup',
                     'trigger_text': (event.plain_text if payload['kind'] == 'message' else payload.get('goal', ''))[:4000]},
                 clock=self.clock,
-                context_policy=RequestContextPolicy.from_settings(self.settings), timeout_seconds=turn_timeout,
+                context_policy=context_policy(self.settings), timeout_seconds=turn_timeout,
+                continuation_mode=getattr(self.settings, 'agent_responses_continuation', 'auto'),
                 require_reply=payload["kind"] in {'message', 'research_result'},
                 reply_source_id=source_id if payload["kind"] in {'message', 'research_result'} else None,
                 model_request_timeout_seconds=self.settings.agent_model_request_timeout_seconds,
@@ -905,14 +990,20 @@ class PrivateHarnessService:
                 finish_after_delivery=lambda:
                     (payload.get('delegated_result') or {}).get('kind')=='media_result')
             async with self._model_lock:
+                if media_return and _completed_media_request(self.sessions.read(session_scope_key)['checkpoint'], source_id):
+                    guard.require_valid()
+                    status, reason = 'completed', 'original_media_request_already_completed'
+                    return
                 with self._transaction() as session:
                     row = session.get(Job, job_id)
                     if row and row.status == "running" and row.locked_by == self._owner:
                         row.lease_until = self.clock().astimezone(UTC).replace(tzinfo=None) + timedelta(seconds=turn_timeout + 60)
-                previous = self.sessions.begin_turn(session_scope_key, {"framework": "deepseek-harness", "version": "0.1.5rc1",
+                native_revision = previous['revision'] + 1
+                if not parallel_context:
+                    previous = self.sessions.begin_turn(session_scope_key, {"framework": "deepseek-harness", "version": "0.1.5rc1",
                     "context_format_version": context_version,
                     "runtime_id": runtime_id, "session_path": str(home), "receipts": receipts}, sources,
-                    expected_revision=previous["revision"], before_commit=guard.require_valid)
+                        expected_revision=self.sessions.read(session_scope_key)['revision'], before_commit=guard.require_valid)
                 delegation_budget.start()
                 from app.agent.media_tasks import media_previews
                 result_images = media_previews(payload.get('delegated_result') or {}, store, guard, self.settings)
@@ -937,13 +1028,16 @@ class PrivateHarnessService:
                 {"role": "assistant", "content": "\n".join(output_texts), "status": result.status,
                     "timestamp": shanghai_aware(self.clock()).isoformat(timespec="seconds"), "reply_source_id": source_id}]
             items = safe_closed_items(items) if context_reusable(result) else safe_closed_items(previous['items'])
-            snapshot = self.sessions.save(session_scope_key, items, {"framework": "deepseek-harness", "version": "0.1.5rc1",
+            _mark_completed_media_request(receipts, source_id, result)
+            snapshot = self.sessions.complete_turn(session_scope_key, items[-2:] if context_reusable(result) else [], {"framework": "deepseek-harness", "version": "0.1.5rc1",
                 "context_format_version": context_version,
                 "runtime_id": runtime_id, "session_path": str(home), "in_flight": False,
                 "last_status": result.status, "reply_source_id": source_id,
                 "task_status": result.task_status,
                 "last_reason": result.reason, "context_reusable": context_reusable(result),
-                "receipts": receipts[-100:]}, tuple(dict.fromkeys([*sources, *known_sources])), expected_revision=previous["revision"],
+                "native_history_retained": True, "native_history_available": bool(native_session_logs(home, runtime_id)),
+                "receipts": receipts[-100:]}, tuple(dict.fromkeys([*sources, *known_sources])), native_revision=native_revision,
+                parallel=parallel_context,
                 before_commit=guard.require_valid, retained_context={'sources': sorted(retained_sources)})
             if output_texts and result.status == 'sent' and context_reusable(result):
                 with session_scope(self.engine) as session:
@@ -960,3 +1054,5 @@ class PrivateHarnessService:
             logger.warning("private_harness_turn_failed user_id=%s job_id=%s error_type=%s", user_id, job_id, type(exc).__name__)
         finally:
             self._finish(job_id, status, reason)
+            if 'parallel_home' in locals() and parallel_home is not None:
+                parallel_home.cleanup()

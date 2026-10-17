@@ -48,9 +48,9 @@ def test_ordinary_timer_or_duplicate_text_cannot_wake_model(sqlite_engine):
         bootstrap_cursor=0, max_source_id=30)[0] is None
 
 
-def test_silence_backoff_and_failure_does_not_consume_sources(sqlite_engine):
+def test_silence_never_increases_interval_and_failure_does_not_consume_sources(sqlite_engine):
     repo, now = setup_repo(sqlite_engine)
-    for iteration, minutes in enumerate([10, 20, 30, 30]):
+    for iteration, minutes in enumerate([5, 5, 5, 5]):
         permit, _, _ = claim(repo, 1 + 8*iteration)
         assert permit
         repo.finish(permit, status='silent')
@@ -121,4 +121,17 @@ def test_busy_hour_stays_bounded_without_spending_a_model_on_local_checks(sqlite
             requests += int(repo.reserve(permit, 'model'))
             repo.finish(permit, status='silent')
         now[0] += timedelta(minutes=1)
-    assert requests == admissions == 3
+    assert requests == admissions == 6  # Real hourly cap, not silent penalties.
+
+
+def test_low_traffic_waits_bounded_time_and_empty_ticks_never_wake(sqlite_engine):
+    repo, now = setup_repo(sqlite_engine)
+    assert claim(repo, count=1)[1] == 'insufficient_new_messages'
+    now[0] += timedelta(seconds=899)
+    assert not claim(repo, count=1)[0]
+    now[0] += timedelta(seconds=1)
+    permit, _, _ = claim(repo, count=1)
+    assert permit
+    repo.finish(permit, status='silent')
+    now[0] += timedelta(hours=2)
+    assert claim(repo, count=1)[1] == 'insufficient_new_messages'

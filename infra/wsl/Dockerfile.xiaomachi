@@ -1,3 +1,14 @@
+FROM golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS xhs-builder
+ARG HTTPS_PROXY
+ARG HTTP_PROXY
+ENV GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn
+WORKDIR /src
+RUN curl -fSL --connect-timeout 8 --max-time 80 -o source.tgz \
+      https://codeload.github.com/xpzouying/xiaohongshu-mcp/tar.gz/7797fd375aba02dcd33afe143f6bee13e5870859 \
+    && tar xzf source.tgz --strip-components=1 && rm source.tgz
+COPY infra/wsl/xhs-crawler/main.go ./cmd/xiaomachi-readonly/main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/xhs-readonly ./cmd/xiaomachi-readonly
+
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ARG PIP_DEFAULT_TIMEOUT=120
@@ -28,7 +39,17 @@ RUN apt-get update \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
+       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libcups2t64 libdrm2 libgbm1 libgtk-3-0t64 \
+       libnspr4 libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 \
+       fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
+
+# Browser and crawler are image dependencies. No runtime download, host daemon,
+# open MCP port, or account write tool is needed for XHS collection.
+RUN python -c "import urllib.request,zipfile,io,os; b=urllib.request.urlopen('https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.84/linux64/chrome-linux64.zip',timeout=120).read(); zipfile.ZipFile(io.BytesIO(b)).extractall('/opt/xhs'); os.rename('/opt/xhs/chrome-linux64','/opt/xhs/chrome')" \
+    && chmod +x /opt/xhs/chrome/chrome /opt/xhs/chrome/chrome_crashpad_handler
+COPY --from=xhs-builder /out/xhs-readonly /usr/local/bin/xhs-readonly
+COPY --from=xhs-builder /src/LICENSE /opt/xhs/UPSTREAM-LICENSE
 
 COPY app ./app
 COPY configs ./configs

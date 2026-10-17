@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 def uses_mihomo(content: str) -> bool:
     values: dict[str, str] = {}
-    keys = {"XIAOMACHI_HTTP_PROXY", "XIAOMACHI_HTTPS_PROXY", "DOCKER_HTTP_PROXY", "DOCKER_HTTPS_PROXY", 'WEB_PAGE_PROXY_URL'}
+    keys = {"XIAOMACHI_HTTP_PROXY", "XIAOMACHI_HTTPS_PROXY", "DOCKER_HTTP_PROXY", "DOCKER_HTTPS_PROXY", 'WEB_PAGE_PROXY_URL', 'X_CRAWLER_PROXY_URL', 'X_CRAWLER_SESSION_FILE'}
     for line in content.splitlines():
         match = re.match(r"\s*(?:export\s+)?([A-Z_]+)\s*=\s*(.*?)\s*$", line)
         if match and match[1] in keys:
@@ -24,7 +24,7 @@ def uses_mihomo(content: str) -> bool:
                 return True
         except ValueError:
             pass
-    page_proxy = values.get('WEB_PAGE_PROXY_URL', '')
+    page_proxy = values.get('WEB_PAGE_PROXY_URL', '') or (values.get('X_CRAWLER_PROXY_URL', 'http://127.0.0.1:18797') if values.get('X_CRAWLER_SESSION_FILE') else '')
     if page_proxy:
         try:
             parsed = urlsplit(page_proxy)

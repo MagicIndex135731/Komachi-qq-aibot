@@ -126,14 +126,15 @@ def test_midnight_patrol_moves_to_random_morning(sqlite_engine):
         now=morning + timedelta(minutes=30))
 
 
-def test_declined_post_is_reviewed_until_content_changes(sqlite_engine):
+def test_actual_assessment_expires_and_content_change_is_immediately_eligible(sqlite_engine):
     repo = SocialAgentRepository(sqlite_engine)
     post = SocialPost(900000101, "post-a", "公开内容", NOW)
     assert repo.unreviewed_posts(account_id=ACCOUNT, posts=(post,)) == (post,)
-    repo.mark_posts_reviewed(account_id=ACCOUNT, posts=(post,), now=NOW)
-    assert not SocialAgentRepository(sqlite_engine).unreviewed_posts(account_id=ACCOUNT, posts=(post,))
+    repo.assess_post(account_id=ACCOUNT, post=post, status='no_response', now=NOW, minutes=30)
+    assert not SocialAgentRepository(sqlite_engine).unreviewed_posts(account_id=ACCOUNT, posts=(post,), now=NOW)
     changed = replace(post, text="新增内容")
-    assert repo.unreviewed_posts(account_id=ACCOUNT, posts=(changed,)) == (changed,)
+    assert repo.unreviewed_posts(account_id=ACCOUNT, posts=(changed,), now=NOW) == (changed,)
+    assert repo.unreviewed_posts(account_id=ACCOUNT, posts=(post,), now=NOW+timedelta(minutes=31)) == (post,)
 
 
 @pytest.mark.parametrize("choose_high,expected_minutes", [(False, 30), (True, 90)])

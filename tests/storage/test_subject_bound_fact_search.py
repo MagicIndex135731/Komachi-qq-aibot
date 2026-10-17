@@ -12,7 +12,7 @@ def test_group_fact_search_applies_explicit_subject_set_without_changing_unbound
     observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
     with session_scope(sqlite_engine) as session:
         memories = MemoryRepository(session)
-        for subject_id, name in (("42", "阿渣"), ("43", "加菲猫"), ("44", "小明")):
+        for subject_id, name in (("42", "小甲"), ("43", "小丁丁"), ("44", "小明")):
             memories.add_memory(
                 scope_type="group",
                 scope_id="10001",

@@ -277,7 +277,32 @@ class AutonomousArtifactStore:
     @staticmethod
     def _description(metadata: dict) -> dict:
         return {"id": metadata["id"], "origin": metadata["origin"], "type": metadata["type"],
-                "size": metadata["size"], "hash": metadata["sha256"]}
+                "size": metadata["size"], "hash": metadata["sha256"],
+                **({'content_sha256':metadata['content_sha256']} if metadata.get('content_sha256') else {}),
+                **({'logical_media_id': metadata['logical_media_id']} if metadata.get('logical_media_id') else {})}
+
+    def bind_media_identity(self, artifact_id: str, identity: str):
+        """Trusted downloader metadata only; this never changes source authority."""
+        if not isinstance(identity, str) or not 1 <= len(identity) <= 4096:
+            raise ValueError('invalid_logical_media_identity')
+        found = self._read(artifact_id)
+        if not found:raise ValueError('artifact authority unavailable')
+        metadata, _ = found
+        if metadata.get('origin') not in {'web_page_image','web_page_video'}:
+            raise ValueError('artifact is not downloaded media')
+        digest = 'media-' + hashlib.sha256(identity.encode()).hexdigest()
+        if metadata.get('logical_media_id') and metadata['logical_media_id'] != digest:
+            raise ValueError('logical_media_identity_changed')
+        metadata['logical_media_id'] = digest
+        metadata['content_sha256'] = (json.loads(found[1].read_text(encoding='utf8')).get('sha256')
+            if metadata['origin']=='web_page_video' else metadata['sha256'])
+        target = self.root / (artifact_id + '.meta.json')
+        temporary = self.root / (artifact_id + '.identity.tmp')
+        try:
+            temporary.write_text(json.dumps(metadata,ensure_ascii=False),encoding='utf8')
+            temporary.replace(target)
+        finally:temporary.unlink(missing_ok=True)
+        return digest
 
     def describe(self, artifact_id: str) -> dict | None:
         found = self._read(artifact_id)

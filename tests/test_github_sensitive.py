@@ -90,7 +90,7 @@ def test_nul_path_parser_does_not_split_newlines_or_quotes() -> None:
 
 
 @pytest.mark.parametrize("relative", ["configs/personas/member.yaml", "infra/wsl/.env.backup",
-    "infra/wsl/runtime/login.json", ".test-tmp-run/report.txt", "cache.sqlite3", "cache.db-wal"])
+    "infra/wsl/runtime/login.json", "infra/wsl/private-secrets/x-session.json", ".test-tmp-run/report.txt", "cache.sqlite3", "cache.db-wal"])
 def test_additional_private_runtime_paths_are_blocked(tmp_path: Path, relative: str) -> None:
     _repo(tmp_path)
     _write(tmp_path, relative, "private fixture")

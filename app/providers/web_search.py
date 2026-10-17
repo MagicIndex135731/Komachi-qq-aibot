@@ -202,6 +202,16 @@ class WebSearchClient:
             return WebSearchReport([WebSearchResult(page.title, page.lines[3], page.url, '', 'turn0view0')],
                 content, 'bilibili_public_metadata')
 
+    def search_resources(self, query: str, max_results: int = 8, *, goal: str = '') -> WebSearchReport:
+        """Use the configured search once; page discovery never calls an LLM."""
+        deadline = time.monotonic() + self.timeout_seconds
+        intent = f'\n当前检索目的：{goal[:1000]}' if goal else ''
+        report = self.search_report(query + intent, max_results=max_results)
+        discover = getattr(self.page_reader, 'discover_resources', None)
+        if callable(discover):
+            report = discover(report, query=query, goal=goal, deadline=deadline)
+        return report
+
     def find_page(self, url: str, *, pattern: str) -> WebSearchReport:
         if self.page_reader is not None and self.provider not in {'wyzlab', 'wyzlab_alpha'}:
             return self.page_reader.find_page(url, pattern=pattern)

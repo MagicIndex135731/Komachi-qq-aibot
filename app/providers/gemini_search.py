@@ -93,7 +93,7 @@ class GeminiSearchClient(WebSearchClient):
                 f"今天是{today}（上海）。请使用Google搜索查证以下问题，优先直接来源，"
                 f"给出简明结果、相关日期及最多{max_results}条来源。下面是检索式，不要解释检索式或账号路径的含义。"
                 "找帖子、图片或视频时优先定位具体原帖或含原帖链接的报道，不能只介绍账号。"
-                "保留检索目的中的最新或指定日期要求；不要用多年前的代表作凑数量，来源可少于上限。"
+                "只保留用户明确的日期要求；无日期时不要自加近期窗口或本人发布、真人自拍等条件，历史素材也可作为候选并注明日期。来源可少于上限。"
                 "只需简短候选列表。不要拼接、猜测链接或未经来源确认的事实；报道日期不是原帖日期。\n" + query}]}],
             # Mixing server search with ordinary functions disables grounding
             # on this relay. This request deliberately contains one native tool.
@@ -102,6 +102,10 @@ class GeminiSearchClient(WebSearchClient):
             # ended real grounded searches with MAX_TOKENS before metadata.
             "generationConfig": {"maxOutputTokens": 8192},
         }
+        from app.core.request_cost import current_request_budget
+        budget=current_request_budget.get()
+        if budget:
+            budget.spend('model_calls');budget.spend('estimated_tokens',9000);budget.reserve_network(MAX_RESPONSE_BYTES)
         texts, metadata, terminal = [], {}, False
         with self.http_client.stream("POST", endpoint, params={"alt": "sse"},
             headers={"x-goog-api-key": self.api_key, "Accept": "text/event-stream"},
@@ -147,6 +151,8 @@ class GeminiSearchClient(WebSearchClient):
                         terminal = finish == "STOP"
                     except (ValueError, TypeError, AttributeError, IndexError) as exc:
                         logger.warning('gemini_search_response_invalid reason=%s', invalid_reason)
+                        if invalid_reason in {'incomplete_SAFETY','incomplete_BLOCKLIST','incomplete_PROHIBITED_CONTENT'}:
+                            raise WebSearchProviderError('web_search_content_rejected') from exc
                         raise WebSearchProviderError("web_response_invalid") from exc
                     if terminal:
                         break
@@ -183,6 +189,11 @@ class GeminiSearchClient(WebSearchClient):
         deadline = time.monotonic() + self.timeout_seconds
         intent = f'\n当前用户的检索目的（保留对象和时间范围）：{goal[:1000]}' if goal else ''
         report = self._search_report(query + intent, max_results, deadline)
+        return self.discover_resources(report, query=query, goal=goal, deadline=deadline)
+
+    def discover_resources(self, report, *, query='', goal='', deadline=None):
+        """Shared HTTP-only discovery; callers have already performed one search."""
+        deadline = deadline or time.monotonic() + 15
         page_deadline = min(deadline, time.monotonic() + 15)
         results, sections, seen = list(report.results), [], {hit.source for hit in report.results}
         candidates = list(enumerate(report.results))

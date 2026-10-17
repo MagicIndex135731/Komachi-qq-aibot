@@ -12,10 +12,10 @@ from typing import Any
 import yaml
 
 
-DEFAULT_HK_PATTERN = r"(?:香港|Hong\s*Kong|(?:^|\W)HK(?:\W|$)|🇭🇰)"
+DEFAULT_JP_PATTERN = r"(?:日本|Japan|(?:^|\W)JP(?:\W|$)|🇯🇵)"
 RATE_ONE_PATTERN = r'(?:[x×✕]\s*1(?:\.0+)?(?![\d.])|(?<![\d.])1(?:\.0+)?\s*[x×✕]|倍率\s*[:：]?\s*1(?:\.0+)?(?![\d.])|(?<![\d.])1(?:\.0+)?\s*倍(?!率))'
-PAGE_GROUP = 'XIAOMACHI-WEB-HK-X1'
-NOVA_GROUP = "XIAOMACHI-NOVA-HK"
+PAGE_GROUP = 'XIAOMACHI-WEB-JP-X1'
+NOVA_GROUP = "XIAOMACHI-NOVA-JP"
 NOVA_HOST = "ai.novacode.top"
 
 DIRECT_RULES = (
@@ -24,7 +24,7 @@ DIRECT_RULES = (
     "DOMAIN-SUFFIX,gtimg.cn,DIRECT",
     "DOMAIN-SUFFIX,tenpay.com,DIRECT",
     # DeepSeek's official API is reachable from mainland China and carries the
-    # bot's chat/search traffic; routing it through the Hong Kong node only adds
+    # bot's chat/search traffic; routing it through a proxy node only adds
     # latency and puts model calls on a residential-ish egress.
     "DOMAIN-SUFFIX,deepseek.com,DIRECT",
     "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
@@ -44,7 +44,7 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 def render_config(
     source: dict[str, Any],
     *,
-    hk_pattern: str = DEFAULT_HK_PATTERN,
+    region_pattern: str = DEFAULT_JP_PATTERN,
     nova_host: str = NOVA_HOST,
 ) -> dict[str, Any]:
     proxies = source.get("proxies")
@@ -55,20 +55,21 @@ def render_config(
     if not isinstance(rules, list):
         raise ValueError("source profile must contain a rules list")
 
-    matcher = re.compile(hk_pattern, re.IGNORECASE)
-    hk_nodes = [
-        name
+    matcher = re.compile(region_pattern, re.IGNORECASE)
+    selected = [
+        dict(item)
         for item in proxies
         if isinstance(item, dict)
         and isinstance((name := item.get("name")), str)
         and matcher.search(name)
     ]
-    if not hk_nodes:
-        raise ValueError("source profile contains no Hong Kong proxy nodes")
+    if not selected:
+        raise ValueError("source profile contains no Japan proxy nodes")
+    _validate_dependencies(selected)
 
-    rendered = dict(source)
-    rendered.update(
-        {
+    # Do not inherit source listeners, providers or country selectors: these
+    # could retain a non-Japanese fallback or bind Windows' reserved ports.
+    rendered = {
             "mixed-port": 18797,
             "mode": "rule",
             "allow-lan": False,
@@ -77,47 +78,45 @@ def render_config(
             "secret": secrets.token_urlsafe(24),
             "log-level": "info",
         }
-    )
-    tun = dict(rendered.get("tun") or {})
-    tun["enable"] = False
-    rendered["tun"] = tun
-    rendered.pop("external-controller-pipe", None)
-    rendered.pop("external-controller-cors", None)
+    rendered["tun"] = {"enable": False}
+    rendered["proxies"] = selected
 
     nova_group = {
         "name": NOVA_GROUP,
         "type": "url-test",
-        "proxies": hk_nodes,
+        "proxies": [item['name'] for item in selected],
         "url": "https://cp.cloudflare.com/generate_204",
         "interval": 300,
         "tolerance": 80,
         "lazy": True,
     }
-    rendered["proxy-groups"] = [
-        nova_group,
-        *[
-            item
-            for item in groups
-            if not (isinstance(item, dict) and item.get("name") == NOVA_GROUP)
-        ],
-    ]
-
-    managed_prefixes = (
-        f"DOMAIN,{nova_host},",
-        *(f"{rule.rsplit(',', 1)[0]}," for rule in DIRECT_RULES),
-    )
-    retained_rules = [
-        rule
-        for rule in rules
-        if isinstance(rule, str)
-        and not any(rule.startswith(prefix) for prefix in managed_prefixes)
-    ]
+    rendered["proxy-groups"] = [nova_group]
     rendered["rules"] = [
         f"DOMAIN,{nova_host},{NOVA_GROUP}",
         *DIRECT_RULES,
-        *retained_rules,
+        f"MATCH,{NOVA_GROUP}",
     ]
     return rendered
+
+
+def _validate_dependencies(selected: list[dict[str, Any]]) -> None:
+    names = {item['name'] for item in selected}
+    if any(item.get('dialer-proxy') not in (None, 'DIRECT')
+           and item['dialer-proxy'] not in names for item in selected):
+        raise ValueError('selected Japan node depends on an excluded proxy')
+
+
+def resolve_ikuuu_source(directory: Path) -> Path:
+    metadata = _load_mapping(directory / 'profiles.yaml')
+    matches = [item for item in metadata.get('items', []) if isinstance(item, dict)
+               and re.search('ikuuu', str(item.get('name', '')), re.IGNORECASE)]
+    if len(matches) != 1:
+        raise ValueError('expected exactly one named ikuuu subscription')
+    root = (directory / 'profiles').resolve()
+    path = (root / str(matches[0].get('file', ''))).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise ValueError('ikuuu source must be a local file inside profiles')
+    return path
 
 
 def render_page_config(source: dict[str, Any], *, unmarked_rate_one: bool = False) -> dict[str, Any]:
@@ -125,14 +124,15 @@ def render_page_config(source: dict[str, Any], *, unmarked_rate_one: bool = Fals
     proxies = source.get('proxies')
     if not isinstance(proxies, list):
         raise ValueError('subscription has no proxy list')
-    hong_kong = re.compile(DEFAULT_HK_PATTERN, re.IGNORECASE)
+    japan = re.compile(DEFAULT_JP_PATTERN, re.IGNORECASE)
     rate_one = re.compile(RATE_ONE_PATTERN, re.IGNORECASE)
     any_rate = re.compile(r'(?:[x×✕]\s*\d|\d(?:\.\d+)?\s*[x×✕]|倍率|\d\s*倍)', re.IGNORECASE)
     selected = [dict(item) for item in proxies if isinstance(item, dict)
-                and isinstance(item.get('name'), str) and hong_kong.search(item['name'])
+                and isinstance(item.get('name'), str) and japan.search(item['name'])
                 and (rate_one.search(item['name']) or unmarked_rate_one and not any_rate.search(item['name']))]
     if not selected:
-        raise ValueError('subscription has no Hong Kong rate-x1 nodes')
+        raise ValueError('subscription has no Japan rate-x1 nodes')
+    _validate_dependencies(selected)
     return {'mixed-port': 18797, 'mode': 'rule', 'allow-lan': False,
             'bind-address': '127.0.0.1', 'external-controller': '127.0.0.1:19090',
             'secret': secrets.token_urlsafe(24), 'log-level': 'warning', 'tun': {'enable': False},
@@ -144,18 +144,28 @@ def render_page_config(source: dict[str, Any], *, unmarked_rate_one: bool = Fals
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--hk-pattern", default=DEFAULT_HK_PATTERN)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument('--clash-directory', type=Path)
+    parser.add_argument('--print-ikuuu-source', action='store_true')
+    parser.add_argument("--region-pattern", default=DEFAULT_JP_PATTERN)
     parser.add_argument("--nova-host", default=NOVA_HOST)
     parser.add_argument('--page-only', action='store_true')
     parser.add_argument('--unmarked-rate-one', action='store_true',
                         help='Explicit operator convention: unlabeled nodes have rate x1')
     args = parser.parse_args()
 
+    if args.print_ikuuu_source:
+        if args.clash_directory is None:
+            parser.error('--clash-directory is required for subscription discovery')
+        print(resolve_ikuuu_source(args.clash_directory))
+        return 0
+    if args.source is None or args.output is None:
+        parser.error('--source and --output are required for rendering')
+
     rendered = render_page_config(_load_mapping(args.source), unmarked_rate_one=args.unmarked_rate_one) if args.page_only else render_config(
         _load_mapping(args.source),
-        hk_pattern=args.hk_pattern,
+        region_pattern=args.region_pattern,
         nova_host=args.nova_host,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +175,7 @@ def main() -> int:
     )
     print(
         f"mihomo_config=rendered proxies={len(rendered['proxies'])} "
-        f"hk_nodes={len(rendered['proxy-groups'][0]['proxies'])}"
+        f"japan_nodes={len(rendered['proxy-groups'][0]['proxies'])}"
     )
     return 0
 

@@ -6,7 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from app.agent.social_contracts import SocialDecision, SocialObservation
-from app.agent.social_policy import configured_social_jobs, in_quiet_hours, resolve_friend_ids
+from app.agent.social_policy import (autonomous_social_enabled, configured_social_jobs,
+                                     in_quiet_hours, resolve_friend_ids)
 from app.adapters.qzone import QzoneUnavailableError, QzoneProtocolError, QzoneRejectedError
 from app.agent.social_images import post_image_inputs
 from app.agent.tool_agent import AgentTool, ToolOutcome
@@ -31,6 +32,8 @@ def build_public_tools(executor, observation, guard, store):
         job = snapshots.get(kind)
         current = next((j for j in configured_social_jobs(executor.router.runtime) if j.kind == kind), None)
         manual = owner_directed()
+        if not manual and not autonomous_social_enabled(executor.router.runtime, kind):
+            raise ValueError('public_tool_autonomy_disabled')
         if job is None or current != job or (not manual and in_quiet_hours(job.quiet_hours, executor.clock())):
             raise ValueError("public_tool_authority_revoked")
         if observation.context or observation.source_message_ids:
@@ -73,6 +76,9 @@ def build_public_tools(executor, observation, guard, store):
             return getattr(guard, "owner_authority", None)
 
     def add(name, description, parameters, handler, *, effect="read", job=None):
+        if (effect == 'write' and not owner_directed()
+                and not autonomous_social_enabled(executor.router.runtime, job.kind)):
+            return
         patrol = observation.job.patrol_interval_seconds is not None and not owner_directed()
         if patrol and effect == "write" and job.kind != observation.job.kind:
             return
@@ -88,6 +94,24 @@ def build_public_tools(executor, observation, guard, store):
     if "qzone_comment" in snapshots:
         job = snapshots["qzone_comment"]
         owner = {"type": "integer", "minimum": 1, "maximum": 2**63 - 1}
+        async def read_social(args):
+            current = authority('qzone_comment')
+            from app.storage.public_social import PublicSocialRepository
+            try:
+                result = PublicSocialRepository(executor.router.engine, account_id=current.scope_id,
+                    clock=executor.clock).read(**args)
+            except ValueError:
+                return ToolOutcome({'error': 'social_activity_query_invalid'}, 'blocked')
+            authority('qzone_comment')
+            return ToolOutcome(result)
+        history_schema = schema(record_id=text_schema(40), kind={'type': 'string',
+            'enum': ['all', 'comment', 'thought', 'observation']}, owner_id=owner,
+            date=text_schema(10), before=text_schema(40), limit={'type': 'integer', 'minimum': 1, 'maximum': 10})
+        history_schema['required'] = []
+        add('read_social_activity', '查询自己近期公开看帖、评论草稿/成功/失败/未知回执和显式打算、笔记。'
+            '主人提到早上/之前的评论或想法时先查此工具，不用重扫好友动态。默认5条短摘要；kind筛选、date按上海日期，'
+            'record_id读取详情，before分页。仅公开记录，不含群私对话；记录不授权发送，恢复目标后仍须读原帖复验，已发送/未知不重做。',
+            history_schema, read_social)
         async def current_friends():
             current = authority("qzone_comment")
             try:
@@ -178,12 +202,38 @@ def build_public_tools(executor, observation, guard, store):
                 viewed.add(key)
             return ToolOutcome({"post_id": post.post_id, "artifact_ids": [item[0] for item in found],
                 "pixels_attached": bool(found), "image_count": len(post.images),
-                "viewed_image_count": len(found), "unseen_image_count": max(0, len(post.images) - len(found))},
+                "viewed_image_count": len(found), "unseen_image_count": max(0, len(post.images) - len(found)),
+                "guidance": "artifact_ids是已读取图片的产物ID，不是评论必需附件；文字评论传artifact_ids=[]，不要为证明看过而附回原图。"},
                 images=tuple(ImageAttachment(url="", local_path=item[1], reference_subject=f"好友{post.owner_id}动态{post.post_id}") for item in found))
         add("observe_post_images", "读取已观察原帖的实际图片像素并保存产物，最多9张；返回已读与未读数量，不能猜测未读图片内容", schema(owner_id=owner, post_id=text_schema(256)), view_post)
 
+        async def assess_post(args):
+            current, friends = await current_friends()
+            key = (args['owner_id'], args['post_id'])
+            post = posts.get(key)
+            if friends is None or post is None or post.owner_id not in friends:
+                return ToolOutcome({'error': 'post_not_observed'}, 'blocked')
+            if args['decision'] == 'no_response' and post.images and not post.text.strip() and key not in viewed:
+                return ToolOutcome({'error': 'read_pixels_or_defer'}, 'blocked')
+            from app.storage.social_agent import SocialAgentRepository
+            SocialAgentRepository(executor.router.engine).assess_post(account_id=current.scope_id, post=post,
+                status=args['decision'], minutes=args['revisit_minutes'], now=executor.clock(),
+                before_commit=guard.require_valid)
+            return ToolOutcome({'saved': True, 'candidate_only': True, 'decision': args['decision'],
+                'revisit_minutes': args['revisit_minutes']})
+        assessment_schema = schema(owner_id=owner, post_id=text_schema(256), decision={'type': 'string',
+                'enum': ['deferred', 'no_response']}, revisit_minutes={'type': 'integer', 'minimum': 5, 'maximum': 180},
+                thought=text_schema(400, 0), next_step=text_schema(300, 0))
+        assessment_schema['required'] = ['owner_id', 'post_id', 'decision', 'revisit_minutes']
+        add('assess_qzone_post', '记录实际评估的原帖版本：暂缓deferred或本版本不回应no_response，5至180分钟后可重看；新内容重新判断。'
+            '可用thought简记看法/暂缓理由、next_step记录实际后续打算，归入近期公开工作记忆。没读图不能否决纯图；不标记未评估候选，不保存长推理或例行等待意图。',
+            assessment_schema, assess_post)
+
         async def comment(args):
             current, friends = await current_friends()
+            if args["artifact_ids"] and not current.allow_images:
+                return ToolOutcome({"error": "comment_images_disabled", "write_dispatched": False,
+                    "guidance": "当前只允许文字评论，尚未派发；保留评论文字并改为artifact_ids=[]。看图产物不需要附回评论。"}, "blocked")
             key = (args["owner_id"], args["post_id"])
             original = posts.get(key)
             if friends is None or original is None or original.owner_id not in friends or (not original.text.strip() and key not in viewed):
@@ -192,9 +242,15 @@ def build_public_tools(executor, observation, guard, store):
             actual = SocialDecision("comment_qzone", args["text"], original.post_id, original.owner_id,
                 image_files=media(args["artifact_ids"]))
             result = await executor.legacy.execute(obs, actual, PublicGuard("qzone_comment"))
-            return ToolOutcome({"result": result.status}, result.status, result.receipt_id)
-        add("comment_qzone", "自行选择已读取好友的真实动态评论，派发前重新核对原帖", schema(owner_id=owner,
-            post_id=text_schema(256), text=text_schema(300), artifact_ids={"type": "array", "items": text_schema(64), "maxItems": 2}), comment, effect="write", job=job)
+            data = {"result": result.status}
+            if result.reason:
+                data["reason"] = result.reason
+            return ToolOutcome(data, result.status, result.receipt_id)
+        add("comment_qzone", "自行选择已读取好友的真实动态评论，派发前重新核对原帖；"
+            + ("文字评论的artifact_ids填[]，仅在需要附图时提供产物ID。" if job.allow_images else
+               "当前仅允许文字评论，artifact_ids必须为[]；读图不需要把原图附回评论。"), schema(owner_id=owner,
+            post_id=text_schema(256), text=text_schema(300), artifact_ids={"type": "array", "items": text_schema(64),
+                "maxItems": 2 if job.allow_images else 0}), comment, effect="write", job=job)
 
     if "qzone_publish" in snapshots:
         job = snapshots["qzone_publish"]

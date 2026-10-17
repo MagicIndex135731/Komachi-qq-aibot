@@ -15,14 +15,17 @@
  <div id="detail" class="detail" hidden>
   <header class="conversation-header"><div><div id="scope-label" class="eyebrow"></div><h2 id="conversation-title"></h2><p id="conversation-subtitle"></p></div><div class="header-actions"><span id="conversation-status" class="chip"></span><button id="delete-selected" class="quiet danger">删除记录</button><button id="open-input" class="quiet">模型输入</button></div></header>
   <div class="conversation-info"><span id="identity-note"></span><label><input id="follow" type="checkbox" checked>跟随最新过程</label></div>
-  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><div id="turn-list"></div><section id="orphan-tasks" hidden><p class="muted small">关联后台任务 · 父回合在更早页面或已过期</p><div id="orphan-task-list"></div></section><div id="tail"></div></div></div>
+  <div id="context-identities" class="context-identities" aria-label="上下文标识"></div>
+  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><details id="orphan-tasks" hidden><summary class="muted small">较早请求的后台任务 · 父回合未在本页显示</summary><div id="orphan-task-list"></div></details><div id="turn-list"></div><div id="tail"></div></div></div>
   <footer class="main-footer usage-footer" aria-label="当前会话上下文和用量">
    <div class="usage-grid">
-    <div class="usage-context" title="最近主模型请求的输入量；实报优先，尚无实报时使用估算。总量是当前配置的窗口，不是累计消耗。"><span>最近请求输入 / 配置窗口</span><strong id="context-usage">未知 / 未知</strong><progress id="context-progress" max="1" value="0" aria-label="上下文占用比例"></progress><small id="context-source">等待请求</small></div>
-    <div title="最近主模型请求：实际缓存输入 ÷ 实际输入。缺失字段保持未知。"><span>最近缓存命中率</span><strong id="latest-cache-ratio">未知</strong><small id="latest-cache-tokens">等待用量实报</small></div>
-    <div title="本会话保留记录中，有完整缓存和输入实报的请求按 token 加权；包括重试和压缩。"><span>会话累计缓存率</span><strong id="total-cache-ratio">未知</strong><small id="total-cache-tokens">等待用量实报</small></div>
-    <div><span>累计输入 token</span><strong id="total-input-tokens">未知</strong><small id="uncached-input-tokens">未缓存输入未知</small></div>
-    <div><span>累计输出 token</span><strong id="total-output-tokens">未知</strong><small>以上游实报为准</small></div>
+    <div class="usage-context" title="完整输入包含缓存，仍占上下文窗口；实报优先，尚无实报时使用估算。窗口占用与累计用量分别计算。"><span>最近上下文 / 配置窗口</span><strong id="context-usage">未知 / 未知</strong><progress id="context-progress" max="1" value="0" aria-label="上下文占用比例"></progress><small id="context-source">等待请求</small></div>
+    <div title="按 CC Switch 归一化口径：新增输入＋输出＋缓存创建＋缓存命中。当前接口输入已含缓存，因此等于输入总量＋输出，不再重复加缓存。"><span>累计消耗 Tokens</span><strong id="total-consumed-tokens">未知</strong><small id="total-consumed-coverage">等待用量实报</small></div>
+    <div title="新增输入＝输入总量－缓存命中；缺缓存实报时不猜为零。"><span>新增输入</span><strong id="fresh-input-tokens">未知</strong><small id="total-input-tokens">含缓存输入未知</small></div>
+    <div><span>输出</span><strong id="total-output-tokens">未知</strong><small>以上游实报为准</small></div>
+    <div><span>缓存命中</span><strong id="total-cache-tokens">未知</strong><small id="cache-read-coverage">等待用量实报</small></div>
+    <div title="当前接口未单独报告缓存创建量；N/A不代表创建量为零。"><span>缓存创建</span><strong id="cache-creation-tokens">N/A</strong><small>上游未单独上报</small></div>
+    <div title="缓存命中 ÷ 同一批请求的输入总量（含缓存），按 token 加权；缺失字段不参与。"><span>缓存命中率</span><strong id="total-cache-ratio">未知</strong><small id="latest-cache-tokens">本次未知</small></div>
     <div><span>累计模型请求</span><strong id="total-model-requests">未知</strong><small>含重试和压缩</small></div>
    </div>
    <div id="usage-coverage" class="usage-coverage">选择会话后显示统计。缺失值不按零计算。</div>

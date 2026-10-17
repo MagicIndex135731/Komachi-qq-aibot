@@ -68,8 +68,6 @@ async def test_followup_recovers_old_evidence_and_finds_post_inside_article(
             assert URL in output(body, 'open_web_page')['data']['content']
             return sse('download_twitter_media', {'ref_id': URL, 'delivery_mode': 'auto',
                 'delivery_text': '报道提到的原帖媒体；报道日期与发帖日期不同'}, number=n)
-        if n == 8:
-            return sse('send_private', {'text': '已从报道中找到原帖，正在下载', 'task_status': 'progress'}, number=n)
         raise AssertionError('Unexpected extra model request')
     class Gateway:
         async def call_api(self, action, params):
@@ -84,7 +82,7 @@ async def test_followup_recovers_old_evidence_and_finds_post_inside_article(
         await dispatcher.handle_private_message(event('older-question', user_id=actor, text='有更新的帖子吗'))
         current_text = '那把这个十月十三号的图片发给我'
         await dispatcher.handle_private_message(event('media-followup', user_id=actor, text=current_text))
-        assert len(requests) == 8
+        assert len(requests) == 7  # Accepted auto download ends locally without another model progress turn.
         async with asyncio.timeout(20):
             while not any(action.endswith('forward_msg') for action, _ in delivered):
                 await asyncio.sleep(.05)
@@ -102,6 +100,11 @@ async def test_followup_recovers_old_evidence_and_finds_post_inside_article(
 @pytest.mark.parametrize('owner', [False, True])
 async def test_fresh_media_request_discovers_real_post_and_delivers_without_seeded_context(
         sqlite_engine, tmp_path, monkeypatch, mp4, owner):
+    from datetime import UTC, datetime
+    monkeypatch.setattr('app.agent.resource_tools.PublicResourceClient.inspect', lambda self,url,**kw:{
+        'source_url':url,'post_id':'900000000000000001','title':'synthetic media','author':'synthetic',
+        'published_at':datetime.now(UTC).isoformat(),'identity_status':'matched','media_count':3,
+        'media':[{'kind':'image','role':'post_image'},{'kind':'video','role':'post_video'}]})
     downloads = provider(monkeypatch, video=mp4)
     delivered, searches, pages = [], [], []
     redirect = 'https://search.example/grounded'
@@ -131,9 +134,12 @@ async def test_fresh_media_request_discovers_real_post_and_delivers_without_seed
             data = output(body, 'search_web')['data']
             assert 'invented' not in data['content']
             candidate = next(hit for hit in data['sources'] if hit['source'] == URL)
-            return sse('download_twitter_media', {'ref_id': candidate['ref_id'],
+            return sse('inspect_web_resources', {'ref_ids':[candidate['source']]}, number=n)
+        if n == 3:
+            candidate=output(body,'inspect_web_resources')['data']['resources'][0]
+            assert candidate['identity_status']=='matched'
+            return sse('download_twitter_media', {'ref_id': candidate['source_url'],
                 'delivery_mode': 'auto', 'delivery_text': 'Found original media'}, number=n)
-        if n == 3:return sse('send_private', {'text': '正在下载并发送', 'task_status': 'progress'}, number=n)
         raise AssertionError('Unexpected extra model request')
     class Gateway:
         async def call_api(self, action, params):

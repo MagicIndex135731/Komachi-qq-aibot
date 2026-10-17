@@ -47,11 +47,40 @@ def client_for(payload, handler=None):
 
 
 @pytest.mark.parametrize("url", [URL, URL.replace("x.com", "mobile.twitter.com") + "?s=20",
-    f"https://twitter.com/i/web/status/{POST_ID}", URL + "/photo/2"])
+    f"https://twitter.com/i/web/status/{POST_ID}", f"https://x.com/i/status/{POST_ID}", URL + "/photo/2"])
 def test_post_url_normalizes_source(url):
     post = parse_post_url(url)
     assert post.post_id == POST_ID
     assert post.source_url == f"https://x.com/i/status/{POST_ID}"
+
+
+async def test_browser_observation_download_reuses_guards_and_provenance(tmp_path):
+    evidence = 'x-posts-' + 'a' * 24 + ':post:0'
+    observation = {'post_id': POST_ID, 'identity_status': 'matched', 'protected':False, 'author': 'sample',
+        'published_at': '2026-10-16T00:00:00+00:00', 'media_count': 1, 'media_error': '',
+        'media': [{'kind': 'photo', 'url': 'https://pbs.twimg.com/media/image.jpg'}]}
+    async with client_for({}) as client:
+        saved = await TwitterMediaDownloader(client).download_resolved(URL, tmp_path,
+            observation, evidence_ref=evidence)
+    assert saved.manifest['resolver'] == 'x_crawler'
+    assert saved.manifest['post']['evidence_ref'] == evidence
+    assert saved.manifest['files'][0]['sha256'] == hashlib.sha256(PHOTO).hexdigest()
+
+
+@pytest.mark.parametrize('change,code', [
+    ({'post_id': '900000000000000002'}, 'post_id_mismatch'),
+    ({'media_count': 2}, 'incomplete_resolved_media'),
+    ({'media': [{'kind': 'photo', 'url': 'https://127.0.0.1/secret'}]}, 'invalid_media_url'),
+    ({'media': [{'kind': 'video', 'url': 'https://video.twimg.com/stream.m3u8'}]}, 'no_mp4_stream'),
+])
+async def test_browser_observation_rejects_wrong_identity_partial_or_unsafe_media(tmp_path, change, code):
+    observation = {'post_id': POST_ID, 'identity_status': 'matched', 'protected':False, 'media_count': 1,
+        'media': [{'kind': 'photo', 'url': 'https://pbs.twimg.com/media/image.jpg'}], **change}
+    async with client_for({}) as client:
+        with pytest.raises(TwitterMediaError, match=code):
+            await TwitterMediaDownloader(client).download_resolved(URL, tmp_path,
+                observation, evidence_ref='x-posts-' + 'a' * 24 + ':post:0')
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("url", ["https://x.com/sample", "https://x.com/search?q=cat",
@@ -81,6 +110,7 @@ async def test_download_mixed_media_preserves_order_and_provenance(tmp_path):
     assert [m["kind"] for m in manifest["files"]] == ["photo", "video", "gif"]
     assert [m["filename"] for m in manifest["files"]] == ["01_photo.jpg", "02_video.mp4", "03_gif.mp4"]
     assert manifest["files"][0]["sha256"] == hashlib.sha256(PHOTO).hexdigest()
+    assert manifest['files'][0]['image_size']=='orig' and 'fallback_reason' not in manifest['files'][0]
     assert len(requests) == 3
     for item in manifest["files"]:
         assert (result.directory / item["filename"]).stat().st_size == item["bytes"]
@@ -147,11 +177,13 @@ async def test_bad_media_rolls_back_run(tmp_path, response, limit, code):
     assert list(tmp_path.iterdir()) == [keep]
 
 
-async def test_total_budget_cleans_already_downloaded_files(tmp_path):
+async def test_total_budget_retains_already_downloaded_files(tmp_path):
     async with client_for(metadata([photo(), photo("second")])) as client:
-        with pytest.raises(TwitterMediaError, match="size_limit"):
-            await TwitterMediaDownloader(client, max_total_bytes=len(PHOTO) + 1).download(URL, tmp_path)
-    assert not list(tmp_path.iterdir())
+        result = await TwitterMediaDownloader(client, max_total_bytes=len(PHOTO) + 1).download(URL, tmp_path)
+    assert len(result.manifest['files']) == 1
+    assert result.manifest['all_requested_downloaded'] is False
+    assert result.manifest['failures'][0]['index'] == 2
+    assert (result.directory / result.manifest['files'][0]['filename']).read_bytes() == PHOTO
 
 
 async def test_transient_download_retries_are_bounded(tmp_path):
@@ -168,7 +200,7 @@ async def test_transient_download_retries_are_bounded(tmp_path):
 
 
 async def test_exhausted_retries_and_no_retry_on_forbidden(tmp_path):
-    for status, expected in [(503, 3), (403, 1)]:
+    for status, expected in [(503, 6), (403, 1), (429, 3)]:
         attempts = 0
         def fail(_):
             nonlocal attempts
@@ -179,6 +211,41 @@ async def test_exhausted_retries_and_no_retry_on_forbidden(tmp_path):
                 await TwitterMediaDownloader(client, retry_delay=0).download(URL, tmp_path)
         assert attempts == expected
         assert not list(tmp_path.iterdir())
+
+
+async def test_original_photo_failure_falls_back_once_to_large_and_records_quality(tmp_path):
+    calls=[]
+    def respond(request):
+        calls.append(request.url)
+        if request.url.host=='pbs.twimg.com' and request.url.params['name']=='orig':
+            return httpx.Response(503)
+        return httpx.Response(200,content=PHOTO if request.url.host=='pbs.twimg.com' else MP4,
+            headers={'content-type':'image/jpeg' if request.url.host=='pbs.twimg.com' else 'video/mp4'})
+    async with client_for(metadata([photo(),video()]),respond) as client:
+        result=await TwitterMediaDownloader(client,retry_delay=0).download(URL,tmp_path)
+    first,second=result.manifest['files']
+    assert first['image_size']=='large' and first['fallback_reason']=='http_503'
+    assert 'name=orig' in first['media_url'] and 'name=large' in first['download_url']
+    assert 'image_size' not in second
+    assert [u.params.get('name') for u in calls]==['orig','orig','orig','large',None]
+    assert (result.directory/first['filename']).read_bytes()==PHOTO
+
+
+async def test_photo_size_limit_fallback_obeys_same_limit(tmp_path):
+    small=b'\xff\xd8\xff\xe0small'
+    async with client_for(metadata([photo()]),lambda r:httpx.Response(200,
+        content=PHOTO if r.url.params['name']=='orig' else small,headers={'content-type':'image/jpeg'})) as client:
+        result=await TwitterMediaDownloader(client,max_file_bytes=10,retry_delay=0).download(URL,tmp_path)
+    assert result.manifest['total_bytes']==len(small)<=10
+    assert result.manifest['files'][0]['fallback_reason']=='size_limit'
+
+
+async def test_video_http_failure_does_not_use_photo_size_fallback(tmp_path):
+    calls=[]
+    async with client_for(metadata([video()]),lambda r:calls.append(r) or httpx.Response(503)) as client:
+        with pytest.raises(TwitterMediaError,match='http_503'):
+            await TwitterMediaDownloader(client,retry_delay=0).download(URL,tmp_path)
+    assert len(calls)==3 and not list(tmp_path.iterdir())
 
 
 async def test_cancel_cleans_partial_run(tmp_path):
@@ -280,3 +347,65 @@ def test_cli_json_success_and_safe_failure(monkeypatch, capsys, tmp_path):
     output = capsys.readouterr()
     assert json.loads(output.err)["error"] == "network_error"
     assert "secret" not in output.err and not output.out
+
+
+async def test_second_item_timeout_keeps_committed_first(tmp_path):
+    committed = []
+    async def commit(item, path):
+        committed.append(path.read_bytes())
+    async def respond(request):
+        if request.url.host == 'cdn.syndication.twimg.com':
+            return httpx.Response(200,json=metadata([photo(),photo('stalled')]))
+        if 'stalled' in request.url.path:
+            await asyncio.Event().wait()
+        return httpx.Response(200,content=PHOTO,headers={'content-type':'image/jpeg'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        result=await TwitterMediaDownloader(client,timeout_seconds=.04,on_file=commit).download(URL,tmp_path)
+    assert committed==[PHOTO] and result.manifest['failures'][0]['error']=='download_timeout'
+
+
+async def test_nine_mib_photo_does_not_consume_or_rollback_sibling(tmp_path):
+    calls=[]
+    def respond(request):
+        calls.append(request.url.path)
+        if 'large' in request.url.path:
+            return httpx.Response(200,headers={'content-type':'image/jpeg','content-length':str(9*1024*1024)})
+        return httpx.Response(200,content=PHOTO,headers={'content-type':'image/jpeg'})
+    async with client_for(metadata([photo(),photo('large')]),respond) as client:
+        result=await TwitterMediaDownloader(client).download(URL,tmp_path)
+    assert len(result.manifest['files'])==1 and len(calls)==3
+    assert result.manifest['failures'][0]['error']=='size_limit'
+
+
+async def test_video_oversize_variant_falls_back_with_shared_receive_counter(tmp_path):
+    calls=[]
+    def respond(request):
+        calls.append(request.url.path)
+        if request.url.path=='/high.mp4':
+            return httpx.Response(200,headers={'content-type':'video/mp4','content-length':str(70*1024*1024)})
+        return httpx.Response(200,content=MP4,headers={'content-type':'video/mp4'})
+    async with client_for(metadata([video()]),respond) as client:
+        result=await TwitterMediaDownloader(client,max_file_bytes=64*1024*1024).download(URL,tmp_path)
+    assert calls==['/high.mp4','/low.mp4']
+    assert result.manifest['received_bytes']==len(MP4) and result.manifest['files'][0]['quality']=='lower_native'
+
+
+async def test_strict_original_photo_does_not_fallback(tmp_path):
+    calls=[]
+    async with client_for(metadata([photo()]),lambda r:calls.append(r) or httpx.Response(404)) as client:
+        with pytest.raises(TwitterMediaError):await TwitterMediaDownloader(client,original_only=True).download(URL,tmp_path)
+    assert len(calls)==1 and calls[0].url.params['name']=='orig'
+
+
+async def test_unknown_length_oversize_fallback_counts_discarded_bytes(tmp_path):
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield MP4+b'x'*600
+            yield b'x'*600
+    def respond(request):
+        if request.url.path=='/high.mp4':return httpx.Response(200,stream=Stream(),headers={'content-type':'video/mp4'})
+        return httpx.Response(200,content=MP4,headers={'content-type':'video/mp4'})
+    async with client_for(metadata([video()]),respond) as client:
+        result=await TwitterMediaDownloader(client,max_file_bytes=1024,max_total_bytes=4096).download(URL,tmp_path)
+    assert result.manifest['files'][0]['download_url'].endswith('/low.mp4')
+    assert result.manifest['received_bytes']==len(MP4)*2+1200

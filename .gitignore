@@ -63,6 +63,7 @@ data/personas/
 infra/wsl/.env
 infra/wsl/.env.backup*
 infra/wsl/runtime/
+infra/wsl/private-secrets/
 infra/wsl/.cache/
 infra/wsl/mihomo/
 

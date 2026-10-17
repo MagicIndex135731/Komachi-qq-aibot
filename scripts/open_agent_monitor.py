@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
@@ -18,19 +20,19 @@ DISTRO = 'Ubuntu_Migrated'
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 
 
-def viewer_ready() -> bool:
+def viewer_ready(url: str = URL) -> bool:
     """Identify the viewer through direct loopback HTTP, including readable data."""
     opener = build_opener(ProxyHandler({}))
     try:
-        with opener.open(URL + 'health', timeout=2) as response:
+        with opener.open(url + 'health', timeout=2) as response:
             health = json.loads(response.read(4096))
         if health.get('status') != 'ok' or not (health.get('read_only') is True
                 or health.get('record_deletion') is True and health.get('bot_control') is False):
             return False
-        with opener.open(URL, timeout=2) as response:
+        with opener.open(url, timeout=2) as response:
             if '小町 · Agent 现场'.encode() not in response.read(65536):
                 return False
-        with opener.open(URL + 'api/conversations', timeout=3) as response:
+        with opener.open(url + 'api/conversations', timeout=3) as response:
             listing = json.loads(response.read(4 * 1024 * 1024))
         return listing.get('read_only') is True and isinstance(listing.get('conversations'), list)
     except (OSError, ValueError, TypeError, AttributeError):
@@ -68,27 +70,60 @@ def resolve_data_root(*, run=subprocess.run) -> Path:
         raise RuntimeError('监控记录目录不可读取，尚未启动本机查看器。') from exc
 
 
+def saved_viewer_url() -> str | None:
+    """State may select a loopback port only; never trust a stored host or URL."""
+    try:
+        with (RUNTIME / 'viewer.json').open(encoding='utf8') as state:
+            port = json.loads(state.read(4096))['port']
+        if type(port) is int and 1024 <= port <= 65535 and port != 7897:
+            return f'http://127.0.0.1:{port}/'
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
 def ensure_viewer(*, run=subprocess.run, spawn=subprocess.Popen) -> str:
     if viewer_ready():
-        return 'existing'
+        return URL
+    saved = saved_viewer_url()
+    if saved and saved != URL and viewer_ready(saved):
+        return saved
     root = resolve_data_root(run=run)
     RUNTIME.mkdir(parents=True, exist_ok=True)
     with (RUNTIME / 'viewer.log').open('ab') as log:
-        spawn([sys.executable, '-B', '-X', 'utf8', str(Path(__file__).resolve()), '--serve', '--root', str(root)],
+        process = spawn([sys.executable, '-B', '-X', 'utf8', str(Path(__file__).resolve()), '--serve', '--root', str(root)],
               cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
               creationflags=NO_WINDOW)
     for _ in range(30):
-        if viewer_ready():
-            return 'windows'
+        saved = saved_viewer_url()
+        if saved and viewer_ready(saved):
+            return saved
+        if process.poll() is not None:
+            break
         time.sleep(0.2)
-    raise RuntimeError('8765 未能启动监控查看器。请查看 data/agent-monitor-launcher/viewer.log；不会占用其他端口。')
+    raise RuntimeError('未能启动监控查看器。请查看 data/agent-monitor-launcher/viewer.log。')
 
 
 def serve(root: Path) -> None:
     sys.path.insert(0, str(ROOT))
     from app.monitor.server import create_server
-    server = create_server(root, port=8765)
     try:
+        server = create_server(root, port=8765)
+    except OSError as exc:
+        if exc.errno not in {errno.EACCES, errno.EADDRINUSE} and getattr(exc, 'winerror', None) not in {10013, 10048}:
+            raise
+        # Bind directly to port zero: Windows chooses an available, non-reserved
+        # port without a check-then-bind race. The server still binds loopback.
+        server = create_server(root, port=0)
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        state = RUNTIME / f'viewer-{os.getpid()}.tmp'
+        try:
+            state.write_text(json.dumps({'port': server.server_port}), encoding='utf8')
+            state.replace(RUNTIME / 'viewer.json')
+        finally:
+            state.unlink(missing_ok=True)
+        print(f'agent_monitor_ready url=http://127.0.0.1:{server.server_port}/', flush=True)
         server.serve_forever()
     finally:
         server.server_close()
@@ -106,10 +141,10 @@ def main() -> int:
                 raise RuntimeError('监控记录目录不可读取。')
             serve(args.root)
         else:
-            ensure_viewer()
-            print('Agent 监控已就绪：' + URL)
+            url = ensure_viewer()
+            print('Agent 监控已就绪：' + url)
             if not args.no_open:
-                webbrowser.open(URL)
+                webbrowser.open(url)
         return 0
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         print(str(exc), file=sys.stderr)

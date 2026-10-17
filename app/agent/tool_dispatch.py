@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from hashlib import sha256
 import json
+import logging
 
 from app.agent.tool_agent import ToolOutcome
 from app.storage.agent_effects import AgentToolEffectRepository
@@ -11,10 +12,13 @@ from app.adapters.qzone import QzoneRejectedError, QzoneUnavailableError
 from app.adapters.account_profile import ProfileRejectedError, ProfileUnavailableError
 
 
+logger = logging.getLogger(__name__)
+
+
 class ToolDispatchBoundary:
     def __init__(self, *, engine, account_id, scope, guard, clock, max_daily=2, cooldown_seconds=60,
                  interactive_group_send: bool = False, group_send_allowed=None, owner_authority=None,
-                 group_interjection_reserve=None, delivery_source_id=None):
+                 group_interjection_reserve=None, delivery_source_id=None, media_identity=None):
         if type(interactive_group_send) is not bool:
             raise ValueError("interactive group send authority must be a boolean")
         self.repository = AgentToolEffectRepository(engine, account_id=account_id, clock=clock)
@@ -29,6 +33,25 @@ class ToolDispatchBoundary:
         self.dispatched = False
         self.uncertain = False
         self.delivery_source_id = delivery_source_id
+        self.media_identity = media_identity
+
+    def _public_history(self, tool, arguments, call_id, outcome, effect_id='', *, required=False):
+        from app.agent.social_memory import capture_public_tool, public_scope
+        from app.storage.public_social import OPERATIONS, PublicSocialRepository
+        if not public_scope(self.scope) or tool.name not in OPERATIONS:
+            return
+        try:
+            capture_public_tool(PublicSocialRepository(self.repository.engine,
+                account_id=self.repository.account_id, clock=self.clock), scope=self.scope,
+                run_id=self.parent.action_id, call_id=call_id, name=tool.name,
+                arguments=arguments, outcome=outcome, effect_id=effect_id,
+                before_commit=self.require_valid if required else None)
+        except Exception as exc:
+            if required:
+                raise
+            # This projection must never turn an acknowledged write into a
+            # retry. Its earlier pending row still resolves through the ledger.
+            logger.warning('public_social_projection_failed error_type=%s', type(exc).__name__)
 
     async def invoke(self, tool, arguments, call_id):
         self.require_valid()
@@ -37,14 +60,16 @@ class ToolDispatchBoundary:
         from app.agent.media_delivery import send_media_once
         return await send_media_once(self.repository, scope=tool.scope or self.scope,
             source_id=self.delivery_source_id, operation=tool.name, arguments=arguments,
-            require_valid=self.require_valid, invoke=lambda: self._invoke(tool, arguments, call_id))
+            require_valid=self.require_valid, media_identity=self.media_identity, invoke=lambda: self._invoke(tool, arguments, call_id))
 
     async def _invoke(self, tool, arguments, call_id):
         self.require_valid()
         if tool.authorization is not None and tool.authorization() is not True:
             return ToolOutcome({'error': 'owner_required'}, 'blocked')
         if tool.effect != "write":
-            return await tool.handler(arguments)
+            outcome = await tool.handler(arguments)
+            self._public_history(tool, arguments, call_id, outcome)
+            return outcome
         digest = sha256(json.dumps(arguments, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         # Repeated payloads within one durable wake are the same requested
         # effect even if a model invents a different call id after a timeout.
@@ -74,12 +99,17 @@ class ToolDispatchBoundary:
         token = self.current.set((record["action_id"], tool))
         try:
             try:
+                if tool.name == 'comment_qzone':
+                    self._public_history(tool, arguments, call_id, ToolOutcome({}, 'pending'),
+                        record['action_id'], required=True)
                 outcome = await tool.handler(arguments)
             except BaseException as exc:
                 known = isinstance(exc, (QzoneRejectedError, QzoneUnavailableError, ProfileRejectedError, ProfileUnavailableError))
                 current_status = self.repository.get(record["action_id"])["status"]
                 state = "blocked" if current_status == "blocked" else "uncertain" if current_status == "dispatching" and not known else "failed"
                 self.repository.finish(record["action_id"], status=state, reason="tool_interrupted")
+                self._public_history(tool, arguments, call_id,
+                    ToolOutcome({'error': type(exc).__name__}, state), record['action_id'])
                 self.uncertain = state == "uncertain"
                 self.receipts.append({"call_id": call_id, "action_id": record["action_id"], "tool": tool.name,
                     "status": state, "receipt_id": None, "replay_allowed": False})
@@ -93,6 +123,7 @@ class ToolDispatchBoundary:
                 outcome = ToolOutcome({"error": "effect_bypassed_dispatch_boundary"}, status)
             self.repository.finish(record["action_id"], status=status if status in {"sent", "uncertain", "failed", "blocked"} else "failed",
                 receipt=outcome.receipt_id, reason="tool:" + tool.name)
+            self._public_history(tool, arguments, call_id, outcome, record['action_id'])
             self.receipts.append({"call_id": call_id, "action_id": record["action_id"], "tool": tool.name,
                 "status": status, "receipt_id": outcome.receipt_id, "replay_allowed": False})
             self.uncertain = status == "uncertain"

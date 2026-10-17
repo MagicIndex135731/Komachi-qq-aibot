@@ -1,11 +1,12 @@
-"""A bounded, tool-free gate before expensive group persona and recall work."""
+"""Legacy decision parser/adapter; production patrols use the owner Agent."""
 from __future__ import annotations
 
 from copy import copy
-from dataclasses import replace
 import json
+import re
 
-from app.agent.context_policy import RequestContextPolicy, estimate_text_tokens
+from app.agent.context_policy import estimate_text_tokens
+from app.agent.conversation_context import context_policy
 from app.agent.tool_agent import ToolTurnResult
 
 JUDGE_POLICY = ('你是群聊参与判断器，只决定小町是否值得主动接话，不生成回复。'
@@ -43,7 +44,8 @@ def judge_packet(rows, *, bot_id: int) -> dict:
 
 def parse_decision(text: str, allowed: set[int]) -> tuple[int | None, str]:
     try:
-        value = json.loads(text)
+        fenced = re.fullmatch(r'\s*```(?:json)?\s*\n(.*?)\n\s*```\s*', text, re.S | re.I)
+        value = json.loads(fenced.group(1) if fenced else text)
     except (ValueError, TypeError):
         return None, 'malformed'
     if not isinstance(value, dict):
@@ -77,9 +79,11 @@ async def judge_participation(executor, observation, guard):
         before_call=lambda kind: guard.reserve_model() and executor.repository.reserve_cost(
             'model:group_autonomous', observation.job.max_model_calls_daily),
         system_identity=JUDGE_POLICY,
-        context_policy=replace(RequestContextPolicy.from_settings(settings), history_tokens=0),
+        context_policy=context_policy(settings, ephemeral=True),
+        continuation_mode=getattr(settings, 'agent_responses_continuation', 'auto'),
         trace_root=settings.data_dir/'agent_monitor' if getattr(settings,'agent_monitor_enabled',False) else None,
         trace_context={**guard.trace_trigger, 'context_kind':'background_group', 'surface':'group',
+            'context_lifetime':'ephemeral', 'context_state':'new', 'context_reason':'ephemeral_judgment',
             'scope_id':observation.job.scope_id, 'context_scope':'background:'+observation.job.key,
             'trigger_kind':'participation_judge', 'request_preview':'轻量群参与判断'},
         cache_namespace='participation:'+str(settings.bot_qq)+':'+observation.job.key,

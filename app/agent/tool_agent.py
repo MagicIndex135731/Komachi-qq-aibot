@@ -88,6 +88,25 @@ def validate_arguments(value: Any, schema: dict) -> bool:
     return False
 
 
+def argument_validation_feedback(value: Any, schema: dict) -> dict:
+    """Bounded schema facts only; never echo malformed input or private values."""
+    if not isinstance(value,dict):return {'expected_type':'object'}
+    properties=schema.get('properties',{})
+    allowed=('type','minItems','maxItems','minLength','maxLength','minimum','maximum','enum','uniqueItems')
+    invalid=[]
+    for key,rule in properties.items():
+        if key in value and not validate_arguments(value[key],rule):
+            expected={k:v for k,v in rule.items() if k in allowed and k!='enum'}
+            if 'enum' in rule:expected['enum']=rule['enum'][:12]
+            if isinstance(rule.get('items'),dict) and 'enum' in rule['items']:
+                expected['item_enum']=rule['items']['enum'][:12]
+            invalid.append({'parameter':key,'expected':expected})
+            if len(invalid)>=8:break
+    return {'invalid_arguments':invalid,
+        'missing_parameters':[k for k in schema.get('required',[]) if k not in value][:8],
+        'unknown_parameter_count':len(set(value)-set(properties))}
+
+
 class AutonomousToolAgent:
     def __init__(self, *, decision_client, max_steps: int = 6, max_image_calls: int = 1,
                  before_call=None, blocking=None) -> None:

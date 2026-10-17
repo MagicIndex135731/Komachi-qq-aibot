@@ -167,11 +167,14 @@ def _retain_uncertain_receipts(previous: dict, checkpoint: dict) -> dict:
     """Context pruning/invalidation cannot accidentally erase write fences."""
     retained = previous.get("receipts", [])
     incoming = checkpoint.get("receipts", [])
-    by_id = {receipt.get("call_id"): receipt for receipt in incoming if receipt.get("call_id")}
+    def identity(receipt):
+        # Provider call IDs need only be unique inside one model request.
+        return json.dumps([receipt.get('run_id'), receipt.get('reply_source_id'), receipt.get('call_id')], sort_keys=True)
+    by_id = {identity(receipt): receipt for receipt in incoming if receipt.get("call_id")}
     for receipt in retained:
         if receipt.get("status") != "uncertain":
             continue
-        replacement = by_id.get(receipt.get("call_id"))
+        replacement = by_id.get(identity(receipt))
         # A confirmed platform receipt may resolve the uncertainty. Merely
         # claiming a different status cannot make the original call replayable.
         if replacement and replacement.get("status") == "sent" and replacement.get("receipt_id"):
@@ -399,6 +402,43 @@ class AgentSessionRepository:
                 before_commit()
             return self._snapshot(row) | {'context_source_message_ids': sorted(retained_sources),
                 'context_memory_dependencies': dict(retained_memory)}
+
+    def complete_turn(self, scope: str, items: list[dict], checkpoint: dict, sources=(), *,
+                      native_revision: int, parallel=False, before_commit=None, retained_context=None) -> dict:
+        """Append one closed result; a concurrent completion never replaces history.
+
+        The normal writer owns native replay. Snapshot workers only append
+        closed application data; the next native turn bootstraps the merged
+        history when another worker completed outside that native session.
+        """
+        incoming_sources = _validate_sources(sources)
+        inherited_sources, inherited_memory = _retained_context(retained_context)
+        retained_context = {'sources': inherited_sources | set(incoming_sources), 'memory': inherited_memory}
+        for _ in range(5):
+            current = self.read(scope)
+            merged = dict(current['checkpoint']) if parallel else dict(checkpoint)
+            receipts = [*current['checkpoint'].get('receipts', []), *checkpoint.get('receipts', [])]
+            merged['receipts'] = list({json.dumps(r, sort_keys=True): r for r in receipts}.values())
+            # This is a bounded context cache; the effect ledger remains the
+            # authority. Never let accumulating confirmed receipts prevent a
+            # completed turn from closing its 16k-character checkpoint.
+            while len(merged['receipts']) > 100 or _json_size(merged['receipts']) > 8000:
+                oldest = next((i for i, receipt in enumerate(merged['receipts'])
+                    if receipt.get('status') not in {'dispatching','uncertain','unknown'}), None)
+                if oldest is None:
+                    break
+                del merged['receipts'][oldest]
+            if items and (parallel or current['revision'] != native_revision):
+                merged['shared_native_dirty'] = True
+            try:
+                return self.save(scope, [*current['items'], *items], merged,
+                    current['source_message_ids'] if parallel and current['checkpoint'].get('in_flight') else sources,
+                    expected_revision=current['revision'], before_commit=before_commit,
+                    retained_context=retained_context)
+            except SessionRevisionConflict:
+                if before_commit:
+                    before_commit()
+        raise SessionRevisionConflict('concurrent completion could not commit')
 
     def clear_if_source(self, scope: str, message_id: int) -> bool:
         from app.storage.db import session_scope

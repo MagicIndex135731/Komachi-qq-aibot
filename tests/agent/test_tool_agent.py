@@ -12,6 +12,15 @@ class Guard:
             raise RuntimeError("revoked")
 
 
+def test_argument_feedback_explains_array_limit_without_echoing_values():
+    from app.agent.tool_agent import argument_validation_feedback
+    schema={'type':'object','properties':{'aliases':{'type':'array','minItems':1,'maxItems':3,
+        'items':{'type':'string'}}},'required':['aliases']}
+    feedback=argument_validation_feedback({'aliases':['PRIVATE_VALUE']*4,'PRIVATE_FIELD':'SECRET'},schema)
+    assert feedback['invalid_arguments']==[{'parameter':'aliases','expected':{'type':'array','minItems':1,'maxItems':3}}]
+    assert feedback['unknown_parameter_count']==1 and 'PRIVATE' not in json.dumps(feedback)
+
+
 class Model:
     def __init__(self, calls):
         self.calls = iter(calls)

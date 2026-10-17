@@ -55,7 +55,7 @@ def test_validate_memory_search_args_rejects_invalid(arguments, error) -> None:
 
 def test_validate_memory_search_args_accepts_valid() -> None:
     assert validate_memory_search_args(
-        {"query": "冰美式", "layer": "facts", "member": "阿渣", "limit": 3}
+        {"query": "冰美式", "layer": "facts", "member": "小甲", "limit": 3}
     ) is None
 
 

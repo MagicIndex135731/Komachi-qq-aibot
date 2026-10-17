@@ -17,8 +17,10 @@ MEDIA_OPERATIONS = frozenset({'generate_image', 'download_web_images', 'download
 
 
 def download_delivery_properties():
-    return {'delivery_mode': {'type':'string', 'enum':['auto','review'],
-        'description':'用户仅要求下载后发送选auto；需要分析、筛选或核对内容选review（默认）。auto绑定原请求，由程序按原顺序交付，无需再次调用发送工具。'},
+    return {'quality':{'type':'string','enum':['best_available','original_only'],
+        'description':'默认best_available按预算选原生版本；用户明确必须原图且不接受降档才original_only'},
+        'delivery_mode': {'type':'string', 'enum':['auto','review'],
+        'description':'用户明确给定来源全部媒体原样发送可选auto；按人物/主题筛选用review（默认），取结果后以原帖正文、日期和类型判断，无须逐份预览。auto绑定原请求，按完成先后交付，不另调用发送工具。'},
         'delivery_text': {'type':'string','maxLength':300,
             'description':'auto完成后的简短说明，不得提前宣称已发送；可留空。'}}
 
@@ -63,7 +65,7 @@ def build_media_batch_tool(tools, guard):
     if not offered:
         return ()
     return (AgentTool('queue_media_batch',
-        '将已发现的多项下载操作按顺序持久排队，每次最多16项。各项仍受原工具权限/大小/格式限制；超过4项先等待容量再继续，排队不代表任务完成。分析筛选用review，纯下载交付可用auto。',
+        '将已发现的多项下载操作持久排队，每次最多16项、每进程最多4个媒体worker并行。各项仍受原工具权限/大小/格式限制；等待容量后继续，先完成的可先交付，排队不代表完成。分析筛选用review，纯下载交付可用auto。',
         {'type': 'object', 'properties': {'operations': {'type': 'array', 'minItems': 1, 'maxItems': 16,
             'items': {'type': 'object', 'properties': {'operation': {'type': 'string', 'enum': sorted(offered)},
                 'arguments': {'anyOf': [tool.parameters for tool in offered.values()]}},
@@ -82,6 +84,7 @@ class MediaJobGuard(ResearchJobGuard):
 
 class MediaTaskQueue(ResearchDelegationQueue):
     job_type = 'agent_media_operation'
+    concurrency = 4
     # Losing a worker must not silently buy the same image a second time.
     max_execution_attempts = 1
     interrupted_execution_status = 'uncertain'
@@ -163,14 +166,30 @@ def media_result(outcome, payload):
     """Return handles and a bounded observation, never transport bytes or logs."""
     data = dict(outcome.data)
     if len(json.dumps(data, ensure_ascii=False)) > 12000:
-        outcome = ToolOutcome({'error': 'media_result_too_large'}, 'failed')
-        data = outcome.data
-    preview_ids = data.get('artifact_ids', ())[:2]
-    if data.get('artifact_id'):
-        preview_ids = [data['artifact_id']]
+        # Resource descriptions may be long; handles are never replaced by an error.
+        keep = {'artifact_id','artifact_ids','media_artifact_ids','video_artifact_id',
+            'video_artifact_ids','requested_count','downloaded_count','all_requested_downloaded',
+            'source_url','post_id','total_bytes','image_roles','quality_fallbacks'}
+        compact = {key:value for key,value in data.items() if key in keep}
+        compact['media'] = [{key:value for key,value in item.items() if key in {
+            'artifact_id','logical_media_id','source_ref','kind','index','status','bytes','image_size','sha256'}}
+            for item in data.get('media',[]) if isinstance(item,dict)]
+        from app.core.media_source import media_source_key
+        for item in compact['media']:
+            if item.get('source_ref'):item['source_ref']=media_source_key(item['source_ref'])
+        compact['failures'] = [{key:str(value)[:160] for key,value in item.items()
+            if key in {'index','image_id','error'}} for item in data.get('failures',[]) if isinstance(item,dict)]
+        compact.update(result_compacted=True, guidance='描述已压缩，保留真实成果句柄；失败和部分完成须如实说明。')
+        data = compact
+    # Downloads return handles; explicit read_artifact is the visual inspection
+    # step. Generations retain their requested preview, not unrelated web pixels.
+    preview_ids = []
+    if payload['operation'] in {'generate_image', 'generate_private_image'}:
+        preview_ids = data.get('artifact_ids', ())[:2]
+        if data.get('artifact_id'):preview_ids = [data['artifact_id']]
     return {'kind': 'media_result', 'operation': payload['operation'], 'task_id': payload['task_id'],
         'status': outcome.status, 'data': data, 'preview_artifact_ids': list(preview_ids),
-        'guidance': '这是后台真实执行结果；核对产物后用发送工具交付。失败或不确定不得称成功，不自动重做。'}
+        'guidance': '这是后台真实执行结果，下载回传不读取像素；主题筛选默认依据原帖正文、日期、类型。只有文字有歧义时才少量查看静态图片，不预览视频或动图。直接下载请求可复用auto交付。失败/未知不声称成功，不重复提交。'}
 
 
 async def execute_web_media(payload, guard, *, engine, settings, web_client, runner):
@@ -179,8 +198,10 @@ async def execute_web_media(payload, guard, *, engine, settings, web_client, run
     guard.require_valid()
     group_id = payload['scope_id'] if payload['surface'] == 'group' else None
     store = media_store(payload, guard, engine=engine, settings=settings)
+    from app.agent.request_budget import worker_budget
+    budget=worker_budget(payload,guard,settings)
     tools = build_web_image_tools(web_client, runner=runner, guard=guard, store=store, settings=settings,
-        prepared_candidates=payload.get('candidates', {}))
+        prepared_candidates=payload.get('candidates', {}), transfer_budget=budget)
     access = build_share_access(SimpleNamespace(engine=engine), group_id=group_id,
         trigger_source_ids=(payload['source_id'],), bot_qq=payload['account_id'],
         addressed_source_ids=(payload['source_id'],) if payload.get('request_addressed') is True else (),
@@ -189,7 +210,9 @@ async def execute_web_media(payload, guard, *, engine, settings, web_client, run
     tool = next(item for item in tools if item.name == payload['operation'])
     if not validate_arguments(payload['arguments'], tool.parameters):
         return media_result(ToolOutcome({'error': 'invalid_media_arguments'}, 'blocked'), payload)
-    outcome = await tool.handler(payload['arguments'])
+    from app.core.request_cost import request_cost_scope
+    with request_cost_scope(budget):
+        outcome = await tool.handler(payload['arguments'])
     guard.require_valid()
     return media_result(outcome, payload)
 
@@ -218,7 +241,7 @@ def media_previews(result, store, guard, settings):
 
 async def deliver_download(payload, guard, *, engine, settings, runner, send, clock, conversation_key):
     """Deliver only an explicitly queued download, through the existing ledger."""
-    from app.agent.media_delivery import resolve_media_bundle
+    from app.agent.media_delivery import resolve_media_bundle,pack_media_files,artifact_delivery_identities
     from app.agent.runtime_trace import AgentTrace, current_trace_context
     from app.agent.tool_dispatch import ToolDispatchBoundary
     guard.require_valid()
@@ -242,15 +265,19 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
         files = await runner.run(resolve_media_bundle,store,settings,identifiers,before_read=before_read)
         if data.get('all_requested_downloaded') is False:
             text = f"成功下载{len(files)}项，另有{len(data.get('failures',[]))}项未完成；这里只发送已取得的媒体。"
+        if data.get('quality_fallbacks'):
+            text += f" 其中{len(data['quality_fallbacks'])}张图片原图不可用，已降为large尺寸（非原图）。"
     else:
         text = '这次媒体下载未完成，暂时无法发送。'
     boundary = ToolDispatchBoundary(engine=engine,account_id=payload['account_id'],scope=payload['scope'],
         guard=guard,max_daily=500,cooldown_seconds=0,clock=clock,
         delivery_source_id=payload['source_id'],
+        media_identity=lambda i:artifact_delivery_identities(store,i),
         interactive_group_send=payload['surface']=='group')
     operation = 'send_'+payload['surface']
     async def handler(args):
-        return await send(boundary, files if args.get('media') else (), args['text'])
+        selected=tuple(files[identifiers.index(i)] for i in args.get('media',[]))
+        return await send(boundary, selected, args['text'])
     tool = AgentTool(operation,'交付原请求已授权的下载结果',{},handler,effect='write')
     observer = AgentTrace(settings.data_dir/'agent_monitor' if getattr(settings,'agent_monitor_enabled',False) else None,
         context={**current_trace_context(), **guard.trace_trigger,
@@ -266,7 +293,15 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
             observer.event('tool.completed',{'name':operation,'call_id':call_id,'effect':'write',
                 'status':outcome.status,'data':outcome.data,'receipt_id':outcome.receipt_id})
             return outcome
-        outcome = await dispatch({'text':text,'media':list(identifiers) if files else []},'auto-media')
+        packets=await runner.run(pack_media_files,identifiers,files) if files else [[]]
+        from app.agent.request_budget import worker_budget
+        budget=worker_budget(payload,guard,settings)
+        for index,packet in enumerate(packets):
+            guard.require_valid()
+            if budget:budget.spend('writes',finalization=True)
+            outcome=await dispatch({'text':text+ (f'（第{index+1}/{len(packets)}批）' if len(packets)>1 else ''),
+                'media':packet},'auto-media-'+str(index))
+            if outcome.status!='sent':break
         if files and outcome.status=='failed' and outcome.data.get('error') in {
                 'qq_send_rejected','qq_video_requires_standalone_message'}:
             # A definite rejection permits one notice, never another upload.

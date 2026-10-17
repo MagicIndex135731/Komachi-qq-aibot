@@ -16,7 +16,7 @@ def prompt(target, environment):
 async def test_native_silent_turns_are_reusable_without_accumulating_observation(tmp_path):
     client, requests, _ = model_client(lambda _, n: responses_sse(number=n))
     agent = HarnessToolAgent(decision_client=client, session_home=tmp_path/'home',
-        session_id='live-session', ephemeral_context=True,
+        session_id='live-session', ephemeral_context=True, idle_patrol=True,
         context_policy=RequestContextPolicy(history_tokens=8000))
     try:
         for index in range(2):
@@ -35,7 +35,7 @@ async def test_native_successful_interaction_survives_next_silent_observation(tm
     client, requests, _ = model_client(lambda _, n: responses_sse(name='send_group', arguments={'text': 'actual reply'}, number=n)
         if n == 1 else responses_sse(number=n))
     agent = HarnessToolAgent(decision_client=client, session_home=tmp_path/'home',
-        session_id='live-session', ephemeral_context=True)
+        session_id='live-session', ephemeral_context=True, idle_patrol=True)
     async def send(args):
         return ToolOutcome({'result': 'sent'}, 'sent', 'synthetic-actual-receipt')
     tool = AgentTool('send_group', 'send', {'type': 'object', 'properties': {'text': {'type': 'string'}},

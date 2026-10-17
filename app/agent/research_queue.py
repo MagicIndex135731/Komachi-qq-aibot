@@ -118,6 +118,7 @@ class ResearchDelegationQueue:
     interrupted_execution_status = 'queued'
     exhausted_execution_status = 'failed'
     guard_type = ResearchJobGuard
+    concurrency = 2
 
     def __init__(self, engine, *, account_id, surface, execute, deliver, authorized, clock=None,
                  task_workspace_root=None, trace_root=None):
@@ -127,6 +128,7 @@ class ResearchDelegationQueue:
         self.task_workspace_root = task_workspace_root
         self.trace_root = trace_root
         self.owner, self.running, self.worker = uuid4().hex, False, None
+        self.workers = []
         self.wake = asyncio.Event()
 
     def prefix(self, scope_id=None):
@@ -183,15 +185,18 @@ class ResearchDelegationQueue:
     async def start(self):
         if not self.running:
             self.running = True
-            self.worker = asyncio.create_task(self._run(), name=self.prefix() + 'worker')
+            self.workers = [asyncio.create_task(self._run(), name=self.prefix() + f'worker-{n}')
+                for n in range(self.concurrency)]
+            self.worker = self.workers[0]
 
     async def stop(self):
         self.running = False
         self.wake.set()
-        if self.worker:
-            self.worker.cancel()
-            await asyncio.gather(self.worker, return_exceptions=True)
-            self.worker = None
+        for task in self.workers:
+            task.cancel()
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        self.workers.clear()
+        self.worker = None
 
     def cancel_scope(self, scope_id, *, before_source_id=None):
         with self.transaction() as session:

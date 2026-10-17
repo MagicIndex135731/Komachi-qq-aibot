@@ -20,13 +20,17 @@ from app.storage.models import Message
 TRUST = 'untrusted_shared_content'
 _APP_KINDS = frozenset({'share', 'json', 'xml'})
 _READ_INTENT = re.compile(r'看(?:看|一下|下)?(?!过|到|见|起来|完|着)|打开(?!过)|读取|读一下|评价|评一评|评论|分析|总结|解读|讲讲|介绍|了解|查查|(?:扒|拔|下载|提取|保存|获取|搬).{0,20}(?:图|视频)|(?:图|视频).{0,20}(?:扒|拔|下载|提取|保存|获取|搬)|read|review|summari[sz]e|analyse|analyze|open|download|extract', re.I)
-_NEGATIVE = re.compile(r'(?:不要|不用|不必|无需|别|不想|不需要|不是(?:让|要|请)(?:你)?).{0,8}(?:看|打开|读|评价|评论|分析|总结|联网|上网|查|搜|扒|拔|下载|提取|保存|搬|取图|发图)|(?:do not|don.t)\s+(?:read|open|search|review|download|extract)', re.I)
+# Negation cannot jump from an exclusion clause into the next positive request.
+_NEGATIVE = re.compile(r'(?:不要|不用|不必|无需|别|不想|不需要|不是(?:让|要|请)(?:你)?)[^，,。！？!?；;\n]{0,8}(?:看|打开|读|评价|评论|分析|总结|联网|上网|查|搜|找|扒|拔|下载|提取|保存|搬|取图|发图)|(?:do not|don.t)\s+(?:read|open|search|review|download|extract)', re.I)
 _WEB_INTENT = re.compile(r'联网|上网|网络搜索|网上(?:查|搜)|搜索|检索|搜一下|查一下|查查|查找|查一查|帮我(?:查|搜)|查询|查证|核实|是真的吗|search\s+(?:the\s+)?web|web\s+search', re.I)
 _QUESTION = re.compile(r'[?？]|什么|怎么|咋|为什么|为何|如何|多少|是否|能否|可否|哪(?:个|种|些|里|儿|位|款|家)|(?:吗|么|呢)[啊呀吧嘛\s。！!]*$|\b(?:what|why|how|when|where|who|which)\b', re.I)
 # Directed requests can put a site, an object and sequencing before the verb
 # ("帮我去站点把作者最新的图片下载给我"). Match that bounded clause,
 # rather than requiring the action to immediately follow the polite prefix.
-_REQUEST = re.compile(r'^\s*(?:(?:请|麻烦|劳驾|帮我|能不能|可以|给我|(?:那|那么|再|然后)?把)[^。！？!?；;\n]{0,100}?)?(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|搬运|找一下|找找|我要看|我想看|想看|给我看|发我|发给我|来点|来张)|\b(?:please|could you|can you|show me|send me|I want to see)\b', re.I)
+_REQUEST = re.compile(r'^\s*(?:(?:继续|接着|然后|再|那(?:么)?)\s*){0,2}(?:(?:请|麻烦|劳驾|帮我|能不能|可以|给我|(?:那|那么|再|然后)?把)[^。！？!?；;\n]{0,100}?)?(?:核对|查证|核实|调查|研究|分析|比较|对比|整理|总结|介绍|讲讲|解释|下载|提取|保存|扒|搬运|找一下|找找|找(?=\s*\S)|我要看|我想看|想看|给我看|发我|发给我|来点|来张)|\b(?:please|could you|can you|show me|send me|I want to see)\b', re.I)
+_LOCATED_REQUEST = re.compile(r'^\s*(?:从|去|到|在)[^，,。！？!?；;\n]{1,60}?(?:找(?!到|过|了|着)|搜索|检索|搜一下|下载(?!过|了|完|到|的|好)|提取(?!过|了|完|的))')
+# Declining visual inspection does not cancel an explicit search/download.
+_VISUAL_EXCLUSION = re.compile(r'(?:不要|不用|不必|无需|别|不需要|不)\s*(?:逐张|逐份|逐个|具体|实际|仔细)?\s*(?:查看|看|预览|抽帧|分析|识别)(?:图片|图像|视频|动图|图)(?:或(?:图片|图像|视频|动图|图))*')
 _SHARE_REFERENCE = re.compile(r'(?:这[个条张份]?|那[个条张份]?|引用|刚才的?|上面的?)(?:APP)?(?:分享|卡片)', re.I)
 
 WEB_REQUEST_POLICY = ('联网仅用于当前真实用户的提问、资料请求、@或称呼小町时按需查证，不要求用户固定说“联网”。'
@@ -123,7 +127,10 @@ class ShareReadAccess:
                     raw = _raw(row)
                     text = _authored_text(raw)
                     request_text = re.sub(r'https?://\S+', '', text)
-                    if _NEGATIVE.search(text):
+                    cancellation_text=_VISUAL_EXCLUSION.sub('',text)
+                    if not (_REQUEST.search(cancellation_text) or _LOCATED_REQUEST.search(cancellation_text)):
+                        cancellation_text=text
+                    if _NEGATIVE.search(cancellation_text):
                         continue
                     quoted = self._quoted(session, row)
                     quoted_links = _app_links(_raw(quoted)) if self._usable(quoted) else ()
@@ -137,7 +144,8 @@ class ShareReadAccess:
                             self._grants.append(_ShareGrant(row.id, quoted.id, _fingerprint(row), _fingerprint(quoted)))
                     elif (not _app_links(raw) and not _SHARE_REFERENCE.search(text)
                             and (row.id in addressed or self._mentioned(raw, row, private=False)
-                                 or _QUESTION.search(request_text) or _REQUEST.search(request_text) or _WEB_INTENT.search(request_text)
+                                 or _QUESTION.search(request_text) or _REQUEST.search(request_text)
+                                 or _LOCATED_REQUEST.search(request_text) or _WEB_INTENT.search(request_text)
                                  or re.search(r'https?://', text) and _READ_INTENT.search(text))):
                         self._grants.append(_ShareGrant(row.id, None, _fingerprint(row), None))
                 except (ValueError, TypeError, RecursionError):
@@ -265,11 +273,25 @@ def wrap_share_web_tools(tools, access, *, observed_source_ids=()):
                 return ToolOutcome({'error': 'web_requires_explicit_request',
                     'guidance': '仅为当前真实用户的提问、资料请求或称呼小町按需联网；主动插话和静默巡检不用联网。APP卡片深读仍需当前引用许可；明确说不要看时停止。'}, 'blocked')
             target = references.get(args.get('ref_id'), args.get('ref_id'))
+            if original.name=='list_x_posts':
+                from app.providers.twitter_timeline import parse_account
+                try:profile='https://x.com/'+parse_account(args.get('account'))
+                except (ValueError,TypeError):return ToolOutcome({'error':'invalid_twitter_account'},'blocked')
+                if not access.known_card_target_allowed(profile,observed_source_ids):
+                    return ToolOutcome({'error':'share_requires_quoted_request'},'blocked')
+            targets = args.get('ref_ids')
+            if isinstance(targets, list):
+                if any(not isinstance(value, str) for value in targets):
+                    return ToolOutcome({'error': 'invalid_resource_targets'}, 'blocked')
+                targets = [references.get(value, value) if isinstance(value, str) else value for value in targets]
+                if any(not access.known_card_target_allowed(value, observed_source_ids) for value in targets):
+                    return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
             if target is not None and not access.known_card_target_allowed(target, observed_source_ids):
                 return ToolOutcome({'error': 'share_requires_quoted_request'}, 'blocked')
             # The reference table is shared with media tools too. Their
             # providers accept URLs, while the model sees search ref_ids.
             resolved = {**args, 'ref_id': target} if target is not None else args
+            if isinstance(targets, list):resolved = {**resolved, 'ref_ids': targets}
             outcome = await original.handler(resolved)
             if not access.web_allowed():
                 return ToolOutcome({'error': 'share_request_revoked'}, 'blocked')
@@ -277,6 +299,10 @@ def wrap_share_web_tools(tools, access, *, observed_source_ids=()):
                 for source in outcome.data.get('sources', ()):
                     if isinstance(source, dict) and isinstance(source.get('ref_id'), str) and isinstance(source.get('source'), str):
                         references[source['ref_id']] = source['source']
+                for resource in outcome.data.get('resources', ()):
+                    if (isinstance(resource,dict) and resource.get('identity_status')=='matched'
+                            and isinstance(resource.get('source_url'),str) and isinstance(resource.get('post_id'),str)):
+                        references[resource['post_id']]=resource['source_url']
             return outcome
         wrapped.append(replace(tool, handler=checked))
     return tuple(wrapped)

@@ -4,7 +4,7 @@ from app.adapters.qzone import QzoneAdapter
 from app.agent.social_contracts import SocialRuntimeOptions
 from app.agent.social_executor import SocialExecutor
 from app.agent.social_planner import SocialPlanner
-from app.agent.social_policy import configured_agent_jobs
+from app.agent.social_policy import configured_agent_jobs, configured_scheduled_jobs
 from app.agent.social_runtime import SocialRuntime
 from app.providers.llm_client import LlmClient
 from app.runtime.providers import build_proactive_judge_client
@@ -128,7 +128,7 @@ def build_social_agent(*, router, sender, gateway, llm_client):
         planner.aclose = aclose
         agent = SocialRuntime(
             engine=router.engine, account_id=settings.bot_qq,
-            jobs=lambda: configured_agent_jobs(runtime), observe=planner.observe,
+            jobs=lambda: configured_scheduled_jobs(runtime), observe=planner.observe,
             decide=planner.decide, execute=executor.execute, policy_check=executor.policy_check,
             options=SocialRuntimeOptions(poll_seconds=settings.social_agent_poll_seconds,
                                          decision_timeout_seconds=settings.social_agent_decision_timeout_seconds,

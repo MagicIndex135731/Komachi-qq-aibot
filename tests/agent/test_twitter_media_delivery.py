@@ -22,7 +22,7 @@ from app.agent.runtime_trace import TraceReader
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
-async def test_private_poll_delivers_then_queued_result_reuses_receipt_without_second_media_send(
+async def test_private_poll_delivery_settles_completed_callback_or_fences_uncertain_send(
         sqlite_engine, tmp_path, monkeypatch, mp4, uncertain):
     import threading
     from tests.agent.test_evidence_followup import output as tool_output
@@ -44,6 +44,7 @@ async def test_private_poll_delivers_then_queued_result_reuses_receipt_without_s
             return sse('send_private', {'text':'First delivery','media_artifact_ids':holder['media'],
                 'as_forward':True,'task_status':'completed'},number=n)
         if n == 4:
+            assert uncertain, 'completed media request must not restart the model'
             packet = observation(body,'Private observation JSON:\n')
             assert packet['delegated_result']['kind'] == 'media_result'
             return sse('send_private', {'text':'Different caption in returned turn',
@@ -74,9 +75,14 @@ async def test_private_poll_delivers_then_queued_result_reuses_receipt_without_s
                 with session_scope(sqlite_engine) as session:
                     active=session.scalar(select(Job.id).where(Job.job_type==agent.job_type,
                         Job.status.in_(('queued','running'))).limit(1))
-                if active is None and len(calls)>=4:break
+                if active is None and len(calls)>=(4 if uncertain else 3):break
                 await asyncio.sleep(.05)
-        assert len(forwards)==1 and len(calls)==4 and len(requests)==4
+        assert len(forwards)==1 and len(calls)==(4 if uncertain else 3) and len(requests)==4
+        if not uncertain:
+            with session_scope(sqlite_engine) as session:
+                callback = session.scalars(select(Job).where(Job.job_type == agent.job_type,
+                    Job.last_error_code == 'original_media_request_already_completed')).one()
+                assert callback.status == 'completed'
     finally:
         await service.stop()
         service.web_search_client.http_client.close()
@@ -90,6 +96,12 @@ async def test_private_natural_media_request_searches_without_url_then_downloads
     from tests.private_chat.test_agent_service import OWNER
 
     media_requests = provider(monkeypatch, video=mp4)
+    from datetime import UTC,datetime
+    monkeypatch.setattr('app.agent.resource_tools.PublicResourceClient.inspect',lambda self,url,**kwargs:{
+        'source_url':url,'post_id':'900000000000000001','title':'合成作品','author':'synthetic',
+        'published_at':datetime.now(UTC).isoformat(),'identity_status':'matched',
+        'date_status':'source_reported','media_count':3,'text':'合成原帖',
+        'media':[{'kind':'image','role':'post_image'},{'kind':'video','role':'post_video'}]})
     web_calls, delivery_calls = [], []
     def search(request):
         web_calls.append(request)
@@ -111,10 +123,10 @@ async def test_private_natural_media_request_searches_without_url_then_downloads
         if n == 3:
             found = output(body)
             assert found['evidence_level'] == 'search_summary' and URL in json.dumps(found)
-            return sse('download_twitter_media', {'ref_id': URL, 'delivery_mode': 'auto'}, number=n)
+            return sse('inspect_web_resources',{'ref_ids':[URL]},number=n)
         if n == 4:
-            assert output(body)['status'] == 'queued'
-            return sse('send_private', {'text': '正在下载，完成后交付', 'task_status': 'progress'}, number=n)
+            assert output(body)['resources'][0]['identity_status']=='matched'
+            return sse('download_twitter_media', {'ref_id': URL, 'delivery_mode': 'auto'}, number=n)
         raise AssertionError('Unnecessary model request after queued delivery')
     class Gateway:
         async def call_api(self, action, params):
@@ -139,7 +151,7 @@ async def test_private_natural_media_request_searches_without_url_then_downloads
         nodes = forwards[0]['messages']
         media = [part for node in nodes for part in node['data']['content']
                  if part['type'] in {'image', 'video'}]
-        assert [part['type'] for part in media] == ['image', 'video', 'video']
+        assert [part['type'] for part in media] == ['image', 'video']
         assert base64.b64decode(media[0]['data']['file'][9:]) == image_bytes()
         assert len(requests) == 4
     finally:
@@ -151,6 +163,11 @@ async def test_private_natural_media_request_searches_without_url_then_downloads
 @pytest.mark.parametrize('uncertain',[False,True])
 @pytest.mark.parametrize('delivery_mode',['review','auto'])
 async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlite_engine,tmp_path,monkeypatch,mp4,surface,uncertain,delivery_mode,record_property):
+    if surface == 'group':
+        from types import SimpleNamespace
+        # composed() creates snapshots using NOW. Validate with that same clock,
+        # so the fixture does not expire seven days after its fixed sample date.
+        monkeypatch.setattr('app.agent.context_dependencies.datetime', SimpleNamespace(now=lambda tz: NOW))
     monitor_root=tmp_path/'agent_monitor'
     requests=provider(monkeypatch,video=mp4)
     web=WebSearchClient(provider='ddgs',base_url='',api_key='',timeout_seconds=10)
@@ -207,7 +224,7 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
                     def on_dispatch(self):pass
                 result=await fixture.executor.run_tools(SocialObservation(job,NOW,'synthetic persona',source_message_ids=(source,)),
                     DirectGuard(),interactive=True,target_user_id=FRIEND,target_message_id='x-download-request',direct_group_reply=True)
-                assert result.status=='sent', result
+                assert result.status==('silent' if delivery_mode=='auto' else 'sent'), result
                 assert await queue.tick()
                 assert await queue.tick()
                 await queue.stop()
@@ -232,12 +249,12 @@ async def test_native_queued_mixed_media_preserves_order_scope_and_receipt(sqlit
         nodes=forwards[0]['messages']
         assert nodes[0]['data']['content']==[{'type':'text','data':{'text':'原帖共3项媒体'}}]
         media=[item for node in nodes for item in node['data']['content'] if item['type'] in {'image','video'}]
-        assert [item['type'] for item in media]==['image','video','video']
-        assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4,mp4]
+        assert [item['type'] for item in media]==['image','video']
+        assert [base64.b64decode(item['data']['file'][9:]) for item in media]==[image_bytes(),mp4]
         if delivery_mode=='auto':
-            # A progress acknowledgement with the actual queued job can close
-            # locally. Formal tasks with remaining work have separate coverage.
-            assert len(model_calls)==2 and sent_result==[]
+            # The queue owns delivery immediately; no stale progress call.
+            assert len(model_calls)==1 and sent_result==[]
+            assert all(action.endswith('forward_msg') for action,_ in gateway.calls)
         record_property('upstream_requests',len(model_calls))
         record_property('delivery_mode',delivery_mode)
         record_property('surface',surface)

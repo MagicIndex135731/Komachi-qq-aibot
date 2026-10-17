@@ -18,9 +18,9 @@ def evidence_descriptor(name, arguments, outcome):
         kind='action_receipts'
     elif name=='research_result' and data.get('source_bound') is True:
         kind='delegated_summary'
-    elif name in {'search_web','open_web_page','find_web_page','read_research_evidence'}:
+    elif name in {'search_web','open_web_page','find_web_page','read_research_evidence','inspect_web_resources','list_x_posts','search_x_posts','search_xhs_posts'}:
         content_kind=str(data.get('content_kind',''))
-        kind=('search_summary' if name=='search_web' or 'summary' in content_kind or content_kind=='grounded_answer'
+        kind=('search_summary' if name in {'search_web','search_xhs_posts'} or 'summary' in content_kind or content_kind=='grounded_answer'
               else 'primary_text' if data.get('content') else 'empty_result')
         for item in data.get('sources',[])[:20]:
             if not isinstance(item,dict):continue
@@ -28,6 +28,23 @@ def evidence_descriptor(name, arguments, outcome):
             if isinstance(value,str) and value.startswith(('https://','http://')):
                 resources.append({'kind':'web_url','url':value[:2000],
                     'date_status':'unverified','author_status':'unverified'})
+        for item in data.get('resources', [])[:12]:
+            if not isinstance(item, dict) or item.get('status') not in {None, 'ok'}:continue
+            url = item.get('source_url')
+            if not url and type(item.get('input_index')) is int:
+                refs = arguments.get('ref_ids', [])
+                index = item['input_index'] - 1
+                if isinstance(refs, list) and 0 <= index < len(refs):url = refs[index]
+            if isinstance(url, str) and url.startswith(('https://', 'http://')):
+                resources = [r for r in resources if r['url'] != url]
+                if name=='search_xhs_posts' and item.get('identity_status')!='matched':
+                    resources.append({'kind':'web_url','url':url[:2000],
+                        'date_status':'unverified','author_status':'unverified'})
+                    continue
+                resources.append({'kind': 'inspected_post', 'url': url[:2000], **{k: item[k] for k in
+                    ('post_id', 'author', 'published_at', 'identity_status', 'date_status', 'author_status',
+                     'media_count', 'media_roles') if k in item}})
+                kind = 'primary_metadata'
     elif name in {'download_web_image','download_web_images','download_web_video','download_twitter_media',
                   'read_artifact','media_result','generate_image','generate_private_image','search_image_references',
                   'execute_python'}:
@@ -35,6 +52,9 @@ def evidence_descriptor(name, arguments, outcome):
             ('artifact_id','artifact_ids','video_artifact_id','video_artifact_ids','media_artifact_ids','artifacts')) else 'tool_result'
     elif name=='list_web_images':
         kind='media_candidates'
+        if data.get('post_id') and data.get('identity_status')=='matched' and data.get('page_url'):
+            resources.append({'kind':'inspected_post','url':data['page_url'],**{k:data[k] for k in
+                ('post_id','author','published_at','identity_status','date_status','author_status','media_count') if k in data}})
     elif name in {'read_research_resources','read_message_links'}:
         kind='resource_index'
         for item in data.get('resources',data.get('links',[]))[:20]:
@@ -52,9 +72,13 @@ def evidence_descriptor(name, arguments, outcome):
         code=error if isinstance(error,str) and len(error)<120 else outcome.status
         failure={'code':code,'category':('unknown_effect' if outcome.status=='uncertain' else
             'local_lookup' if code in {'task_evidence_unavailable','task_checkpoint_unavailable',
-                                      'invalid_task_id','invalid_task_evidence','invalid_resource_page'} else
+                                      'invalid_task_id','invalid_task_evidence','invalid_resource_page',
+                                      'resource_freshness_unverified'} else
             'authority' if code in {'owner_required','web_requires_explicit_request','share_request_revoked',
                                    'share_requires_quoted_request','memory_out_of_scope'} else
+            'access' if code in {'web_resource_session_required', 'web_resource_extractor_unavailable',
+                'web_resource_http_401', 'web_resource_http_403', 'web_image_note_unavailable',
+                'web_resource_dynamic_or_empty'} else
             'capacity' if any(v in code for v in ('budget','capacity','limit','cache_busy')) else
             'arguments' if any(v in code for v in ('argument','invalid_','not_allowed')) else 'provider'),
             'retryable':outcome.status!='uncertain' and any(v in code for v in

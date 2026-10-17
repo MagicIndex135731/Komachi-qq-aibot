@@ -41,6 +41,43 @@ def test_window_uses_latest_input_and_cache_is_weighted_without_double_count(tmp
     assert stats['usage']['uncached_input_tokens']==280
     assert stats['usage']['uncached_known_requests']==2
     assert stats['usage']['request_count']==stats['usage']['cache_known_requests']==2
+    assert stats['usage']['real_total_tokens']==407
+    assert stats['usage']['total_known_requests']==2
+    assert stats['usage']['cache_creation_tokens'] is None
+
+
+def test_ccswitch_screenshot_fresh_input_and_total_do_not_double_count_cache(tmp_path):
+    trace=make_trace(tmp_path)
+    request(trace,'m01-a01');finish(trace,'m01-a01',320200,314496,1313)
+    trace.finish('ok','done');trace.close()
+    stats=read(tmp_path)
+    assert stats['usage']['uncached_input_tokens']==5704
+    assert stats['usage']['real_total_tokens']==321513
+    assert stats['usage']['real_total_tokens']==5704+314496+1313
+    assert stats['context']['input_tokens']==320200
+    assert stats['usage']['cache_ratio']==pytest.approx(314496/320200)
+
+
+def test_total_requires_input_and_output_from_same_request_without_guessing_cache(tmp_path):
+    trace=make_trace(tmp_path)
+    request(trace,'m01-a01');finish(trace,'m01-a01',100,20,None)
+    request(trace,'m02-a01');finish(trace,'m02-a01',None,None,7)
+    trace.finish('ok','done');trace.close()
+    stats=read(tmp_path)['usage']
+    assert stats['input_tokens']==100 and stats['output_tokens']==7
+    assert stats['real_total_tokens'] is None and stats['total_known_requests']==0
+    assert stats['uncached_input_tokens']==80 and stats['uncached_known_requests']==1
+
+
+def test_all_cached_input_is_zero_fresh_and_missing_cache_is_unknown(tmp_path):
+    trace=make_trace(tmp_path)
+    request(trace,'m01-a01');finish(trace,'m01-a01',100,100,5)
+    request(trace,'c01-a01',purpose='compaction');finish(trace,'c01-a01',20,None,3)
+    trace.finish('ok','done');trace.close()
+    stats=read(tmp_path)['usage']
+    assert stats['uncached_input_tokens']==0 and stats['uncached_known_requests']==1
+    assert stats['real_total_tokens']==128 and stats['total_known_requests']==2
+    assert stats['cache_ratio']==1 and stats['cache_known_requests']==1
 
 
 def test_pending_main_request_uses_estimate_and_compaction_only_affects_cost(tmp_path):

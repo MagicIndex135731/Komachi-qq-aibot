@@ -213,9 +213,9 @@ async def test_native_group_observed_reference_edits_owned_pixels_and_reuses_out
         assert reference_metadata["source_message_ids"] == output_metadata["source_message_ids"] == [origin]
         assert "data:image/png;base64," in json.dumps(requests[1])
         assert latest(requests[3], "read_artifact")["data"]["pixels_attached"]
-        first_session = fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"]
+        first_session = fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"]
         await scheduled_wake(fixture)
-        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"] == first_session
+        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"] == first_session
         assert len(requests) == 9 and fixture.image_client.calls == [] and len(fixture.image_client.edit_calls) == 1
         assert "编辑产物已保存" in json.dumps(requests[5], ensure_ascii=False)
         assert [action for action, _ in writes(fixture)] == ["send_group_msg", "set_group_card"]
@@ -356,11 +356,11 @@ async def test_native_production_group_pixels_history_memory_persona_goal_and_ar
         assert "data:image/png;base64," in json.dumps(requests[3])
         assert "FOREIGN_SECRET" not in json.dumps(requests, ensure_ascii=False)
         assert latest(requests[1], "read_persona")["data"]["expression_style"] in requests[0]["input"][0]["content"]
-        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
+        state = fixture.executor.sessions.read(f"group:{GROUP}")
         assert source in state["source_message_ids"]
         first_session = state["checkpoint"]["session_id"]
         await scheduled_wake(fixture)
-        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["session_id"] == first_session
+        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["session_id"] == first_session
         assert "复用猫画探索夜空主题" in json.dumps(requests[10], ensure_ascii=False)
         assert len(fixture.image_client.calls) == 1
         assert [a for a, _ in writes(fixture)] == ["send_group_msg"]
@@ -368,7 +368,7 @@ async def test_native_production_group_pixels_history_memory_persona_goal_and_ar
         assert recorded[0][:2] == ("send_group", "sent")
         assert recorded[0][2] == "actual-group-receipt"
         assert len(requests) == 14
-        assert fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]["receipts"][0]["status"] == "sent"
+        assert fixture.executor.sessions.read(f"group:{GROUP}")["checkpoint"]["receipts"][0]["status"] == "sent"
 
 
 @pytest.mark.asyncio
@@ -584,7 +584,7 @@ async def test_native_unknown_gateway_receipt_persists_uncertainty_and_never_aut
         await scheduled_wake(fixture)
         assert len(requests) == 1
         assert len(writes(fixture)) == 1 and effects(sqlite_engine)[0][1] == "uncertain"
-        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
+        state = fixture.executor.sessions.read(f"group:{GROUP}")
         assert state["checkpoint"]["receipts"][0]["status"] == "uncertain"
         await scheduled_wake(fixture)
         assert len(writes(fixture)) == 1
@@ -596,7 +596,7 @@ async def test_native_daily_budget_blocks_continuation_before_an_external_write(
     async with composed(sqlite_engine, tmp_path, client, runtime="harness", options={"max_model_calls_daily": 1}) as fixture:
         await scheduled_wake(fixture)
         assert len(requests) == 1 and writes(fixture) == []
-        state = fixture.executor.sessions.read(f"background:group:{GROUP}")
+        state = fixture.executor.sessions.read(f"group:{GROUP}")
         assert state["checkpoint"]["last_status"] == "blocked"
         assert state["checkpoint"]["last_reason"] == "model_daily_budget"
         assert state["items"] == []
@@ -616,13 +616,13 @@ async def test_native_revoked_sources_rotate_framework_history_and_block_saved_p
         job = configured_social_jobs(fixture.router.runtime)[0]
         observation = SocialObservation(job, NOW, "小町", ("SOURCE_TO_REVOKE",), (origin,))
         await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
-        first = fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"]
+        first = fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"]
         with session_scope(sqlite_engine) as session:
             session.get(Message, origin).raw_json = {"delivery_state": "deleted"}
         current = add_source(sqlite_engine, platform_id="native-safe-current", text="SAFE_CURRENT")
         later = replace(observation, context=("SAFE_CURRENT",), source_message_ids=(current,))
         await fixture.executor.run_tools(later, PolicyGuard(fixture.executor, later, scheduled=True))
-        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"] != first
+        assert fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"] != first
         assert "SOURCE_TO_REVOKE" not in json.dumps(requests[3], ensure_ascii=False)
         assert latest(requests[-1], "read_artifact")["status"] in {"failed", "blocked"}
         assert writes(fixture) == []
@@ -638,18 +638,18 @@ async def test_native_inflight_checkpoint_rotates_uncommitted_framework_history(
         job = configured_social_jobs(fixture.router.runtime)[0]
         observation = SocialObservation(job, NOW, "synthetic persona")
         await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
-        state = fixture.executor.sessions.read('background:' + job.key)
+        state = fixture.executor.sessions.read(job.key)
         initial = state["checkpoint"]["session_id"]
         # Simulate a killed process after its native log was appended but the
         # project's source/effect checkpoint had not reached a closed turn.
         if rotate_reason == "grok_model":
             client.model = client.responses_model = "grok-4.7"
         else:
-            fixture.executor.sessions.begin_turn('background:' + job.key, state["checkpoint"], (),
+            fixture.executor.sessions.begin_turn(job.key, state["checkpoint"], (),
                                                  expected_revision=state["revision"])
         await fixture.executor.run_tools(observation, PolicyGuard(fixture.executor, observation, scheduled=True))
         assert len(requests) == 2
-        assert fixture.executor.sessions.read('background:' + job.key)["checkpoint"]["session_id"] != initial
+        assert fixture.executor.sessions.read(job.key)["checkpoint"]["session_id"] != initial
         assert "UNCOMMITTED_NATIVE_HISTORY" not in json.dumps(requests[1])
         assert writes(fixture) == []
 
@@ -660,11 +660,9 @@ async def test_native_unaddressed_group_event_owns_decision_silence_and_continua
     from test_harness_runtime import model_client,responses_sse
     from test_delegation_composition import observation
     def model(body,n):
-        if not body['tools']:
-            packet=observation(body,'Group observation JSON:\n')
-            return responses_sse(text=json.dumps({'decision':'participate' if send else 'silent',
-                'source_id':packet['messages'][-1]['id'],'reason':'natural_hook'}),number=n)
-        if n==2:return responses_sse(name='read_persona',arguments={},call_id=f'mature-{n}',number=n)
+        assert body['tools']
+        if not send:return responses_sse(number=n)
+        if n==1:return responses_sse(name='read_persona',arguments={},call_id=f'mature-{n}',number=n)
         return responses_sse(name='send_group',arguments={'text':'夜空的颜色很有趣','artifact_ids':[]},call_id=f'mature-{n}',number=n)
     client,requests,_=model_client(model)
     async with composed(sqlite_engine, tmp_path, client, runtime="harness") as fixture:
@@ -704,7 +702,7 @@ async def test_native_unaddressed_group_event_owns_decision_silence_and_continua
                         break
                     await asyncio.sleep(0.02)
             assert status == ("sent" if send else "silent")
-            assert len(requests) == (3 if send else 1)
+            assert len(requests) == (2 if send else 1)
             assert len(writes(fixture)) == int(send)
             checkpoint = fixture.executor.sessions.read(f"background:group:{GROUP}")["checkpoint"]
             assert not checkpoint  # stateless decisions never grow a native patrol history

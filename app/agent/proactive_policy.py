@@ -18,7 +18,7 @@ def limits_for(router, group_id):
     defaults = ProactiveLimits()
     for name, maximum in [('minimum_messages', 30), ('interval_seconds', 3600),
             ('max_backoff_seconds', 86400), ('hourly_models', 100), ('hourly_speeches', 30),
-            ('speech_cooldown_seconds', 86400)]:
+            ('speech_cooldown_seconds', 86400), ('max_wait_seconds', 86400)]:
         value = router._group_policy_int(group_id=group_id,
             key='proactive_observation_' + name, default=getattr(defaults, name))
         values[name] = max(1, min(maximum, value))
@@ -56,11 +56,17 @@ def admit_proactive(router, observation, guard, *, interactive, clock):
             Message.id.in_(observation.source_message_ids))))
         rows = [r for r in rows if r.user_id != router.runtime.settings.bot_qq
                 and is_usable_memory_source(r, group_id=group_id)]
-        candidates = [(r.id, normalized(r.plain_text)) for r in rows if normalized(r.plain_text)
-            and not re.fullmatch(r'哈+|嗯+|哦+|好+|[?？!！]+|ok|wx', normalized(r.plain_text))]
+        candidates = []
+        for row in rows:
+            value = normalized(row.plain_text)
+            segments = (row.raw_json or {}).get('message', [])
+            has_image = isinstance(segments, list) and any(isinstance(s, dict) and
+                s.get('type') == 'image' for s in segments)
+            if has_image or value and not re.fullmatch(r'哈+|嗯+|哦+|好+|[?？!！]+|ok|wx', value):
+                candidates.append((row.id, value or 'image:' + str(row.id)))
     triggers = getattr(guard, 'trace_trigger', {}).get('trigger_evidence', {}).get('source_ids', []) if interactive else []
     seen = max((r.id for r in rows), default=0)
-    bootstrap = min(triggers) - 1 if triggers else seen
+    bootstrap = min(triggers) - 1 if triggers else min((i for i, _ in candidates), default=seen+1) - 1
     repository = ProactiveRepository(router.engine, account_id=router.runtime.settings.bot_qq, clock=clock)
     due = bool(getattr(guard, 'trace_trigger', {}).get('trigger_reason_code') == 'intention_due')
     permit, reason, metrics = repository.claim(group_id, candidates=candidates,

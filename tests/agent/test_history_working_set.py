@@ -20,7 +20,11 @@ async def test_legacy_history_estimate_does_not_preempt_total_budget(sqlite_engi
     class Harness:
         def __init__(self, **kwargs):
             sessions.append(kwargs['session_id'])
+            from app.agent.harness_session_files import native_file_path
+            self.native = native_file_path(kwargs['session_home']/'sessions/synthetic'/kwargs['session_id']/'session.v3.jsonl')
         async def run(self, *args, **kwargs):
+            self.native.parent.mkdir(parents=True, exist_ok=True)
+            self.native.write_text('{}\n')
             return ToolTurnResult(status, trace=({'status': 'model_request', 'outcome': 'completed',
                 'output_disposition': 'committed',
                 'context_history_estimated_tokens': budget + 1},))

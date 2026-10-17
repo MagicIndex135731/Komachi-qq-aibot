@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = (
     "README.md", "docs/ARCHITECTURE.md", "docs/CONFIGURATION.md", "docs/MEMORY.md",
-    "docs/DEVELOPMENT.md", "docs/SECURITY.md", "infra/wsl/README.md",
+    "docs/DEVELOPMENT.md", "docs/SECURITY.md", "docs/TOOLS.md", "infra/wsl/README.md",
 )
 LINKS = re.compile(r"!?\[[^\]\n]*\]\((<[^>]+>|[^)\n]+)\)")
 PRIVATE = ("data/", "backlog/", "docs/project/", ".codex/", ".agents/")

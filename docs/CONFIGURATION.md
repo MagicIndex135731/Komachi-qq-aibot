@@ -39,6 +39,7 @@ TZ=Asia/Shanghai
 | `LLM_SUPPORTS_VISION_INPUT` / `LLM_VISION_MODEL` | 是否发送真实像素、可选独立视觉模型 |
 | `LLM_CONTEXT_WINDOW_TOKENS` / `LLM_MAX_OUTPUT_TOKENS` | 模型窗口与输出预算；须与实际模型匹配 |
 | `GROUP_AGENT_ENABLED` / `AGENT_RUNTIME` | 默认持续群 Agent / `harness`；legacy 用于显式回退 |
+| `GROUP_AGENT_MAX_CONCURRENT_TURNS` | 群聊进程同时执行的回合数，默认2，范围1–8；单群最多3个 |
 | `AGENT_MODEL_FIRST_OUTPUT_TIMEOUT_SECONDS` | 首个有效输出期限，模板 90 秒 |
 | `AGENT_MODEL_PROGRESS_TIMEOUT_SECONDS` | 后续有效增量停滞期限，模板 45 秒 |
 | `AGENT_MODEL_REQUEST_TIMEOUT_SECONDS` | 每请求总预算，模板 120 秒 |
@@ -70,18 +71,23 @@ groups:
 
 `proactive_interval_seconds` 为原有群发言间隔；Harness还执行下面的主动观察及发言限额，取更严格的门槛。直接 @、回复小町和同一人的有效近期接话使用明确互动路径，任务交付单独处理。
 
-Harness在本地检查后才调用模型，每轮最近最多30条群消息；静默也推进该批观察位置，失败不消费来源。以下字段在`default_group_behavior`及各群均可设置：
+`recent_context_limit`设定互动/巡检窗口，默认/null为30，上限30。转发只计外层，包内/图片按需读；引用、工具补读和Agent历史另计。静默推进观察位置，失败不消费来源。
+
+例如`memory_enabled: false`配合`recent_context_limit: 10`可仅使用最近10条自动观察，仍保留引用与显式工具的独立权限。改变窗口不会删除旧消息或旧会话。私聊最多3个在途任务、进程最多4个模型执行；媒体队列每进程4个worker，资料队列2个，超额任务等待容量。
 
 | 字段 | 默认与含义 |
 | --- | --- |
 | `proactive_observation_minimum_messages` | 8条不同有效新消息；重复和纯笑声不计入 |
-| `proactive_observation_interval_seconds` | 初始300秒；没有新内容不会仅因到时调用 |
-| `proactive_observation_max_backoff_seconds` | 连续静默按600、1200秒退避，最多1800秒 |
+| `proactive_observation_interval_seconds` | 固定300秒；静默不延长下一批新内容的间隔 |
+| `proactive_observation_max_wait_seconds` | 新内容不足8条时最多等待900秒；无新内容不调用 |
+| `proactive_observation_max_backoff_seconds` | 旧配置兼容保留，现行准入不使用静默指数退避 |
 | `proactive_observation_hourly_models` | 滚动一小时6次主动请求，工具后续、重试和内部压缩都计入 |
 | `proactive_observation_hourly_speeches` | 滚动一小时3次自主插话；分段算一次，不要求用完 |
 | `proactive_observation_speech_cooldown_seconds` | 自主插话至少间隔600秒 |
 
-事件消息和定时群观察共用持久额度，重启不清零。普通群巡检先做一次无工具轻量判断，最多30条/约1500 token观察资料，无完整人格记忆和旧巡检历史；批准后正式回复，判断和回复共同计入上述模型额度。明确互动不经过此判断。发言冷却或额度不允许时不做插话推理；数量和时间达标仍可沉默。`proactive_min_new_messages`保留为既有参与策略，不能绕过上述限制。
+事件消息、定时观察和直接互动归同一群主体及检查点。普通观察使用当前人格、约1500 token动态消息切片和至多1500 token闭合历史锚点，工具/固定规则/像素及当轮读取另计；不预加载完整V3，记忆和上下文按需读取。人格Agent同轮可接话或安静结束，不再先调用无人格判官；纯空轮不保存历史或来源依赖。紧凑观察和完整行动各有稳定工具profile，缓存需分别统计；共用主体不保证上游命中。直接消息优先，未派发观察被新直接输入撤销；已派发或未知写入先收尾，账本防重不回退。真实到期工作使用完整工具，仍受主动预算约束。
+
+群消息和定时观察共用持久额度，重启不清零。图片来源可成为新增内容；重复文字和纯笑声不计入。发送仍受真实发言间隔、反馈和额度限制，模型后续、重试及压缩均计费。`proactive_min_new_messages`继续用于legacy路径；Harness由上述批量/最长等待统一准入，避免低流量群在两层永久等待。
 
 `proactive_feedback_enabled` 默认开启。嫌烦/闭嘴请求结合真实引用和最近机器人发言识别，不要求写机器人名字；对工作或明确其他人的抱怨不计入。确认后该群主动静默 `proactive_feedback_quiet_seconds`（默认 1200 秒），随后在反馈发出后的 `proactive_feedback_duration_seconds`（默认 7200 秒）内使用 `proactive_feedback_interval_seconds`（默认 `600-1200` 秒）。新反馈重新计时；同一消息重放不延长，来源撤回后失效，过期恢复原间隔。普通 @ 提问保留，但嫌烦请求本身不会被接梗反击。各字段可按群覆盖，群间互不影响。
 
@@ -102,6 +108,7 @@ Harness在本地检查后才调用模型，每轮最近最多30条群消息；�
 | `AGENT_WEB_TASK_MAX_CALLS` / `AGENT_WEB_TASK_MAX_CHARS` | 正式资料回合默认16次网络尝试、96000结果字符；可设8–24次/48000–128000字符。普通回合8次/48000字符，失败重试也计数 |
 | `AGENT_TASK_TURN_TIMEOUT_SECONDS` | 直接群互动与私聊主回合默认600秒；不再以关键词决定路由或时限。独立资料子任务后台最多300秒，完成摘要回传主会话；模型单次仍受自己的超时控制 |
 | `WEB_PAGE_PROXY_URL` | 留空直连；可设 `http://127.0.0.1:18797`，用于本地网页及网页图片/视频读取，聊天与搜索接口维持原出口 |
+| `X_CRAWLER_SESSION_FILE` / `X_CRAWLER_PROXY_URL` | 可选容器内X爬虫；会话路径设 `/run/xiaomachi-secrets/x-session.json`，代理默认 `http://127.0.0.1:18797`。gallery-dl主源、twscrape有限备选；凭据只读挂载、不读非公开帖，元数据及媒体字节共用此代理。部署见WSL操作 |
 | `DOWNLOAD_MEDIA_RETENTION_HOURS` | 网页及X下载图片/视频保留24小时，可设1–168小时；群私启动及每小时清理，有效待回传任务保护文件 |
 | `DOWNLOAD_MEDIA_CACHE_MAX_MIB` | 网页/X下载缓存共享上限512MiB，可设128–8192MiB；下载前预留空间，优先清理旧且未使用的媒体，满且全被保护时拒绝新下载 |
 | `AGENT_CONTEXT_COMPACTION_ENABLED` / `AGENT_CONTEXT_COMPACTION_THRESHOLD_RATIO` | 原生压缩默认启用；完整输入软阈值还受窗口62%和硬保护余量约束；摘要不发送QQ |
@@ -109,7 +116,8 @@ Harness在本地检查后才调用模型，每轮最近最多30条群消息；�
 | `AGENT_CONTEXT_HARD_INPUT_TOKENS` | 默认160000，并扣除模型窗口中的输出、安全和后续工具预留；超出不向上游发送 |
 | `AGENT_CONTEXT_RETAIN_TOKENS` / `AGENT_CONTEXT_SUMMARY_TOKENS` | 近期完整内容最多32000，受目标减固定/临时输入及摘要余量限制；摘要最多8192输出token，每轮内部总结最多2次 |
 | `AGENT_MEMORY_CONTEXT_TOKENS` | Agent自动召回及显式记忆工具每次正文默认8000估算token，在最终packer中保留完整证据与来源；不与约3000的近期观察互相挤占 |
-| `AGENT_CONTEXT_HISTORY_TOKENS` / `AGENT_BACKGROUND_HISTORY_TOKENS` | 前者为旧配置兼容字段，不再触发主会话换段；后者控制后台近期保留量（默认8000）。后台总输入软阈值32000、目标20000；当前明确问题不截断 |
+| `AGENT_CONTEXT_HISTORY_TOKENS` / `AGENT_BACKGROUND_HISTORY_TOKENS` | 压缩后保留的近期完整历史与摘要共享预算，默认24000/8000；不作为完整输入的压缩触发阈值，不按回合数轮换。后台总输入软阈值32000、目标20000；当前明确问题不截断 |
+| `AGENT_RESPONSES_CONTINUATION` | `off/auto/on`，默认auto，仅官方OpenAI Responses在同一应用回合内启用previous_response_id增量并显式store=true；自定义渠道需验证后显式on。off保留SDK的store=false。新回合从本地权威历史重放，明确状态失效才有限回退完整输入 |
 | `AGENT_MONITOR_ENABLED` | 默认false；启用私有最终请求/公开过程采集及本机只读8765网页，操作与保留限额见WSL指南和架构 |
 | `WEB_SEARCH_REASONING_EFFORT` | 搜索独立思考强度；Sol 套餐 low，Gemini 套餐 medium，不随主聊天强度切换 |
 | `LLM_WEB_SEARCH_MODEL` / `LLM_WEB_SEARCH_API_KEY` | 搜索模型留空复用主模型。主接口的 Wyzlab alpha 可覆盖搜索 key；独立外部搜索使用 `SEARCH_BASE_URL` / `SEARCH_API_KEY` 和指定搜索模型，凭据只放私有环境 |
@@ -134,6 +142,8 @@ APP 分享卡片解析无需新开关。群聊/私聊可发送卡片后引用提
 
 ## 主动空间与好友评论
 
+`qzone.publish.enabled` 控制发布能力；`autonomous_enabled` 默认 true，设为 false 仅关闭自主发布的调度与调用，保留真实主人明确指令发布。评论可独立设置同名字段；已有配置省略该字段时行为保持。
+
 环境 `SOCIAL_AGENT_ENABLED=true` 与本地 social 总开关/分项开关共同启用。公开模板保守关闭发布和评论。以下只示范字段，启用前须确认自己的账号、好友范围与预算：
 
 ```yaml
@@ -157,6 +167,7 @@ qzone:
   comment:
     enabled: true
     autonomous_tools: true
+    allow_images: false
     all_friends: true
     friend_ids: []
     max_daily: 3
@@ -167,6 +178,8 @@ qzone:
 ```
 
 `all_friends` 是明确授权当前全部好友；也可关闭并使用 `friend_ids` 固定名单。读取、看图和实际评论前都会再核验。上面空间可见性 4 表示好友可见，64 表示仅自己可见。
+
+评论`allow_images: false`时只能发送文字，`artifact_ids`必须为空；读取原帖图片不会自动把图片附在评论中。近期草稿、结果和明确保存的想法通过`read_social_activity`按需查询，不新增开关，也不自动补发。记录保留与迁移见[记忆指南](MEMORY.md#近期公开社交记录)。
 
 巡检是机会而非必发：90–180 分钟随机间隔、夜间静默、早晨延迟。午夜只重置自然日计数，不立即执行。发布每天最多 1 条且隔 18 小时；评论每好友每天 1 条、合计 3 条、每轮最多一条；主动空间写入共同间隔 60 分钟。读取/沉默不占写入次数；发布/评论模型预算分别默认 60 次/日，其他预算仍适用。
 

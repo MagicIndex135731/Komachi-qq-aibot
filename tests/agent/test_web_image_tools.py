@@ -88,7 +88,7 @@ async def test_paging_and_page_download_budgets(sqlite_engine, tmp_path, monkeyp
         assert len(second.data['images']) == 5 and second.data['next_offset'] is None
         batch = await tools['download_web_images'].handler({'image_ids': [item['image_id'] for item in page.data['images']]})
         assert batch.status == 'ok' and len(batch.data['artifact_ids']) == 20 and batch.data['all_requested_downloaded']
-        assert len(batch.images) == 2
+        assert not batch.images and batch.data['preview_count'] == 0
         assert (await tools['download_web_image'].handler({'image_id': second.data['images'][0]['image_id']})).status == 'blocked'
         for n in range(3):
             assert (await tools['list_web_images'].handler({'ref_id': f'https://example.com/page{n}'})).status == 'ok'

@@ -66,6 +66,27 @@ async def test_mixed_order_scoped_cache_and_no_standalone_directory(sqlite_engin
         http.close()
 
 
+async def test_large_photo_fallback_reaches_scoped_artifacts_and_quality_result(sqlite_engine,tmp_path,monkeypatch):
+    _,store,guard,http=tools_for(monkeypatch,sqlite_engine,tmp_path,lambda _:None)
+    calls=[]
+    def respond(request):
+        if request.url.host=='cdn.syndication.twimg.com':
+            return httpx.Response(200,json={'id_str':POST,'mediaDetails':[
+                {'type':'photo','media_url_https':'https://pbs.twimg.com/media/synthetic.png'}]})
+        calls.append(request.url.params['name'])
+        return (httpx.Response(404) if request.url.params['name']=='orig' else
+            httpx.Response(200,content=image_bytes(),headers={'content-type':'image/png'}))
+    monkeypatch.setattr('app.agent.twitter_media.download_client',lambda _:httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    try:
+        outcome=await build_twitter_media_tool(runner=Runner(),guard=guard,store=store).handler({'ref_id':URL})
+        assert outcome.status=='ok' and calls==['orig','large']
+        assert outcome.data['quality_fallbacks']==[{'index':1,'image_size':'large','reason':'http_404'}]
+        assert outcome.data['media'][0]['image_size']=='large' and '不能声称全部原图' in outcome.data['guidance']
+        assert store.get(outcome.data['artifact_ids'][0]).read_bytes()==image_bytes()
+        assert not list(store.root.glob('.twitter-download-*'))
+    finally:http.close()
+
+
 @pytest.mark.parametrize('failure', ['invalid_video', 'revoked', 'cancelled'])
 async def test_failed_mixed_download_removes_staging_and_registered_siblings(sqlite_engine, tmp_path, monkeypatch, failure):
     _, store, guard, http = tools_for(monkeypatch, sqlite_engine, tmp_path, lambda _: None)
@@ -81,11 +102,14 @@ async def test_failed_mixed_download_removes_staging_and_registered_siblings(sql
     tool = build_twitter_media_tool(runner=Runner(), guard=guard, store=store)
     try:
         if failure == 'invalid_video':
-            assert (await tool.handler({'ref_id': URL})).status == 'failed'
+            result = await tool.handler({'ref_id': URL})
+            assert result.status == 'ok' and result.data['downloaded_count'] == 1
+            assert result.data['all_requested_downloaded'] is False
+            assert store.get(result.data['artifact_ids'][0]).read_bytes() == image_bytes()
         else:
             with pytest.raises(RuntimeError if failure == 'revoked' else asyncio.CancelledError):
                 await tool.handler({'ref_id': URL})
-        assert not list(store.root.glob('art-*.meta.json'))
+        assert len(list(store.root.glob('art-*.meta.json'))) == (1 if failure == 'invalid_video' else 0)
         assert not list(store.root.glob('.twitter-download-*'))
         assert not list(DownloadedMediaCache.for_store(store).root.glob('webvid-*'))
     finally:

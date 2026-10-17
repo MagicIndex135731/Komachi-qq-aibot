@@ -152,8 +152,13 @@ async def test_native_album_download_and_merged_forward(sqlite_engine, tmp_path,
     requests = []
     def respond(request):
         requests.append(request)
-        return httpx.Response(200, content=image_bytes()) if request.url.host == 'cdn.example.com' else httpx.Response(200,
-            headers={'Content-Type': 'text/html'}, text=note_page())
+        if request.url.host=='cdn.example.com':
+            import io
+            from PIL import Image
+            body=io.BytesIO()
+            Image.new('RGB',(32,24),'red' if len(requests)==2 else 'blue').save(body,'PNG')
+            return httpx.Response(200,content=body.getvalue())
+        return httpx.Response(200,headers={'Content-Type':'text/html'},text=note_page())
     with httpx.Client(transport=httpx.MockTransport(respond)) as http:
         provider = WebImageClient(http_client=http)
         monkeypatch.setattr('app.agent.web_images.WebImageClient', lambda _: provider)

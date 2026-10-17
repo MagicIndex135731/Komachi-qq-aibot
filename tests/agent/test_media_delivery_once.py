@@ -116,3 +116,76 @@ async def test_group_poll_return_and_auto_paths_share_claim_and_keep_real_dispat
     assert len(repository(sqlite_engine).recent('group:900000102')) == 1
     assert (await run('new-request', {'artifact_ids':['art-a','art-b']}, source=11)).status == 'sent'
     assert len(calls) == 2
+
+
+async def test_later_overlapping_bundle_sends_only_new_assets(sqlite_engine):
+    repo=repository(sqlite_engine);calls=[]
+    async def run(ids):
+        args={'media_artifact_ids':ids}
+        async def send():calls.append(list(args['media_artifact_ids']));return ToolOutcome({},'sent','receipt-'+str(len(calls)))
+        return await send_media_once(repo,scope='private:900000102',source_id=10,operation='send_private',
+            arguments=args,require_valid=lambda:None,invoke=send)
+    await run(['art-a'])
+    result=await run(['art-a','art-b'])
+    assert calls==[['art-a'],['art-b']] and result.data['sent_artifact_ids']==['art-b']
+    assert (await run(['art-b','art-a'])).data['already_delivered']
+
+
+async def test_same_logical_asset_variant_is_not_a_new_delivery(sqlite_engine):
+    calls=[]
+    async def send():calls.append(True);return ToolOutcome({},'sent','receipt')
+    for identifier in ['art-original','art-small']:
+        result=await send_media_once(repository(sqlite_engine),scope='private:900000102',source_id=10,
+            operation='send_private',arguments={'artifact_ids':[identifier]},require_valid=lambda:None,
+            invoke=send,media_identity=lambda _:'same-source-media-1')
+        assert result.status=='sent'
+    assert len(calls)==1
+
+
+async def test_unknown_asset_cannot_replay_inside_changed_bundle(sqlite_engine):
+    calls=[]
+    async def unknown():calls.append(True);return ToolOutcome({},'uncertain')
+    await deliver(repository(sqlite_engine),unknown,artifact_ids=['art-a'])
+    result=await deliver(repository(sqlite_engine),unknown,artifact_ids=['art-a','art-b'])
+    assert result.status=='uncertain' and len(calls)==1
+
+
+def test_pack_albums_preserves_order_and_sends_video_alone(tmp_path):
+    from app.agent.media_delivery import pack_media_files
+    paths=[]
+    for i in range(6):
+        p=tmp_path/str(i)
+        with p.open('wb') as f:f.truncate(8*1024*1024)
+        paths.append(('image' if i<5 else 'video',str(p)))
+    assert pack_media_files(list('abcdef'),paths)==[list('abcd'),['e','f']]
+
+
+async def test_aliases_deduplicate_same_source_variants_and_exact_bytes_across_sources(sqlite_engine):
+    calls=[]
+    aliases={'art-a':('source-a','bytes-one'),'art-a-small':('source-a','bytes-two'),
+        'art-repost':('source-b','bytes-one'),'art-new':('source-c','bytes-three')}
+    async def run(identifier):
+        async def send():calls.append(identifier);return ToolOutcome({},'sent','receipt-'+str(len(calls)))
+        return await send_media_once(repository(sqlite_engine),scope='private:900000102',source_id=10,
+            operation='send_private',arguments={'artifact_ids':[identifier]},require_valid=lambda:None,invoke=send,
+            media_identity=lambda i:aliases[i])
+    for identifier in aliases:assert (await run(identifier)).status=='sent'
+    assert calls==['art-a','art-new']
+
+
+async def test_unmapped_legacy_subset_cannot_replay_after_upgrade(sqlite_engine):
+    from app.agent.media_delivery import _send_bundle_once
+    calls=[]
+    async def send():calls.append(True);return ToolOutcome({},'sent','legacy-receipt')
+    repo=repository(sqlite_engine)
+    await _send_bundle_once(repo,scope='private:900000102',source_id=10,operation='send_private',
+        arguments={'artifact_ids':['art-a','art-b']},require_valid=lambda:None,invoke=send)
+    # Recreate the historical receipt shape, without changing original messages.
+    from app.storage.db import session_scope
+    from app.storage.agent_effects import AgentToolEffect
+    from sqlalchemy import select
+    with session_scope(sqlite_engine) as session:
+        row=session.scalars(select(AgentToolEffect).where(AgentToolEffect.operation=='media_delivery_once')).one()
+        row.receipt={'receipt_id':'legacy-receipt'}
+    result=await deliver(repo,send,artifact_ids=['art-a'])
+    assert result.status=='blocked' and result.data['error']=='legacy_media_delivery_subset_unverified' and len(calls)==1

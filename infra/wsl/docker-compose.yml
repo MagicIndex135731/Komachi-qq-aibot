@@ -54,6 +54,8 @@ services:
       - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}}
     volumes:
       - xiaomachi_data:/workspace/data
+      - ./private-secrets:/run/xiaomachi-secrets:ro
+      - xiaomachi_xhs_session:/workspace/data/xhs-crawler
     depends_on:
       napcat:
         condition: service_started
@@ -83,12 +85,17 @@ services:
       - NO_PROXY=${XIAOMACHI_NO_PROXY:-${DOCKER_NO_PROXY:-localhost,127.0.0.1,napcat,xiaomachi,host.docker.internal}}
     volumes:
       - xiaomachi_data:/workspace/data
+      - ./private-secrets:/run/xiaomachi-secrets:ro
+      - xiaomachi_xhs_session:/workspace/data/xhs-crawler
     depends_on:
       napcat:
         condition: service_started
     command: ["python", "-m", "app.private_main"]
 
 volumes:
+  xiaomachi_xhs_session:
+    external: true
+    name: xiaomachi-xhs-session
   napcat_config:
     name: xiaomachi-napcat-config
   napcat_logs:

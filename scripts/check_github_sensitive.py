@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BLOCKLIST = REPO_ROOT / "data/project-tools/.secrets-blocklist"
 PRIVATE_DIRECTORIES = (
     ".trellis/", "data/", "backlog/", "docs/project/", ".agents/", ".codex/",
-    "configs/personas/", "infra/wsl/runtime/", "infra/wsl/.cache/", "infra/wsl/mihomo/",
+    "configs/personas/", "infra/wsl/runtime/", "infra/wsl/.cache/", "infra/wsl/mihomo/", "infra/wsl/private-secrets/",
     ".worktrees/", ".artifacts/", ".venv/", ".venv-wsl/", "release/",
 )
 GENERIC_PATTERNS = (

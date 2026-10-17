@@ -10,7 +10,7 @@ from app.storage.models import Job, Message
 from test_media_tasks import setup_queue
 
 
-@pytest.mark.parametrize('state',['sent','rejected','uncertain','revoked','cancelled'])
+@pytest.mark.parametrize('state',['sent','rejected','uncertain','revoked','cancelled','fallback'])
 async def test_automatic_delivery_fences_sources_unknown_results_and_one_failure_notice(sqlite_engine,tmp_path,state):
     from test_autonomous_social import image_bytes
     settings=SimpleNamespace(data_dir=tmp_path)
@@ -22,7 +22,8 @@ async def test_automatic_delivery_fences_sources_unknown_results_and_one_failure
         store.root.mkdir(parents=True,exist_ok=True)
         path=store.root/'synthetic.png';path.write_bytes(image_bytes())
         identifier=DownloadedMediaCache.for_store(store,settings).register(store,path,'web_page_image')
-        return media_result(ToolOutcome({'artifact_ids':[identifier]}),payload)
+        return media_result(ToolOutcome({'artifact_ids':[identifier],
+            **({'quality_fallbacks':[{'index':1,'image_size':'large','reason':'http_503'}]} if state=='fallback' else {})}),payload)
     async def send(boundary,files,text):
         boundary.on_dispatch()
         calls.append((len(files),text))
@@ -43,9 +44,10 @@ async def test_automatic_delivery_fences_sources_unknown_results_and_one_failure
     await queue.tick()
     assert not await queue.tick()
     assert [n for n,_ in calls]==([1,0] if state=='rejected' else [] if state in {'revoked','cancelled'} else [1])
+    if state=='fallback':assert 'large' in calls[0][1] and '非原图' in calls[0][1]
     with session_scope(sqlite_engine) as session:
         row=session.get(Job,outcome.data['job_id'])
-        assert row.status=={'sent':'completed','rejected':'failed','uncertain':'uncertain',
+        assert row.status=={'sent':'completed','fallback':'completed','rejected':'failed','uncertain':'uncertain',
             'revoked':'blocked','cancelled':'cancelled'}[state]
 
 

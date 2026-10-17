@@ -22,6 +22,17 @@ def test_goal_seed_uses_authored_text_and_excludes_card_title_and_quote_instruct
 @pytest.mark.parametrize('text,allowed',[
     ('我要看某个作者最近发的cos图',True),('想看这个作者新发的视频',True),
     ('show me the newest photos from that creator',True),
+    ('继续帮我去X找一些关于某人的cos照片',True),('然后再帮我找一些最近的照片',True),
+    ('帮我去X找一些cos图片，相同素材不要重发，可以找同一造型的其他镜头。',True),
+    ('帮我找新的cos视频。旧素材不要重发。请实际查看筛选。',True),
+    ('帮我找图片，但是不要联网。',False),('不要搜索，也别下载图片。',False),
+    ('帮我从X找一些日本拉面的图片和视频；不用逐张看图，不查看视频或动图。',True),
+    ('从X找图片，不要预览视频，直接按帖子正文筛选。',True),
+    ('帮我找图片，不用逐张看图，但是不要联网。',False),
+    ('不用逐张看图，不查看视频或动图。',False),
+    ('从X找一些最近7天火箭发射的实拍照片',True),('在某个平台搜一下机械键盘组装的视频',True),
+    ('从X看到了火箭照片',False),('从网站下载过图片',False),('从朋友那找到了照片',False),
+    ('继续',False),('OK',False),('继续，但别找图片了',False),
     ('别下载图片了',False),('我不想看那个视频',False),('这张照片真好看',False)])
 def test_natural_media_request_has_live_web_authority_without_fixed_search_verb(context,text,allowed):
     request=seed(context.router.engine,message_id='natural-request',raw_json={

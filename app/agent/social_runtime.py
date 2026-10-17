@@ -39,6 +39,10 @@ class SocialDispatchGuard:
         self.closed = False
         self.trace_trigger = {}
 
+    @property
+    def source_message_ids(self):
+        return self.observation.source_message_ids
+
     def valid(self) -> bool:
         runtime = self.runtime
         if (self.closed or not runtime.running or not runtime.connected or self.generation != runtime._generation
@@ -361,7 +365,7 @@ class SocialRuntime:
             self.repository.finish(account_id=self.account_id, owner=self._owner, epoch=epoch, action_id=action_id,
                                    status=status, receipt_id=result.receipt_id, reason=reason, now=clock())
             if job.patrol_interval_seconds is not None and status in {"sent", "silent"}:
-                self.repository.mark_posts_reviewed(account_id=self.account_id, posts=observation.posts, now=clock())
+                self.repository.note_posts_offered(account_id=self.account_id, posts=observation.posts, now=clock())
         except asyncio.CancelledError:
             status = "uncertain" if guard is not None and guard.dispatched else "blocked"
             reason = "cancelled_after_dispatch" if status == "uncertain" else "cancelled_before_dispatch"
@@ -384,4 +388,4 @@ class SocialRuntime:
                                      status=status, reason=reason, now=clock())
         # Local admission did not run a model. Preserve a due goal for retry
         # instead of silently consuming it when a rolling quota is exhausted.
-        return entered_agent and not reason.startswith('proactive_admission:')
+        return entered_agent and not reason.startswith('proactive_admission:') and reason != 'patrol_superseded'

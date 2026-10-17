@@ -36,6 +36,19 @@ def _enabled(value: dict) -> bool:
     return enabled
 
 
+def autonomous_social_enabled(runtime: RuntimeConfig, kind: str) -> bool:
+    """Keep autonomous Qzone permission separate from owner-directed capability."""
+    name = {'qzone_publish': 'publish', 'qzone_comment': 'comment'}.get(kind)
+    if name is None:
+        return True
+    qzone = _mapping(runtime.social_policy.get('qzone', {}), 'qzone policy')
+    config = _mapping(qzone.get(name, {}), f'qzone {name}')
+    enabled = config.get('autonomous_enabled', True)
+    if type(enabled) is not bool:
+        raise ValueError('qzone autonomous_enabled must be a boolean')
+    return enabled
+
+
 def _number(value: dict, key: str, default: float, *, minimum=60, maximum=604800) -> float:
     import math
 
@@ -106,6 +119,7 @@ def configured_social_jobs(runtime: RuntimeConfig) -> tuple[SocialJob, ...]:
     for name, kind in (("publish", "qzone_publish"), ("comment", "qzone_comment")):
         config = _mapping(qzone.get(name, {}), f"qzone {name}")
         if _enabled(config):
+            autonomous_social_enabled(runtime, kind)
             job = _job(key=kind, kind=kind, scope_id=runtime.settings.bot_qq, config=config)
             if _enabled(patrol):
                 from dataclasses import replace
@@ -153,6 +167,12 @@ def configured_agent_jobs(runtime: RuntimeConfig) -> tuple[SocialJob, ...]:
             event_goals_only=True, allow_images=True, quiet_hours=None, min_idle_seconds=0,
             max_steps=16, max_daily=50, max_model_calls_daily=500, max_image_calls_daily=10))
     return (*jobs, *goals)
+
+
+def configured_scheduled_jobs(runtime: RuntimeConfig) -> tuple[SocialJob, ...]:
+    """Scheduled work excludes disabled autonomy; owner tools retain capabilities."""
+    return tuple(job for job in configured_agent_jobs(runtime)
+                 if autonomous_social_enabled(runtime, job.kind))
 
 
 async def resolve_friend_ids(job: SocialJob, qzone_adapter) -> tuple[int, ...]:

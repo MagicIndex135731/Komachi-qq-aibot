@@ -19,6 +19,7 @@ docs/project
 AGENTS.md
 data
 infra/wsl/runtime
+infra/wsl/private-secrets
 release
 tmp*
 *.db

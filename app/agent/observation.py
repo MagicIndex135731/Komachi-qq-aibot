@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from app.adapters.outbound_guard import current_group_dispatch
+from app.config import group_recent_context_limit
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.reply_policy import PolicyInput
 from app.core.search_policy import detect_address_intent
@@ -38,7 +39,8 @@ class GroupObservationService:
     def _recent(self, messages, group_id: int):
         return [
             item
-            for item in messages.list_recent_group_messages(group_id=group_id, limit=30)
+            for item in messages.list_recent_group_messages(
+                group_id=group_id, limit=group_recent_context_limit(self.router.runtime, group_id))
             if is_usable_memory_source(item, group_id=group_id)
         ]
 
@@ -146,7 +148,8 @@ class GroupObservationService:
         # and source but must not be stopped by that turn's own first sent row.
         if not continued_dispatch and self.router.reply_policy._in_cooldown(policy_input):
             return "cooldown"
-        if not continued_dispatch and require_new_messages:
+        if (not continued_dispatch and require_new_messages
+                and getattr(self.router.runtime.settings, 'agent_runtime', 'legacy') != 'harness'):
             minimum = max(1, min(30, self.router._group_policy_int(
                 group_id=group_id, key='proactive_min_new_messages', default=1)))
             if minimum > 1 and meaningful_new_messages(self._recent(messages, group_id), bot_id=self.router.runtime.settings.bot_qq,

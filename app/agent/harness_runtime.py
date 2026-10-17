@@ -26,11 +26,13 @@ from uuid import uuid4
 
 import httpx
 
-from app.agent.tool_agent import AgentTool, ToolOutcome, ToolTurnResult, validate_arguments
+from app.agent.tool_agent import AgentTool, ToolOutcome, ToolTurnResult, validate_arguments, argument_validation_feedback
 from app.agent.harness_session_files import native_file_path
 from app.agent.model_observation import request_context_counts, usage_token_metrics
 from app.agent.context_policy import RequestContextPolicy, estimate_request_tokens, estimate_text_tokens, compact_memory_packet, compact_memory_prompt
 from app.agent.context_recovery import application_turn_marker
+from app.agent.conversation_context import PatrolProgress
+from app.agent.responses_continuation import ResponsesContinuation, continuation_supported, cache_identity, provider_identity
 from app.agent.model_stream import ModelStreamBudget
 from app.agent.runtime_trace import AgentTrace, current_trace_context, observe_with
 from app.runtime.blocking import BoundedBlockingRunner
@@ -85,7 +87,8 @@ class HarnessToolAgent:
                  system_identity: str | None = None, ephemeral_context: bool = False,
                  admission_metrics=None, cache_namespace: str | None = None,
                  finish_after_delivery=None, trace_conversation_key: str | None = None,
-                 task_workspace=None, initial_evidence=()) -> None:
+                 task_workspace=None, initial_evidence=(), continuation_mode: str = 'auto',
+                 idle_patrol: bool = False) -> None:
         if not 1 <= max_steps <= 32 or not 0 <= max_image_calls <= 4 or not 1 <= max_external_writes <= 8:
             raise ValueError("invalid Harness turn budget")
         self.decision_client = decision_client
@@ -100,6 +103,10 @@ class HarnessToolAgent:
         self.finish_after_delivery = finish_after_delivery
         self.task_workspace = task_workspace
         self.initial_evidence = initial_evidence
+        if continuation_mode not in {'off', 'auto', 'on'}:
+            raise ValueError('invalid Responses continuation mode')
+        self.continuation_mode, self.idle_patrol = continuation_mode, idle_patrol
+        self.context_retention = {'retain_history': True, 'reason': 'active_context_retained'}
         self.final_response = ''
         self.clock = clock or (lambda: datetime.now(UTC))
         self.require_reply = require_reply
@@ -157,10 +164,29 @@ class HarnessToolAgent:
         bridge = _Bridge(self, by_name, guard, asyncio.get_running_loop(), resources,
                          invoke_tool or self.invoke_tool)
         bridge.control = control
+        # Reserve inside the existing turn deadline, never extend its source guard.
+        reserve = min(20.0, self.timeout_seconds / 4) if control and control.requires_media else 0
+        bridge.finalization_deadline = bridge.deadline
+        bridge.deadline -= reserve
+        request_budget=bridge.request_budget()
+        if request_budget:
+            try:
+                budget_end=time.monotonic()+max(0,request_budget.snapshot()['expires_at']-self.task_workspace.clock())
+                bridge.finalization_deadline=min(bridge.finalization_deadline,budget_end)
+                bridge.deadline=min(bridge.deadline,budget_end-30)
+            except ValueError:
+                bridge.deadline=bridge.finalization_deadline=time.monotonic()
+                bridge.stop_reason='request_budget_exhausted'
+        persistent = not temporary
+        bridge.persistent_context = persistent
+        native_identity = str(home) + ':' + str(session_id or self.session_id or 'xiaomachi')
         bridge.observer = AgentTrace(self.trace_root, context={**current_trace_context(), **self.trace_context,
             "model": bridge.model, "protocol": bridge.protocol,
+            'context_session_key': hashlib.sha256(native_identity.encode()).hexdigest()[:24],
+            'context_lifetime': self.trace_context.get('context_lifetime') or ('persistent' if persistent else 'ephemeral'),
+            'context_state_owner': 'local',
             "context_window_tokens": self.context_policy.context_window},
-            session_key=str(home) + ":" + str(session_id or self.session_id or "xiaomachi"),
+            session_key=native_identity,
             conversation_key=self.trace_conversation_key or str(home))
         # Scoped live examples retain developer authority, but are not stored
         # as the native session's fixed persona or conversation input. Replayed
@@ -265,15 +291,16 @@ class HarnessToolAgent:
                     bridge.runtime_phase = "completed"
                     self.final_response = result.final_response
                     return result
-            run_budget = asyncio.timeout(self.timeout_seconds)
+            run_budget = asyncio.timeout(self.timeout_seconds - reserve)
             async with run_budget:
                 result = await self.blocking.run(execute)
             if not bridge.last_write or bridge.last_write.status != "uncertain":
                 guard.require_valid()
-            reason = bridge.stop_reason or ("model_finished" if result.finish_reason == "completed" else "runtime:" + str(result.finish_reason))
+            reason = bridge.stop_reason or bridge.patrol_progress.finish_reason or ("model_finished" if result.finish_reason == "completed" else "runtime:" + str(result.finish_reason))
             if (reason == "model_finished" and self.require_reply and bridge.delivery_tool()
-                    and not bridge.write_calls and not bridge.image_calls):
+                    and not bridge.write_calls and not bridge.image_calls and not bridge.auto_handoff):
                 reason = "required_reply_not_delivered"
+            await bridge.finalize_media()
             return bridge.result(reason)
         except asyncio.CancelledError:
             bridge.revoke()
@@ -283,11 +310,12 @@ class HarnessToolAgent:
                 bridge.trace.append({"status": "runtime_error", "error": "TimeoutError", "phase": bridge.runtime_phase})
                 return bridge.result(bridge.stop_reason or "runtime_error")
             bridge.stop_reason = bridge.stop_reason or "turn_timeout"
-            bridge.revoke()
+            await bridge.finalize_media()
             return bridge.result(bridge.stop_reason)
         except Exception as exc:
             # Expose safe diagnostics; the model never receives keys or bodies.
             bridge.trace.append({"status": "runtime_error", "error": type(exc).__name__, "phase": bridge.runtime_phase})
+            await bridge.finalize_media()
             return bridge.result(bridge.stop_reason or "runtime_error")
         finally:
             aborted = bridge.cancelled.is_set()
@@ -300,7 +328,9 @@ class HarnessToolAgent:
                     harness.client.config.shutdown_timeout_seconds, 0.5)
             await asyncio.to_thread(harness.close)
             await asyncio.to_thread(bridge.close)
-            if (self.ephemeral_context and not aborted and bridge.stop_reason == ''
+            if (self.ephemeral_context and self.idle_patrol and not bridge.patrol_progress.meaningful
+                    and self.context_retention.get('reason') == 'idle_history_discarded'
+                    and not aborted and bridge.stop_reason == ''
                     and bridge.runtime_phase == 'completed' and bridge.write_calls == 0
                     and not self.require_reply):
                 from app.agent.harness_session_files import discard_silent_native_turn
@@ -335,6 +365,9 @@ class _Bridge:
         self.delivery_recovery = False
         self.task_recovery = False
         self.pending_jobs = {}
+        self.auto_handoff = False
+        self.auto_delivery_jobs = set()
+        self.auto_handoff_failed = False
         self.control = None
         self.model_turn_id = uuid4().hex
         self.stop_reason = ""
@@ -342,6 +375,11 @@ class _Bridge:
         self.last_write: ToolOutcome | None = None
         self.last_write_name = ""
         self.deadline = time.monotonic() + owner.timeout_seconds
+        self.finalization_deadline = self.deadline
+        self.pending_model_calls = 0
+        self.pending_model_tokens = 0
+        self.exploration_closed = False
+        self.finalizer_used = False
         self.harness = None
         self._pending = set()
         self._seen_calls: dict[str, dict] = {}
@@ -350,6 +388,9 @@ class _Bridge:
         self._count_lock = threading.Lock()
         client = owner.decision_client
         self.protocol = "openai-responses" if client.responses_model else "openai-completions"
+        self.patrol_progress = PatrolProgress(owner.idle_patrol)
+        self.continuation = ResponsesContinuation(enabled=continuation_supported(
+            owner.continuation_mode, client.base_url, self.protocol))
         self.model = client.responses_model or client.model
         self.vision_model = client.vision_model or self.model
         self.instructions = ""
@@ -374,12 +415,88 @@ class _Bridge:
         self.observer.close()
 
     def require_valid(self):
+        if self.exploration_closed:raise RuntimeError('media_exploration_closed')
         if time.monotonic() > self.deadline:
             self.stop_reason = "turn_timeout"
             raise RuntimeError("Harness turn deadline exceeded")
         if self.cancelled.is_set() or self.stop_reason:
             raise RuntimeError("Harness action authority ended")
         self.guard.require_valid()
+
+    def request_budget(self):
+        workspace=self.owner.task_workspace
+        return getattr(workspace,'media_budget',None) if workspace else None
+
+    def admit_model_budget(self,estimated_tokens):
+        budget=self.request_budget()
+        if budget:
+            budget.spend('model_calls',1+self.pending_model_calls)
+            budget.spend('estimated_tokens',estimated_tokens+self.pending_model_tokens)
+            self.pending_model_calls=self.pending_model_tokens=0
+        else:
+            self.pending_model_calls+=1
+            self.pending_model_tokens+=estimated_tokens
+
+    async def finalize_media(self):
+        """No model, new reads or downloads; a finite reserved send authority."""
+        if (self.finalizer_used or not self.control or not self.control.requires_media
+                or self.auto_handoff or self.cancelled.is_set() or self.control.unknown
+                or self.last_write and self.last_write.status=='uncertain'):
+            return
+        self.finalizer_used=True
+        self.exploration_closed=True
+        remaining=self.finalization_deadline-time.monotonic()
+        if remaining<=0:return
+        name=self.delivery_tool()
+        identifiers=self.control.approved_artifacts()
+        if not name or not identifiers:return
+        # A finalizer cannot reuse expired/revoked/cross-scope authority. All
+        # file, source, effect and gateway checks still execute in the send tool.
+        try:
+            self.guard.require_valid()
+            budget=self.request_budget()
+            tool=self.tools[name]
+            props=tool.parameters.get('properties',{})
+            selected=[];size=0
+            if 'media_artifact_ids' in props:
+                for identifier in identifiers:
+                    is_video=identifier in self.control.video_artifacts
+                    length=self.control.asset_details.get(identifier,{}).get('bytes') or (64*1024*1024 if is_video else 8*1024*1024)
+                    if selected and (len(selected)>=20 or size+length>32*1024*1024):break
+                    selected.append(identifier);size+=length
+                    if length>32*1024*1024:break
+                args={'text':f'先交付本次已筛选并校验的{len(selected)}份媒体；其余数量、类型或覆盖仍有缺口。',
+                    'media_artifact_ids':selected,'as_forward':True,'task_status':'partial'}
+            else:
+                video=next((i for i in identifiers if i in self.control.video_artifacts),None)
+                images=[i for i in identifiers if i in self.control.image_artifacts]
+                if images:
+                    selected=images[:4]
+                    args={'text':f'先交付已筛选并校验的{len(selected)}张图片，其余仍有缺口。',
+                        'artifact_ids':selected,'as_forward':len(selected)>2,'task_status':'partial'}
+                elif video:
+                    selected=[video]
+                    args={'text':'先交付本次已筛选并校验的视频，其余仍有缺口。',
+                        'video_artifact_id':video,'task_status':'partial'}
+                else:return
+            if budget:budget.spend('writes',finalization=True)
+            if self.write_calls>=self.owner.max_external_writes or self._tool_lock.locked():return
+            self.guard.require_valid()
+            async with asyncio.timeout(remaining):
+                tool=self.tools[name]
+                if tool.authorization is not None and tool.authorization() is not True:return
+                if not validate_arguments(args,tool.parameters):return
+                result=await (self.invoke_tool(tool,args,'reserved-media-finalizer') if self.invoke_tool else tool.handler(args))
+            if result.status=='sent' and not result.receipt_id:
+                result=ToolOutcome({'error':'media_finalizer_missing_receipt'},'uncertain')
+            self.write_calls+=1
+            self.last_write=result;self.last_write_name=name
+            self.trace.append({'tool':name,'status':result.status,'receipt_id':result.receipt_id,
+                'execution_kind':'deterministic_media_finalizer','artifact_count':len(selected)})
+            self.control._last_preflight={'stage':'partial','media':True,'artifact_ids':selected}
+            self.control.observe(name,args,result,'reserved-media-finalizer')
+        except (ValueError,RuntimeError,OSError,TimeoutError) as exc:
+            self.trace.append({'status':'media_finalizer_blocked','error':type(exc).__name__})
 
     def delivery_tool(self):
         candidates = [name for name in ("send_group", "send_private")
@@ -388,6 +505,7 @@ class _Bridge:
 
     def can_recover_delivery(self):
         return bool(self.owner.require_reply and self.delivery_tool() and not self.delivery_recovery
+            and not self.auto_handoff
             and not self.write_calls and not self.image_calls and not self.last_write
             and not self.stop_reason and not self.cancelled.is_set()
             and self.model_calls < self.owner.max_steps and self.deadline - time.monotonic() >= 5.0)
@@ -409,6 +527,7 @@ class _Bridge:
             return {'status': 'blocked', 'completion_gaps': ['task_dependency_unavailable']}
 
     def can_recover_task(self):
+        if self.auto_handoff:return False
         state = self.task_state()
         gaps = state.get('completion_gaps', [])
         if self.control and self.control.can_stop and not (self.owner.task_workspace.formal
@@ -421,6 +540,7 @@ class _Bridge:
             and self.model_calls < self.owner.max_steps and self.deadline - time.monotonic() >= 5.0)
 
     def delivery_complete(self):
+        if self.auto_handoff:return True
         if not self.last_write or self.last_write.status != 'sent':
             return False
         if self.control is not None:
@@ -464,6 +584,8 @@ class _Bridge:
             return {'error': 'task_review_budget_unavailable'}
         if self.owner.before_call and not self.owner.before_call('model'):
             return {'error': 'task_review_daily_budget'}
+        try:self.admit_model_budget(4096)
+        except ValueError:return {'error':'task_review_request_budget'}
         with self._count_lock:
             self.model_calls += 1
             index = self.model_calls
@@ -472,6 +594,7 @@ class _Bridge:
         def usage(value):
             usages.append(value)
             self.owner.decision_client._record_usage(value)
+            if self.request_budget():self.request_budget().record_usage(value)
         started = time.monotonic()
         status = 'completed'
         try:
@@ -505,6 +628,15 @@ class _Bridge:
                 or self.deadline - time.monotonic() <= min(45.0, self.owner.timeout_seconds / 3)))
 
     def result(self, reason):
+        self.owner.context_retention = (self.patrol_progress.retention() if self.owner.idle_patrol
+            else {'retain_history': True, 'reason': 'active_context_retained'})
+        if self.write_calls:
+            self.owner.context_retention = {'retain_history': True, 'reason': 'external_action_retained'}
+        if not getattr(self, 'persistent_context', bool(self.owner.session_path)):
+            self.owner.context_retention = {'retain_history': False, 'reason': 'ephemeral_context_finished'}
+        if self.stop_reason or self.runtime_phase != 'completed' or reason.startswith(('runtime:', 'runtime_error')):
+            self.owner.context_retention = {'retain_history': False, 'reason': 'failed_context_unusable'}
+        self.observer.event('context.retention', self.owner.context_retention)
         task_state = self.task_state()
         if task_state:
             self.observer.event('task.state', task_state)
@@ -514,6 +646,9 @@ class _Bridge:
             status = self.last_write.status
             self.observer.finish(status, "tool:" + self.last_write_name)
             return ToolTurnResult(status, self.last_write.receipt_id, "tool:" + self.last_write_name, tuple(self.trace), task_state)
+        if self.auto_handoff and reason=='model_finished':
+            self.observer.finish('silent','background_auto_handoff')
+            return ToolTurnResult('silent',reason='background_auto_handoff',trace=tuple(self.trace),task_status=task_state)
         status = ("failed" if reason in {"model_request_timeout", "model_first_output_timeout", "model_progress_timeout", "model_stream_incomplete", "model_stream_buffer_exceeded", "turn_timeout", "model_provider_failed", "model_input_rejected", "model_image_input_rejected", "required_reply_not_delivered", 'context_capacity_exhausted'}
                   else "blocked" if self.stop_reason else
                   "failed" if reason.startswith(("runtime:", "runtime_error")) else "silent")
@@ -525,9 +660,10 @@ class _Bridge:
         fixed_tokens = estimate_request_tokens({'instructions': self.instructions, 'tools': [
             {'name': tool.name, 'description': tool.description, 'parameters': tool.parameters}
             for tool in self.tools.values()]})
-        self.compaction_threshold = (min(int(policy.context_window * policy.threshold_ratio),
-            policy.history_tokens + fixed_tokens) if policy.history_tokens else
-            int(policy.context_window * policy.threshold_ratio))
+        # Retained closed history is a post-compaction allowance, not the
+        # trigger for the whole request. Current tools/evidence may exceed
+        # that small allowance while the full input remains well below soft.
+        self.compaction_threshold = int(policy.context_window * policy.threshold_ratio)
         if policy.soft_input_tokens:
             usable = max(1024, policy.context_window - self.owner.decision_client.max_output_tokens
                 - policy.safety_tokens - policy.tool_reserve_tokens)
@@ -536,6 +672,10 @@ class _Bridge:
         retain_tokens = min(policy.retain_tokens, max(512,
             (policy.target_input_tokens - fixed_tokens - policy.summary_tokens - estimate_text_tokens(self.live_context))
             if policy.target_input_tokens else (policy.history_tokens or policy.context_window) // 3))
+        if policy.history_tokens:
+            # The summary and retained recent messages share one history
+            # budget; exceeding it immediately would retrigger compaction.
+            retain_tokens = min(retain_tokens, max(512, policy.history_tokens - policy.summary_tokens))
         providers = {}
         for name, path in (('xiaomachi-model', '/v1'), ('xiaomachi-compactor', '/compact/v1')):
             providers[name] = {'api': self.protocol, 'apiKeyEnv': 'XIAOMACHI_LOCAL_MODEL_KEY',
@@ -588,8 +728,8 @@ class _Bridge:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
                 try:
+                    self.end_headers()
                     self.wfile.write(data)
                 except (OSError, ConnectionError):
                     pass
@@ -642,6 +782,7 @@ class _Bridge:
         try:
             with observe_with(self.observer, call_id=call_id):
                 result = await self._call_tool(body)
+                self.patrol_progress.observe(name, body.get('arguments') or {}, result)
             if (self.control is not None and tool is not None
                     and validate_arguments(body.get('arguments'), tool.parameters)
                     and not was_seen and not result.get('duplicate') and not result.get('task_progress')
@@ -652,6 +793,12 @@ class _Bridge:
                             tuple(result.get('images', ()))), call_id)
                     if self.control.active:
                         result['task_progress'] = progress
+                    if (self.control.requires_media and progress['no_progress'] and not self.auto_handoff
+                            and not self.control.review_used and name in {
+                                'search_web','list_x_posts','search_x_posts','search_xhs_posts','inspect_web_resources'}):
+                        self.control.review_used=True
+                        progress['review']=await self.review_task(self.control,'')
+                        self.control._persist()
                 except (ValueError, OSError, RuntimeError):
                     self.stop_reason = self.stop_reason or 'task_checkpoint_unavailable'
                     self.trace.append({'status': 'task_checkpoint_unavailable'})
@@ -678,10 +825,36 @@ class _Bridge:
                 return cached["result"] if cached["signature"] == signature else {"status": "blocked", "data": {"error": "call_id_reused"}}
             tool = self.tools.get(name)
             if tool is None or not validate_arguments(args, tool.parameters):
-                return {"status": "blocked", "data": {"error": "tool_or_arguments_not_allowed"}}
+                return {"status": "blocked", "data": {"error": "tool_or_arguments_not_allowed",
+                    'handler_executed':False,
+                    **(argument_validation_feedback(args,tool.parameters) if tool else {}),
+                    'guidance':'工具参数未通过本地schema校验，尚未请求上游。这不代表站点不可用或没有权限；按invalid_arguments的字段/上限修正，保留用户的主题、时间及明确门槛，不转用raw或擅加点赞数。'}}
+            if self.auto_handoff and tool.effect=='write':
+                return {'status':'blocked','data':{'error':'automatic_media_handoff',
+                    'guidance':'自动下载任务已接管交付；主回合结束，不再发送可能过时的进度或重复下载。'}}
             if tool.authorization is not None and tool.authorization() is not True:
                 return {"status": "blocked", "data": {"error": "owner_required"}}
+            early = self.patrol_progress.before(name, args)
+            if early is not None:
+                self._seen_calls[call_id] = {'signature': signature, 'result': early}
+                return early
+            args_adjusted = False
             if self.control is not None:
+                prepared = self.control.prepare_tool_arguments(name, args)
+                args_adjusted = prepared.get('delivery_mode') != args.get('delivery_mode') or (
+                    name=='queue_media_batch' and any(
+                        new['arguments'].get('delivery_mode') != old['arguments'].get('delivery_mode')
+                        for old,new in zip(args['operations'],prepared['operations'])))
+                args = prepared
+                budget=self.request_budget()
+                if budget:
+                    try:
+                        budget.spend('tool_calls')
+                        if name in {'search_web','search_x_posts','search_xhs_posts','list_x_posts'}:
+                            budget.spend('discovery_calls')
+                        if tool.effect=='write':budget.spend('writes')
+                    except ValueError as exc:
+                        return {'status':'blocked','data':{'error':str(exc),'handler_executed':False}}
                 rejected = self.control.preflight(name, args)
                 if rejected is not None:
                     if self.control.needs_review and not self.control.review_used:
@@ -689,7 +862,7 @@ class _Bridge:
                         rejected.data['review'] = await self.review_task(self.control, args.get('text', ''))
                         self.control._persist()
                     return {'status': rejected.status, 'data': rejected.data}
-                if name == 'search_web' and self.control.stalled >= 3:
+                if name == 'search_web' and self.control.method_progress.get(name,{}).get('no_gain',0) >= 3:
                     return {'status': 'blocked', 'data': {'error': 'strategy_change_required',
                         'guidance': '连续查询没有新增目标证据；换用已知资源/其他获准能力，或如实partial/blocked，勿继续改词搜索。'}}
             if name in _MEMORY_READ_TOOLS and self.owner.require_reply:
@@ -702,7 +875,9 @@ class _Bridge:
             if self.delivery_recovery and (name != self.delivery_tool() or self.write_calls):
                 return {"status": "blocked", "data": {"error": "delivery_recovery_only",
                     "next_action": "Deliver once with the current send tool, then finish."}}
-            if tool.effect == "write" and self.write_calls >= self.owner.max_external_writes:
+            if tool.effect == "write" and self.write_calls >= (self.owner.max_external_writes -
+                    (1 if self.control and self.control.requires_media and not (args.get('artifact_ids') or
+                        args.get('media_artifact_ids') or args.get('video_artifact_id')) else 0)):
                 # Keep attempts bounded, but don't make a confirmed rejection
                 # consume the user's only possible failure explanation.
                 text_only = (name == self.delivery_tool() and isinstance(args.get('text'), str)
@@ -719,7 +894,9 @@ class _Bridge:
             if tool.effect == "write":
                 self.write_calls += 1
             try:
-                outcome = await (self.invoke_tool(tool, args, call_id) if self.invoke_tool else tool.handler(args))
+                from app.core.request_cost import request_cost_scope
+                with request_cost_scope(self.request_budget()):
+                    outcome = await (self.invoke_tool(tool, args, call_id) if self.invoke_tool else tool.handler(args))
             except asyncio.CancelledError:
                 if tool.effect == "write":
                     self.last_write = ToolOutcome({"error": "cancelled_write"}, "uncertain")
@@ -737,8 +914,21 @@ class _Bridge:
                         self.pending_jobs[entry['job_id']] = state
                     else:
                         self.pending_jobs.pop(entry['job_id'], None)
+            auto_download=name in {'download_twitter_media','download_web_images','download_web_video','queue_media_batch'}
+            accepted_auto=(self.owner.require_reply and outcome.status=='ok' and auto_download
+                    and (name!='queue_media_batch' or outcome.data.get('all_accepted') is True)
+                    and not outcome.data.get('failures') and entries
+                    and all(isinstance(entry,dict) and type(entry.get('job_id')) is int
+                        and entry['job_id']>0 and entry.get('delivery')=='automatic_delivery_to_original_request'
+                        for entry in entries))
+            if accepted_auto:self.auto_delivery_jobs.update(entry['job_id'] for entry in entries)
+            elif self.auto_delivery_jobs and auto_download:self.auto_handoff_failed=True
+            self.auto_handoff=bool(self.auto_delivery_jobs) and not self.auto_handoff_failed and (
+                set(self.pending_jobs)<=self.auto_delivery_jobs)
             encoded = self.owner.decision_client._load_input_images(list(outcome.images)) if outcome.images else []
             data = compact_memory_packet(outcome.data)
+            if args_adjusted:
+                data = {**data, 'delivery_mode_adjusted':'review'}
             if isinstance(data, dict) and data.get('trust') == 'untrusted_external_sources':
                 # Native adapters may rewrite call IDs. Bind fresh evidence to
                 # this bridge turn independently of that wire representation.
@@ -783,10 +973,13 @@ class _Bridge:
 
     def _forward(self, handler, body, budget, *, compaction=False):
         self.require_valid()
-        if not compaction and self.delivery_complete():
+        if not compaction and (self.delivery_complete() or self.patrol_progress.finished):
             # Close the native tool loop after its real tool result is saved.
             # This is local completion, never an upstream call or usage.
-            self.observer.event('delivery.completed', {'source':'application', 'receipt_id':self.last_write.receipt_id})
+            self.observer.event('context.finished' if self.patrol_progress.finished else 'delivery.handed_off' if self.auto_handoff else 'delivery.completed',
+                {'source':'application','receipt_id':self.last_write.receipt_id if self.last_write else None,
+                    **({'reason': self.patrol_progress.finish_reason} if self.patrol_progress.finished else {}),
+                    **({'job_ids':sorted(self.pending_jobs)} if self.auto_handoff else {})})
             handler.send_response(200)
             handler.stream_started = True
             handler.send_header('Content-Type', 'text/event-stream')
@@ -795,7 +988,9 @@ class _Bridge:
             # item as an empty model response. Emit a complete local message,
             # so its session closes normally and remains reusable next turn.
             identity = 'local-' + self.model_turn_id
-            text = 'Application recorded the current delivery receipt. No additional action.'
+            text = ('Application closed the patrol after its saved working checkpoint. No additional action.' if self.patrol_progress.finished else
+                'Application handed off the accepted automatic media jobs. Delivery is pending; no additional main-turn action.'
+                if self.auto_handoff else 'Application recorded the current delivery receipt. No additional action.')
             if self.protocol == 'openai-responses':
                 response = {'id': identity, 'object': 'response', 'model': self.model,
                     'status': 'in_progress', 'output': []}
@@ -832,6 +1027,7 @@ class _Bridge:
             include_current_media=not compaction)
         projection_metrics['context_history_estimated_tokens'] = estimate_request_tokens({
             'input': body.get('input', body.get('messages', []))})
+        estimated_tokens=estimate_request_tokens(body)+self.owner.decision_client.max_output_tokens
         with self._count_lock:
             if compaction:
                 if self.compaction_calls >= 2:
@@ -841,7 +1037,12 @@ class _Bridge:
                 self.stop_reason = "model_budget_exhausted"
                 return handler.reply(429, {"error": {"message": "model_budget_exhausted"}})
             else:
-                self.model_calls += 1
+                pass
+            try:self.admit_model_budget(estimated_tokens)
+            except ValueError as exc:
+                self.stop_reason='request_budget_exhausted'
+                return handler.reply(429,{'error':{'message':str(exc)}})
+            if not compaction:self.model_calls += 1
             model_call_index = self.model_calls
         endpoint = "/responses" if self.protocol == "openai-responses" else "/chat/completions"
         body["parallel_tool_calls"] = False
@@ -873,6 +1074,7 @@ class _Bridge:
             self.trace.append({"status": "delivery_reserved", "memory_reads": self.memory_reads})
         # Transport retry is independent of the Agent loop. Only model requests
         # before response bytes are committed may be retried, with a hard bound.
+        retry_full_payload = None
         with self.resources.hold() if self.resources else nullcontext():
             for attempt in range(3):
                 budget.check()
@@ -947,6 +1149,27 @@ class _Bridge:
                 if self.owner.before_call and not self.owner.before_call("model"):
                     self.stop_reason = "model_daily_budget"
                     return handler.reply(429, {"error": {"message": "model_daily_budget"}})
+                wire_body, full_body = body, body
+                continuation_metrics = {'continuation_mode': 'full', 'continuation_reason': 'compaction'}
+                if not compaction:
+                    if retry_full_payload is not None:
+                        wire_body = full_body = retry_full_payload
+                        retry_full_payload = None
+                        continuation_metrics = {'continuation_mode': 'full', 'continuation_reason': 'explicit_state_rejection'}
+                    else:
+                        # The native SDK defaults to stateless store=false.
+                        # This application-owned capability setting opts into
+                        # provider state; disabled/custom-auto keep SDK replay.
+                        if self.continuation.uses_provider_state:
+                            body = {**body, 'store': True}
+                        canonical = base_input if body.get('input', [])[:len(base_input)] == base_input else None
+                        wire_body, full_body, continuation_metrics = self.continuation.prepare(body, canonical_input=canonical)
+                wire_context_tokens = estimate_request_tokens(full_body)
+                if wire_context_tokens > input_ceiling:
+                    self.stop_reason = 'context_capacity_exhausted'
+                    return handler.reply(413, {'error': {'message': self.stop_reason}})
+                projection_metrics['canonical_context_estimated_tokens'] = projection_metrics['context_estimated_tokens']
+                projection_metrics['context_estimated_tokens'] = wire_context_tokens
                 if self.owner.admission_metrics is not None:
                     projection_metrics.update(self.owner.admission_metrics())
                 # All exported fields are allowlisted scalars. Never include
@@ -959,8 +1182,11 @@ class _Bridge:
                     'context_compaction_threshold_tokens': (getattr(self, 'compaction_threshold', int(self.owner.context_policy.context_window * self.owner.context_policy.threshold_ratio))
                         if self.owner.context_policy.compaction_enabled else None),
                     "model_call_index": model_call_index, "attempt": attempt + 1, "protocol": self.protocol,
+                    **continuation_metrics,
+                    'prompt_cache_key_id': cache_identity(wire_body.get('prompt_cache_key')),
+                    'provider_context_estimated_tokens': wire_context_tokens,
                     "model": model if re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", model) else "configured_model",
-                    **request_context_counts(body, protocol=self.protocol), "http_status": None,
+                    **request_context_counts(wire_body, protocol=self.protocol), "http_status": None,
                     "headers_ms": None, "first_sse_byte_ms": None, "terminal": "none", "outcome": "transport_error"}
                 request_id = f"{'c' if compaction else 'm'}{self.compaction_calls if compaction else model_call_index:02d}-a{attempt+1:02d}"
                 started = time.monotonic()
@@ -971,17 +1197,38 @@ class _Bridge:
                         metrics["first_sse_byte_ms"] = round((time.monotonic() - started) * 1000, 3)
                 try:
                     request = client.http_client.build_request(
-                        "POST", client.base_url + endpoint, json=body,
+                        "POST", client.base_url + endpoint, json=wire_body,
                         headers={"Authorization": "Bearer " + client.api_key})
                     remaining = max(0.001, budget.deadline - time.monotonic())
                     request.extensions["timeout"] = {key: min(value or remaining, remaining, budget.first_seconds)
                         for key, value in request.extensions.get("timeout", {}).items()}
-                    self.observer.request(request_id, body, metrics, purpose=metrics["purpose"])
+                    self.observer.request(request_id, wire_body, metrics, purpose=metrics["purpose"])
                     response = client.http_client.send(request, stream=True)
                     budget.response = response
                     budget.check()
                     metrics["headers_ms"] = round((time.monotonic() - started) * 1000, 3)
                     metrics["http_status"] = response.status_code
+                    if wire_body.get('previous_response_id') and response.status_code in {400, 404, 422}:
+                        error_bytes = bytearray()
+                        for part in response.iter_bytes():
+                            if len(error_bytes) + len(part) > 65536:
+                                break
+                            error_bytes.extend(part)
+                        try:
+                            error = json.loads(error_bytes)
+                        except (ValueError, UnicodeError):
+                            error = {}
+                        fallback_reason = self.continuation.reject(response.status_code, error)
+                        if fallback_reason and attempt < 2:
+                            self.continuation.reset(fallback_reason, disable=fallback_reason == 'continuation_unsupported')
+                            retry_full_payload = full_body
+                            metrics.update(outcome='continuation_fallback', continuation_reason=fallback_reason,
+                                           output_disposition='discarded')
+                            continue
+                        self.stop_reason = 'model_provider_failed'
+                        metrics.update(outcome='http_error', output_disposition='discarded')
+                        handler.reply(response.status_code, {'error': {'message': 'upstream_continuation_rejected'}})
+                        return
                     if response.status_code in {429, 500, 502, 503, 504, 522} and attempt < 2:
                         metrics["outcome"] = "http_retry"
                         continue
@@ -1005,6 +1252,7 @@ class _Bridge:
                     pending_bytes = 0
                     retry_empty = False
                     output_prefix = ''
+                    completed_response = None
                     explicit_refusal = False
                     saw_output = False
                     metrics['output_disposition'] = 'pending' if stage_empty else 'streamed'
@@ -1054,6 +1302,10 @@ class _Bridge:
                                     if terminal:
                                         metrics["terminal"] = event.removeprefix("response.")
                                         result = chunk.get("response")
+                                        if isinstance(result, dict):
+                                            metrics['provider_response_id'] = provider_identity(result.get('id'))
+                                            if not compaction and event == 'response.completed':
+                                                completed_response = result
                                         usage_payload = result.get("usage") if isinstance(result, dict) else None
                                         details = result.get("incomplete_details") if isinstance(result, dict) else None
                                         reason = details.get("reason") if isinstance(details, dict) else None
@@ -1104,6 +1356,9 @@ class _Bridge:
                             handler.wfile.flush()
                         if terminal:
                             metrics["outcome"] = "completed" if metrics["terminal"] == "done" else metrics["terminal"]
+                            if completed_response is not None and committed and not self.stop_reason:
+                                self.continuation.complete(completed_response)
+                                metrics['provider_chain_id'] = self.continuation.chain_id
                             self.trace.append({"status": "model_stream_completed", "protocol": self.protocol,
                                 "model_call_index": model_call_index, "terminal": metrics["terminal"]})
                             break
@@ -1141,6 +1396,8 @@ class _Bridge:
                     metrics["outcome"] = budget.reason or ("revoked" if self.cancelled.is_set() or self.stop_reason else "stream_error")
                     raise
                 finally:
+                    if not compaction and metrics.get('outcome') != 'completed':
+                        self.continuation.reset('uncommitted_response')
                     if metrics.get('output_disposition') == 'pending':
                         metrics['output_disposition'] = 'discarded'
                     metrics["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -1157,7 +1414,9 @@ class _Bridge:
                     # cache fields remain compatible in the existing recorder.
                     if isinstance(usage_payload, dict) and usage_payload and metrics["usage_status"] != "invalid":
                         extract = client._extract_responses_usage if self.protocol == "openai-responses" else client._extract_chat_completions_usage
-                        client._record_usage(extract({"usage": usage_payload}, model=model))
+                        observed_usage=extract({"usage": usage_payload}, model=model)
+                        client._record_usage(observed_usage)
+                        if self.request_budget():self.request_budget().record_usage(observed_usage)
                     try:
                         if response is not None:
                             response.close()

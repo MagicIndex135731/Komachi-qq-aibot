@@ -15,7 +15,8 @@ from app.adapters.outbound_guard import GroupDispatchScope, group_dispatch_scope
 from app.adapters.sender import OutboundMessage, QQMessageDeliveryUncertainError
 from app.adapters.qzone import QzoneRejectedError, QzoneUnavailableError
 from app.agent.social_contracts import SocialDecision, SocialObservation, SocialResult
-from app.agent.social_policy import configured_social_jobs, in_quiet_hours, friend_authorized, resolve_friend_ids
+from app.agent.social_policy import (autonomous_social_enabled, configured_social_jobs,
+                                     in_quiet_hours, friend_authorized, resolve_friend_ids)
 from app.core.memory_source_guard import is_usable_memory_source
 from app.core.time_utils import ASIA_SHANGHAI
 from app.storage.db import session_scope
@@ -43,6 +44,8 @@ class SocialExecutor:
             return False
         now = self.clock()
         manual = owner_authority is not None and owner_authority() is True
+        if not manual and not autonomous_social_enabled(self.router.runtime, observation.job.kind):
+            return False
         if current != observation.job or observation.suppressed_reason or (not manual and in_quiet_hours(current.quiet_hours, now)):
             return False
         expected = {"group": "send_group", "qzone_publish": "publish_qzone", "qzone_comment": "comment_qzone"}

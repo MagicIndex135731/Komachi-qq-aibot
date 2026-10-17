@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from app.agent.context_policy import RequestContextPolicy
 from app.agent.harness_runtime import HarnessToolAgent
+from app.agent.tool_agent import ToolOutcome
 from test_harness_runtime import Guard, model_client, responses_sse, ModelHandler, request_body, tool, bridge_factory
 
 
@@ -166,23 +167,67 @@ def test_full_envelope_ceiling_includes_schema_and_blocks_before_paid_request(br
     assert bridge.trace[-1]['status']=='context_budget_blocked'
 
 
-def test_main_total_budget_replaces_legacy_history_rotation(bridge_factory):
+def test_main_history_budget_includes_summary_and_total_input_remains_bounded(bridge_factory):
     from app.config import AppSettings
     bridge, requests, _ = bridge_factory(lambda *_: responses_sse())
     policy = RequestContextPolicy.from_settings(AppSettings(NAPCAT_WS_URL='ws://localhost:3001',
         LLM_BASE_URL='https://example.com', LLM_API_KEY='synthetic', BOT_QQ=900000099, OWNER_QQ=900000101))
     bridge.owner.context_policy = policy
     patches = bridge.patch()
-    assert policy.history_tokens == 0
-    assert bridge.compaction_threshold == 96000
+    assert policy.history_tokens == 24000
+    assert policy.history_tokens <= bridge.compaction_threshold <= policy.soft_input_tokens
     compaction = next(item for row in patches for item in row.get('insert', [])
         if item.get('id') == 'xiaomachi-compaction')
-    assert 24000 <= compaction['config']['retainTokens'] <= 32000
+    assert 512 <= compaction['config']['retainTokens'] <= policy.history_tokens - policy.summary_tokens
     body = request_body()
     body['input'] = [{'role': 'user', 'content': '汉' * 165000}]
     sink = ModelHandler()
     bridge.forward(sink, body)
     assert not requests and sink.replies[0][0] == 413
+
+
+@pytest.mark.parametrize('history_tokens',[8000,24000,64000])
+def test_retained_history_budget_does_not_lower_full_request_soft_threshold(bridge_factory,history_tokens):
+    bridge,_,_=bridge_factory(lambda *_:responses_sse())
+    bridge.owner.context_policy=RequestContextPolicy(history_tokens=history_tokens,
+        soft_input_tokens=96000,target_input_tokens=64000,hard_input_tokens=160000)
+    bridge.patch()
+    assert bridge.compaction_threshold==96000
+
+
+@pytest.mark.asyncio
+async def test_native_medium_media_task_does_not_recompact_old_prefix_before_delivery(tmp_path):
+    calls=[];delivered=[];summaries=[];main=0
+    def script(body,number):
+        nonlocal main
+        summary=body.get('max_output_tokens')==512
+        summaries.append(summary)
+        if summary:return responses_sse(text='CHECKPOINT: only closed older topic',number=number)
+        main+=1
+        if main==1:stream=responses_sse(text='CLOSED_OLDER_TOPIC',number=number)
+        elif main<5:stream=responses_sse(name='read_fixture',arguments={},number=number,call_id=f'c{number}')
+        else:stream=responses_sse(name='send_private',arguments={'text':'按原帖文字挑选的两份视频'},number=number,call_id=f'c{number}')
+        return stream.replace(b'"input_tokens": 10',b'"input_tokens": 45000')
+    client,requests,_=model_client(script)
+    policy=RequestContextPolicy(history_tokens=24000,soft_input_tokens=96000,
+        target_input_tokens=64000,hard_input_tokens=160000,summary_tokens=512)
+    async def read(args):
+        calls.append(args)
+        return ToolOutcome({'post_text':'SYNTHETIC_POST_TEXT '*500,'video_artifact_ids':['art-video-a','art-video-b']})
+    async def send(args):delivered.append(args);return ToolOutcome({},'sent','synthetic-confirmed')
+    offered=(tool('read_fixture',read),tool('send_private',send,effect='write',
+        properties={'text':{'type':'string'}},required=('text',)))
+    for index,prompt in enumerate(('OLDER_TOPIC: '+'closed ordinary chat '*6500,'CURRENT_TOPIC: get a few videos from post text')):
+        agent=HarnessToolAgent(decision_client=client,session_home=tmp_path/'medium-media',
+            session_id='persistent',context_policy=policy,max_steps=8,
+            finish_after_delivery=lambda:True)
+        try:
+            result=await agent.run(['System persona: stable synthetic',prompt],offered,Guard())
+            if index:assert result.status=='sent' and result.receipt_id=='synthetic-confirmed',result
+        finally:agent.close()
+    client.http_client.close()
+    assert not any(summaries),'A 45k working request must not trigger the 96k full-input compactor'
+    assert len(requests)==5 and len(calls)==3 and len(delivered)==1
 
 
 @pytest.mark.asyncio

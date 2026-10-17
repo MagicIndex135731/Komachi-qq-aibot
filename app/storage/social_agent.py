@@ -108,6 +108,16 @@ class SocialPatrolReview(Base):
     reviewed_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class SocialPatrolCandidate(Base):
+    """Version-scoped attention, independent of the durable send ledger."""
+    __tablename__ = 'social_patrol_candidates'
+    account_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24))
+    revisit_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 @dataclass(frozen=True, slots=True)
 class SocialLease:
     owner: str
@@ -277,16 +287,51 @@ class SocialAgentRepository:
                 row.last_status, row.last_reason = "observing", ""
             return (*result, *patrol_due)
 
-    def unreviewed_posts(self, *, account_id: int, posts: tuple[SocialPost, ...]) -> tuple[SocialPost, ...]:
+    def unreviewed_posts(self, *, account_id: int, posts: tuple[SocialPost, ...], now=None) -> tuple[SocialPost, ...]:
         from app.agent.social_cadence import post_fingerprint
         from app.storage.db import session_scope
         if len(posts) > 100:
             raise ValueError("patrol observation exceeds budget")
         fingerprints = {post_fingerprint(post) for post in posts}
+        current = utc_naive(now or datetime.now(UTC))
         with session_scope(self.engine) as session:
-            seen = set(session.scalars(select(SocialPatrolReview.fingerprint).where(
-                SocialPatrolReview.account_id == account_id, SocialPatrolReview.fingerprint.in_(fingerprints))))
+            seen = set(session.scalars(select(SocialPatrolCandidate.fingerprint).where(
+                SocialPatrolCandidate.account_id == account_id,
+                SocialPatrolCandidate.fingerprint.in_(fingerprints), SocialPatrolCandidate.revisit_at > current)))
         return tuple(post for post in posts if post_fingerprint(post) not in seen)
+
+    def assess_post(self, *, account_id, post, status, now, minutes=30, before_commit=None):
+        if status not in {'deferred', 'no_response'} or type(minutes) is not int or not 5 <= minutes <= 180:
+            raise ValueError('invalid_patrol_assessment')
+        self._candidate_state(account_id=account_id, posts=(post,), status=status,
+            now=now, minutes=minutes, before_commit=before_commit)
+
+    def note_posts_offered(self, *, account_id, posts, now):
+        # Availability is not an evaluation. A short local admission pause
+        # prevents unchanged packets being polled repeatedly, without teaching
+        # the personality that these posts were rejected.
+        self._candidate_state(account_id=account_id, posts=posts, status='offered', now=now, minutes=180)
+
+    def _candidate_state(self, *, account_id, posts, status, now, minutes, before_commit=None):
+        from app.agent.social_cadence import post_fingerprint
+        if len(posts) > 100:
+            raise ValueError('patrol observation exceeds budget')
+        current = utc_naive(now)
+        with self._write_scope() as session:
+            session.execute(delete(SocialPatrolCandidate).where(SocialPatrolCandidate.account_id == account_id,
+                SocialPatrolCandidate.updated_at < current - timedelta(days=2)))
+            for post in posts:
+                fingerprint = post_fingerprint(post)
+                row = session.get(SocialPatrolCandidate, (account_id, fingerprint))
+                if row is None:
+                    row = SocialPatrolCandidate(account_id=account_id, fingerprint=fingerprint)
+                    session.add(row)
+                elif status == 'offered' and row.revisit_at > current:
+                    continue  # Do not overwrite an explicit assessment.
+                row.status, row.updated_at = status, current
+                row.revisit_at = current + timedelta(minutes=minutes)
+            if before_commit:
+                before_commit()
 
     def mark_posts_reviewed(self, *, account_id: int, posts: tuple[SocialPost, ...], now: datetime) -> None:
         from app.agent.social_cadence import post_fingerprint

@@ -137,17 +137,17 @@ def test_explicit_member_reference_admits_only_named_or_mentioned_third_party() 
     source = Source("m1", 10, 99, datetime(2026, 7, 22, 8, tzinfo=UTC))
     member_plan = plan(
         subject_ids=("42",), subject_binding="explicit",
-        subject_aliases_removed=("加菲猫",),
+        subject_aliases_removed=("小丁丁",),
     )
-    assert eligible(replace(source, content="加菲猫在看向日葵马戏团"), member_plan)
+    assert eligible(replace(source, content="小丁丁在看向日葵马戏团"), member_plan)
     assert eligible(replace(source, mentioned_uins=("42",)), member_plan)
     assert not eligible(replace(source, content="我也在看"), member_plan)
     assert not eligible(replace(source, content="加菲在看"), member_plan)
     assert not eligible(
-        replace(source, content="加菲猫在看向日葵马戏团", delivery_state="blocked"),
+        replace(source, content="小丁丁在看向日葵马戏团", delivery_state="blocked"),
         member_plan,
     )
     assert not eligible(
-        replace(source, content="加菲猫在看向日葵马戏团"),
+        replace(source, content="小丁丁在看向日葵马戏团"),
         replace(member_plan, subject_binding="requester"),
     )
