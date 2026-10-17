@@ -12,7 +12,9 @@ def test_page_group_is_only_japan_rate_one_and_selects_lowest_delay():
     assert [p['name'] for p in config['proxies']]==['日本01 x1','JP 02 ×1.0']
     group=config['proxy-groups'][0]
     assert group['type']=='url-test' and group['tolerance']==0 and group['lazy'] is False
-    assert config['rules']==['MATCH,'+group['name']]
+    assert config['rules'][-1]=='MATCH,'+group['name']
+    assert 'GEOSITE,cn,DIRECT' in config['rules'] and 'GEOIP,CN,DIRECT' in config['rules']
+    assert config['rules'].index('DOMAIN-SUFFIX,xiaohongshu.com,DIRECT') < config['rules'].index('GEOSITE,cn,DIRECT')
     assert config['bind-address']=='127.0.0.1' and not config['allow-lan']
     assert config['tun']['enable'] is False
     assert config['mixed-port']==18797
@@ -46,3 +48,24 @@ def test_japan_node_cannot_silently_use_excluded_hong_kong_dialer():
     with pytest.raises(ValueError, match='excluded proxy'):
         render_page_config({'proxies':[{'name':'日本 x1','dialer-proxy':'香港 x1'},
                                        {'name':'香港 x1'}]})
+
+
+@pytest.mark.parametrize('host',[
+    'www.xiaohongshu.com','edith.xiaohongshu.com','xhslink.com',
+    'sns-video-bd.xhscdn.com','sns-img-qc.xhscdn.com','cdn.xhsimg.com',
+    'cdn.xhsstatic.com','www.example.cn','api.deepseek.com'])
+def test_domestic_domain_rules_match_before_japan_fallback(host):
+    config=render_page_config({'proxies':[{'name':'日本 x1'}]})
+    matches=[rule for rule in config['rules'] if rule.startswith('DOMAIN-SUFFIX,')
+        and (host==rule.split(',')[1] or host.endswith('.'+rule.split(',')[1]))]
+    assert matches and matches[0].endswith(',DIRECT')
+    assert config['rules'].index(matches[0])<config['rules'].index('GEOSITE,cn,DIRECT')
+
+
+def test_domestic_rules_do_not_match_lookalike_suffix_or_override_explicit_provider():
+    from infra.wsl.scripts.render_mihomo_config import NOVA_HOST,PAGE_GROUP
+    config=render_page_config({'proxies':[{'name':'日本 x1'}]})
+    assert config['rules'][0]==f'DOMAIN,{NOVA_HOST},{PAGE_GROUP}'
+    for host in ['xiaohongshu.com.evil.test','xhscdn.com.evil.test','example.com']:
+        assert not any(host==r.split(',')[1] or host.endswith('.'+r.split(',')[1])
+            for r in config['rules'] if r.startswith('DOMAIN-SUFFIX,'))

@@ -19,6 +19,13 @@ NOVA_GROUP = "XIAOMACHI-NOVA-JP"
 NOVA_HOST = "ai.novacode.top"
 
 DIRECT_RULES = (
+    # Pin commonly used mainland pages and their CDN/short-link domains before
+    # the general geographic rules; GeoSite updates must not regress these.
+    "DOMAIN-SUFFIX,xiaohongshu.com,DIRECT",
+    "DOMAIN-SUFFIX,xhslink.com,DIRECT",
+    "DOMAIN-SUFFIX,xhscdn.com,DIRECT",
+    "DOMAIN-SUFFIX,xhsimg.com,DIRECT",
+    "DOMAIN-SUFFIX,xhsstatic.com,DIRECT",
     "DOMAIN-SUFFIX,qq.com,DIRECT",
     "DOMAIN-SUFFIX,qpic.cn,DIRECT",
     "DOMAIN-SUFFIX,gtimg.cn,DIRECT",
@@ -31,6 +38,11 @@ DIRECT_RULES = (
     "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR6,::1/128,DIRECT,no-resolve",
+    "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+    "DOMAIN-SUFFIX,cn,DIRECT",
+    "GEOSITE,cn,DIRECT",
+    "GEOIP,CN,DIRECT",
 )
 
 
@@ -139,7 +151,7 @@ def render_page_config(source: dict[str, Any], *, unmarked_rate_one: bool = Fals
             'proxies': selected, 'proxy-groups': [{'name': PAGE_GROUP, 'type': 'url-test',
                 'proxies': [item['name'] for item in selected], 'url': 'https://cp.cloudflare.com/generate_204',
                 'interval': 300, 'tolerance': 0, 'lazy': False, 'timeout': 5000}],
-            'rules': ['MATCH,' + PAGE_GROUP]}
+            'rules': [f'DOMAIN,{NOVA_HOST},{PAGE_GROUP}', *DIRECT_RULES, 'MATCH,' + PAGE_GROUP]}
 
 
 def main() -> int:

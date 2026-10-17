@@ -216,7 +216,7 @@ docker exec xiaomachi-bot python -m scripts.backup_memory_v2 \
 
 ## 8. GPU 与模型缓存
 
-网页独立出口：WSL回环18797，7897留给Windows；当前只用ikuuu日本x1节点。默认同步入口从Clash的profiles.yaml定位唯一名含ikuuu的订阅，不修改本机配置。私有YAML放 `/opt/xiaomachi/shared/mihomo/`（目录0700、文件0600），用 `render_mihomo_config.py --source <ikuuu私有文件> --output <候选文件> --page-only` 创建 `XIAOMACHI-WEB-JP-X1` url-test组，每300秒测延迟、容差0、关闭TUN/LAN；不继承其他国家节点、选择组、provider或监听端口。无日本节点或存在外部dialer依赖时拒绝生成。确认同一运营商未标倍率默认x1后才加 `--unmarked-rate-one`（同步脚本对应 `-UnmarkedRateOne`），明确其他倍率仍排除。先 `mihomo -t -d /opt/xiaomachi/shared/mihomo -f <候选文件>` 校验，再私密备份旧配置、原子替换并重启服务。只设置 `WEB_PAGE_PROXY_URL=http://127.0.0.1:18797`，主模型/搜索/find/QQ维持原出口，不设置全局代理；失败不静默换出口。重启后复验日本实际出口及页面代理链。环境与订阅不进入Git，模型套餐切换保留该非套餐字段。
+网页独立出口：WSL回环18797，7897留给Windows；国内直连，海外使用ikuuu日本x1节点。两个渲染入口共用国内规则：小红书主站/短链/xhscdn/xhsimg/xhsstatic、QQ、DeepSeek、私网及.cn优先DIRECT，再GEOSITE cn、GEOIP CN，最后MATCH日本组；Nova模型域名保留显式代理优先级。地理规则须有同目录GeoSite.dat与Country.mmdb；以[Mihomo规则](https://wiki.metacubex.one/config/rules/)为准，不能用名称包含“中国”判断域名。默认从Clash的profiles.yaml定位唯一ikuuu订阅，不修改本机配置。私有YAML放 `/opt/xiaomachi/shared/mihomo/`（目录0700、文件0600），用 `render_mihomo_config.py --source <私有订阅> --output <候选文件> --page-only` 创建 `XIAOMACHI-WEB-JP-X1` url-test组，每300秒测延迟、容差0、关闭TUN/LAN；不继承其他国家节点、组、provider或监听端口。无日本节点或存在外部dialer依赖时拒绝生成。仅确认同运营商未标倍率默认x1后加 `--unmarked-rate-one`（同步脚本 `-UnmarkedRateOne`），其他倍率仍排除。先 `mihomo -t -d /opt/xiaomachi/shared/mihomo -f <候选文件>`，私密备份、原子替换，再重启或用认证[控制器API](https://wiki.metacubex.one/api/)热加载；通过/rules及实际TLS连接核对国内DIRECT、海外日本链。只设置 `WEB_PAGE_PROXY_URL=http://127.0.0.1:18797`，其他组件沿原出口，不设全局代理，不静默换出口。环境与订阅不进入Git，模型套餐切换保留该字段。
 
 基础镜像包含 CUDA/cuDNN 和 fastembed-gpu，但 GPU 设备是可选。无 NVIDIA 设置 `ENABLE_GPU=0`、`MEMORY_EMBEDDING_DEVICE=auto`，用 CPU；启用需 Windows NVIDIA 驱动、WSL GPU 支持和 NVIDIA Container Toolkit/CDI。
 
