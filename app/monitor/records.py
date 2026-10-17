@@ -69,7 +69,7 @@ class MonitorRecords:
 
     def delete_conversation(self, conversation_id):
         with self.lock:
-            conversation = self.reader.read_conversation(conversation_id)
+            conversation = self.reader.read_conversation(conversation_id, include_reset_history=True)
             return self.delete_traces([meta['trace_id'] for meta in
                 (*conversation['turns'], *conversation.get('task_traces', ()))])
 

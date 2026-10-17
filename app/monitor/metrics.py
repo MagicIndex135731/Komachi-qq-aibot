@@ -88,7 +88,7 @@ class ConversationMetrics:
     def read(self, conversation_id):
         conversation = self.reader.read_conversation(conversation_id)
         turns = conversation['turns']
-        latest_meta = next((meta for meta in reversed(turns) if not _background_execution(meta)), turns[-1])
+        latest_meta = next((meta for meta in reversed(turns) if not _background_execution(meta)), turns[-1] if turns else {})
         current_session = latest_meta.get('session_key')
         inputs, outputs, cache_inputs, cache_counts, totals = [], [], [], [], []
         requests = 0
@@ -161,5 +161,10 @@ class ConversationMetrics:
                 'cache_ratio':sum(cache_counts)/sum(cache_inputs) if sum(cache_inputs) else None,
                 'input_known_requests':len(inputs), 'output_known_requests':len(outputs),
                 'cache_known_requests':len(cache_counts), 'events_complete':complete}
+            if not turns and conversation.get('reset_source_id'):
+                for field in ('input_tokens', 'output_tokens', 'real_total_tokens',
+                              'cached_input_tokens', 'uncached_input_tokens'):
+                    usage[field] = 0
         return {'conversation_id':conversation_id, 'context':context, 'usage':usage,
+                'reset_source_id':conversation.get('reset_source_id'),
                 'scope':'retained_conversation_requests', 'read_only':True}

@@ -16,7 +16,7 @@
   <header class="conversation-header"><div><div id="scope-label" class="eyebrow"></div><h2 id="conversation-title"></h2><p id="conversation-subtitle"></p></div><div class="header-actions"><span id="conversation-status" class="chip"></span><button id="delete-selected" class="quiet danger">删除记录</button><button id="open-input" class="quiet">模型输入</button></div></header>
   <div class="conversation-info"><span id="identity-note"></span><label><input id="follow" type="checkbox" checked>跟随最新过程</label></div>
   <div id="context-identities" class="context-identities" aria-label="上下文标识"></div>
-  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><details id="orphan-tasks" hidden><summary class="muted small">较早请求的后台任务 · 父回合未在本页显示</summary><div id="orphan-task-list"></div></details><div id="turn-list"></div><div id="tail"></div></div></div>
+  <div id="thread-scroll" class="thread-scroll"><div id="thread" class="thread"><button id="load-older" class="quiet load-older" hidden>加载更早的回合</button><details id="orphan-tasks" hidden><summary class="muted small">较早请求的后台任务 · 父回合未在本页显示</summary><div id="orphan-task-list"></div></details><div id="reset-notice" class="muted small" hidden></div><div id="turn-list"></div><div id="tail"></div></div></div>
   <footer class="main-footer usage-footer" aria-label="当前会话上下文和用量">
    <div class="usage-grid">
     <div class="usage-context" title="完整输入包含缓存，仍占上下文窗口；实报优先，尚无实报时使用估算。窗口占用与累计用量分别计算。"><span>最近上下文 / 配置窗口</span><strong id="context-usage">未知 / 未知</strong><progress id="context-progress" max="1" value="0" aria-label="上下文占用比例"></progress><small id="context-source">等待请求</small></div>

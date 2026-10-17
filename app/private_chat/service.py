@@ -364,6 +364,9 @@ class PrivateChatService:
             return True
         if not result['applied']:
             return True
+        from app.agent.monitor_reset import record_context_reset
+        record_context_reset(getattr(self.agent_handler, 'settings', None), surface='private', scope_id=event.user_id,
+            source_id=source_id, reset_at=result['reset_at'])
         self._reset_private_draw_state(user_id=event.user_id)
         if self.agent_handler is not None:
             await self.agent_handler.cancel_user(event.user_id, before_source_id=source_id)

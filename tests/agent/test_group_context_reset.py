@@ -50,6 +50,7 @@ async def test_group_new_message_does_not_reintroduce_masked_latest_messages(sql
             number=n, call_id=f'group-reset-{n}')
     client, requests, _ = model_client(model)
     async with composed(sqlite_engine, tmp_path, client, runtime='harness') as fixture:
+        fixture.router.runtime.settings = fixture.router.runtime.settings.model_copy(update={'agent_monitor_enabled':True})
         await fixture.agent.stop()
         fixture.clock[0] = datetime.now(UTC)
         old = event('group-old', 'OLD_GROUP_USER_POISON_100')
@@ -62,6 +63,9 @@ async def test_group_new_message_does_not_reintroduce_masked_latest_messages(sql
         async def cancel(group):
             cancelled.append(group)
         assert await fixture.router.try_handle_context_reset(command, cancel_group=cancel)
+        from app.agent.monitor_reset import read_reset
+        boundary = read_reset(fixture.router.runtime.settings.data_dir/'agent_monitor', 'group', GROUP)
+        assert boundary and boundary['source_id'] > 0
         assert cancelled == [GROUP] and len(requests) == before
         phase['reset'] = True
         assert (await turn(fixture, event('group-new', 'NEW_GROUP_REQUEST_100'))).status == 'sent'

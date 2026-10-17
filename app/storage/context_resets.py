@@ -189,4 +189,5 @@ class ContextResetRepository:
                 DevSessionRepository(session).create_owner_session(owner_qq=identifier, session_mode='daily')
             session.flush()
             return {'applied': True, 'excluded_count': len(excluded), 'mode': mode,
+                    'reset_at': now.replace(tzinfo=UTC).timestamp(),
                     'target_message_id': target.id if target is not None else None}

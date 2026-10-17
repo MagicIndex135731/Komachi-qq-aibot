@@ -3088,6 +3088,9 @@ class InboundRouter(GroupReplyDeliveryMixin):
             await self._send_prebuilt_reply(event, '上下文重置失败，请稍后重试。')
             return True
         if result['applied']:
+            from app.agent.monitor_reset import record_context_reset
+            record_context_reset(self.runtime.settings, surface='group', scope_id=event.group_id,
+                source_id=source_id, reset_at=result['reset_at'])
             for key in tuple(self.pending_group_image_turns):
                 if key[0] == event.group_id:
                     self.pending_group_image_turns.pop(key, None)

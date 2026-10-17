@@ -88,7 +88,8 @@ def current_trace_context() -> dict:
     trace, call_id = active
     meta = trace.meta
     result = {'parent_trace_id': trace.trace_id,
-        'workflow_id': meta.get('workflow_id') or trace.trace_id}
+        'workflow_id': meta.get('workflow_id') or trace.trace_id,
+        'workflow_started_at': meta.get('workflow_started_at') or meta['started_at']}
     conversation = meta.get('workflow_conversation_id')
     if not conversation:
         conversation = _conversation_identity(meta)[0]
@@ -566,7 +567,7 @@ class TraceReader:
             raise ValueError("trace_request_id_invalid")
         return _load(self._directory(trace_id) / f"request-{request_id}.json")
 
-    def list_conversations(self, *, limit=100):
+    def list_conversations(self, *, limit=100, include_reset_history=False):
         groups = {}
         trace_groups = {}
         traces = [_view_meta(meta) for meta in self.list_traces(limit=500)]
@@ -601,6 +602,45 @@ class TraceReader:
                     workflow_conversation_id=_conversation_identity(owner)[0],
                     parent_tool_call_id=call_id, lineage_recovered='recorded_job_result')
         by_trace = {meta['trace_id']:meta for meta in traces}
+        from app.agent.monitor_reset import read_reset
+        boundaries = {}
+        def scope_key(meta):
+            surface, scope = meta.get('surface'), meta.get('scope_id')
+            return (surface, scope) if isinstance(surface, str) and type(scope) is int else (None, None)
+        for meta in traces:
+            scope = scope_key(meta)
+            if scope[0] and scope not in boundaries:
+                boundaries[scope] = read_reset(self.root, *scope)
+
+        def visible(meta, depth=0):
+            boundary = boundaries.get(scope_key(meta))
+            if not boundary:
+                return True
+            source = meta.get('source_id')
+            if (meta.get('started_at', 0) <= boundary['reset_at']
+                    or type(source) is int and source <= boundary['source_id']
+                    or type(meta.get('workflow_started_at')) in (int, float)
+                    and meta['workflow_started_at'] <= boundary['reset_at']):
+                return False
+            if depth < 8:
+                for key in ('parent_trace_id', 'workflow_id'):
+                    parent = by_trace.get(meta.get(key)) if isinstance(meta.get(key), str) else None
+                    if (parent and parent is not meta and
+                            (parent.get('surface'), parent.get('scope_id')) ==
+                            (meta.get('surface'), meta.get('scope_id')) and not visible(parent, depth+1)):
+                        return False
+            return True
+
+        previous_owners = {}
+        for meta in traces:
+            key, quality = _conversation_identity(meta)
+            if (boundaries.get(scope_key(meta))
+                    and quality in {'logical', 'native_context'} and not _background_execution(meta)
+                    and meta.get('context_kind', meta.get('surface')) in {'group', 'private'}):
+                previous_owners.setdefault(key, (meta, quality))
+        if not include_reset_history:
+            traces = [meta for meta in traces if visible(meta)]
+        by_trace = {meta['trace_id']:meta for meta in traces}
         for meta in traces:
             key, quality = _conversation_identity(meta)
             trace_groups[meta['trace_id']] = key
@@ -622,6 +662,20 @@ class TraceReader:
                     if isinstance(chain, str)))[:64],
                 request_preview=last.get('request_preview'), model=last.get('model'))
             results.append(group)
+        retained = {group['conversation_id'] for group in results}
+        for key, (meta, quality) in previous_owners.items():
+            if key in retained:
+                continue
+            results.append({'conversation_id':key, 'identity_quality':quality,
+                'surface':meta['surface'], 'scope_id':meta['scope_id'], 'actor_id':meta.get('actor_id'),
+                'context_kind':meta.get('context_kind', meta['surface']), 'context_scope':meta.get('context_scope'),
+                'turns':[], 'turn_count':0, 'native_session_count':0, 'ephemeral_execution_count':0,
+                'provider_chain_ids':[], 'status':'reset', 'updated_at':0})
+        for group in results:
+            boundary = boundaries.get(scope_key(group))
+            if boundary:
+                group.update(reset_source_id=boundary['source_id'], reset_at=boundary['reset_at'])
+                group['updated_at'] = max(group['updated_at'], boundary['reset_at'])
         by_id = {group['conversation_id']: group for group in results}
         # Retain old native-context URLs and persisted worker ancestry after
         # changing the sidebar to stable owner identities. Ambiguous aliases
@@ -667,10 +721,10 @@ class TraceReader:
                 group['updated_at'] = max(group['updated_at'], *(item.get('updated_at', 0) for item in children))
         return sorted(results, key=lambda g: g['updated_at'], reverse=True)[:min(100, max(1, limit))]
 
-    def read_conversation(self, conversation_id: str):
+    def read_conversation(self, conversation_id: str, *, include_reset_history=False):
         if not isinstance(conversation_id, str) or not CONVERSATION_ID.fullmatch(conversation_id):
             raise ValueError('conversation_id_invalid')
-        for group in self.list_conversations():
+        for group in self.list_conversations(include_reset_history=include_reset_history):
             if group['conversation_id'] == conversation_id or conversation_id in group.get('conversation_aliases', ()):
                 return group
         raise FileNotFoundError('conversation_not_found')

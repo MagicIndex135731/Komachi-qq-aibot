@@ -19,6 +19,7 @@ async def test_new_message_and_context_tool_cannot_restore_reset_content(sqlite_
             return sse('read_private_context', {}, number=n)
         return sse('send_private', {'text': '正常新回复' if phase['reset'] else 'OLD_BOT_POISON_100'}, number=n)
     service, agent, dispatcher, sender, requests = setup(sqlite_engine, tmp_path, model)
+    agent.settings.agent_monitor_enabled = True
     await service.start()
     try:
         await dispatcher.handle_private_message(event('before-reset', user_id=user, text='OLD_USER_POISON_100'))
@@ -29,6 +30,9 @@ async def test_new_message_and_context_tool_cannot_restore_reset_content(sqlite_
             daily.summary = 'OLD_SUMMARY_POISON_100'
         before = len(requests)
         await dispatcher.handle_private_message(event('reset', user_id=user, text='重置上下文'))
+        from app.agent.monitor_reset import read_reset
+        boundary = read_reset(tmp_path/'agent_monitor', 'private', user)
+        assert boundary and boundary['source_id'] > 0
         assert len(requests) == before  # deterministic control, no model call
         assert '已重置' in sender.texts[-1][1] and '没有批量屏蔽旧消息' in sender.texts[-1][1]
         phase['reset'] = True

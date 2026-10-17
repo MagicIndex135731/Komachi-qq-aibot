@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const state = {conversations:[], selected:null, conversation:null, turns:new Map(), tasks:new Map(), taskTurns:new Map(), visible:12, requests:[], requestKey:null, snapshot:null, paused:false, busy:false, deleting:false, generation:0, inputGeneration:0};
-const labels = {pending:"等待容量",queued:"已排队",running:"执行中",result_ready:"结果已就绪",delivering:"正在回传或交付",completed:"已完成",sent:"已发送",ok:"完成",failed:"失败",blocked:"受限",uncertain:"结果未知",silent:"静默完成",interrupted:"执行中断"};
+const labels = {reset:"上下文已重置",pending:"等待容量",queued:"已排队",running:"执行中",result_ready:"结果已就绪",delivering:"正在回传或交付",completed:"已完成",sent:"已发送",ok:"完成",failed:"失败",blocked:"受限",uncertain:"结果未知",silent:"静默完成",interrupted:"执行中断"};
 const kinds = {group:"群聊",background_group:"独立群巡检",private:"私聊",public:"公开任务",research:"独立资料任务",owner_task:"独立委派任务",media_task:"后台媒体任务",research_job:"资料任务调度"};
 const workerKinds = new Set(["background_tool","delegation_job","tool_delivery"]);
 const operations = {download_twitter_media:"X / Twitter 媒体下载",download_web_images:"网页图片下载",download_web_video:"网页视频下载",generate_image:"图像生成"};
@@ -26,12 +26,14 @@ function followTail(){if($("follow").checked)$("thread-scroll").scrollTop=$("thr
 function sidebar(){
  const surface=$("surface").value,query=$("search").value.trim().toLowerCase();
  const rows=state.conversations.filter(c=>(surface==="all"||c.surface===surface)&&json([c.scope_id,c.actor_id,c.request_preview,c.conversation_id,...c.turns.map(t=>t.context_scope)]).toLowerCase().includes(query));
- const signature=json([state.selected,state.deleting,surface,query,rows.map(c=>[c.conversation_id,c.turn_count,c.native_session_count,c.task_count,c.status,c.request_preview])]);if($("conversations").dataset.signature===signature)return;$("conversations").dataset.signature=signature;
+ const signature=json([state.selected,state.deleting,surface,query,rows.map(c=>[c.conversation_id,c.turn_count,c.native_session_count,c.task_count,c.status,c.request_preview,c.reset_source_id])]);if($("conversations").dataset.signature===signature)return;$("conversations").dataset.signature=signature;
  $("conversation-count").textContent=String(rows.length);$("conversations").replaceChildren();
  for(const c of rows){const item=el("div",undefined,"conversation-item"),b=el("button",undefined,"conversation"+(c.conversation_id===state.selected?" selected":""));b.disabled=state.deleting;b.append(el("div",scopeName(c),"conversation-title"));const row=el("div",undefined,"conversation-row");row.append(el("span",contextCount(c)),el("span",statusName(c.status)));b.append(row,el("div",c.identity_quality==="native_only"?"旧记录 · 逻辑关联未知":c.request_preview||"等待下一轮执行","conversation-preview"));b.addEventListener("click",()=>selectConversation(c.conversation_id));const remove=el("button","删除","delete-conversation");remove.disabled=state.deleting;remove.title="删除此会话的监控记录";remove.setAttribute("aria-label","删除监控记录："+scopeName(c));remove.addEventListener("click",()=>deleteConversation(c));item.append(b,remove);$("conversations").append(item);}
  if(!rows.length)$("conversations").append(el("p","暂无符合条件的会话","muted small"));
 }
 function header(c){
+ $("reset-notice").hidden=!c.reset_source_id;
+ $("reset-notice").textContent=c.reset_source_id?`已于 ${date(c.reset_at)} 重置上下文；下方仅展示本轮流程和统计。${c.turns.length?"":"等待新的请求。"}`:"";
  $("scope-label").textContent=c.identity_quality==="logical"?"同一会话主体":c.identity_quality==="native_context"?"同一本地上下文":c.identity_quality==="ephemeral"?"独立判断记录":"历史执行记录";
  $("conversation-title").textContent=scopeName(c);
  $("conversation-subtitle").textContent=`${contextCount(c)}${c.task_count?" · "+c.task_count+" 个关联后台任务":""} · ${c.model||"模型见各次请求"}`;
@@ -213,10 +215,14 @@ function usageFooter(stats){
  $("total-input-tokens").textContent=`含缓存输入 ${count(u.input_tokens,u.input_known_requests)}`;
  $("total-output-tokens").textContent=count(u.output_tokens,u.output_known_requests);
  $("total-model-requests").textContent=number(u.request_count);
- $("usage-coverage").textContent=stats?`本会话保留记录 · 新增输入＝输入总量－缓存命中；累计消耗＝含缓存输入＋输出。实报覆盖：输入 ${u.input_known_requests}/${u.request_count}、输出 ${u.output_known_requests}/${u.request_count}、缓存 ${u.cache_known_requests}/${u.request_count}。N/A为未单独上报；token数量不等于费用。子模型另计。${u.events_complete?"":"部分观测事件缺失或尚未读完。"}`:"正在读取当前会话用量…";
+ $("usage-coverage").textContent=stats?`本${state.conversation?.reset_source_id?"轮重置后":"会话保留"}记录 · 新增输入＝输入总量－缓存命中；累计消耗＝含缓存输入＋输出。实报覆盖：输入 ${u.input_known_requests}/${u.request_count}、输出 ${u.output_known_requests}/${u.request_count}、缓存 ${u.cache_known_requests}/${u.request_count}。N/A为未单独上报；token数量不等于费用。子模型另计。${u.events_complete?"":"部分观测事件缺失或尚未读完。"}`:"正在读取当前会话用量…";
+ if(stats&&u.request_count===0&&state.conversation?.reset_source_id){$("total-cache-ratio").textContent="暂无请求";$("latest-cache-tokens").textContent="本轮尚无模型请求";}
  if(stats&&u.request_count===0&&["media_task","research_job"].includes(state.conversation?.context_kind)){for(const id of ["context-usage","latest-cache-tokens","total-cache-ratio"])$(id).textContent="不适用 · 无模型请求";}
 }
 async function updateConversation(c){
+ if(state.conversation?.conversation_id===c.conversation_id&&(state.conversation.reset_source_id||0)!==(c.reset_source_id||0)){
+  clearSelection();state.selected=c.conversation_id;$("empty").hidden=true;$("detail").hidden=false;$("follow").checked=true;sidebar();
+ }
  const generation=state.generation,following=$("follow").checked&&nearBottom();state.conversation=c;
  const retained=new Set(c.turns.map(meta=>meta.trace_id));let removed=false;for(const [id,t] of state.turns){if(!retained.has(id)){t.node.remove();state.turns.delete(id);removed=true;}}
  if(removed){state.inputGeneration++;state.requestKey=null;state.snapshot=null;$("input-drawer").hidden=true;$("comparison").hidden=true;$("input-body").replaceChildren();for(const id of ["input-meta","raw-input","previous-body","current-body","compare-info"])$(id).textContent="";}
@@ -229,7 +235,7 @@ async function updateConversation(c){
  // Bound concurrent reads; event cursors retain expanded cards and growing streams.
  for(let i=0;i<needed.length;i+=4){await Promise.all(needed.slice(i,i+4).map(t=>loadTurn(t,generation)));if(generation!==state.generation)return;}
  await taskCards(c,generation);if(generation!==state.generation)return;requestOptions();header(c);if(following)followTail();
- try{const stats=await api(`/api/conversations/${c.conversation_id}/metrics`);if(generation===state.generation)usageFooter(stats);}catch(e){if(generation===state.generation){usageFooter(null);$("usage-coverage").textContent="用量统计暂不可用；执行记录仍可查看。";}}
+ try{const stats=await api(`/api/conversations/${c.conversation_id}/metrics`);if(generation===state.generation&&(stats.reset_source_id||0)===(c.reset_source_id||0))usageFooter(stats);}catch(e){if(generation===state.generation){usageFooter(null);$("usage-coverage").textContent="用量统计暂不可用；执行记录仍可查看。";}}
 }
 function clearSelection(){
  state.generation++;state.inputGeneration++;state.selected=null;state.conversation=null;state.turns=new Map();state.tasks=new Map();state.taskTurns=new Map();state.requests=[];state.requestKey=null;state.snapshot=null;state.visible=12;
