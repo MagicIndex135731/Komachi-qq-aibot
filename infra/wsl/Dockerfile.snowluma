@@ -1,0 +1,10 @@
+# Keep the upstream runtime and its login volumes; apply a narrow web fix.
+FROM motricseven7/snowluma:v1.14.15@sha256:8b934a2882bdb63f00ec67b97731fe8a8e840409b6ae98ca688618742bd0ef0d
+COPY infra/wsl/scripts/patch_snowluma_qzone.cjs /opt/xiaomachi/patch_snowluma_qzone.cjs
+# The upstream Node file capability needs SYS_PTRACE at runtime. BuildKit has
+# no such capability; remove it for this build step, then restore it exactly.
+RUN task_node="$(readlink -f "$(command -v node)")" \
+    && task_caps="$(getcap "$task_node" | cut -d ' ' -f 2-)" \
+    && setcap -r "$task_node" \
+    && node /opt/xiaomachi/patch_snowluma_qzone.cjs /app/runtime \
+    && setcap "$task_caps" "$task_node"

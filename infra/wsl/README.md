@@ -85,6 +85,8 @@ bootstrap 创建初始本地运行目录、缺失的 `.env` 和持久 watchdog P
 
 ### SnowLuma
 
+运行镜像由固定 v1.14.15 上游构建本地兼容层（Dockerfile.snowluma）：空间凭据刷新只得到 p_skey 时，补齐当前登录账号的 uin/p_uin，账号冲突拒绝；不保存凭据或伪造认证键。原帖/动态网页读取限制为每次5秒、2MiB，旧接口明确限流才沿用上游备用路由。评论仍需好友/原帖复验，未知写入不重放。首次启动由 Compose 构建兼容镜像；修订兼容层后先 build snowluma，再只重建该服务。
+
 Compose 固定使用上游维护的 `motricseven7/snowluma` 镜像及 digest。使用者需阅读发行包 EULA/隐私协议后确认相关变量。WebUI 初始密码由启动生成，入口脚本可帮助取得本机初始密码；登录后修改为自己的密码。
 
 打开桌面入口完成手机 QQ 扫码，再在 WebUI 确认 OneBot 11 HTTP/正向 WebSocket 已启用。当前应用连接 `ws://127.0.0.1:3001`，配置默认不发送 access token；采用这个方案时清空 SnowLuma OneBot 连接的 token，并把端口限制在可信本机网络。不要把 WebUI 登录 token 与 OneBot token 混淆。

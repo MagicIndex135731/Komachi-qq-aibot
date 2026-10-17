@@ -2,9 +2,12 @@ name: xiaomachi-linux-snowluma-stack
 
 services:
   snowluma:
-    # SnowLuma ships no official image; this is the upstream-maintained runtime
-    # image (SnowLuma.Docker.Framework) pinned to the amd64 digest of v1.14.15.
-    image: motricseven7/snowluma:v1.14.15@sha256:8b934a2882bdb63f00ec67b97731fe8a8e840409b6ae98ca688618742bd0ef0d
+    # Local compatibility layer over the pinned upstream runtime; login/data
+    # volumes and the upstream entrypoint stay unchanged.
+    image: xiaomachi-snowluma:qzone-cookie-v1
+    build:
+      context: ../..
+      dockerfile: infra/wsl/Dockerfile.snowluma
     container_name: xiaomachi-snowluma
     restart: "unless-stopped"
     # Every container in this stack runs on the host network: the Docker daemon
