@@ -171,6 +171,12 @@ def _apply_schema_migrations(connection) -> None:
             text("SELECT name FROM sqlite_master WHERE type='table'")
         )
     }
+    if "context_resets" in table_names:
+        _add_missing_columns(connection, "context_resets", {
+            "mode": "VARCHAR(20) NOT NULL DEFAULT 'legacy_count'",
+            "automatic_after_id": "INTEGER NOT NULL DEFAULT 0",
+            "target_message_id": "INTEGER NULL",
+        })
     if "agent_tool_effects" in table_names:
         _add_missing_columns(connection, "agent_tool_effects", {
             "reservation_attempts": "INTEGER NOT NULL DEFAULT 1", "wake_id": "VARCHAR(160) NOT NULL DEFAULT ''",

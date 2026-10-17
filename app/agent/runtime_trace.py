@@ -492,6 +492,49 @@ class AgentTrace:
 class TraceReader:
     def __init__(self, root: Path):
         self.root = Path(root).absolute()
+        self._job_link_cache = {}
+
+    def _recorded_jobs(self, meta):
+        """Read explicit queue results only; source/time proximity is not lineage."""
+        trace_id = meta['trace_id']
+        path = self._directory(trace_id) / 'events.jsonl'
+        try:
+            stat = path.stat()
+            if path.is_symlink() or stat.st_size > MAX_TURN_BYTES + 65536:
+                return {}
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self._job_link_cache.get(trace_id)
+            if cached and cached[0] == signature:
+                return cached[1]
+            jobs = {}
+            with path.open('rb') as handle:
+                for raw in handle:
+                    if len(raw) > MAX_EVENT_BYTES + 65536:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict) or not isinstance(event.get('data'), dict):
+                        continue
+                    data = event['data']
+                    if event.get('kind') == 'job.queued':
+                        entries = [data]
+                    elif event.get('kind') == 'tool.completed' and data.get('status') in {'ok', 'queued'}:
+                        result = data.get('data')
+                        if not isinstance(result, dict):
+                            continue
+                        entries = [result, *(result.get('jobs') if isinstance(result.get('jobs'), list) else [])]
+                    else:
+                        continue
+                    for item in entries:
+                        job_id = item.get('job_id') if isinstance(item, dict) else None
+                        if type(job_id) is int and job_id > 0:
+                            jobs[job_id] = data.get('call_id')
+            self._job_link_cache[trace_id] = (signature, jobs)
+            return jobs
+        except OSError:
+            return {}
 
     def _directory(self, trace_id):
         if not isinstance(trace_id, str) or not TRACE_ID.fullmatch(trace_id):
@@ -527,6 +570,36 @@ class TraceReader:
         groups = {}
         trace_groups = {}
         traces = [_view_meta(meta) for meta in self.list_traces(limit=500)]
+        live = {meta['trace_id'] for meta in traces}
+        self._job_link_cache = {key: value for key, value in self._job_link_cache.items() if key in live}
+        # Some application-side tools ran outside the optional observation
+        # context. Their saved tool result still proves the exact queued job.
+        workers = [meta for meta in traces if _background_execution(meta)]
+        candidates = {}
+        for worker in workers:
+            if type(worker.get('job_id')) is not int or type(worker.get('source_id')) is not int:
+                continue
+            scope = tuple(worker.get(key) for key in ('surface', 'scope_id', 'source_id', 'actor_id'))
+            candidates.setdefault(scope, []).append(worker)
+        for scope, items in candidates.items():
+            owners = {}
+            for meta in traces:
+                if _background_execution(meta) or tuple(meta.get(key) for key in ('surface', 'scope_id', 'source_id', 'actor_id')) != scope:
+                    continue
+                for job_id, call_id in self._recorded_jobs(meta).items():
+                    owners.setdefault(job_id, []).append((meta, call_id))
+            for worker in items:
+                matches = owners.get(worker['job_id'], [])
+                if len(matches) != 1:
+                    continue
+                owner, call_id = matches[0]
+                # An existing main-parent association remains authoritative.
+                known = next((m for m in traces if m['trace_id'] == worker.get('parent_trace_id')), None)
+                if known and not _background_execution(known):
+                    continue
+                worker.update(parent_trace_id=owner['trace_id'], workflow_id=owner['trace_id'],
+                    workflow_conversation_id=_conversation_identity(owner)[0],
+                    parent_tool_call_id=call_id, lineage_recovered='recorded_job_result')
         by_trace = {meta['trace_id']:meta for meta in traces}
         for meta in traces:
             key, quality = _conversation_identity(meta)

@@ -355,7 +355,8 @@ class PrivateChatService:
                 return True
         try:
             result = ContextResetRepository(self.engine, account_id=self._private_sender_user_id()).reset(
-                scope=f'private:{event.user_id}', actor_id=event.user_id, source_id=source_id, count=command.count)
+                scope=f'private:{event.user_id}', actor_id=event.user_id, source_id=source_id,
+                count=command.count, action=command.action)
         except Exception:
             logger.exception('private_context_reset_failed user_id=%s', event.user_id)
             await self._send_private_text(user_id=event.user_id, text='上下文重置失败，请稍后重试。',

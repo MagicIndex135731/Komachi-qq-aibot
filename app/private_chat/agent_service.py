@@ -765,6 +765,23 @@ class PrivateHarnessService:
                     'share_sources': observed_share_sources(forward_router,None,known_sources,private_user_id=user_id,access=share_access),
                     'forward_sources': observed_forward_sources(forward_router,None,known_sources,private_user_id=user_id)}, images=tuple(event.images))
 
+            async def search_private_history(args):
+                guard.require_valid()
+                query = args['query'].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                with session_scope(self.engine) as session:
+                    rows = list(session.scalars(select(Message).where(Message.group_id.is_(None),
+                        Message.user_id == user_id, Message.plain_text.like('%'+query+'%', escape='\\'))
+                        .order_by(Message.id.desc()).limit(12)))
+                    rows = [r for r in rows if is_usable_memory_source(r, author_id=user_id)]
+                    if len(set(known_sources) | {r.id for r in rows}) > 200:
+                        return ToolOutcome({'error':'source_budget_exhausted'}, 'blocked')
+                    known_sources[:] = list(dict.fromkeys([*known_sources, *(r.id for r in rows)]))
+                    value = [{'source_id':r.id, 'message_id':r.platform_msg_id,
+                        'text':r.plain_text[:700], 'timestamp':shanghai_aware(r.timestamp).isoformat(timespec='seconds')}
+                        for r in rows]
+                guard.require_valid()
+                return ToolOutcome({'messages':value, 'kind':'private_inbound_history'})
+
             async def schedule(args):
                 guard.require_valid()
                 result = self._enqueue(user_id=user_id, source_id=source_id, private_scope=payload["private_scope"],
@@ -802,6 +819,8 @@ class PrivateHarnessService:
             from app.agent.request_task import delivery_properties
             send_schema['properties'].update(delivery_properties())
             tools = [AgentTool("read_private_context", "读取当前用户的日常上下文和实际图片", _schema(), context),
+                AgentTool('search_private_history','按需查询当前用户以前发来的原消息；隔离内容不可读取，重置不会删除正常存档',
+                    _schema(query=_text(100)),search_private_history),
                 AgentTool('read_artifact','必要时少量确认当前用户合法静态图片；主题媒体以原帖正文判断，不逐份看图，不预览视频/动图。仅artifact_id，不接受路径，不跨用户或撤回来源',
                     _schema(artifact_id=_text(64)),read_artifact),
                 AgentTool("send_private", "向当前用户发送聊天或结果；图片普通最多2张，as_forward=true最多20张。media_artifact_ids配合as_forward=true按原顺序打包图片/视频，不与artifact_ids/video_artifact_id混用；video_artifact_id只发单视频。按真实回执判断成功", send_schema, send, "write"),

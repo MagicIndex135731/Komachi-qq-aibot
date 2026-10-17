@@ -30,7 +30,7 @@ async def test_new_message_and_context_tool_cannot_restore_reset_content(sqlite_
         before = len(requests)
         await dispatcher.handle_private_message(event('reset', user_id=user, text='重置上下文'))
         assert len(requests) == before  # deterministic control, no model call
-        assert '已重置' in sender.texts[-1][1] and '2 条' in sender.texts[-1][1]
+        assert '已重置' in sender.texts[-1][1] and '没有批量屏蔽旧消息' in sender.texts[-1][1]
         phase['reset'] = True
         await dispatcher.handle_private_message(event('after-reset', user_id=user, text='NEW_REQUEST_100'))
         new_inputs = json.dumps(requests[before:], ensure_ascii=False)
@@ -109,7 +109,7 @@ async def test_reset_requires_exact_authored_text_and_allowed_private_user(sqlit
         quoted = event('quoted-reset', text='重置上下文')
         quoted.raw_payload['message'].insert(0, {'type': 'reply', 'data': {'id': 'prior'}})
         await dispatcher.handle_private_message(quoted)
-        assert requests and sender.texts[-1][1] == '普通聊天'
+        assert not requests and '失败' in sender.texts[-1][1]
         count = len(requests)
         await dispatcher.handle_private_message(event('bad-count', text='重置上下文 0'))
         assert len(requests) == count and '用法' in sender.texts[-1][1]

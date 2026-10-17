@@ -988,9 +988,11 @@ class MessageRepository:
         return self.session.execute(stmt).scalar_one_or_none() is not None
 
     def list_recent_group_messages(self, *, group_id: int, limit: int) -> list[Message]:
+        from app.storage.context_resets import automatic_context_floor
         stmt = (
             select(Message)
-            .where(Message.group_id == group_id)
+            .where(Message.group_id == group_id,
+                   Message.id > automatic_context_floor(self.session, f'group:{group_id}'))
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
         return self._recent_message_pages(stmt, limit=limit)
@@ -1005,8 +1007,9 @@ class MessageRepository:
             return []
         page_size = min(limit, 128)
         selected = []
+        observed = 0
         cursor = None
-        while len(selected) < limit:
+        while observed < limit:
             page_stmt = stmt.limit(page_size)
             if cursor is not None:
                 timestamp, identifier = cursor
@@ -1018,12 +1021,13 @@ class MessageRepository:
                 break
             for message in page:
                 if (self._is_reserved_outbound(message)
-                        or message.context_excluded
                         or skip_unconfirmed and self._is_unconfirmed_outbound(message)
                         or skip_qq_blocked and self.is_qq_blocked_outbound(message)):
                     continue
-                selected.append(message)
-                if len(selected) >= limit:
+                observed += 1
+                if not message.context_excluded:
+                    selected.append(message)
+                if observed >= limit:
                     break
             cursor = (page[-1].timestamp, page[-1].id)
             if len(page) < page_size:

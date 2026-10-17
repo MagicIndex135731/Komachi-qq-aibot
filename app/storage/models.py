@@ -163,6 +163,9 @@ class ContextReset(Base):
     scope: Mapped[str] = mapped_column(String(160), index=True)
     requested_count: Mapped[int] = mapped_column(Integer)
     excluded_count: Mapped[int] = mapped_column(Integer)
+    mode: Mapped[str] = mapped_column(String(20), default='legacy_count', server_default='legacy_count')
+    automatic_after_id: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
+    target_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
 

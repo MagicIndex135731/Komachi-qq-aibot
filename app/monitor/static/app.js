@@ -56,7 +56,7 @@ function boundary(meta,previous){
  return [(previous&&previous.session_key===meta.session_key?"相同执行标识（旧记录）":"上下文延续状态未记录")+" · "+base,false];
 }
 function createTurn(meta,index,previous,nested=false){
- const t={meta,cursor:0,events:[],streams:{},requests:new Map(),tools:new Map(),node:el("article",undefined,"turn"+(nested?" nested-turn":"")+(nested&&workerKinds.has(meta.execution_kind)?" worker-turn":"")),index,nested};
+ const t={meta,cursor:0,events:[],streams:{},requests:new Map(),tools:new Map(),jobAnchors:new Map(),node:el("article",undefined,"turn"+(nested?" nested-turn":"")+(nested&&workerKinds.has(meta.execution_kind)?" worker-turn":"")),index,nested};
  t.node.dataset.trace=meta.trace_id;
  const [text,reset]=boundary(meta,previous);t.boundary=el("div",text,"context-boundary"+(reset?" reset":""));t.node.append(t.boundary);
  const trigger=el("div",undefined,"trigger-message"+(directTriggers.has(meta.trigger_kind)?"":" background")),heading=el("div",undefined,"trigger-heading");
@@ -72,12 +72,13 @@ function createTurn(meta,index,previous,nested=false){
  t.warning=el("div",undefined,"turn-warning");t.node.append(t.warning);return t;
 }
 function eventNode(t,event,title,className){const n=el("div",undefined,"event-node "+(className||"")),head=el("div",undefined,"event-head");head.append(el("strong",title),el("time",clock(event.at)));n.append(head);t.flow.append(n);return {node:n,head};}
+function jobAnchor(t,id,node){if(!Number.isInteger(id)||id<=0||t.jobAnchors.has(String(id)))return;const host=el("div",undefined,"task-anchor");node.append(host);t.jobAnchors.set(String(id),host);}
 function renderEvent(t,event){
  const d=event.data||{};
  if(event.kind==="turn.started"||event.kind==="model.progress")return;
  if(event.kind==="context.retention"){const failed=d.reason==="failed_context_unusable",ephemeral=d.reason==="ephemeral_context_finished",r=eventNode(t,event,failed?"本轮执行上下文不可复用":ephemeral?"独立执行结束 · 不保留跨轮历史":d.retain_history?"本轮上下文已保留":"空巡检结束 · 本轮历史未追加","terminal");r.node.append(el("div",failed?"失败或中断的生成不能用于后续恢复，已有真实回执独立保留。":ephemeral?"本次仅使用独立输入窗口，缓存路由键不携带聊天历史。":d.retain_history?"有实际工作进展或交互，供后续安全续接。":"没有需要续接的新进展，已有有效上下文保持可用。","event-note"));detail(r.node,"保留策略",d);return;}
  if(event.kind==="job.queued"){
-  const r=eventNode(t,event,`已提交后台任务 · #${d.job_id}`,"tool");r.node.append(el("div",`${operations[d.operation]||"独立资料研究"} · ${statusName(d.status)} · ${d.execution_kind==="background_tool"?"后台工具，不创建模型子对话":"独立模型上下文"}`,"event-note"));detail(r.node,"排队记录",d);return;
+  const r=eventNode(t,event,`已提交后台任务 · #${d.job_id}`,"tool");r.node.append(el("div",`${operations[d.operation]||"独立资料研究"} · ${statusName(d.status)} · ${d.execution_kind==="background_tool"?"后台工具，不创建模型子对话":"独立模型上下文"}`,"event-note"));detail(r.node,"排队记录",d);jobAnchor(t,d.job_id,r.node);return;
  }
  if(event.kind==="job.phase.started"||event.kind==="job.phase.completed"){
   const started=event.kind.endsWith("started"),phase=d.phase==="running"?"执行后台任务":d.delivery_mode==="auto"?"自动交付原请求":"回传结果到主对话";
@@ -97,6 +98,7 @@ function renderEvent(t,event){
  if(event.kind==="tool.completed"){
   let r=t.tools.get(d.call_id);if(!r)r=[...t.tools.values()].findLast(v=>v.started.name===d.name&&!v.finished);if(!r){r=eventNode(t,event,"工具返回 · "+(d.name||"未知"),"tool");r.chip=el("span");r.head.insertBefore(r.chip,r.head.lastChild);}
   r.finished=d;r.chip.textContent=statusName(d.status);r.chip.className="chip "+(labels[d.status]?d.status:"");detail(r.node,"工具结果与回执",d);
+  if(["ok","queued"].includes(d.status)){for(const item of [d.data,...(Array.isArray(d.data?.jobs)?d.data.jobs:[])])jobAnchor(t,item?.job_id,r.node);}
   if(d.effect==="write"||d.receipt_id){const sent=d.status==="sent",text=r.started?.arguments?.text;r.node.append(el("div",sent?d.data?.already_delivered?"复用已有发送回执 · 未再次发送":"已发送 · 实际回执已返回":`对外操作 · ${statusName(d.status)}，请查看回执`,"event-note"+(!sent?" error":"")));if(typeof text==="string")r.node.append(el("div",text,sent?"delivery-text":"output-text"));}return;
  }
  if(event.kind==="turn.completed"){
@@ -174,7 +176,7 @@ async function taskCards(c,generation){
   items.sort((a,b)=>a.started_at-b.started_at||a.trace_id.localeCompare(b.trace_id));
   let card=state.tasks.get(id);if(!card){
    card={node:el("details",undefined,"child-task"),summary:el("summary"),body:el("div",undefined,"task-traces")};
-   card.node.append(card.summary,card.body);card.node.open=jobs.size===1||items.some(m=>m.status==="running");state.tasks.set(id,card);
+   card.node.append(card.summary,card.body);state.tasks.set(id,card);
    card.node.addEventListener("toggle",()=>{if(card.node.open)loadTaskCard(card,state.generation).then(requestOptions).catch(e=>error(e.message));});
   }
   card.metas=items;const first=items[0],last=items.at(-1),models=items.reduce((n,m)=>n+(m.model_requests||0),0);
@@ -182,7 +184,7 @@ async function taskCards(c,generation){
   const outcome=returned?.status==="sent"?"已交付原请求":returned?.status==="uncertain"?"交付结果未知":last.status==="running"?"执行中":last.status==="sent"?"已交付原请求":last.status!=="ok"?statusName(last.status):last.job_phase==="delivering"?"结果已回传主对话":"执行结果已就绪";
   const status=returned?.status||last.status,color=["failed","blocked","uncertain","interrupted","running"].includes(status)?status:"ok";
   card.summary.replaceChildren(el("strong",`${operations[first.operation]||(workerKinds.has(first.execution_kind)&&first.execution_kind!=="delegation_job"?"后台工具任务":"独立资料研究")} · #${id}`),el("span",outcome,"chip "+color),el("span",models?`${models} 次模型请求 · 独立上下文`:first.operation==="generate_image"?"不创建模型子对话 · 绘图服务另计":first.operation||workerKinds.has(first.execution_kind)&&first.execution_kind!=="delegation_job"?"无对话模型调用":"模型过程尚未采集","task-model-note"));
-  const parent=state.turns.get(first.workflow_id),host=parent&&parent.node.isConnected?parent.childTasks:$("orphan-task-list");
+  const parent=state.turns.get(first.workflow_id),host=parent&&parent.node.isConnected?(parent.jobAnchors.get(id)||parent.tools.get(first.parent_tool_call_id)?.node||parent.childTasks):$("orphan-task-list");
   if(card.node.parentNode!==host)host.append(card.node);
  }
  $("orphan-tasks").hidden=!$("orphan-task-list").children.length;

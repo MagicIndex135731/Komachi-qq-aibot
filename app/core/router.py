@@ -3081,7 +3081,8 @@ class InboundRouter(GroupReplyDeliveryMixin):
             return True
         try:
             result = ContextResetRepository(self.engine, account_id=self.runtime.settings.bot_qq).reset(
-                scope=f'group:{event.group_id}', actor_id=event.user_id, source_id=source_id, count=command.count)
+                scope=f'group:{event.group_id}', actor_id=event.user_id, source_id=source_id,
+                count=command.count, action=command.action)
         except Exception:
             logger.exception('group_context_reset_failed group_id=%s', event.group_id)
             await self._send_prebuilt_reply(event, '上下文重置失败，请稍后重试。')

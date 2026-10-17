@@ -573,6 +573,21 @@ async def build_agent_memory(
     context: ServiceToolContext, *, query: str | None = None, addressed: bool = False,
 ) -> ToolOutcome:
     """Build a normal group wake's complete existing memory context."""
+    context.guard.require_valid()
+    from app.storage.context_resets import automatic_context_floor
+    job = context.observation.job
+    if job.kind == 'group' and getattr(context.router, '_group_memory_enabled', lambda **_: True)(group_id=job.scope_id):
+        with session_scope(context.router.engine) as session:
+            after = automatic_context_floor(session, f'group:{job.scope_id}')
+        if after:
+            allowed = context.memory_search_allowed
+            if getattr(context, 'target_message_id', None):
+                request = _request(context, query=query, addressed=addressed)
+                allowed = allowed and MemoryQueryResolver._quote_role(request.query, request.quoted_message) != 'conversation_anchor'
+            context.guard.require_valid()
+            return ToolOutcome({'mode': 'manual_recall_after_reset', 'evidence': '',
+                'source_message_ids': [], 'memory_search_allowed': allowed,
+                'guidance': '会话已重开，旧记忆不自动预载；需要时调用memory_search或memory_read。'})
     return await _run_read(context, query=query, addressed=addressed, preload=True)
 
 

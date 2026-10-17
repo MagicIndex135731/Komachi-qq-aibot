@@ -318,7 +318,7 @@ async def test_real_private_harness_sends_with_receipt_and_owns_only_restricted_
         assert sender.texts == [(OWNER, "夜空很适合慢慢看")]
         assert len(requests) == 1
         names = {value["name"] for value in requests[0]["tools"]}
-        assert names == {"read_private_context", "read_artifact", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'read_research_resources', 'resume_research_task', 'delegate_research_task', 'media_task_status', 'set_task_goal', 'review_task_progress'}
+        assert names == {"read_private_context", "search_private_history", "read_artifact", "read_message_links", "read_self_activity", "send_private", "generate_private_image", "private_image_status", "schedule_private_wakeup", "list_private_wakeups", "cancel_private_wakeup", 'begin_research_task', 'update_research_task', 'read_research_task', 'read_research_evidence', 'read_research_resources', 'resume_research_task', 'delegate_research_task', 'media_task_status', 'set_task_goal', 'review_task_progress'}
         snapshot = agent.sessions.read(f"private:{OWNER}")
         assert snapshot["checkpoint"]["receipts"][0]["receipt_id"] == "private-receipt-1"
         source_id = snapshot["checkpoint"]["reply_source_id"]

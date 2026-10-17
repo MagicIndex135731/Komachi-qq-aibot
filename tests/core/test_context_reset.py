@@ -4,8 +4,8 @@ import pytest
 from app.core.context_reset import parse_context_reset
 
 
-@pytest.mark.parametrize('text,count', [('重置上下文', 30), ('重置上下文 50', 50),
-    ('重置上下文５０条', 50), ('清空上下文', 30), ('开新对话', 30)])
+@pytest.mark.parametrize('text,count', [('重置上下文', None), ('重置上下文 50', 50),
+    ('重置上下文５０条', 50), ('清空上下文', None), ('开新对话', None)])
 def test_exact_context_reset_command(text, count):
     command = parse_context_reset(text, default_count=30)
     assert command.count == count and command.error == ''

@@ -14,6 +14,12 @@ def receipt_identity(receipt):
         'action_id', 'call_id', 'tool', 'operation', 'status', 'receipt_id', 'replay_allowed'}}
 
 
+def automatic_context_floor(session, scope):
+    """Automatic replay only; explicit history and source masks are independent."""
+    return session.scalar(select(ContextReset.automatic_after_id).where(ContextReset.scope == scope)
+        .order_by(ContextReset.source_id.desc()).limit(1)) or 0
+
+
 class ContextResetRepository:
     def __init__(self, engine, *, account_id):
         self.engine, self.account_id = engine, account_id
@@ -25,7 +31,7 @@ class ContextResetRepository:
                 ContextReset.account_id == self.account_id, ContextReset.scope == scope)
                 .order_by(ContextReset.source_id.desc()).limit(1)) or 0
 
-    def reset(self, *, scope, actor_id, source_id, count):
+    def reset(self, *, scope, actor_id, source_id, count=None, action='reset'):
         from app.storage.agent_sessions import AgentContextSnapshot, AgentSessionCheckpoint, AgentSessionDependency
         from app.storage.autonomous_agent import AutonomousIntention, AutonomousIntentionWakeup
         from app.storage.db import session_scope
@@ -33,7 +39,9 @@ class ContextResetRepository:
         from app.storage.repositories import DevSessionRepository
 
         match = re.fullmatch(r'(group|private):([1-9][0-9]{0,18})', scope)
-        if not match or type(count) is not int or not 1 <= count <= 1000:
+        if (not match or action not in {'reset', 'isolate', 'restore'}
+                or count is not None and (type(count) is not int or not 1 <= count <= 1000)
+                or action != 'reset' and count is not None):
             raise ValueError('invalid_context_reset')
         surface, identifier = match[1], int(match[2])
         with session_scope(self.engine) as session:
@@ -42,7 +50,7 @@ class ContextResetRepository:
             if prior:
                 if prior.scope != scope or prior.account_id != self.account_id:
                     raise ValueError('context_reset_scope_mismatch')
-                return {'applied': False, 'excluded_count': prior.excluded_count}
+                return {'applied': False, 'excluded_count': prior.excluded_count, 'mode': prior.mode}
             source = session.get(Message, source_id)
             if (not is_usable_memory_source(source, author_id=actor_id)
                     or (source.raw_json or {}).get('direction') == 'outbound'
@@ -59,14 +67,36 @@ class ContextResetRepository:
                     & (Message.raw_json['direction'].as_string() == 'outbound')
                     & (Message.raw_json['recipient_user_id'].as_integer() == identifier)))
             # Bound at the committed command: a concurrent newer message is never masked.
-            rows = list(session.scalars(select(Message).where(predicate, Message.id < source_id)
-                .order_by(Message.id.desc()).limit(count)))
+            mode = action if action != 'reset' else 'session' if count is None else 'legacy_count'
+            target = None
+            if action in {'isolate', 'restore'}:
+                from app.core.message_content import extract_reply_to_msg_id
+                reply_id = extract_reply_to_msg_id((source.raw_json or {}).get('message', []))
+                if not reply_id:
+                    raise ValueError('context_reset_target_missing')
+                identifiers = [reply_id, f'private-inbound-{identifier}-{reply_id}'] if surface == 'private' else [reply_id]
+                target = session.scalar(select(Message).where(predicate, Message.id < source_id,
+                    or_(Message.platform_msg_id.in_(identifiers),
+                        Message.raw_json['message_id'].as_string() == str(reply_id)))
+                    .order_by(Message.id.desc()).limit(1))
+                if (target is None or session.get(ContextReset, target.id) is not None
+                        or action == 'isolate' and not (target.context_excluded or is_usable_memory_source(target))):
+                    raise ValueError('context_reset_target_unavailable')
+            rows = ([target] if action == 'isolate' else [] if count is None else
+                list(session.scalars(select(Message).where(predicate, Message.id < source_id)
+                    .order_by(Message.id.desc()).limit(count))))
             # Already masked rows count toward the requested range, without reaching
             # farther back on a repeated reset. Provisional output is never context.
             excluded = [row.id for row in rows if row.context_excluded or is_usable_memory_source(row)]
             now = datetime.now(UTC).replace(tzinfo=None)
+            if action == 'restore':
+                mask = session.get(ContextExcludedMessage, target.id)
+                if mask is not None:
+                    session.delete(mask)
             session.add(ContextReset(source_id=source_id, account_id=self.account_id, scope=scope,
-                requested_count=count, excluded_count=len(excluded), created_at=now))
+                requested_count=count or 0, excluded_count=len(excluded), created_at=now,
+                mode=mode, automatic_after_id=source_id if mode == 'session' else 0,
+                target_message_id=target.id if target is not None else None))
             session.flush()
             for message_id in [*excluded, source_id]:
                 if session.get(ContextExcludedMessage, message_id) is None:
@@ -158,4 +188,5 @@ class ContextResetRepository:
                 # New daily session excludes the old rolling summary and legacy tasks.
                 DevSessionRepository(session).create_owner_session(owner_qq=identifier, session_mode='daily')
             session.flush()
-            return {'applied': True, 'excluded_count': len(excluded)}
+            return {'applied': True, 'excluded_count': len(excluded), 'mode': mode,
+                    'target_message_id': target.id if target is not None else None}
