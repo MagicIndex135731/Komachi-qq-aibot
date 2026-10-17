@@ -295,6 +295,13 @@ class RequestTaskControl:
 
     def describe(self,args):
         self.workspace._check()
+        selection=dict(args.get('media_selection',{}))
+        from app.core.post_freshness import constraint_text
+        original=constraint_text(self.workspace.request)
+        supplied=selection.pop('constraint_evidence',{})
+        # Validate before changing the active goal or candidate decisions.
+        for proof in supplied.values():
+            if not proof or proof not in original:raise ValueError('user_constraint_evidence_unverified')
         reviews={}
         for item in args.get('media_selection',{}).get('candidate_reviews',[]):
             key=self._resource_key(item['ref_id'])
@@ -307,12 +314,7 @@ class RequestTaskControl:
         self.delivery='media' if self.requires_media else args.get('delivery','text')
         self.requires_media=self.delivery=='media'
         if self.requires_media:self._ensure_budget()
-        selection=dict(args.get('media_selection',{}))
-        from app.core.post_freshness import constraint_text
-        original=constraint_text(self.workspace.request)
-        supplied=selection.pop('constraint_evidence',{})
         for field,proof in supplied.items():
-            if not proof or proof not in original:raise ValueError('user_constraint_evidence_unverified')
             self.constraint_evidence[field]={'proof':proof,'provenance':'explicit_user'}
         if self.publisher_proof:selection['publisher_scope']='subject_only'
         if self.explicit_publisher_account:selection['publisher_account']=self.explicit_publisher_account
@@ -815,7 +817,17 @@ class RequestTaskControl:
             return {'type':'object','properties':properties,'required':list(required),'additionalProperties':False}
         async def describe(args):
             guard.require_valid()
-            return ToolOutcome(self.describe(args))
+            try:
+                return ToolOutcome(self.describe(args))
+            except ValueError as exc:
+                guidance = {
+                    'task_candidate_not_observed':'候选尚未在本请求核验；先读取或检索对应来源，再记录筛选决定。旧对话提到的帖子不等于本轮已核验。',
+                    'user_constraint_evidence_unverified':'约束依据必须来自当前真实用户原话；删除或纠正无依据的约束后再记录目标。',
+                }.get(str(exc))
+                if guidance is None:
+                    raise
+                return ToolOutcome({'error':str(exc), 'failure_stage':'goal_validation',
+                    'handler_executed':False, 'guidance':guidance}, 'blocked')
         async def reflect(args):
             guard.require_valid()
             advice={}

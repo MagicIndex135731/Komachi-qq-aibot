@@ -171,6 +171,7 @@ class PrivateHarnessService:
             private_scope=payload['private_scope'], kind='research_result', goal=payload['goal'],
             key='research-result:' + str(guard.job_id), before_commit=guard.require_valid,
             trace_lineage=current_trace_context(),
+            request_addressed=payload.get('request_addressed') is True,
             delegated_result={**payload['result'], 'parent_task_id': payload.get('parent_task_id'),
                 'returned_job_id': guard.job_id}, dependencies=guard.snapshot())
         self._wake.set()
@@ -228,7 +229,8 @@ class PrivateHarnessService:
         return True
 
     def _enqueue(self, *, user_id, source_id, private_scope, kind="message", goal="", delay_seconds=0, key=None,
-                 before_commit=None, delegated_result=None, dependencies=None, trace_lineage=None):
+                 before_commit=None, delegated_result=None, dependencies=None, trace_lineage=None,
+                 request_addressed=False):
         if kind=='wakeup' and user_id!=self.service.owner_qq:
             return {'error':'owner_required'}
         if not self.allowed(user_id) or not self._valid_source(source_id, user_id):
@@ -248,6 +250,7 @@ class PrivateHarnessService:
                 status="queued", payload_json={"account_id": self.account_id, "user_id": user_id,
                     "source_id": source_id, "private_scope": private_scope, "kind": kind, "goal": goal,
                     **({'delegated_result': delegated_result, 'dependencies': dependencies,
+                        'request_addressed': request_addressed is True,
                         '_trace_parent': trace_lineage or {}} if delegated_result is not None else {})})
             return {"task_id": row.id, "status": row.status, "run_at": row.run_at.isoformat(), "kind": kind}
 
@@ -555,9 +558,16 @@ class PrivateHarnessService:
             if (payload.get('delegated_result') or {}).get('parent_task_id'):
                 workspace.resume(payload['delegated_result']['parent_task_id'])
             from app.agent.shared_links import build_share_access, observed_share_sources, share_context_text, wrap_share_web_tools, WEB_REQUEST_POLICY
+            # The private transport already selects the addressee. Only a real
+            # current message or a dependency-validated queue return can carry
+            # that fact; stored goals, model output and wakeups cannot mint it.
+            direct_private_request = bool(authored_request_text(raw, event.plain_text).strip()) and (
+                payload['kind'] == 'message' or payload['kind'] == 'research_result'
+                and payload.get('dependencies') and payload.get('request_addressed') is True)
             share_access = build_share_access(SimpleNamespace(engine=self.engine), group_id=None,
                 trigger_source_ids=(source_id,) if payload['kind'] == 'message'
                     or payload['kind'] == 'research_result' and payload.get('dependencies') else (),
+                addressed_source_ids=(source_id,) if direct_private_request else (),
                 private_user_id=user_id, bot_qq=self.settings.bot_qq)
             runtime_id = previous["checkpoint"].get("runtime_id") or uuid4().hex
             context_version = model_context_format_version(self.service.llm_client)
@@ -596,7 +606,7 @@ class PrivateHarnessService:
                     'context_snapshot': freeze_context(),
                     'parent_task_id': workspace.task_id if workspace.formal else None,
                     'request_budget':workspace.media_budget.reference() if getattr(workspace,'media_budget',None) else None,
-                    'candidates': candidates or {},
+                    'candidates': candidates or {}, 'request_addressed': bool(direct_private_request),
                     'private_scope': payload['private_scope'], 'goal': '完成媒体下载并交付真实产物'},
                     parent_turn='source:' + str(source_id), before_commit=guard.require_valid)
                 return result
@@ -947,7 +957,8 @@ class PrivateHarnessService:
                     'parent_task_id': workspace.task_id if workspace.formal else None,
                     'request_budget':workspace.media_budget.reference() if getattr(workspace,'media_budget',None) else None,
                     'deliverable': args['deliverable'], 'task_id': child.task_id, 'task_key': f'delegate:{job_id}',
-                    'resume_task_id': args.get('task_id'), 'private_scope': payload['private_scope']},
+                    'resume_task_id': args.get('task_id'), 'private_scope': payload['private_scope'],
+                    'request_addressed': bool(direct_private_request)},
                     parent_turn=job_id, before_commit=guard.require_valid)
                 return ToolOutcome(result, 'blocked' if result['status'] == 'blocked' else 'ok')
 

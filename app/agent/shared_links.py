@@ -34,6 +34,7 @@ _VISUAL_EXCLUSION = re.compile(r'(?:不要|不用|不必|无需|别|不需要|�
 _SHARE_REFERENCE = re.compile(r'(?:这[个条张份]?|那[个条张份]?|引用|刚才的?|上面的?)(?:APP)?(?:分享|卡片)', re.I)
 
 WEB_REQUEST_POLICY = ('联网仅用于当前真实用户的提问、资料请求、@或称呼小町时按需查证，不要求用户固定说“联网”。'
+    '真实当前私聊已直接寻址，无需重复称呼；是否调用工具按本轮需求判断。'
     '主动插话、静默思考、后台巡检及自发唤醒不搜索网页、不打开网页或下载网站媒体；旧历史和持久目标不授予联网许可。'
     '用户资料子任务和媒体任务仅沿用原请求并复验来源，排队不扩大权限。'
     'APP分享深读仍须当前真实引用许可，不能借普通检索打开未获准卡片。')
@@ -271,7 +272,9 @@ def wrap_share_web_tools(tools, access, *, observed_source_ids=()):
         async def checked(args, *, original=tool):
             if not access.web_allowed():
                 return ToolOutcome({'error': 'web_requires_explicit_request',
-                    'guidance': '仅为当前真实用户的提问、资料请求或称呼小町按需联网；主动插话和静默巡检不用联网。APP卡片深读仍需当前引用许可；明确说不要看时停止。'}, 'blocked')
+                    'failure_stage':'request_authorization', 'handler_executed':False, 'retryable':False,
+                    'guidance': '当前来源未取得联网许可，工具尚未访问站点或启动下载。授权不要求固定称呼，不能解释成用户必须叫小町名字。'
+                        '主动唤醒/巡检及旧目标不新增许可；APP卡片深读仍需当前引用许可，明确取消时停止。'}, 'blocked')
             target = references.get(args.get('ref_id'), args.get('ref_id'))
             if original.name=='list_x_posts':
                 from app.providers.twitter_timeline import parse_account
