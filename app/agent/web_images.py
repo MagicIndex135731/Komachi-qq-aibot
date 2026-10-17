@@ -30,6 +30,12 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
     page_calls, downloads, downloaded_bytes = 0, 0, 0
     image_budget=None
 
+    def unmetered():
+        from app.core.request_cost import current_request_budget
+        from app.agent.media_request_policy import unmetered_media
+        budget=transfer_budget or current_request_budget.get()
+        return bool(getattr(budget,'unmetered',False) or unmetered_media(guard=guard))
+
     def failure(exc):
         guard.require_valid()
         code = str(exc) if isinstance(exc, WebImageError) or isinstance(exc, ValueError) and str(exc).startswith(('media_cache_','request_budget_','media_transfer_')) else (
@@ -49,7 +55,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
         except (ValueError, KeyError, TypeError):
             return ToolOutcome({'error': 'invalid_web_image_argument'}, 'blocked')
         if url not in pages:
-            if page_calls >= 4:
+            if page_calls >= 4 and not unmetered():
                 return ToolOutcome({'error': 'web_image_page_budget'}, 'blocked')
             page_calls += 1
             try:
@@ -83,12 +89,12 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
             return ToolOutcome({'error': 'web_image_candidate_out_of_turn'}, 'blocked')
         artifact_id = saved.get(image_id)
         if artifact_id is None:
-            if image_budget is None:
+            if image_budget is None or unmetered():
                 from app.core.request_cost import current_request_budget
                 from app.core.media_variants import TransferBudget
                 image_budget=TransferBudget(32*1024*1024,deadline=deadline or time.monotonic()+90,
                     check=guard.require_valid,parent=transfer_budget or current_request_budget.get())
-            if downloads >= 20 or downloaded_bytes >= 32 * 1024 * 1024:
+            if not unmetered() and (downloads >= 20 or downloaded_bytes >= 32 * 1024 * 1024):
                 return ToolOutcome({'error': 'web_image_download_budget'}, 'blocked')
             downloads += 1
 
@@ -143,13 +149,13 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
         artifacts, failures, previews, roles, media = [], [], [], [], []
         deadline = time.monotonic() + 90
         for image_id in ids:
-            if time.monotonic() >= deadline:
+            if not unmetered() and time.monotonic() >= deadline:
                 failures.append({'image_id': image_id, 'error': 'web_image_batch_deadline'})
                 continue
             if args.get('quality')=='original_only' and candidates[image_id].get('quality')!='verified_original':
                 failures.append({'image_id':image_id,'error':'original_quality_unverified'})
                 continue
-            result = await download({'image_id': image_id}, deadline=deadline)
+            result = await download({'image_id': image_id}, deadline=None if unmetered() else deadline)
             if result.status == 'ok':
                 artifacts.append(result.data['artifact_id'])
                 roles.append(result.data['image_role'])
@@ -183,7 +189,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
             except ValueError as exc:
                 return failure(exc)
             return ToolOutcome({'video_artifact_id': artifact_id, **info, 'cached_in_turn': True})
-        if video_calls >= 2:
+        if video_calls >= 2 and not unmetered():
             return ToolOutcome({'error': 'web_video_turn_budget'}, 'blocked')
         video_calls += 1
         def fetch_video():
@@ -250,7 +256,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
             schema({'ref_id': text(2000), 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 159}}, ['ref_id']), serial(listing)),
         AgentTool('download_web_image', '下载本回合list_web_images返回的image_id，校验并展示真实图片像素，质量以实际来源为准，保存为当前会话artifact_id。核对目标后用send_group/send_private的artifact_ids发送。',
             schema({'image_id': text(64)}, ['image_id']), serial(download)),
-        AgentTool('download_web_images', '后台按序下载本轮image_ids，最多20张/32MiB/90秒；回传真实产物句柄，不默认输入像素。需看图时read_artifact；直接交付选auto，禁止重复排队/发送。',
+        AgentTool('download_web_images', '后台按序下载本轮image_ids，单批最多20张；媒体请求可继续分批，每次网络传输独立超时。回传真实产物句柄，不默认输入像素。需看图时read_artifact；直接交付选auto，禁止重复排队/发送。',
             schema({'image_ids': {'type': 'array', 'items': text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True},
                 **download_delivery_properties()}, ['image_ids']), serial(batch)),
         AgentTool('download_web_video', '后台下载公开网页或获准卡片的真实H.264 MP4，最大128MiB/20分钟；立即返回任务编号，完成后回传video_artifact_id再发送。不要重复排队；不观看/抽帧或执行网页脚本。',

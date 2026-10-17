@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 from app.providers.x_posts import XSearchOptions, parse_target, search_target
@@ -16,6 +17,7 @@ from app.providers.twitter_media import TwitterMediaError, parse_post_url
 
 class XCrawlerClient:
     _slots = threading.BoundedSemaphore(1)
+    _queue_timeout = 180
 
     def __init__(self, session_file: str, proxy: str, *, runner=None):
         parts = urlsplit(proxy)
@@ -45,12 +47,17 @@ class XCrawlerClient:
             raise TwitterMediaError('invalid_x_target')
         from app.core.request_cost import current_request_budget
         budget=current_request_budget.get()
-        if budget:budget.reserve_network(32*1024*1024)
         check()
-        if not self._slots.acquire(timeout=8):
-            raise TwitterMediaError('x_crawler_crawler_busy')
+        deadline = min(time.monotonic() + self._queue_timeout, budget.deadline if budget else float('inf'))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:raise TwitterMediaError('x_crawler_crawler_busy')
+            if self._slots.acquire(timeout=min(0.25, remaining)):break
+            check()
+            if budget:budget.check()
         try:
             check()
+            if budget:budget.reserve_network(32*1024*1024)
             root = Path(__file__).resolve().parents[2]
             env = {k: os.environ[k] for k in ('PATH', 'LANG', 'SYSTEMROOT') if k in os.environ}
             env.update(PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE='1', TWS_TELEMETRY='0',

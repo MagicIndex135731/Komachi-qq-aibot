@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from datetime import UTC
 from hashlib import sha256
 import json
 from types import SimpleNamespace
@@ -93,11 +94,62 @@ class MediaTaskQueue(ResearchDelegationQueue):
     exhausted_execution_status = 'uncertain'
     guard_type = MediaJobGuard
     allow_confirmed_bot_dependencies = True
+    claim_scan_limit = 512
 
     def __init__(self, engine, *, authorized, available=lambda: True, **kwargs):
         self.available = available
+        self._deliver_result = kwargs.pop('deliver')
+        kwargs['deliver'] = self._deliver_request
         super().__init__(engine, authorized=lambda payload: authorized(payload)
             and payload.get('source_fingerprints') == self.source_fingerprints(payload['sources']), **kwargs)
+
+    @staticmethod
+    def _review_download(payload):
+        return (payload.get('delivery_mode', 'review') == 'review'
+            and payload.get('operation') in MEDIA_OPERATIONS - {'generate_image'})
+
+    def occupies_capacity(self, row):
+        # READY files wait for their request's siblings, not for a worker slot.
+        return super().occupies_capacity(row) and not (
+            row.status == 'result_ready' and self._review_download(row.payload_json))
+
+    def _review_siblings(self, session, payload):
+        return list(session.scalars(select(Job).where(Job.job_type == self.job_type,
+            Job.job_key.startswith(self.prefix(payload['scope_id'])),
+            Job.payload_json['scope'].as_string() == payload['scope'],
+            Job.payload_json['actor_id'].as_integer() == payload['actor_id'],
+            Job.payload_json['source_id'].as_integer() == payload['source_id'],
+            Job.payload_json['parent_task_id'].as_string() == payload['parent_task_id']
+                if payload.get('parent_task_id') else Job.payload_json['parent_task_id'].as_string().is_(None)
+            ).order_by(Job.id)))
+
+    async def _deliver_request(self, payload, guard):
+        if not self._review_download(payload):return await self._deliver_result(payload, guard)
+        guard.require_valid()
+        with session_scope(self.engine) as session:
+            rows = [(row.id, row.status, dict(row.payload_json))
+                for row in self._review_siblings(session, payload) if self._review_download(row.payload_json)]
+        returned = []
+        for identifier, state, item in rows:
+            if state not in {'completed', 'result_ready', 'delivering', 'failed', 'blocked'}:continue
+            if not self.authorized(item) or not guard.valid_dependencies({
+                    'sources': item['sources'], 'memory': item.get('memory', {}),
+                    **({'context_snapshot': item['context_snapshot']} if item.get('context_snapshot') else {})}):
+                raise RuntimeError('media_batch_source_revoked')
+            returned.append((identifier, item.get('item_result', item.get('result', {
+                'status': 'failed', 'data': {'error': 'media_execution_failed'}}))))
+        result = merge_media_results(returned, payload)
+        outcome = await self._deliver_result({**payload, 'result': result}, guard)
+        guard.require_valid()
+        # The leader's durable result handoff is idempotent. Settle siblings
+        # only after it succeeds; a lost leader fences the request as unknown.
+        if outcome == 'completed':
+            with self.transaction(guard.require_valid) as session:
+                for row in self._review_siblings(session, payload):
+                    if row.id != guard.job_id and row.status == 'result_ready' and self._review_download(row.payload_json):
+                        row.status = 'completed';row.completed_at = self.clock().astimezone(UTC).replace(tzinfo=None)
+                        row.last_error_code = 'media_result_aggregated'
+        return outcome
 
     def claim(self):
         # A transient disconnected gateway is not revoked request authority.
@@ -105,6 +157,14 @@ class MediaTaskQueue(ResearchDelegationQueue):
         return super().claim() if self.available() else None
 
     def admit_claim(self, session, row, phase, now):
+        if self._review_download(row.payload_json):
+            siblings = [s for s in self._review_siblings(session, row.payload_json)
+                if self._review_download(s.payload_json)]
+            if any(s.status in {'uncertain', 'cancelled'} for s in siblings):
+                row.status = 'blocked';row.last_error_code = 'media_request_unknown_or_cancelled';row.completed_at = now
+                return False
+            if phase == 'delivering' and any(s.id != row.id and s.status in {
+                    'pending', 'queued', 'running', 'delivering'} for s in siblings):return False
         plan=row.payload_json.get('fallback_plan')
         if not plan:return True
         payload=row.payload_json
@@ -154,7 +214,7 @@ class MediaTaskQueue(ResearchDelegationQueue):
     def prefix(self, scope_id=None):
         return f'media:{self.account_id}:{self.surface}:' + (f'{scope_id}:' if scope_id is not None else '')
 
-    def submit(self, payload, *, parent_turn, before_commit):
+    def submit(self, payload, *, parent_turn, before_commit, continuation=False):
         if payload.get('operation') not in MEDIA_OPERATIONS:
             return ToolOutcome({'error': 'media_operation_not_allowed'}, 'blocked')
         arguments = dict(payload['arguments'])
@@ -178,11 +238,16 @@ class MediaTaskQueue(ResearchDelegationQueue):
             with session_scope(self.engine) as session:
                 # Reusing an existing job cannot change its delivery contract.
                 mode = session.get(Job,result['job_id']).payload_json.get('delivery_mode','review')
+            if continuation and result['execution_status'] in {'completed', 'failed', 'blocked', 'uncertain', 'cancelled'}:
+                return ToolOutcome({'error': 'media_task_already_settled', 'job_id': result['job_id'],
+                    'previous_status': result['execution_status'], 'replay_allowed': False,
+                    'guidance': '原任务已结算，查询已有结果；缺份数时选择另一个已核验来源，不重复提交。'}, 'blocked')
             result['delivery'] = ('automatic_delivery_to_original_request' if mode=='auto'
                 else 'background_media_result_returns_to_main')
             if mode=='auto':
                 result['guidance'] = '程序会按原请求自动交付；可简短告知排队，不手动重复发送或重新提交。'
         return ToolOutcome(result, 'blocked' if result['status'] == 'blocked' else 'ok')
+
 
     def status_tool(self, *, scope_id, actor_id, guard):
         async def status(args):
@@ -207,6 +272,38 @@ class MediaTaskQueue(ResearchDelegationQueue):
              'required': ['job_id'], 'additionalProperties': False}, status)
 
 
+def merge_media_results(results, payload):
+    """Retain ready handles, identities and failures across one original request."""
+    data = {'media_artifact_ids': [], 'artifact_ids': [], 'video_artifact_ids': [],
+        'media': [], 'failures': [], 'jobs': [], 'quality_fallbacks': [], 'video_quality_fallbacks': []}
+    seen = set()
+    for identifier, result in results:
+        item = result.get('data', {})
+        data['jobs'].append({'job_id': identifier, 'status': 'completed'})
+        if result.get('status') != 'ok':
+            data['failures'].append({'job_id': identifier, 'error': item.get('error', 'media_download_failed')})
+            continue
+        for key in ('media_artifact_ids', 'artifact_ids', 'video_artifact_ids'):
+            values = item.get(key, [])
+            if key == 'media_artifact_ids' and not values:
+                values = item.get('artifact_ids', []) + ([item['video_artifact_id']] if item.get('video_artifact_id') else [])
+            if key == 'video_artifact_ids' and item.get('video_artifact_id'):values = [*values, item['video_artifact_id']]
+            data[key].extend(i for i in values if i not in data[key])
+        for medium in item.get('media', []):
+            if medium.get('artifact_id') not in seen:
+                data['media'].append(medium);seen.add(medium.get('artifact_id'))
+        for key in ('failures', 'quality_fallbacks', 'video_quality_fallbacks'):data[key].extend(item.get(key, []))
+    data['downloaded_count'] = len(data['media_artifact_ids'])
+    data['requested_count'] = data['downloaded_count'] + len(data['failures'])
+    data['all_requested_downloaded'] = not data['failures']
+    data['request_aggregated'] = True
+    data['total_bytes'] = sum(m.get('bytes', 0) for m in data['media'])
+    if len(results) == 1:data = {**results[0][1].get('data', {}), **data}
+    data['guidance'] = ('同一原请求的下载结果已汇总；失败不撤销成功文件。仍缺数量时可按原主题、日期与类型选择新来源有限续补，'
+        '原任务不可重复执行。新下载排队后等待下一次汇总，最终合并发送已核验成果；真实未知结果禁止重放。')
+    return media_result(ToolOutcome(data, 'ok' if data['media_artifact_ids'] else 'failed'), payload)
+
+
 def media_result(outcome, payload):
     """Return handles and a bounded observation, never transport bytes or logs."""
     data = dict(outcome.data)
@@ -214,7 +311,8 @@ def media_result(outcome, payload):
         # Resource descriptions may be long; handles are never replaced by an error.
         keep = {'artifact_id','artifact_ids','media_artifact_ids','video_artifact_id',
             'video_artifact_ids','requested_count','downloaded_count','all_requested_downloaded',
-            'source_url','post_id','total_bytes','image_roles','quality_fallbacks','video_quality_fallbacks','failure_detail','error'}
+            'source_url','post_id','total_bytes','image_roles','quality_fallbacks','video_quality_fallbacks',
+            'failure_detail','error','jobs','request_aggregated'}
         compact = {key:value for key,value in data.items() if key in keep}
         compact['media'] = [{key:value for key,value in item.items() if key in {
             'artifact_id','logical_media_id','source_ref','kind','index','status','bytes','image_size','sha256','quality','fallback_reason'}}
@@ -334,8 +432,10 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
             text += f" 其中{len(data['video_quality_fallbacks'])}段视频采用较低清晰度的原生版本。"
     else:
         text = '这次媒体下载未完成，暂时无法发送。'
+    from app.agent.request_budget import worker_budget
+    budget=worker_budget(payload,guard,settings)
     boundary = ToolDispatchBoundary(engine=engine,account_id=payload['account_id'],scope=payload['scope'],
-        guard=guard,max_daily=500,cooldown_seconds=0,clock=clock,
+        guard=guard,max_daily=None if budget and budget.unmetered else 500,cooldown_seconds=0,clock=clock,
         delivery_source_id=payload['source_id'],
         media_identity=lambda i:artifact_delivery_identities(store,i),
         interactive_group_send=payload['surface']=='group')
@@ -359,8 +459,6 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
                 'status':outcome.status,'data':outcome.data,'receipt_id':outcome.receipt_id})
             return outcome
         packets=await runner.run(pack_media_files,identifiers,files) if files else [[]]
-        from app.agent.request_budget import worker_budget
-        budget=worker_budget(payload,guard,settings)
         for index,packet in enumerate(packets):
             guard.require_valid()
             if budget:budget.spend('writes',finalization=True)

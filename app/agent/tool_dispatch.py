@@ -18,15 +18,19 @@ logger = logging.getLogger(__name__)
 class ToolDispatchBoundary:
     def __init__(self, *, engine, account_id, scope, guard, clock, max_daily=2, cooldown_seconds=60,
                  interactive_group_send: bool = False, group_send_allowed=None, owner_authority=None,
-                 group_interjection_reserve=None, delivery_source_id=None, media_identity=None):
+                 group_interjection_reserve=None, delivery_source_id=None, media_identity=None,
+                 chat_cadence_only: bool = False):
         if type(interactive_group_send) is not bool:
             raise ValueError("interactive group send authority must be a boolean")
+        if type(chat_cadence_only) is not bool:
+            raise ValueError('chat cadence authority must be a boolean')
         self.repository = AgentToolEffectRepository(engine, account_id=account_id, clock=clock)
         self.scope, self.parent, self.clock = scope, guard, clock
         self.max_daily, self.cooldown_seconds = max_daily, cooldown_seconds
         self.interactive_group_send = interactive_group_send
         self.group_send_allowed = group_send_allowed
         self.group_interjection_reserve = group_interjection_reserve
+        self.chat_cadence_only = chat_cadence_only
         self.owner_authority = owner_authority
         self.current = ContextVar("agent_tool_effect", default=None)
         self.receipts = []
@@ -105,19 +109,27 @@ class ToolDispatchBoundary:
                 outcome = await tool.handler(arguments)
             except BaseException as exc:
                 known = isinstance(exc, (QzoneRejectedError, QzoneUnavailableError, ProfileRejectedError, ProfileUnavailableError))
-                current_status = self.repository.get(record["action_id"])["status"]
+                recorded = self.repository.get(record["action_id"])
+                current_status = recorded["status"]
                 state = "blocked" if current_status == "blocked" else "uncertain" if current_status == "dispatching" and not known else "failed"
-                self.repository.finish(record["action_id"], status=state, reason="tool_interrupted")
+                failure = recorded.get('reason') if state == 'blocked' else None
+                self.repository.finish(record["action_id"], status=state, reason=failure or "tool_interrupted")
                 self._public_history(tool, arguments, call_id,
                     ToolOutcome({'error': type(exc).__name__}, state), record['action_id'])
                 self.uncertain = state == "uncertain"
                 self.receipts.append({"call_id": call_id, "action_id": record["action_id"], "tool": tool.name,
                     "status": state, "receipt_id": None, "replay_allowed": False})
                 if isinstance(exc, Exception):
-                    return ToolOutcome({"error": type(exc).__name__}, state)
+                    return ToolOutcome({"error": failure or type(exc).__name__}, state)
                 raise
             recorded = self.repository.get(record["action_id"])
             status = outcome.status
+            if recorded['status'] == 'blocked' and recorded['dispatched_at'] is None:
+                # A handler may wrap a local dispatch stop as a generic send
+                # failure. Preserve the authoritative pre-dispatch reason.
+                status = 'blocked'
+                outcome = ToolOutcome({**outcome.data, 'error': recorded['reason'] or 'effect_dispatch_blocked',
+                    'replay_allowed': False}, status)
             if status == "sent" and recorded["status"] != "dispatching":
                 status = "failed"
                 outcome = ToolOutcome({"error": "effect_bypassed_dispatch_boundary"}, status)
@@ -154,11 +166,12 @@ class ToolDispatchBoundary:
         chat_send = current is not None and current[1].name == "send_group" and self.group_send_allowed is not None
         manual = self.owner_authority is not None
         if chat_send and not direct_reply and not manual and not self.group_send_allowed():
-            raise RuntimeError("group chat cadence or policy revoked")
+            self._block_dispatch('group_chat_cadence_or_policy_revoked')
         if (chat_send and not direct_reply and not manual and self.group_interjection_reserve is not None
                 and not self.group_interjection_reserve()):
-            raise RuntimeError('proactive_speech_budget')
-        daily_limit = None if direct_reply or manual else (
+            self._block_dispatch('proactive_speech_budget')
+        cadence_only = chat_send and self.chat_cadence_only and current[1].daily_limit is None
+        daily_limit = None if direct_reply or manual or cadence_only else (
             current[1].daily_limit if current is not None and current[1].daily_limit is not None else self.max_daily)
         cooldown = 0 if direct_reply or chat_send or manual or (current and current[1].per_target_daily_limit) else (
             current[1].cooldown_seconds if current is not None and current[1].cooldown_seconds is not None else self.cooldown_seconds)
@@ -178,3 +191,9 @@ class ToolDispatchBoundary:
             parent.record_tool_dispatch(current[0])
         elif not getattr(parent, "dispatched", False):
             self.parent.on_dispatch()
+
+    def _block_dispatch(self, reason):
+        current = self.current.get()
+        if current is not None:
+            self.repository.finish(current[0], 'blocked', reason=reason)
+        raise RuntimeError(reason)

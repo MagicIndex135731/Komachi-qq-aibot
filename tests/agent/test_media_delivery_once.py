@@ -217,7 +217,7 @@ def test_pack_albums_preserves_order_and_sends_video_alone(tmp_path):
         p=tmp_path/str(i)
         with p.open('wb') as f:f.truncate(8*1024*1024)
         paths.append(('image' if i<5 else 'video',str(p)))
-    assert pack_media_files(list('abcdef'),paths)==[list('abcd'),['e','f']]
+    assert pack_media_files(list('abcdef'),paths)==[list('abcdef')]
 
 
 async def test_aliases_deduplicate_same_source_variants_and_exact_bytes_across_sources(sqlite_engine):

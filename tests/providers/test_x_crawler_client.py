@@ -70,10 +70,14 @@ def test_guard_rechecked_after_child_completion():
 
 
 def test_contending_worker_wait_is_bounded(monkeypatch):
-    calls=[]
-    monkeypatch.setattr(XCrawlerClient,'_slots',SimpleNamespace(acquire=lambda **kw:calls.append(kw) or False))
+    import app.providers.x_crawler_client as transport
+    clock=[0.0];calls=[]
+    def acquire(**kw):calls.append(kw);clock[0]+=kw['timeout'];return False
+    monkeypatch.setattr(XCrawlerClient,'_slots',SimpleNamespace(acquire=acquire))
+    monkeypatch.setattr(XCrawlerClient,'_queue_timeout',.5)
+    monkeypatch.setattr(transport.time,'monotonic',lambda:clock[0])
     with pytest.raises(TwitterMediaError,match='crawler_busy'):client_with().inspect(URL)
-    assert calls==[{'timeout':8}]
+    assert calls==[{'timeout':.25},{'timeout':.25}]
 
 
 async def test_configured_downloader_uses_crawler_without_public_resolver(tmp_path):

@@ -435,9 +435,10 @@ class GroupAgentRuntime:
                 timeout = (self.options.task_execution_timeout_seconds
                     if decision.reason == 'direct_trigger'
                     else self.options.execution_timeout_seconds)
-                result = await asyncio.wait_for(
+                from app.agent.media_request_policy import await_request_work
+                result = await await_request_work(
                     self.execute(target, batch, decision, guard),
-                    timeout=timeout,
+                    timeout=timeout,guard=guard,
                 )
                 if not isinstance(result, AgentActionResult) or result.status not in {
                     "sent", "uncertain", "blocked", "failed", "silent",

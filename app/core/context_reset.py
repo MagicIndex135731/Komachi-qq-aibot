@@ -97,8 +97,9 @@ class ContextResetGuard:
         return self.repository.latest_source_id(self.scope) == self.generation and self.parent.valid()
 
     def require_valid(self):
-        if not self.valid():
+        if self.repository.latest_source_id(self.scope) != self.generation:
             raise RuntimeError('context_reset_authority_revoked')
+        self.parent.require_valid()
 
     def on_dispatch(self):
         self.require_valid()

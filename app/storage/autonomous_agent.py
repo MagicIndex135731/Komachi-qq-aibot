@@ -83,17 +83,20 @@ class AutonomousRepository:
                 before_commit()
 
     @staticmethod
-    def _validate_cost(kind: str, limit: int) -> None:
+    def _validate_cost(kind: str, limit: int | None) -> None:
         budget_kind = kind.removeprefix('owner:').removeprefix('private:') if isinstance(kind, str) else kind
-        if (not isinstance(kind, str) or len(kind) > 200 or type(limit) is not int or not 0 <= limit <= 500
+        model_usage = budget_kind == 'model' or isinstance(budget_kind,str) and budget_kind.startswith('model:')
+        if (not isinstance(kind, str) or len(kind) > 200 or
+                not (limit is None and model_usage or type(limit) is int and 0 <= limit <= 500)
                 or budget_kind not in {"model", "image", "profile:nickname", "profile:avatar"}
                 and not re.fullmatch(r"profile:card:[1-9][0-9]{0,18}", budget_kind)
                 and not re.fullmatch(r"(?:model|image):(?:group_interactive|group_autonomous|qzone_publish|qzone_comment|profile)", budget_kind)):
             raise ValueError("invalid cost budget")
         if budget_kind.startswith("profile:card:") and int(kind.rsplit(":", 1)[1]) > 2**63 - 1:
             raise ValueError("invalid profile group")
-    def cost_available(self, kind: str, limit: int) -> bool:
+    def cost_available(self, kind: str, limit: int | None) -> bool:
         self._validate_cost(kind, limit)
+        if limit is None:return True
         start = utc_naive(self.clock().astimezone(ASIA_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0))
         with Session(self.engine) as session:
             count = session.scalar(select(func.count()).select_from(AutonomousUsage).where(
@@ -101,7 +104,7 @@ class AutonomousRepository:
                 AutonomousUsage.created_at >= start)) or 0
         return count < limit
 
-    def reserve_cost(self, kind: str, limit: int) -> bool:
+    def reserve_cost(self, kind: str, limit: int | None) -> bool:
         self._validate_cost(kind, limit)
         instant = self.clock()
         now = instant.astimezone(UTC).replace(tzinfo=None)
@@ -111,7 +114,7 @@ class AutonomousRepository:
             with Session(bind=conn) as session:
                 count = session.scalar(select(func.count()).select_from(AutonomousUsage).where(
                     AutonomousUsage.account_id == self.account_id, AutonomousUsage.kind == kind, AutonomousUsage.created_at >= start)) or 0
-                if count >= limit:
+                if limit is not None and count >= limit:
                     conn.rollback()
                     return False
                 session.add(AutonomousUsage(id=uuid4().hex, account_id=self.account_id, kind=kind, created_at=now))

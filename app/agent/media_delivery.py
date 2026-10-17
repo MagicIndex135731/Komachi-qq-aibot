@@ -190,19 +190,28 @@ def resolve_media_bundle(store, settings, identifiers, *, before_read):
     return tuple(files)
 
 
-def pack_media_files(identifiers, files):
-    """Pack small media at 20/32MiB; a larger valid video occupies its own packet."""
-    from pathlib import Path
+MEDIA_PACKET_BYTES = 128 * 1024 * 1024
+
+
+def plan_media_packets(identifiers, sizes):
+    """One bounded forward message, split only at 20 items or 128 MiB."""
     packets=[];pending=[];size=0
-    for identifier,(kind,path) in zip(identifiers,files,strict=True):
-        length=Path(path).stat().st_size
-        if kind=='video' and length>32*1024*1024:
-            if pending:packets.append(pending);pending=[];size=0
-            packets.append([identifier])
-        else:
-            if pending and (len(pending)>=20 or size+length>32*1024*1024):
-                packets.append(pending);pending=[];size=0
-            if kind=='image' and length>8*1024*1024:raise ValueError('image_exceeds_artifact_budget')
-            pending.append(identifier);size+=length
+    for identifier,length in zip(identifiers,sizes,strict=True):
+        if type(length) is not int or not 0 <= length <= MEDIA_PACKET_BYTES:
+            raise ValueError('invalid_media_packet_size')
+        if pending and (len(pending)>=20 or size+length>MEDIA_PACKET_BYTES):
+            packets.append(pending);pending=[];size=0
+        pending.append(identifier);size+=length
     if pending:packets.append(pending)
     return packets
+
+
+def pack_media_files(identifiers, files):
+    """Validate file sizes, then use the shared forward planner."""
+    from pathlib import Path
+    sizes=[]
+    for kind,path in files:
+        length=Path(path).stat().st_size
+        if kind=='image' and length>8*1024*1024:raise ValueError('image_exceeds_artifact_budget')
+        sizes.append(length)
+    return plan_media_packets(identifiers,sizes)

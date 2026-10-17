@@ -25,6 +25,19 @@ async def test_auto_download_handoff_skips_stale_progress_and_next_upstream_requ
     assert result.task_status['status']=='waiting'
 
 
+async def test_verified_review_return_hands_new_download_to_its_next_result(bridge_factory):
+    bridge,requests,_=bridge_factory(lambda *_:responses_sse(),require_reply=True)
+    bridge.owner.initial_evidence=({'kind':'media_result','status':'failed','data':{'error':'synthetic_404'}},)
+    async def queue(args):
+        return ToolOutcome({'job_id':43,'status':'queued','execution_status':'queued',
+            'delivery':'background_media_result_returns_to_main'})
+    bridge.tools={'download_twitter_media':tool('download_twitter_media',queue)}
+    result=await bridge.call_tool({'name':'download_twitter_media','arguments':{},'call_id':'replacement'})
+    assert result['status']=='ok' and bridge.auto_handoff
+    handler=ModelHandler();bridge.forward(handler,{'model':bridge.model,'input':[]})
+    assert not requests
+
+
 async def test_review_download_keeps_main_conversation_in_charge(bridge_factory):
     bridge,_,_=bridge_factory(lambda *_:responses_sse(),require_reply=True)
     async def queue(args):return ToolOutcome({'job_id':42,'status':'queued',

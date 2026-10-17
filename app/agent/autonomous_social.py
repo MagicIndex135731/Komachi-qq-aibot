@@ -266,7 +266,8 @@ class AutonomousSocialExecutor:
         result = await self.run_tools(observation, guard, interactive=True, target_user_id=payload['actor_id'],
             target_message_id=message_id, direct_group_reply=True, research_result={**payload['result'],
                 'parent_task_id': payload.get('parent_task_id'), 'returned_job_id': guard.job_id})
-        return 'completed' if result.status == 'sent' else result.status if result.status in {'uncertain', 'blocked'} else 'failed'
+        return ('completed' if result.status == 'sent' or result.reason == 'background_auto_handoff'
+            else result.status if result.status in {'uncertain', 'blocked'} else 'failed')
 
     def handles_group(self, group_id):
         return self.runtime_mode == "harness" or any(j.kind == "group" and j.scope_id == group_id
@@ -301,6 +302,7 @@ class AutonomousSocialExecutor:
             return AgentActionResult('uncertain' if prior_delivery == 'uncertain' else 'silent',
                 note='prior_reply_delivery_' + prior_delivery)
         class InteractiveGuard:
+            parent = guard
             action_id = "interactive-" + str(guard.turn_id)
             trace_trigger = {'trigger_origin': 'group_message_batch', 'trigger_evidence': ingress_evidence}
             dispatched = False
@@ -325,9 +327,10 @@ class AutonomousSocialExecutor:
         foreground_timeout = (self.router.runtime.settings.agent_task_turn_timeout_seconds
             if direct else self.router.runtime.settings.group_agent_turn_timeout_seconds)
         try:
-            result = await asyncio.wait_for(self.run_tools(obs, interactive_guard, interactive=True,
+            from app.agent.media_request_policy import await_request_work
+            result = await await_request_work(self.run_tools(obs, interactive_guard, interactive=True,
                 target_user_id=event.user_id, target_message_id=event.platform_msg_id,
-                direct_group_reply=direct), timeout=max(0.1, foreground_timeout - 10))
+                direct_group_reply=direct), timeout=max(0.1, foreground_timeout - 10),guard=interactive_guard)
         except TimeoutError:
             result = ToolTurnResult("failed", reason="foreground_timeout")
         if (self.runtime_mode == "harness" and direct and result.status in {"failed", "silent"}
@@ -674,6 +677,8 @@ class AutonomousSocialExecutor:
                     cancel_background=lambda identifier: [queue.cancel_task(job.scope_id, actor_id, identifier,
                         before_commit=guard.require_valid) for queue in (self.media_jobs, self.research_jobs)],
                     task_content_budget=getattr(self.router.runtime.settings, 'agent_web_task_max_chars', 96000))
+                from app.agent.media_request_policy import bind_request_workspace
+                bind_request_workspace(guard,workspace)
                 session_scope_key = workspace.context_scope
                 prior = self.sessions.read(session_scope_key)
                 policy = RequestContextPolicy.from_settings(self.router.runtime.settings)
@@ -791,6 +796,7 @@ class AutonomousSocialExecutor:
             from app.agent.observation import GroupObservationService
             dispatch = ToolDispatchBoundary(engine=self.router.engine, account_id=self.router.runtime.settings.bot_qq,
                 scope=scope, guard=guard, clock=self.clock, max_daily=job.max_daily,
+                chat_cadence_only=job.chat_cadence_only,
                 cooldown_seconds=job.cooldown_seconds,
                 group_interjection_reserve=getattr(original_guard, 'reserve_speech', None),
                 owner_authority=owner_authority,
@@ -805,8 +811,14 @@ class AutonomousSocialExecutor:
             guard = dispatch
         group_images_allowed = job.kind == "group" and job.allow_images and self.image_service is not None
         from app.agent.research_queue import ResearchJobGuard
-        request_continuation = (isinstance(original_guard, ResearchJobGuard)
-            and original_guard.payload.get('source_id') == (current_target or {}).get('source_id'))
+        from app.agent.patrol_context import OwnerTurnGuard
+        from app.core.context_reset import ContextResetGuard
+        request_guard = original_guard
+        while isinstance(request_guard, (OwnerTurnGuard, ContextResetGuard)):
+            request_guard = request_guard.parent
+        request_continuation = (isinstance(request_guard, ResearchJobGuard)
+            and request_guard.payload.get('request_addressed') is True
+            and request_guard.payload.get('source_id') == (current_target or {}).get('source_id'))
         web_source = (owner_source if owner_command else current_target
             if interactive and (research_result is None or request_continuation) else None)
         if hasattr(original_guard, 'reserve_model'):
@@ -927,7 +939,8 @@ class AutonomousSocialExecutor:
             guard.require_valid()
             if hasattr(original_guard, 'reserve_model'):
                 return ToolOutcome({'error': 'media_requires_current_user_request'}, 'blocked')
-            if research_result and research_result.get('kind') == 'media_result' and not (
+            continuation = bool(research_result and research_result.get('kind') == 'media_result')
+            if continuation and operation == 'generate_image' and not (
                     request_continuation and workspace and workspace.formal):
                 return ToolOutcome({'error': 'media_result_cannot_resubmit'}, 'blocked')
             if operation == 'generate_image':
@@ -946,7 +959,8 @@ class AutonomousSocialExecutor:
                 'candidates': candidates or {}, 'request_addressed': bool(direct_group_reply),
                 'goal': '完成媒体操作并交付真实产物', 'model_limit': 500 if owner_authority else job.max_model_calls_daily,
                 'image_limit': job.max_image_calls_daily},
-                parent_turn='source:' + str(current_target['source_id']), before_commit=guard.require_valid)
+                parent_turn='source:' + str(current_target['source_id']), before_commit=guard.require_valid,
+                continuation=continuation)
             return result
 
         async def generate(args):
@@ -1014,6 +1028,7 @@ class AutonomousSocialExecutor:
 
         from app.agent.image_operations import image_operations
         from app.agent.social_cadence import cost_bucket
+        from app.agent.media_request_policy import unmetered_media
         generate_pixels, download_image_bytes, save_image_pixels = image_operations(
             service=self.image_service, guard=guard, runner=self.blocking, store=store,
             settings=self.router.runtime.settings, artifact_path=artifact_path,
@@ -1378,6 +1393,7 @@ class AutonomousSocialExecutor:
             before_call=lambda kind: (kind != 'model' or not hasattr(original_guard, 'reserve_model')
                 or original_guard.reserve_model()) and self.repository.reserve_cost(cost_bucket(kind, job.kind,
                 interactive=interactive and not hasattr(original_guard, 'reserve_model'), owner=bool(owner_authority)),
+                None if kind == 'model' and unmetered_media(workspace) and direct_group_reply else
                 500 if owner_authority else job.max_model_calls_daily if kind == "model" else job.max_image_calls_daily),
             blocking=self.runtime_blocking if self.runtime_mode == "harness" else self.blocking)
         if self.runtime_mode == "harness":

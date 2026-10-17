@@ -101,6 +101,10 @@ class ResearchJobGuard:
                     and row.status == self.phase and row.lease_until and row.lease_until.replace(tzinfo=UTC) > self.queue.clock()
                     and self.queue.clock().timestamp() - self.payload['created_at'] <= 7 * 86400):
                 return False
+            from app.agent.media_request_policy import unmetered_media
+            now=self.queue.clock().astimezone(UTC).replace(tzinfo=None)
+            if unmetered_media(guard=self) and row.lease_until < now+timedelta(seconds=120):
+                row.lease_until=now+timedelta(seconds=900)
         return self.valid_source(self.payload['source_id'], author=True) and self.valid_dependencies(self.snapshot())
 
     def require_valid(self):
@@ -134,6 +138,9 @@ class ResearchDelegationQueue:
     def prefix(self, scope_id=None):
         return f'research:{self.account_id}:{self.surface}:' + (f'{scope_id}:' if scope_id is not None else '')
 
+    def occupies_capacity(self, row):
+        return row.status in ACTIVE_STATES
+
     @contextmanager
     def transaction(self, before_commit=None):
         with self.engine.connect() as connection:
@@ -165,7 +172,7 @@ class ResearchDelegationQueue:
                     and item.payload_json['actor_id'] == payload['actor_id'])
                 if len(waiting) >= 512 or sum(own(item) for item in waiting) >= 128:
                     return {'status': 'blocked', 'reason': 'delegation_queue_capacity'}
-                active = [item for item in waiting if item.status in ACTIVE_STATES]
+                active = [item for item in waiting if self.occupies_capacity(item)]
                 state = 'pending' if len(active) >= 16 or sum(own(item) for item in active) >= 4 else 'queued'
                 row = Job(job_type=self.job_type, job_key=key, status=state, run_at=now,
                           max_attempts=self.max_execution_attempts, payload_json={**payload,
@@ -223,6 +230,7 @@ class ResearchDelegationQueue:
             # every read and delivery. It never creates timer authority.
             active = list(session.scalars(select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self.prefix()), Job.status.in_(ACTIVE_STATES))))
+            active = [item for item in active if self.occupies_capacity(item)]
             for pending in session.scalars(select(Job).where(Job.job_type == self.job_type,
                     Job.job_key.startswith(self.prefix()), Job.status == 'pending')
                     .order_by(Job.id).limit(512)):
@@ -235,7 +243,7 @@ class ResearchDelegationQueue:
             session.flush()
             rows = tuple(session.scalars(select(Job).where(Job.job_type == self.job_type,
                 Job.job_key.startswith(self.prefix()), Job.status.in_(('queued', 'running', 'result_ready', 'delivering')))
-                .order_by(Job.run_at, Job.id).limit(16)))
+                .order_by(Job.run_at, Job.id).limit(getattr(self, 'claim_scan_limit', 16))))
             for row in rows:
                 if row.status in {'running', 'delivering'}:
                     if row.lease_until and row.lease_until > now:
@@ -332,14 +340,16 @@ class ResearchDelegationQueue:
                         observer.event('tool.started', {'name': payload['operation'], 'call_id': 'media-execute',
                             'effect': 'image' if payload['operation'] == 'generate_image' else 'read',
                             'arguments': payload['arguments']})
-                    result = await asyncio.wait_for(self.execute(payload, guard), timeout=330)
+                    from app.agent.media_request_policy import await_request_work
+                    result = await await_request_work(self.execute(payload, guard), timeout=330,guard=guard)
                     if media:
                         observer.event('tool.completed', {'name': payload['operation'], 'call_id': 'media-execute',
                             'status': result.get('status', 'unknown'), 'data': result.get('data', {})})
                     guard.require_valid()
                     settled = self.finish(job_id, phase, status='result_ready', payload={**payload, **guard.snapshot(), 'result': result})
                 else:
-                    result = await asyncio.wait_for(self.deliver(payload, guard), timeout=650)
+                    from app.agent.media_request_policy import await_request_work
+                    result = await await_request_work(self.deliver(payload, guard), timeout=650,guard=guard)
                     guard.require_valid()
                     settled = self.finish(job_id, phase, status=result if result in {'completed', 'uncertain', 'failed', 'blocked'} else 'failed')
                 reason = 'background_result_ready' if phase == 'running' else 'background_delivery_finished'

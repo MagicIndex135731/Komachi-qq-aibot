@@ -40,6 +40,8 @@ def build_web_tools(client, *, settings, runner, guard, workspace=None) -> tuple
     turn_budget = 8000 if getattr(settings, "agent_runtime", "harness") == "legacy" else MAX_TURN_CHARS
 
     def budgets():
+        from app.agent.media_request_policy import unmetered_media
+        if unmetered_media(workspace):return float('inf'),float('inf')
         task = workspace is not None and workspace.formal and getattr(settings, 'agent_runtime', 'harness') != 'legacy'
         limit = int(getattr(settings, 'agent_web_task_max_chars', 96000)) if task else turn_budget
         return (int(getattr(settings, 'agent_web_task_max_calls', 16)) if task else MAX_CALLS,

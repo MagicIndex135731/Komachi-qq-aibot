@@ -106,7 +106,8 @@ async def test_slow_group_request_does_not_hold_later_reply(sqlite_engine):
         await runtime.stop()
 
 
-async def test_media_workers_deliver_fast_job_before_slow_job(sqlite_engine):
+@pytest.mark.parametrize('mode',[None,'auto'])
+async def test_media_workers_deliver_independent_fast_request_before_slow_request(sqlite_engine,mode):
     from app.agent.media_tasks import MediaTaskQueue
     from tests.agent.test_research_queue import fixture_queue
     release, slow_started = asyncio.Event(), asyncio.Event()
@@ -125,8 +126,18 @@ async def test_media_workers_deliver_fast_job_before_slow_job(sqlite_engine):
     queue = MediaTaskQueue(sqlite_engine, account_id=template.account_id, surface='private',
         execute=execute, deliver=deliver, authorized=lambda _:True, clock=lambda:now[0])
     for tag in ('slow','fast'):
-        data = {**payload,'tag':tag,'operation':'download_web_images','arguments':{},
-            'source_fingerprints':queue.source_fingerprints(payload['sources'])}
+        # Independent requests have independent canonical sources. Same-source
+        # review siblings intentionally wait for one joint return instead.
+        from app.storage.db import session_scope
+        from app.storage.models import Message
+        with session_scope(sqlite_engine) as session:
+            row=Message(platform_msg_id='media-request-'+tag,group_id=None,user_id=payload['actor_id'],
+                timestamp=now[0],plain_text='synthetic '+tag+' request',raw_json={})
+            session.add(row);session.flush();source=row.id
+        data = {**payload,'source_id':source,'sources':[source],'tag':tag,
+            'operation':'download_web_images','arguments':{},
+            'source_fingerprints':queue.source_fingerprints([source]),
+            **({'delivery_mode':mode} if mode else {})}
         queue.enqueue(data, parent_turn=tag, before_commit=lambda:None)
     await queue.start()
     try:

@@ -113,7 +113,8 @@ def build_twitter_account_tool(client, *, runner, guard, workspace=None, setting
                     'search_conditions','media_type_counts','missing_media_types','ranking','topic_match','requested_topic_terms',
                     'empty_reason','search_visibility'}}
                     | {'cached_in_turn':True,'context_retention':'compact_v1'},old.status)
-            if len(completed)>=(4 if search else 2):
+            from app.agent.media_request_policy import unmetered_media
+            if len(completed)>=(4 if search else 2) and not unmetered_media(workspace):
                 return ToolOutcome({'error':'twitter_timeline_turn_budget'},'blocked')
             cancelled=Event()
             def check():
@@ -196,7 +197,7 @@ def build_twitter_account_tool(client, *, runner, guard, workspace=None, setting
 
     if search:
         return AgentTool('search_x_posts',
-            '主题媒体优先用此工具跨发布者检索。semantic模式用subject_terms给人名/本地名/完整handle别名，有额外内容主题才用topic_terms给主题词，各组OR、两组AND。仅按人物找图片/视频可省略topic_terms，类型直接填media_types，不必编造主题。默认topic_match=keywords，严格主题词不足时可改review按主体召回，仍以原帖正文核对主题，不把搜索命中直接当作相关，不预览视频/动图。media_types按需求填image/video，两种都要时填两种。无日期默认不限下界/12条/latest，时间进入站内搜索再精确核验；热门用sort=top，不代表回复数最高。min_likes/min_replies/min_reposts仅用户明确数字门槛时填，禁止编造100赞等条件。未限定天数且不足可说明日期后合理扩大，明确窗口不可放宽。最多4次查询。raw仅用于用户原样查询。',
+            '主题媒体优先用此工具跨发布者检索。semantic模式用subject_terms给人名/本地名/完整handle别名，有额外内容主题才用topic_terms给主题词，各组OR、两组AND。仅按人物找图片/视频可省略topic_terms，类型直接填media_types，不必编造主题。默认topic_match=keywords，严格主题词不足时可改review按主体召回，仍以原帖正文核对主题，不把搜索命中直接当作相关，不预览视频/动图。media_types按需求填image/video，两种都要时填两种。无日期默认不限下界/12条/latest，时间进入站内搜索再精确核验；热门用sort=top，不代表回复数最高。min_likes/min_replies/min_reposts仅用户明确数字门槛时填，禁止编造100赞等条件。未限定天数且不足可说明日期后合理扩大，明确窗口不可放宽。媒体任务按实际收获继续查询。raw仅用于用户原样查询。',
             {'type':'object','properties':{
                 'subject_terms':{'type':'array','items':{'type':'string','minLength':1,'maxLength':40},'minItems':1,'maxItems':MAX_X_SUBJECT_TERMS,
                     'description':'同一内容主体的别名，包含已知完整账号名/提及，不是from发布者限制'},

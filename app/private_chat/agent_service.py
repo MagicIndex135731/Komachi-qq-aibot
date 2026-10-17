@@ -443,6 +443,10 @@ class PrivateHarnessService:
                     row = session.get(Job, job_id)
                     if not row or row.status != "running" or row.locked_by != parent._owner or row.lease_until <= parent.clock().astimezone(UTC).replace(tzinfo=None):
                         return False
+                    from app.agent.media_request_policy import unmetered_media
+                    now = parent.clock().astimezone(UTC).replace(tzinfo=None)
+                    if unmetered_media(guard=inner) and row.lease_until < now + timedelta(seconds=120):
+                        row.lease_until=now+timedelta(seconds=660)
                 return parent._valid_sources(set(known_sources) | retained_sources, user_id)
             def require_valid(inner):
                 if not inner.valid():
@@ -598,7 +602,8 @@ class PrivateHarnessService:
 
             async def submit_media(operation, args, candidates=None):
                 guard.require_valid()
-                if (payload.get('delegated_result') or {}).get('kind') == 'media_result' and not workspace.formal:
+                continuation = (payload.get('delegated_result') or {}).get('kind') == 'media_result'
+                if continuation and operation == 'generate_image' and not workspace.formal:
                     return ToolOutcome({'error': 'media_result_cannot_resubmit'}, 'blocked')
                 result = self.media_jobs.submit({'account_id': self.account_id, 'surface': 'private',
                     'scope': scope, 'scope_id': user_id, 'actor_id': user_id, 'source_id': source_id,
@@ -608,12 +613,15 @@ class PrivateHarnessService:
                     'request_budget':workspace.media_budget.reference() if getattr(workspace,'media_budget',None) else None,
                     'candidates': candidates or {}, 'request_addressed': bool(direct_private_request),
                     'private_scope': payload['private_scope'], 'goal': '完成媒体下载并交付真实产物'},
-                    parent_turn='source:' + str(source_id), before_commit=guard.require_valid)
+                    parent_turn='source:' + str(source_id), before_commit=guard.require_valid,
+                    continuation=continuation)
                 return result
 
             async def send(args):
                 from app.core.url_policy import explicitly_requests_urls, filter_reply_urls
-                raw_text = filter_reply_urls(args['text'], allow_urls=explicitly_requests_urls(event.plain_text))
+                from app.agent.request_budget import source_receipt_urls_allowed
+                raw_text = filter_reply_urls(args['text'], allow_urls=explicitly_requests_urls(event.plain_text)
+                    or source_receipt_urls_allowed(scope,source_id,args['text']))
                 if workspace.formal or payload['kind'] == 'research_result':
                     from app.core.chat_style import MODEL_THINK_BLOCK_PATTERN
                     text = MODEL_THINK_BLOCK_PATTERN.sub('', raw_text).replace('\r\n', '\n').strip()
@@ -898,7 +906,8 @@ class PrivateHarnessService:
                     nonlocal marked, dispatched
                     guard.require_valid()
                     if not marked:
-                        if not self.effects.mark_dispatching(effect_id, daily_limit=None if user_id == self.service.owner_qq else 500, before_commit=guard.require_valid):
+                        from app.agent.media_request_policy import unmetered_media
+                        if not self.effects.mark_dispatching(effect_id, daily_limit=None if user_id == self.service.owner_qq or unmetered_media(workspace) else 500, before_commit=guard.require_valid):
                             raise RuntimeError("private_tool_budget_exhausted")
                         marked, dispatched = True, True
                 current_dispatch = {"effect_id": effect_id, "dispatch": dispatch}
@@ -918,10 +927,13 @@ class PrivateHarnessService:
                 return result
 
             tools.extend(workspace.tools(guard))
+            from app.agent.media_request_policy import bind_request_workspace, unmetered_media, await_request_work
+            bind_request_workspace(guard,workspace)
             turn_timeout = getattr(self.settings, 'agent_task_turn_timeout_seconds', 600)
             delegation_budget = DelegationBudget(turn_timeout)
             reserve_cost = lambda kind: self.costs.reserve_cost(
                 ('owner:' if user_id == self.service.owner_qq else 'private:') + kind,
+                None if kind == 'model' and unmetered_media(workspace) else
                 500 if kind == 'model' or user_id == self.service.owner_qq else 10)
 
             async def delegate_research(args):
@@ -1037,8 +1049,8 @@ class PrivateHarnessService:
                 delegation_budget.start()
                 from app.agent.media_tasks import media_previews
                 result_images = media_previews(payload.get('delegated_result') or {}, store, guard, self.settings)
-                result = await asyncio.wait_for(agent.run(prompt, tuple(tools), guard,
-                    images=(*event.images, *result_images)), timeout=turn_timeout)
+                result = await await_request_work(agent.run(prompt, tuple(tools), guard,
+                    images=(*event.images, *result_images)), timeout=turn_timeout,workspace=workspace)
             guard.require_valid()
             failure_notice = None
             if output_texts:

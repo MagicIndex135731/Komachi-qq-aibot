@@ -47,7 +47,8 @@ def build_resource_tool(client, *, runner, guard, workspace=None, resolve=public
                         results.append({k: v for k, v in old.items() if k in
                             {'source_url', 'status', 'error', 'task_id', 'evidence_id'}} | {'cached_in_turn': True})
                         continue
-                    if len(completed) >= 6 or time.monotonic() >= deadline:
+                    from app.agent.media_request_policy import unmetered_media
+                    if len(completed) >= 6 and not unmetered_media(workspace) or time.monotonic() >= deadline:
                         results.append({'source_url': url, 'status': 'blocked', 'error': 'web_resource_turn_budget'})
                         continue
                     try:

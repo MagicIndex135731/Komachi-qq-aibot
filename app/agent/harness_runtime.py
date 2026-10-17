@@ -34,6 +34,7 @@ from app.agent.context_recovery import application_turn_marker
 from app.agent.conversation_context import PatrolProgress
 from app.agent.responses_continuation import ResponsesContinuation, continuation_supported, cache_identity, provider_identity
 from app.agent.model_stream import ModelStreamBudget
+from app.agent.media_request_policy import unmetered_media, await_request_work, RequestWorkTimeout
 from app.agent.runtime_trace import AgentTrace, current_trace_context, observe_with
 from app.runtime.blocking import BoundedBlockingRunner
 from app.core.time_utils import CONVERSATION_TIME_POLICY, conversation_time_context
@@ -169,7 +170,9 @@ class HarnessToolAgent:
         bridge.finalization_deadline = bridge.deadline
         bridge.deadline -= reserve
         request_budget=bridge.request_budget()
-        if request_budget:
+        if request_budget and request_budget.unmetered:
+            bridge.deadline=bridge.finalization_deadline=float('inf')
+        elif request_budget:
             try:
                 budget_end=time.monotonic()+max(0,request_budget.snapshot()['expires_at']-self.task_workspace.clock())
                 bridge.finalization_deadline=min(bridge.finalization_deadline,budget_end)
@@ -221,7 +224,9 @@ class HarnessToolAgent:
             # authority stay in isolated dsh_home; native host tools are off.
             profile="sdk-minimal", dsh_home=str(home), cwd=str(Path.cwd().resolve()),
             provider="xiaomachi-model", model=bridge.model, max_tokens=self.decision_client.max_output_tokens,
-            patches=(str(patch),), request_timeout_seconds=self.timeout_seconds,
+            # The outer policy owns ordinary turn expiry. The SDK's RPC
+            # timeout cannot be extended when a late media goal is selected.
+            patches=(str(patch),), request_timeout_seconds=None,
             # A cold runtime materializes its plugin profile before it can
             # answer initialize. Its bounded startup budget shares the turn
             # deadline instead of failing at the SDK's shorter default.
@@ -291,9 +296,8 @@ class HarnessToolAgent:
                     bridge.runtime_phase = "completed"
                     self.final_response = result.final_response
                     return result
-            run_budget = asyncio.timeout(self.timeout_seconds - reserve)
-            async with run_budget:
-                result = await self.blocking.run(execute)
+            result = await await_request_work(self.blocking.run(execute),
+                timeout=self.timeout_seconds-reserve,workspace=self.task_workspace)
             if not bridge.last_write or bridge.last_write.status != "uncertain":
                 guard.require_valid()
             reason = bridge.stop_reason or bridge.patrol_progress.finish_reason or ("model_finished" if result.finish_reason == "completed" else "runtime:" + str(result.finish_reason))
@@ -305,16 +309,19 @@ class HarnessToolAgent:
         except asyncio.CancelledError:
             bridge.revoke()
             raise
-        except TimeoutError:
-            if not run_budget.expired():
-                bridge.trace.append({"status": "runtime_error", "error": "TimeoutError", "phase": bridge.runtime_phase})
-                return bridge.result(bridge.stop_reason or "runtime_error")
+        except TimeoutError as exc:
+            if not isinstance(exc,RequestWorkTimeout):
+                bridge.trace.append({'status':'runtime_error','error':'TimeoutError','phase':bridge.runtime_phase})
+                bridge.stop_reason=bridge.stop_reason or 'runtime_error'
+                await bridge.finalize_media()
+                return bridge.result(bridge.stop_reason)
             bridge.stop_reason = bridge.stop_reason or "turn_timeout"
             await bridge.finalize_media()
             return bridge.result(bridge.stop_reason)
         except Exception as exc:
             # Expose safe diagnostics; the model never receives keys or bodies.
             bridge.trace.append({"status": "runtime_error", "error": type(exc).__name__, "phase": bridge.runtime_phase})
+            bridge.stop_reason=bridge.stop_reason or 'runtime_error'
             await bridge.finalize_media()
             return bridge.result(bridge.stop_reason or "runtime_error")
         finally:
@@ -379,7 +386,9 @@ class _Bridge:
         self.pending_model_calls = 0
         self.pending_model_tokens = 0
         self.exploration_closed = False
+        self.budget_delivery_only = False
         self.finalizer_used = False
+        self.finalized_sources = set()
         self.harness = None
         self._pending = set()
         self._seen_calls: dict[str, dict] = {}
@@ -416,6 +425,8 @@ class _Bridge:
 
     def require_valid(self):
         if self.exploration_closed:raise RuntimeError('media_exploration_closed')
+        if self.unmetered_media():
+            self.deadline=self.finalization_deadline=float('inf')
         if time.monotonic() > self.deadline:
             self.stop_reason = "turn_timeout"
             raise RuntimeError("Harness turn deadline exceeded")
@@ -426,6 +437,19 @@ class _Bridge:
     def request_budget(self):
         workspace=self.owner.task_workspace
         return getattr(workspace,'media_budget',None) if workspace else None
+
+    def unmetered_media(self):
+        return unmetered_media(self.owner.task_workspace)
+
+    def model_capacity_available(self):
+        return self.unmetered_media() or self.model_calls < self.owner.max_steps
+
+    def send_capacity_available(self):
+        return self.unmetered_media() or self.write_calls < self.owner.max_external_writes
+
+    def finalization_seconds(self):
+        # Each packet still has a transport timeout; no whole-request expiry.
+        return min(self.owner.timeout_seconds,self.finalization_deadline-time.monotonic())
 
     def admit_model_budget(self,estimated_tokens):
         budget=self.request_budget()
@@ -439,18 +463,28 @@ class _Bridge:
 
     async def finalize_media(self):
         """Recover excluded candidates, then send only existing approved files."""
-        await self.recover_excluded_media()
-        if (self.finalizer_used or not self.control or not self.control.requires_media
+        # Spend the final opportunity on existing files first. Model capacity
+        # alone need not forbid the established finite, model-free fallback
+        # when there is no file and the transfer/tool/deadline budget permits it.
+        if not (self.stop_reason and 'budget' in self.stop_reason and self.control and self.control.artifacts):
+            await self.recover_excluded_media()
+        if (self.finalizer_used or not self.control or not self.control.requires_media or self.pending_jobs
                 or self.auto_handoff or self.cancelled.is_set() or self.control.unknown
                 or self.last_write and self.last_write.status=='uncertain'):
             return
         self.finalizer_used=True
         self.exploration_closed=True
-        remaining=self.finalization_deadline-time.monotonic()
+        remaining=self.finalization_seconds()
         if remaining<=0:return
         name=self.delivery_tool()
-        identifiers=self.control.approved_artifacts()
-        if not name or not identifiers:return
+        approved=set(self.control.approved_artifacts())
+        available=set(self.control.fallback_ready_artifacts())
+        identifiers=[i for i in self.control.asset_order if i in approved|available]
+        fallback=bool(available-approved)
+        if not name:return
+        if not identifiers:
+            await self.finalize_source_receipts(name)
+            return
         # A finalizer cannot reuse expired/revoked/cross-scope authority. All
         # file, source, effect and gateway checks still execute in the send tool.
         try:
@@ -458,47 +492,115 @@ class _Bridge:
             budget=self.request_budget()
             tool=self.tools[name]
             props=tool.parameters.get('properties',{})
-            selected=[];size=0
+            from app.agent.media_delivery import plan_media_packets
+            from app.core.video_file import MAX_VIDEO_BYTES
             if 'media_artifact_ids' in props:
-                from app.core.video_file import MAX_VIDEO_BYTES
-                for identifier in identifiers:
-                    is_video=identifier in self.control.video_artifacts
-                    length=self.control.asset_details.get(identifier,{}).get('bytes') or (MAX_VIDEO_BYTES if is_video else 8*1024*1024)
-                    if selected and (len(selected)>=20 or size+length>32*1024*1024):break
-                    selected.append(identifier);size+=length
-                    if length>32*1024*1024:break
-                args={'text':f'先交付本次已筛选并校验的{len(selected)}份媒体；其余数量、类型或覆盖仍有缺口。',
-                    'media_artifact_ids':selected,'as_forward':True,'task_status':'partial'}
+                sizes=[self.control.asset_details.get(identifier,{}).get('bytes') or
+                    (MAX_VIDEO_BYTES if identifier in self.control.video_artifacts else 8*1024*1024)
+                    for identifier in identifiers]
+                packets=plan_media_packets(identifiers,sizes)
             else:
-                video=next((i for i in identifiers if i in self.control.video_artifacts),None)
                 images=[i for i in identifiers if i in self.control.image_artifacts]
-                if images:
-                    selected=images[:4]
-                    args={'text':f'先交付已筛选并校验的{len(selected)}张图片，其余仍有缺口。',
-                        'artifact_ids':selected,'as_forward':len(selected)>2,'task_status':'partial'}
-                elif video:
-                    selected=[video]
-                    args={'text':'先交付本次已筛选并校验的视频，其余仍有缺口。',
-                        'video_artifact_id':video,'task_status':'partial'}
-                else:return
-            if budget:budget.spend('writes',finalization=True)
-            if self.write_calls>=self.owner.max_external_writes or self._tool_lock.locked():return
-            self.guard.require_valid()
-            async with asyncio.timeout(remaining):
-                tool=self.tools[name]
-                if tool.authorization is not None and tool.authorization() is not True:return
-                if not validate_arguments(args,tool.parameters):return
-                result=await (self.invoke_tool(tool,args,'reserved-media-finalizer') if self.invoke_tool else tool.handler(args))
-            if result.status=='sent' and not result.receipt_id:
-                result=ToolOutcome({'error':'media_finalizer_missing_receipt'},'uncertain')
-            self.write_calls+=1
-            self.last_write=result;self.last_write_name=name
-            self.trace.append({'tool':name,'status':result.status,'receipt_id':result.receipt_id,
-                'execution_kind':'deterministic_media_finalizer','artifact_count':len(selected)})
-            self.control._last_preflight={'stage':'partial','media':True,'artifact_ids':selected}
-            self.control.observe(name,args,result,'reserved-media-finalizer')
+                video=next((i for i in identifiers if i in self.control.video_artifacts),None)
+                packets=[images[:4]] if images else [[video]] if video else []
+            for selected in packets:
+                remaining=self.finalization_seconds()
+                if remaining<=0 or not self.send_capacity_available() or self._tool_lock.locked():break
+                completed=(not fallback and self.control._content_count(self.control.delivered_artifacts|set(selected))>=self.control.minimum_media_count
+                    and set(identifiers)<=self.control.delivered_artifacts|set(selected))
+                args={'text':('本次筛选的媒体已打包。' if completed else
+                    f'先交付本次已筛选并校验的{len(selected)}份媒体；其余数量、类型或覆盖仍有缺口。'),
+                    'task_status':'completed' if completed else 'partial'}
+                if fallback:args['text']='先交付已取得的候选媒体，其中部分内容尚未逐项核实；目标仍有缺口。'
+                sources=self.control.fallback_sources(selected)
+                if 'media_artifact_ids' in props:args.update(media_artifact_ids=selected,as_forward=True)
+                elif selected[0] in self.control.video_artifacts:args['video_artifact_id']=selected[0]
+                else:args.update(artifact_ids=selected,as_forward=len(selected)>2)
+                if 'artifact_ids' in props:args.setdefault('artifact_ids',[])
+                rejected=self.control.preflight(name,args)
+                if rejected is not None and completed:
+                    args.update(task_status='partial',text=f'先交付本次已筛选的{len(selected)}份媒体，其余仍有缺口。')
+                    rejected=self.control.preflight(name,args)
+                if rejected is not None:break
+                if self.stop_reason and 'budget' in self.stop_reason:args['text']='本次处理额度已用完，'+args['text']
+                elif self.stop_reason:args['text']='本次处理遇到中断，'+args['text']
+                attached=[]
+                if fallback or self.stop_reason and 'budget' in self.stop_reason:
+                    for source in sources:
+                        if len(args['text'])+len(source)+4<=props.get('text',{}).get('maxLength',300):
+                            args['text']+='\n来源：'+source;attached.append(source)
+                if budget:budget.spend('writes',finalization=True)
+                self.guard.require_valid()
+                async with asyncio.timeout(remaining):
+                    if tool.authorization is not None and tool.authorization() is not True:break
+                    if not validate_arguments(args,tool.parameters):
+                        self.trace.append({'status':'media_finalizer_blocked','error':'invalid_delivery_arguments'})
+                        break
+                    from app.agent.request_budget import source_receipt_scope
+                    with source_receipt_scope(self.control.workspace,sources):
+                        result=await (self.invoke_tool(tool,args,'reserved-media-finalizer-'+str(self.write_calls))
+                            if self.invoke_tool else tool.handler(args))
+                if result.status=='sent' and not result.receipt_id:
+                    result=ToolOutcome({'error':'media_finalizer_missing_receipt'},'uncertain')
+                self.write_calls+=1
+                self.last_write=result;self.last_write_name=name
+                self.trace.append({'tool':name,'status':result.status,'receipt_id':result.receipt_id,
+                    'execution_kind':'deterministic_media_finalizer','artifact_count':len(selected)})
+                self.control.observe(name,args,result,'reserved-media-finalizer')
+                if result.status!='sent':break
+                self.finalized_sources.update(attached)
+            if self.last_write and self.last_write.status=='sent' and (self.stop_reason or fallback):
+                await self.finalize_source_receipts(name)
+
         except (ValueError,RuntimeError,OSError,TimeoutError) as exc:
             self.trace.append({'status':'media_finalizer_blocked','error':type(exc).__name__})
+
+    async def finalize_source_receipts(self, name):
+        """A finite budget stop retains observed posts even without a ready file."""
+        if not self.stop_reason and self.control.stage=='completed':return
+        reason=self.stop_reason or 'media_incomplete'
+        if self.last_write and self.last_write.status!='sent':return
+        sources=[url for url in self.control.fallback_sources() if url not in self.finalized_sources]
+        if not sources or not self.send_capacity_available():return
+        tool=self.tools[name];props=tool.parameters.get('properties',{})
+        limit=props.get('text',{}).get('maxLength',300)
+        caption=('本次处理额度已用完' if 'budget' in reason else '本次处理遇到中断' if self.stop_reason else '本次媒体尚未取齐')+'，媒体尚未完成；以下是已找到、尚未逐项核实的候选帖子来源：'
+        packets=[];attached=[];text=caption
+        for source in sources:
+            if len(caption)+len(source)+1>limit:
+                self.trace.append({'status':'source_finalizer_blocked','error':'source_exceeds_message_size'})
+                continue
+            if len(text)+len(source)+1>limit:
+                packets.append((text,attached));text=caption;attached=[]
+            text+='\n'+source;attached.append(source)
+        if attached:packets.append((text,attached))
+        try:
+            self.guard.require_valid()
+            self.control.failures.append({'code':reason,'category':'capacity','retryable':False})
+            for index,(text,attached) in enumerate(packets):
+                if not self.send_capacity_available():break
+                args={'text':text,'task_status':'partial'}
+                if 'artifact_ids' in props:args['artifact_ids']=[]
+                if self.control.preflight(name,args) is not None or not validate_arguments(args,tool.parameters):return
+                if tool.authorization is not None and tool.authorization() is not True:return
+                budget=self.request_budget()
+                if budget:budget.spend('writes',finalization=True)
+                remaining=self.finalization_seconds()
+                if remaining<=0:return
+                self.guard.require_valid()
+                from app.agent.request_budget import source_receipt_scope
+                call_id='reserved-source-finalizer-'+str(index)
+                with source_receipt_scope(self.control.workspace,attached):
+                    async with asyncio.timeout(remaining):
+                        result=await (self.invoke_tool(tool,args,call_id) if self.invoke_tool else tool.handler(args))
+                if result.status=='sent' and not result.receipt_id:result=ToolOutcome({'error':'source_receipt_missing'},'uncertain')
+                self.write_calls+=1;self.last_write=result;self.last_write_name=name
+                self.control.observe(name,args,result,call_id)
+                self.trace.append({'tool':name,'status':result.status,'execution_kind':'deterministic_source_finalizer'})
+                if result.status!='sent':break
+                self.finalized_sources.update(attached)
+        except (ValueError,RuntimeError,OSError,TimeoutError) as exc:
+            self.trace.append({'status':'source_finalizer_blocked','error':type(exc).__name__})
 
     async def recover_excluded_media(self):
         """Queue a bounded local download when model exclusions left no media."""
@@ -620,7 +722,7 @@ class _Bridge:
             and not self.auto_handoff
             and not self.write_calls and not self.image_calls and not self.last_write
             and not self.stop_reason and not self.cancelled.is_set()
-            and self.model_calls < self.owner.max_steps and self.deadline - time.monotonic() >= 5.0)
+            and self.model_capacity_available() and self.deadline - time.monotonic() >= 5.0)
 
     def task_state(self):
         workspace = self.owner.task_workspace
@@ -649,7 +751,7 @@ class _Bridge:
             and (gaps or state.get('status') == 'active') and not self.task_recovery
             and 'unknown_external_effect' not in gaps and 'task_dependency_unavailable' not in gaps
             and not self.stop_reason and not self.cancelled.is_set()
-            and self.model_calls < self.owner.max_steps and self.deadline - time.monotonic() >= 5.0)
+            and self.model_capacity_available() and self.deadline - time.monotonic() >= 5.0)
 
     def delivery_complete(self):
         if self.auto_handoff:return True
@@ -692,7 +794,7 @@ class _Bridge:
         """At most one diagnostic, reserved from the same turn/global budget."""
         self.require_valid()
         seconds = min(20.0, self.deadline - time.monotonic() - 5.0)
-        if seconds < 5 or self.model_calls >= self.owner.max_steps - 1:
+        if seconds < 5 or not self.unmetered_media() and self.model_calls >= self.owner.max_steps - 1:
             return {'error': 'task_review_budget_unavailable'}
         if self.owner.before_call and not self.owner.before_call('model'):
             return {'error': 'task_review_daily_budget'}
@@ -735,8 +837,8 @@ class _Bridge:
 
     def delivery_due(self):
         return (self.owner.require_reply and not (self.last_write and self.last_write.status in {"sent", "uncertain"})
-            and (self.delivery_recovery or self.memory_reads >= self.owner.max_memory_reads
-                or self.model_calls >= self.owner.max_steps
+            and (self.budget_delivery_only or self.delivery_recovery or not self.unmetered_media() and self.memory_reads >= self.owner.max_memory_reads
+                or not self.model_capacity_available()
                 or self.deadline - time.monotonic() <= min(45.0, self.owner.timeout_seconds / 3)))
 
     def result(self, reason):
@@ -762,8 +864,8 @@ class _Bridge:
             self.observer.finish('silent','background_auto_handoff')
             return ToolTurnResult('silent',reason='background_auto_handoff',trace=tuple(self.trace),task_status=task_state)
         status = ("failed" if reason in {"model_request_timeout", "model_first_output_timeout", "model_progress_timeout", "model_stream_incomplete", "model_stream_buffer_exceeded", "turn_timeout", "model_provider_failed", "model_input_rejected", "model_image_input_rejected", "required_reply_not_delivered", 'context_capacity_exhausted'}
-                  else "blocked" if self.stop_reason else
-                  "failed" if reason.startswith(("runtime:", "runtime_error")) else "silent")
+                  else "failed" if reason.startswith(("runtime:", "runtime_error")) else
+                  "blocked" if self.stop_reason else "silent")
         self.observer.finish(status, reason)
         return ToolTurnResult(status, reason=reason, trace=tuple(self.trace), task_status=task_state)
 
@@ -958,6 +1060,11 @@ class _Bridge:
                 return early
             args_adjusted = False
             if self.control is not None:
+                if self.budget_delivery_only and name in {'search_web','search_x_posts','search_xhs_posts','list_x_posts',
+                        'inspect_web_resources','list_web_images','download_web_image','download_web_images',
+                        'download_web_video','download_twitter_media','queue_media_batch'}:
+                    return {'status':'blocked','data':{'error':'request_budget_delivery_only','handler_executed':False,
+                        'guidance':'剩余额度只保留交付，停止新搜索和重复读取；从现有产物或帖子证据筛选并发送，未核实项如实partial。'}}
                 prepared = self.control.prepare_tool_arguments(name, args)
                 args_adjusted = prepared.get('delivery_mode') != args.get('delivery_mode') or (
                     name=='queue_media_batch' and any(
@@ -980,7 +1087,7 @@ class _Bridge:
                         rejected.data['review'] = await self.review_task(self.control, args.get('text', ''))
                         self.control._persist()
                     return {'status': rejected.status, 'data': rejected.data}
-                if name == 'search_web' and self.control.method_progress.get(name,{}).get('no_gain',0) >= 3:
+                if name == 'search_web' and not self.unmetered_media() and self.control.method_progress.get(name,{}).get('no_gain',0) >= 3:
                     return {'status': 'blocked', 'data': {'error': 'strategy_change_required',
                         'guidance': '连续查询没有新增目标证据；换用已知资源/其他获准能力，或如实partial/blocked，勿继续改词搜索。'}}
             if name in _MEMORY_READ_TOOLS and self.owner.require_reply:
@@ -993,7 +1100,7 @@ class _Bridge:
             if self.delivery_recovery and (name != self.delivery_tool() or self.write_calls):
                 return {"status": "blocked", "data": {"error": "delivery_recovery_only",
                     "next_action": "Deliver once with the current send tool, then finish."}}
-            if tool.effect == "write" and self.write_calls >= (self.owner.max_external_writes -
+            if tool.effect == "write" and not (self.unmetered_media() and name == self.delivery_tool()) and self.write_calls >= (self.owner.max_external_writes -
                     (1 if self.control and self.control.requires_media and not (args.get('artifact_ids') or
                         args.get('media_artifact_ids') or args.get('video_artifact_id')) else 0)):
                 # Keep attempts bounded, but don't make a confirmed rejection
@@ -1039,6 +1146,19 @@ class _Bridge:
                     and all(isinstance(entry,dict) and type(entry.get('job_id')) is int
                         and entry['job_id']>0 and entry.get('delivery')=='automatic_delivery_to_original_request'
                         for entry in entries))
+            # A verified media return can queue a new, source-checked download.
+            # End this model turn after all native tool results are saved; the
+            # next aggregated return owns completion, not another poll loop.
+            accepted_review=(self.owner.require_reply and outcome.status=='ok' and auto_download
+                and any(isinstance(value,dict) and value.get('kind')=='media_result'
+                    for value in self.owner.initial_evidence)
+                and (name!='queue_media_batch' or outcome.data.get('all_accepted') is True)
+                and not outcome.data.get('failures') and entries
+                and all(isinstance(entry,dict) and type(entry.get('job_id')) is int
+                    and entry['job_id']>0 and entry.get('delivery')=='background_media_result_returns_to_main'
+                    and entry.get('execution_status',entry.get('status')) in {'pending','queued','running'}
+                    for entry in entries))
+            accepted_auto = accepted_auto or accepted_review
             if accepted_auto:self.auto_delivery_jobs.update(entry['job_id'] for entry in entries)
             elif self.auto_delivery_jobs and auto_download:self.auto_handoff_failed=True
             self.auto_handoff=bool(self.auto_delivery_jobs) and not self.auto_handoff_failed and (
@@ -1146,12 +1266,19 @@ class _Bridge:
         projection_metrics['context_history_estimated_tokens'] = estimate_request_tokens({
             'input': body.get('input', body.get('messages', []))})
         estimated_tokens=estimate_request_tokens(body)+self.owner.decision_client.max_output_tokens
+        request_budget=self.request_budget()
+        if request_budget and not request_budget.unmetered and self.control and self.control.artifacts:
+            try:
+                snapshot=request_budget.snapshot()
+                if request_budget.remaining_for('estimated_tokens',snapshot)<2*estimated_tokens:
+                    self.budget_delivery_only=True
+            except ValueError:self.budget_delivery_only=True
         with self._count_lock:
             if compaction:
-                if self.compaction_calls >= 2:
+                if not self.unmetered_media() and self.compaction_calls >= 2:
                     return handler.reply(429, {'error': {'message': 'compaction_budget_exhausted'}})
                 self.compaction_calls += 1
-            elif self.model_calls >= self.owner.max_steps:
+            elif not self.model_capacity_available():
                 self.stop_reason = "model_budget_exhausted"
                 return handler.reply(429, {"error": {"message": "model_budget_exhausted"}})
             else:

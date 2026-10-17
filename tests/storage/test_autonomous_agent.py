@@ -92,10 +92,17 @@ def test_zero_budget_and_upper_limit_boundary_are_enforced(sqlite_engine):
     assert repo.reserve_cost("model", 500)
 
 
-@pytest.mark.parametrize("limit", [True, False, -1, 501, 1.5, "2", None])
+@pytest.mark.parametrize("limit", [True, False, -1, 501, 1.5, "2"])
 def test_cost_limit_rejects_boolean_noninteger_and_out_of_range_values(sqlite_engine, limit):
     with pytest.raises(ValueError):
         repository(sqlite_engine).reserve_cost("model", limit)
+    with session_scope(sqlite_engine) as session:
+        assert list(session.scalars(select(AutonomousUsage))) == []
+
+
+def test_unmetered_limit_does_not_authorize_images_or_profile_writes(sqlite_engine):
+    for kind in ('image','profile:nickname','profile:avatar'):
+        with pytest.raises(ValueError):repository(sqlite_engine).reserve_cost(kind,None)
     with session_scope(sqlite_engine) as session:
         assert list(session.scalars(select(AutonomousUsage))) == []
 

@@ -1312,7 +1312,8 @@ class MessageRepository:
                           exclude_owner_user_id: int | None = None) -> datetime | None:
         stmt = (
             select(Message)
-            .where(Message.group_id == group_id, Message.user_id == bot_user_id)
+            .where(Message.group_id == group_id, Message.user_id == bot_user_id,
+                   func.coalesce(func.json_extract(Message.raw_json, '$.delivery_state'), '') != 'deleted')
             .order_by(Message.timestamp.desc(), Message.id.desc())
         )
         if exclude_owner_user_id is not None:

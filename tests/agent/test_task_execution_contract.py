@@ -81,12 +81,18 @@ def test_worker_and_model_checkpoint_updates_do_not_lose_pending_work(tmp_path):
 
 @pytest.mark.asyncio
 async def test_batch_exceeds_concurrency_capacity_then_restart_drains_in_order_without_model(sqlite_engine):
+    from app.agent.media_tasks import media_result
     delivered = []
+    async def execute(payload, guard):
+        guard.require_valid()
+        ref=payload['arguments']['ref_id'];identifier='art-'+ref.rsplit('/',1)[-1]
+        return media_result(ToolOutcome({'media_artifact_ids':[identifier],
+            'media':[{'artifact_id':identifier,'source_ref':ref,'kind':'video','bytes':100}]}),payload)
     async def deliver(payload, guard):
         guard.require_valid()
-        delivered.append(payload['arguments']['ref_id'])
+        delivered.extend(item['source_ref'] for item in payload['result']['data']['media'])
         return 'completed'
-    queue, payload, now = setup_queue(sqlite_engine, deliver=deliver)
+    queue, payload, now = setup_queue(sqlite_engine, execute=execute, deliver=deliver)
     async def submit(args):
         return queue.submit({**payload, 'arguments': args}, parent_turn='same-request', before_commit=lambda: None)
     offered = AgentTool('download_web_video', 'download', {'type': 'object', 'properties': {
@@ -102,7 +108,8 @@ async def test_batch_exceeds_concurrency_capacity_then_restart_drains_in_order_w
     assert [item['job_id'] for item in duplicate.data['jobs']] == [item['job_id'] for item in result.data['jobs']]
     # Recreate only the worker, keeping its SQLite ledger and source authority.
     queue.owner = 'restarted-worker'
-    for _ in range(18):
+    # Nine executions followed by one source-bound review return.
+    for _ in range(10):
         assert await queue.tick()
     assert not await queue.tick()
     assert delivered == ['https://example.com/video/' + str(index) for index in range(9)]

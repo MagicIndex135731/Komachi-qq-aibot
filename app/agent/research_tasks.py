@@ -120,7 +120,7 @@ class ResearchTaskWorkspace:
     def _load(self, path):
         if not path.is_file():
             return None
-        if path.stat().st_size > 256 * 1024:
+        if path.stat().st_size > 256 * 1024 and not getattr(getattr(self,'media_budget',None),'_unmetered',False):
             raise ValueError('task_record_too_large')
         data = json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(data, dict):
@@ -130,7 +130,7 @@ class ResearchTaskWorkspace:
     def _write(self, path, data):
         self._check(data)
         encoded = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        if len(encoded.encode('utf-8')) > 256 * 1024:
+        if len(encoded.encode('utf-8')) > 256 * 1024 and not getattr(getattr(self,'media_budget',None),'_unmetered',False):
             raise ValueError('task_record_too_large')
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + '.' + uuid4().hex + '.tmp')
@@ -268,12 +268,16 @@ class ResearchTaskWorkspace:
         # scope. Formal checkpoints and queued jobs own durable continuation;
         # ordinary chat must not create an ever-growing directory per message.
         self._write(self.root/'request-goal.json',data)
+        if getattr(self, 'media_budget', None) is not None:
+            # Parallel requests in one conversation must not replace each
+            # other's pending media selection. Reuse the existing budget home.
+            self._write(self._file('media-goal.json'), data)
         self.request_control = dict(control)
 
     @serialized_checkpoint
     def media_selection_for_source(self):
         """Resume source-checked candidates and goal, never old artifact authority."""
-        data=self._load(self.root/'request-goal.json')
+        data=self._load(self._file('media-goal.json')) or self._load(self.root/'request-goal.json')
         if not data or data.get('source_id')!=self.source_id or data.get('task_id')!=self.task_id:
             return {}
         self._check(data)
@@ -430,7 +434,8 @@ class ResearchTaskWorkspace:
         state['updated_at'] = self.clock()
         entries = state.get('evidence', [])
         if ref not in {item['evidence_id'] for item in entries}:
-            if len(entries) >= 128:
+            from app.agent.media_request_policy import unmetered_media
+            if len(entries) >= 128 and not unmetered_media(self):
                 raise ValueError('task_evidence_budget_exhausted')
             entries.append({'evidence_id': ref, 'sources': [s.get('source') for s in data.get('sources', [])
                             if isinstance(s, dict)], 'content_chars': len(data.get('content', '')),
@@ -495,7 +500,8 @@ class ResearchTaskWorkspace:
                 elif kind == 'resources':
                     data = self.resource_page(**args)
                 else:
-                    remaining = (self.task_content_budget if self.formal else 48000) - self.archived_read_chars - self.web_result_chars
+                    from app.agent.media_request_policy import unmetered_media
+                    remaining = 34000 if unmetered_media(self) else (self.task_content_budget if self.formal else 48000) - self.archived_read_chars - self.web_result_chars
                     if remaining < 2000:
                         return ToolOutcome({'error': 'task_content_budget_exhausted',
                             'guidance': '本轮原文预算已用完；保存覆盖、缺口和下一步，按已有证据交付阶段结果。'}, 'blocked')

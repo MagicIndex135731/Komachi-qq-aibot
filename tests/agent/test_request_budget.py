@@ -26,7 +26,7 @@ def test_same_request_budget_survives_wakes_and_reserves_last_send(tmp_path):
 
 def test_expired_or_revoked_budget_never_becomes_a_new_budget(tmp_path):
     clock=[1000];valid=[True]
-    w=workspace(tmp_path,clock=lambda:clock[0],valid=lambda _:valid[0]);budget=RequestBudget(w)
+    w=workspace(tmp_path,clock=lambda:clock[0],valid=lambda _:valid[0]);budget=RequestBudget(w,limits={})
     clock[0]+=601
     with pytest.raises(ValueError):RequestBudget(w).spend('model_calls')
     valid[0]=False
@@ -34,7 +34,7 @@ def test_expired_or_revoked_budget_never_becomes_a_new_budget(tmp_path):
 
 
 @pytest.mark.parametrize('state',['ready','unreviewed','revoked','uncertain','cancelled','expired'])
-async def test_model_zero_finalizer_only_sends_current_approved_ready(bridge_factory,tmp_path,state):
+async def test_model_zero_finalizer_keeps_ready_partials_and_authority_fences(bridge_factory,tmp_path,state):
     import time
     bridge,requests,_=bridge_factory(lambda *_:responses_sse(),require_reply=True)
     w=workspace(tmp_path);bridge.owner.task_workspace=w
@@ -57,10 +57,11 @@ async def test_model_zero_finalizer_only_sends_current_approved_ready(bridge_fac
     if state=='cancelled':bridge.cancelled.set()
     if state=='expired':bridge.finalization_deadline=time.monotonic()-1
     await bridge.finalize_media()
-    assert len(sends)==(1 if state=='ready' else 0) and not requests
+    assert len(sends)==(1 if state in {'ready','unreviewed'} else 0) and not requests
     if sends:
         assert sends[0]['artifact_ids']==['art-a'] and sends[0]['task_status']=='partial'
         assert bridge.control.stage=='partial' and bridge.control.minimum_media_count==2
+        if state=='unreviewed':assert '尚未逐项核实' in sends[0]['text']
 
 
 def test_reviews_and_compaction_are_each_one_admission_without_losing_prior_calls(bridge_factory,tmp_path):

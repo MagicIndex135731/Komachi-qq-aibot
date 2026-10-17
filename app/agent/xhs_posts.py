@@ -26,7 +26,8 @@ def build_xhs_search_tool(*, runner, guard, workspace=None):
                 old=completed[key]
                 return ToolOutcome({k:v for k,v in old.data.items() if k in
                     {'error','guidance','task_id', 'evidence_id', 'sources', 'coverage', 'visible_posts'}} | {'cached_in_turn': True},old.status)
-            if attempts >= 4:return ToolOutcome({'error': 'xhs_search_turn_budget'}, 'blocked')
+            from app.agent.media_request_policy import unmetered_media
+            if attempts >= 4 and not unmetered_media(workspace):return ToolOutcome({'error': 'xhs_search_turn_budget'}, 'blocked')
             attempts += 1
             try:
                 data = await runner.run(client.search_posts, args['query'], limit=args.get('limit', 6),
@@ -56,7 +57,7 @@ def build_xhs_search_tool(*, runner, guard, workspace=None):
             return ToolOutcome(result)
 
     return AgentTool('search_xhs_posts',
-        '小红书站内找公开笔记，容器内复用人工登录态。query填主体与同主题关键词，不能擅自限定本人发布；最多12条可见候选，日期和附件须再inspect_web_resources核验。最多4次搜索；正文优先筛选，不默认看图或预览视频。',
+        '小红书站内找公开笔记，容器内复用人工登录态。query填主体与同主题关键词，不能擅自限定本人发布；单次最多12条可见候选，日期和附件须再inspect_web_resources核验。媒体任务按实际目标选择搜索次数，正文优先筛选，不默认看图或预览视频。',
         {'type': 'object', 'properties': {
             'query': {'type': 'string', 'minLength': 1, 'maxLength': 120},
             'limit': {'type': 'integer', 'minimum': 1, 'maximum': 12},

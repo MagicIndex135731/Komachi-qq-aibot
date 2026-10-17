@@ -73,7 +73,11 @@ async def test_fallback_preserves_admission_and_never_repeats_media(bridge_facto
     if state == 'cancelled': bridge.cancelled.set()
     if state == 'revoked': bridge.guard.require_valid = lambda: (_ for _ in ()).throw(RuntimeError('revoked'))
     if state == 'expired': bridge.finalization_deadline = time.monotonic() - 1
-    if state == 'budget': c.workspace.media_budget.spend('tool_calls', 64)
+    if state == 'budget':
+        from app.agent.request_budget import RequestBudget
+        c.workspace.media_budget.path.unlink()
+        c.workspace.media_budget=RequestBudget(c.workspace,limits={})
+        c.workspace.media_budget.spend('tool_calls',64)
     await bridge.finalize_media()
     assert not calls and not requests
 

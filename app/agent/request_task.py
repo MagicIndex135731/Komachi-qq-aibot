@@ -34,6 +34,8 @@ _ARTIFACT_TOOLS={'download_web_image','download_web_images','download_web_video'
 _DOWNLOAD_TOOLS={'download_twitter_media','download_web_images','download_web_video'}
 _REQUIREMENTS={'source_evidence','primary_source','media_delivery'}
 TASK_POLICY=(
+    '用户媒体搜集不设累计token、模型轮数、工具次数、下载总量、发送次数或整单时间额度；按实际目标与收获自主选择何时交付。'
+    '单次网络超时、真实上游限流、文件/缓存容量及QQ发送包约束仍有效；避免重复空搜，已有成果可分批partial交付再继续搜集，不能因一次失败丢弃已取得文件。'
     '当前请求目标始终有轻量记录，不必先建正式研究任务。按用户目标选择工具，工具ok不等于完成目标。'
     '需要时用set_task_goal描述语义目标/交付条件；不扩权限或另开执行。'
     '媒体目标分别理解内容主体、发布者限制、日期、数量和类型；关于某人不等于仅限本人发帖，只有用户限定发布者时才限制来源。'
@@ -55,12 +57,12 @@ TASK_POLICY=(
     '历史回复里“不能下载/没有工具”等口头断言不代表当前能力；以本轮工具目录、权限和实际执行结果为准，不能直接沿用旧拒绝。'
     '跨轮证据使用原结果task_id加evidence_id读取，不切换当前目标；本地证据定位失败后按当前请求恢复读取或搜索来源，不能当成网站下载失败。'
     '新闻报道日期、搜索收录日期和原帖发布日期是不同事实；下载最新或指定日期的帖子须核对原帖，缺证据时说明日期未核实。'
-    '媒体请求可用search_web发现实际来源页内的原帖链接，站点条件限制最终媒体来源而非发现方法；站内无成果时按预算切换跨发布者、独立高精度handle或WebSearch，不机械遍历全部工具。优先source/ref_id，不使用生成摘要猜出的链接。'
+    '媒体请求可用search_web发现实际来源页内的原帖链接，站点条件限制最终媒体来源而非发现方法；站内无成果时按实际收获切换跨发布者、独立高精度handle或WebSearch，不机械遍历全部工具。优先source/ref_id，不使用生成摘要猜出的链接。'
     '一个报道404或一次页面未找到关键词只说明该次定位失败，不证明用户必须亲自提供链接。'
     '工具反馈的missing/no_progress用于调整方法；反复没有新证据时换策略，必要时review_task_progress最多一次短复核。'
     'send_group/send_private可标task_status=progress/partial/blocked/completed：进展提示与诚实受阻可以发送，'
-    '后台承诺须有真实pending_jobs；本地校验拦截不代表已排队。已有合格媒体可先partial交付，仍有预算和候选继续找；首次发送不等于请求完成。'
-    '按原帖正文/日期/类型确认合格后，用candidate_reviews标selected并记录依据，随后下载；这使程序在模型预算耗尽时能交付已有合格文件。未评估候选和未知回执不进入自动收尾。图片视频完成须本请求实际产物及真实回执；无依据不要宣称已完成或做不到。'
+    '后台承诺须有真实pending_jobs；本地校验拦截不代表已排队。已有合格媒体可先partial交付，仍有候选可继续找；首次发送不等于请求完成。'
+    '按原帖正文/日期/类型确认合格后，用candidate_reviews标selected并记录依据，随后下载；遇上游失败时程序也会独立交付已有有效文件。未逐项核实的可信下载只能标候选partial，未知回执不得重放。图片视频完成须本请求实际产物及真实回执；无依据不要宣称已完成或做不到。'
     '未知写入不重试，硬权限不绕过；有界尝试仍缺条件时说明具体尝试、缺口和下一步。')
 
 
@@ -88,6 +90,7 @@ class RequestTaskControl:
         self.artifacts=set()
         self.artifact_sources={}
         self.delivery_approved=set()
+        self.download_ready_artifacts=set()
         self.asset_details={}
         self.asset_order=[]
         self.logical_media={}
@@ -549,7 +552,7 @@ class RequestTaskControl:
                 +('已有本轮可下载的原帖或媒体候选，先用对应下载工具核验；不能略过后要求用户代找链接。'
                   '若候选实际不符，用set_task_goal.media_selection.candidate_reviews逐项记录ref_id和排除原因后如实partial；不得下载无关内容凑数。'
                   if 'discovered_media_not_attempted' in missing else '')
-                +('纠偏预算已到建议上限，避免重复搜索，按已有实际尝试报告缺口。' if self.corrections>=2 else '')},'blocked')
+                +('连续校验失败，核对具体缺口并调整方法，优先复用已有证据或其他候选。' if self.corrections>=2 else '')},'blocked')
 
     def observe(self,name,args,outcome,call_id):
         # Other goals are inferred by the main model. Once it actually starts
@@ -636,6 +639,10 @@ class RequestTaskControl:
                 artifact_data=result.get('data',{}) if isinstance(result,dict) else {}
             if name in _ARTIFACT_TOOLS or name=='media_task_status':
                 requested=artifact_data.get('requested_count')
+                if artifact_data.get('request_aggregated') and self.topic_selection:
+                    # Failed topic candidates are replaceable; the original
+                    # user quantity remains the floor after a replacement.
+                    requested=artifact_data.get('downloaded_count',requested)
                 if type(requested) is int and requested>0:
                     self.expected_artifacts=max(self.expected_artifacts,min(requested,20))
                 identifiers=[]
@@ -653,19 +660,26 @@ class RequestTaskControl:
                             identifiers.append(item['artifact_id'])
                 if name=='read_artifact' and outcome.images and args.get('artifact_id'):
                     identifiers.append(args['artifact_id'])
-                for identifier in identifiers[:20]:
+                from app.agent.media_request_policy import unmetered_media
+                retained=identifiers if unmetered_media(self.workspace) else identifiers[:320]
+                for identifier in retained:
                     if identifier not in self.asset_order:self.asset_order.append(identifier)
-                self.artifacts.update(identifiers[:20])
+                self.artifacts.update(retained)
+                if name in _DOWNLOAD_TOOLS|{'download_web_image','media_result'}:
+                    self.download_ready_artifacts.update(retained)
                 self.video_artifacts.update(artifact_data.get('video_artifact_ids',[]))
                 if artifact_data.get('video_artifact_id'):self.video_artifacts.add(artifact_data['video_artifact_id'])
                 source=artifact_data.get('page_url') or artifact_data.get('source_url')
                 if source:
+                    self.resource_urls.add(source)
                     for identifier in identifiers:self.artifact_sources[identifier]=self._resource_key(source)
                 for item in artifact_data.get('media',[]):
                     if isinstance(item,dict) and item.get('artifact_id'):
                         identifier=item['artifact_id']
                         self.asset_details[identifier]={k:item[k] for k in ('kind','bytes','quality','image_size') if k in item}
-                        if item.get('source_ref'):self.artifact_sources[identifier]=self._resource_key(item['source_ref'])
+                        if item.get('source_ref'):
+                            self.resource_urls.add(item['source_ref'])
+                            self.artifact_sources[identifier]=self._resource_key(item['source_ref'])
                         self._observe_media_identity(identifier,item.get('logical_media_id'),item.get('sha256'))
                 if len(set(identifiers))==1:
                     self.asset_details.setdefault(identifiers[0],{}).update({k:artifact_data[k] for k in ('bytes','quality','width','height') if k in artifact_data})
@@ -689,7 +703,7 @@ class RequestTaskControl:
                         self.content_groups[identifier]=self.content_groups.get(group,group)
                         self._observed_photos[identifier]=thumbnail
                 if identifiers:self.kinds.add('media_artifacts')
-            entries=data.get('jobs',[]) if name=='queue_media_batch' else [data]
+            entries=data.get('jobs',[]) if name in {'queue_media_batch','media_result'} and data.get('jobs') else [data]
             for entry in entries:
                 if isinstance(entry,dict) and type(entry.get('job_id')) is int:
                     self.jobs[entry['job_id']]=entry.get('execution_status',entry.get('status'))
@@ -763,6 +777,43 @@ class RequestTaskControl:
                 approved.append(identifier)
         return approved
 
+    def fallback_sources(self, identifiers=None):
+        """Observed source receipts only, respecting every original hard filter."""
+        if self.unknown:return []
+        result=[]
+        wanted={self.artifact_sources.get(i) for i in identifiers} if identifiers is not None else None
+        for post,row in self.post_metadata.items():
+            url=row['url'];key=self._resource_key(url)
+            if wanted is not None and key not in wanted:continue
+            if (not self._source_constraints(url) and self.candidate_reviews.get(key,{}).get('decision')!='excluded'
+                    and (self.publication_filter['provenance']!='explicit_user' or self._check_publication(post) is None)):
+                result.append(url)
+        for url in sorted(self.resource_urls):
+            key=self._resource_key(url)
+            if wanted is not None and key not in wanted:continue
+            if (not resource_ready(url) or self._source_constraints(url)
+                    or self.candidate_reviews.get(key,{}).get('decision')=='excluded'):continue
+            if self.publication_filter['provenance']=='explicit_user':
+                post=next((pid for pid,row in self.post_metadata.items() if self._resource_key(row['url'])==key),None)
+                if self._check_publication(post) is not None:continue
+            result.append(url)
+        return list(dict.fromkeys(result))
+
+    def fallback_ready_artifacts(self):
+        """Keep deliberately fetched files usable as explicitly unreviewed partials."""
+        if self.unknown:return []
+        result=[]
+        for identifier in self.asset_order:
+            if identifier not in self.download_ready_artifacts or identifier in self.delivered_artifacts:continue
+            source=self.artifact_sources.get(identifier)
+            if (not source or self._source_constraints(source)
+                    or self.candidate_reviews.get(source,{}).get('decision')=='excluded'):continue
+            if self.publication_filter['provenance']=='explicit_user':
+                post=next((pid for pid,row in self.post_metadata.items() if self._resource_key(row['url'])==source),None)
+                if self._check_publication(post) is not None:continue
+            result.append(identifier)
+        return result
+
     def excluded_media_sources(self):
         """Current unattempted candidates when terminal model selection is zero."""
         if (not self.requires_media or self.unknown or self.artifacts or self.delivered_artifacts
@@ -779,12 +830,16 @@ class RequestTaskControl:
         return [url for url in urls if not self._source_constraints(url)][:12]
 
     def _persist(self):
-        resources=list(self.post_metadata.values())[-32:]
+        from app.agent.media_request_policy import unmetered_media
+        unmetered=unmetered_media(self.workspace)
+        resources=list(self.post_metadata.values())
+        if not unmetered:resources=resources[-32:]
         known={r['url'] for r in resources}
-        resources+=[{'kind':'web_url','url':url} for url in sorted(self.resource_urls-known)][:(32-len(resources))]
-        candidates={'resources':resources,'source_refs':dict(list(self.source_refs.items())[-32:]),
-            'attempted_resources':sorted(self.attempted_resources)[-32:],
-            'candidate_reviews':dict(list(self.candidate_reviews.items())[-32:]),
+        additional=[{'kind':'web_url','url':url} for url in sorted(self.resource_urls-known)]
+        resources+=additional if unmetered else additional[:max(0,32-len(resources))]
+        candidates={'resources':resources,'source_refs':dict(self.source_refs) if unmetered else dict(list(self.source_refs.items())[-32:]),
+            'attempted_resources':sorted(self.attempted_resources) if unmetered else sorted(self.attempted_resources)[-32:],
+            'candidate_reviews':dict(self.candidate_reviews) if unmetered else dict(list(self.candidate_reviews.items())[-32:]),
             'discovery_attempts':self.discovery_attempts}
         self.workspace.save_request_control({'goal':self.goal,'active':self.active,**self.state(),'failures':self.failures,
             'calls':self.calls,'last_delivery':self.last_delivery,'candidate_evidence':candidates,
