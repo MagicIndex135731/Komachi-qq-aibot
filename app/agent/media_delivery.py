@@ -130,9 +130,12 @@ async def _send_bundle_once(repository: AgentToolEffectRepository, *, scope: str
     canonical_scope = canonical_delivery_scope(scope)
     scope_hash = sha256(canonical_scope.encode()).hexdigest()
     digest = sha256(json.dumps([source_id, sorted(set(identifiers))], separators=(',', ':')).encode()).hexdigest()
+    # Sibling assets may arrive while this bundle is still awaiting a receipt.
+    # The version must exist in the reservation transaction, not only at finish.
+    claim_metadata = {'asset_claim_version': 2, 'artifact_ids': identifiers}
     record = repository.reserve('media-delivery:' + scope_hash,
         run_id=f'media-source:{scope_hash}:{source_id}', tool_call_id=operation + ':' + digest,
-        operation='media_delivery_once', payload_hash=digest, sources=(source_id,))
+        operation='media_delivery_once', payload_hash=digest, sources=(source_id,), initial_receipt=claim_metadata)
     if not record['fresh']:
         receipt = record.get('receipt') or {}
         receipt_id = receipt.get('receipt_id') if isinstance(receipt, dict) else None
@@ -150,7 +153,7 @@ async def _send_bundle_once(repository: AgentToolEffectRepository, *, scope: str
         # The real dispatch fence owns precise network state. Across crashes
         # or cancellation we conservatively retain this cross-turn claim.
         repository.mark_dispatching(record['action_id'], daily_limit=None)
-        repository.finish(record['action_id'], 'uncertain', reason='media_delivery_interrupted')
+        repository.finish(record['action_id'], 'uncertain', receipt=claim_metadata, reason='media_delivery_interrupted')
         raise
     status = result.status
     if status == 'sent' and not result.receipt_id:
@@ -162,7 +165,7 @@ async def _send_bundle_once(repository: AgentToolEffectRepository, *, scope: str
         # remain repairable once through the repository's existing bound.
         repository.mark_dispatching(record['action_id'], daily_limit=None)
     repository.finish(record['action_id'], status if status in {'sent', 'uncertain', 'failed', 'blocked'} else 'failed',
-        receipt={'receipt_id': result.receipt_id,'asset_claim_version':2,'artifact_ids':identifiers}, reason='media_delivery_settled')
+        receipt={**claim_metadata, 'receipt_id': result.receipt_id}, reason='media_delivery_settled')
     return result
 
 

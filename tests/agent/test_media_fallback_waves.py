@@ -17,6 +17,58 @@ def enqueue(queue, payload, index, *, minimum=2, types=('video',), key='syntheti
     finally:local_fallback_plan.reset(token)
 
 
+@pytest.mark.parametrize('first_status', ['sent', 'failed', 'uncertain'])
+async def test_parallel_delivery_fence_preserves_three_item_goal_and_replacement(sqlite_engine, first_status):
+    import asyncio
+    from app.agent.media_delivery import send_media_once
+    from app.storage.agent_effects import AgentToolEffectRepository
+    entered, release = asyncio.Event(), asyncio.Event()
+    downloads, sends = [], []
+    async def execute(payload, guard):
+        index = int(payload['arguments']['ref_id'].rsplit('/', 1)[1])
+        downloads.append(index)
+        return {'status':'ok', 'data':{'video_artifact_id':f'art-video-{index}'}}
+    async def deliver(payload, guard):
+        identifier = payload['result']['data']['video_artifact_id']
+        index = int(identifier.rsplit('-', 1)[1])
+        async def send():
+            guard.on_dispatch()
+            sends.append(index)
+            if index == 0 and first_status != 'sent':
+                if first_status == 'uncertain':entered.set()
+                return ToolOutcome({}, first_status)
+            if len(sends) == 3:entered.set()
+            await release.wait()
+            return ToolOutcome({}, 'sent', f'receipt-{index}')
+        outcome = await send_media_once(AgentToolEffectRepository(sqlite_engine, account_id=payload['account_id']),
+            scope=payload['scope'], source_id=payload['source_id'], operation='send_private',
+            arguments={'artifact_ids':[identifier]}, require_valid=guard.require_valid, invoke=send)
+        return {'sent':'completed', 'failed':'failed', 'uncertain':'uncertain', 'blocked':'blocked'}[outcome.status]
+    queue, payload, _ = setup_queue(sqlite_engine, execute=execute, deliver=deliver)
+    jobs = [enqueue(queue, payload, i, minimum=3) for i in range(5)]
+    async def worker():
+        for _ in range(20):
+            if not await queue.tick():return
+        raise AssertionError('fallback queue did not settle')
+    workers = [asyncio.create_task(worker()) for _ in range(3)]
+    try:
+        async with asyncio.timeout(3):await entered.wait()
+        if first_status != 'uncertain':assert sends == [0, 1, 2] and downloads == [0, 1, 2]
+    finally:
+        release.set()
+        async with asyncio.timeout(5):await asyncio.gather(*workers)
+    assert sends == {'sent':[0, 1, 2], 'failed':[0, 1, 2, 3], 'uncertain':[0]}[first_status]
+    with session_scope(sqlite_engine) as session:
+        rows = [session.get(Job, job) for job in jobs]
+        if first_status == 'uncertain':
+            assert [row.status for row in rows] == ['uncertain'] + ['blocked']*4
+        else:
+            assert all(row.status == 'completed' for row in rows[1:])
+            assert rows[0].status == ('failed' if first_status == 'failed' else 'completed')
+            skipped = rows[4:] if first_status == 'failed' else rows[3:]
+            assert all(row.attempt_count == 0 and row.last_error_code == 'media_fallback_goal_satisfied' for row in skipped)
+
+
 async def test_first_three_fail_then_two_remaining_complete_without_another_model(sqlite_engine):
     downloads=[]; delivered=[]
     async def execute(payload,guard):

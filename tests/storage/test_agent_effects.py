@@ -39,6 +39,33 @@ def test_effect_reservations_are_persistent_and_idempotent(sqlite_engine):
         reserve(repo, payload_hash="b" * 64)
 
 
+def test_initial_receipt_is_atomic_copied_and_only_applied_to_fresh_claims(sqlite_engine):
+    repo = repository(sqlite_engine)
+    metadata = {'asset_claim_version':2, 'artifact_ids':['art-a']}
+    def claim(initial):
+        return repo.reserve(SCOPE, run_id='synthetic-run', tool_call_id='c', operation='send_group',
+            payload_hash=HASH, sources=(1, 2), initial_receipt=initial)
+    first = claim(metadata)
+    assert first['fresh'] and first['receipt'] == metadata
+    metadata['artifact_ids'].append('art-b')
+    assert repository(sqlite_engine).read(first['action_id'])['receipt'] == first['receipt']
+    assert claim({'asset_claim_version':99})['receipt'] == first['receipt']
+    repo.finish(first['action_id'], 'failed')
+    repaired = claim(metadata)
+    assert repaired['fresh'] and repaired['receipt'] == metadata and repaired['reservation_attempts'] == 2
+    repo.mark_dispatching(first['action_id'], daily_limit=None)
+    repo.finish(first['action_id'], 'uncertain', receipt={'error':'lost receipt'})
+    assert claim(metadata)['receipt'] == {'error':'lost receipt'}
+
+
+def test_initial_receipt_cannot_relabel_existing_legacy_reservation(sqlite_engine):
+    repo = repository(sqlite_engine)
+    first = reserve(repo)
+    again = repo.reserve(SCOPE, run_id='synthetic-run', tool_call_id='c', operation='send_group',
+        payload_hash=HASH, sources=(1, 2), initial_receipt={'asset_claim_version':2})
+    assert not again['fresh'] and again['receipt'] is None and again['action_id'] == first['action_id']
+
+
 def test_completed_call_is_never_dispatched_twice(sqlite_engine):
     repo = repository(sqlite_engine)
     effect = reserve(repo)

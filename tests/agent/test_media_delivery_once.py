@@ -52,6 +52,66 @@ async def test_concurrent_claim_has_one_sender_and_reserved_crash_is_not_replaye
     assert (await deliver(repository(sqlite_engine), send)).data['already_delivered']
 
 
+@pytest.mark.parametrize('surface', ['group', 'private'])
+async def test_three_distinct_media_send_before_any_receipt_settles(sqlite_engine, surface):
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def run(identifier):
+        async def send():
+            calls.append(identifier)
+            if len(calls) == 3:entered.set()
+            await release.wait()
+            return ToolOutcome({}, 'sent', 'receipt-' + identifier)
+        return await send_media_once(repository(sqlite_engine), scope=surface+':900000102',
+            source_id=10, operation='send_'+surface, arguments={'artifact_ids':[identifier]},
+            require_valid=lambda:None, invoke=send)
+    pending = [asyncio.create_task(run('art-'+str(i))) for i in range(3)]
+    try:
+        # A fresh repository per sender also tests visibility across workers.
+        async with asyncio.timeout(2):await entered.wait()
+    finally:
+        release.set()
+        results = await asyncio.gather(*pending)
+    assert calls == ['art-0', 'art-1', 'art-2']
+    assert all(result.status == 'sent' for result in results)
+    assert (await run('art-1')).data['already_delivered']
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('state', ['reserved', 'dispatching', 'uncertain', 'sent'])
+async def test_real_legacy_claim_is_never_relabelled_or_bypassed(sqlite_engine, state):
+    from hashlib import sha256
+    import json
+    scope_hash = sha256(b'private:900000102').hexdigest()
+    digest = sha256(json.dumps([10, ['art-a', 'art-b']], separators=(',', ':')).encode()).hexdigest()
+    repo = repository(sqlite_engine)
+    claim = repo.reserve('media-delivery:'+scope_hash, run_id=f'media-source:{scope_hash}:10',
+        tool_call_id='send_private:'+digest, operation='media_delivery_once', payload_hash=digest, sources=(10,))
+    if state != 'reserved':repo.mark_dispatching(claim['action_id'], daily_limit=None)
+    if state in {'sent', 'uncertain'}:
+        repo.finish(claim['action_id'], state, receipt={'receipt_id':'old-receipt'} if state == 'sent' else None)
+    async def forbidden():raise AssertionError('legacy subset must not reach sender')
+    result = await deliver(repository(sqlite_engine), forbidden, artifact_ids=['art-a'])
+    assert result.status == ('blocked' if state == 'sent' else 'uncertain')
+    assert result.data['error'] == 'legacy_media_delivery_subset_unverified'
+    assert repo.read(claim['action_id'])['receipt'] == ({'receipt_id':'old-receipt'} if state == 'sent' else None)
+
+
+async def test_interrupted_new_bundle_retains_its_version_and_asset_fence(sqlite_engine):
+    from hashlib import sha256
+    async def cancelled():raise asyncio.CancelledError()
+    repo = repository(sqlite_engine)
+    with pytest.raises(asyncio.CancelledError):
+        await deliver(repo, cancelled, artifact_ids=['art-a'])
+    scope_hash = sha256(b'private:900000102').hexdigest()
+    claim, = repo.media_delivery_claims('media-delivery:'+scope_hash, f'media-source:{scope_hash}:10')
+    assert claim['status'] == 'uncertain'
+    assert claim['receipt']['asset_claim_version'] == 2
+    async def forbidden():raise AssertionError('unknown asset cannot replay')
+    result = await deliver(repository(sqlite_engine), forbidden, artifact_ids=['art-a', 'art-b'])
+    assert result.status == 'uncertain' and result.data['error'] == 'media_delivery_already_claimed'
+
+
 @pytest.mark.parametrize('interrupted', [False, True])
 async def test_unknown_or_cancelled_delivery_cannot_be_replayed(sqlite_engine, interrupted):
     calls = []

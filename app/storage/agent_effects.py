@@ -92,7 +92,13 @@ class AgentToolEffectRepository:
         return row if row and row.account_id == self.account_id else None
 
     def reserve(self, scope: str, *, run_id: str, tool_call_id: str, operation: str,
-                payload_hash: str, sources=()) -> dict:
+                payload_hash: str, sources=(), initial_receipt=None) -> dict:
+        """Persist initial claim metadata atomically, only for a fresh attempt.
+
+        Metadata is not a platform receipt: only a settled sent effect with
+        its actual receipt confirms delivery. Existing unknown claims retain
+        their original metadata and fence.
+        """
         AutonomousRepository._validate_scope(scope)
         for value, limit in ((run_id, 160), (tool_call_id, 200), (operation, 80)):
             if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 for c in value):
@@ -103,6 +109,7 @@ class AgentToolEffectRepository:
                 or any(type(source) is not int or not 1 <= source <= 2**63 - 1 for source in sources)
                 or len(set(sources)) != len(sources)):
             raise ValueError("invalid effect sources")
+        copied_receipt = _json_copy(initial_receipt)
         identity = json.dumps([self.account_id, run_id, tool_call_id], separators=(",", ":"))
         effect_id = "effect-" + sha256(identity.encode("utf-8")).hexdigest()
         with self._transactions._write_scope() as session:
@@ -118,7 +125,7 @@ class AgentToolEffectRepository:
                     unresolved = self._unresolved(session, scope, operation, payload_hash)
                     if unresolved is not None:
                         return self._snapshot(unresolved)
-                    row.status, row.reason, row.receipt = "reserved", "", None
+                    row.status, row.reason, row.receipt = "reserved", "", copied_receipt
                     row.payload_hash, row.source_message_ids = payload_hash, list(sources)
                     row.reservation_attempts += 1
                     row.updated_at = utc_naive(self.clock())
@@ -133,7 +140,7 @@ class AgentToolEffectRepository:
             now = utc_naive(self.clock())
             row = AgentToolEffect(action_id=effect_id, account_id=self.account_id, scope=scope,
                 run_id=run_id, tool_call_id=tool_call_id, operation=operation, payload_hash=payload_hash,
-                status="reserved", reservation_attempts=1, source_message_ids=list(sources), receipt=None, reason="",
+                status="reserved", reservation_attempts=1, source_message_ids=list(sources), receipt=copied_receipt, reason="",
                 created_at=now, updated_at=now)
             session.add(row)
             session.flush()
