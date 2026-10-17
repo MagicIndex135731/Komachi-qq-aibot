@@ -17,7 +17,15 @@ def test_invalid_video_is_explicitly_rejected(change):
     note = {'type': 'video', 'video': {'media': {'stream': {'h264': [item]}}}}
     if change == 'image_note': note['type'] = 'normal'
     if change == 'private_url': item['masterUrl'] = 'http://127.0.0.1/a.mp4'
-    if change == 'oversize': item['size'] = 65*1024*1024
-    if change == 'long_video': item['duration'] = 601000
+    if change == 'oversize': item['size'] = 128*1024*1024+1
+    if change == 'long_video': item['duration'] = 1200001
     if change == 'no_h264': note['video']['media']['stream'] = {'h265': [item]}
     with pytest.raises(ValueError): parse_note_video(note, 'https://www.xiaohongshu.com/')
+
+
+@pytest.mark.parametrize('size,duration',[(65*1024*1024,601000),(128*1024*1024,1200000)])
+def test_video_above_old_limit_and_at_new_boundary_is_accepted(size,duration):
+    note={'type':'video','video':{'media':{'stream':{'h264':[{
+        'masterUrl':'https://cdn.example.com/a.mp4','size':size,'duration':duration}]}}}}
+    result=parse_note_video(note,'https://www.xiaohongshu.com/')
+    assert result['declared_bytes']==size and result['duration_seconds']==duration/1000

@@ -44,12 +44,14 @@
 | `list_web_images` | 从公开网页提取有说明的原图候选，可分页；候选不代表已下载或看过 |
 | `download_web_image` | 直接下载本轮候选的一张原图，验证像素并返回会话产物 |
 | `download_web_images` | 确定性后台下载；每批最多20张、32MiB、90秒，返回产物句柄、角色及失败；不默认输入像素，需要看图时`read_artifact` |
-| `download_web_video` | 下载小红书/B站兼容公开视频；B站复用yt-dlp并有公开MP4回退，抖音无会话时可能失败。H.264 MP4，最大64MiB、10分钟 |
-| `download_twitter_media` | 后台下载X公开单帖图片/视频/动图，原图失败可降large并注明；最多16项/128MiB/180秒，单视频64MiB/10分钟，图片8MiB及像素校验 |
+| `download_web_video` | 下载小红书/B站兼容公开视频；B站复用yt-dlp并有公开MP4回退，抖音无会话时可能失败。H.264 MP4，最大128MiB、20分钟 |
+| `download_twitter_media` | 后台下载X公开单帖图片/视频/动图，原图失败可降large并注明；最多16项/128MiB/180秒，单视频128MiB/20分钟，图片8MiB及像素校验 |
 | `media_task_status` | 查询本提问者、本会话的后台媒体任务；排队、生成和发送是不同状态，不重新执行任务 |
 | `queue_media_batch` | 将已发现的下载操作持久排队，每次最多16项、每进程最多4个媒体worker并行；先完成的可先交付。各项保留原工具参数、权限和预算，等待容量后继续 |
 
 已有原帖可核验/下载；限定发布者用list_x_posts，主题用search_x_posts。lookback_days为软检索策略，可为null；用户明确日期不可放宽。同轮最多4种搜索、2种账号读取，词序/大小写/重复词等价复用。图和视频都要时media_types填两种；missing_media_types报告缺口。top非全站互动最高，不擅加热度门槛。lexical_match仅词面，主体/主题仍需核验；嵌入可能仅置顶/热门，空结果只表示覆盖缺口。
+
+已有候选零选中时本地取回、失败续补；数量和类型齐全或回执未知时停止。
 
 Fantia用gallery-dl，Bangumi用官方API。X/小红书在容器采集，凭据不导出；无会话的指定URL保留公开解析。封面/正文/网页图分开，复用媒体缓存、队列与账本。
 
@@ -139,7 +141,7 @@ Gemini 搜索摘要里未经来源元数据确认的链接不作为可操作地�
 
 ## 独立 X 下载命令行
 
-不启动机器人也可手动下载；使用现有 Python 环境和 `httpx`：
+独立下载，依赖 Python 和 `httpx`：
 
 ```powershell
 python -B -X utf8 scripts/download_twitter_media.py "https://x.com/i/status/900000000000000001"
@@ -148,6 +150,6 @@ python -B -X utf8 scripts/download_twitter_media.py "帖子链接" -o "D:/Downlo
 
 默认保存到 `data/twitter_media/帖子ID-随机串/`，含媒体和 `manifest.json`。图片orig网络/可恢复HTTP、不完整或超字节预算时仅降到large；预算、时限、校验不变。鉴权、429、非法URL/签名、取消不降档，视频在同一预算内最多试3种原生MP4，动图标kind=gif。清单保留来源/顺序/解析器/字节/SHA256和image_size/fallback_reason；quality_fallbacks及自动交付文字注明非原图。CLI先用公开嵌入，失败试FxTwitter，`--resolver`可指定syndication/fxtwitter，不读取浏览器登录态。
 
-CLI视频默认100MiB/文件、图片8MiB、300MiB/次、180秒，可用`--max-file-mib`、`--max-total-mib`、`--timeout`调整，每URL最多3次尝试。**手动文件由用户管理，不自动淘汰**；失败/取消清理本次半成品，重复下载保留旧结果。机器人使用前述更严格限制及受控缓存。
+CLI视频默认100MiB/文件、图片8MiB、300MiB/次、180秒，可用`--max-file-mib`、`--max-total-mib`、`--timeout`调整，每URL最多3次尝试。**手动文件由用户管理，不自动淘汰**；失败/取消清理本次半成品，重复下载保留旧结果。机器人使用前述限制及受控缓存。
 
 配置X会话后，X工具使用容器gallery-dl及一次twscrape备选；搜索与筛选规则见上文，交付沿用缓存、队列和QQ回执。会话、代理及更新见[WSL操作](../infra/wsl/README.md)，扩站见[开发合同](DEVELOPMENT.md#x爬虫采集合同)。

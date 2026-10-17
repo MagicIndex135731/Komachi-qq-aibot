@@ -397,6 +397,25 @@ async def test_strict_original_photo_does_not_fallback(tmp_path):
     assert len(calls)==1 and calls[0].url.params['name']=='orig'
 
 
+@pytest.mark.parametrize('reason', ['duration_limit','estimated_size_limit','unsupported_codec'])
+async def test_rejected_video_variants_report_precise_safe_reason(tmp_path,reason):
+    variant={'url':'https://video.twimg.com/ordinary.mp4','codec':'h264',
+        'width':1280,'height':720,'duration_seconds':20,'bitrate':500_000}
+    variant.update({'duration_seconds':1201} if reason=='duration_limit' else
+        {'bitrate':80_000_000} if reason=='estimated_size_limit' else {'codec':'hevc'})
+    observation={'post_id':POST_ID,'identity_status':'matched','protected':False,'media_count':1,
+        'media':[{'kind':'video','url':variant['url'],'variants':[variant]}]}
+    calls=[]
+    async with client_for({},lambda request:calls.append(request) or httpx.Response(500)) as client:
+        with pytest.raises(TwitterMediaError) as caught:
+            await TwitterMediaDownloader(client,max_file_bytes=64*1024*1024).download_resolved(URL,tmp_path,
+                observation,evidence_ref='x-posts-'+'a'*24+':post:0')
+    assert caught.value.code=='no_mp4_stream_within_budget'
+    assert caught.value.details['stage']=='video_variant_selection'
+    assert caught.value.details['rejected_by_reason'][reason]==1
+    assert not calls and not list(tmp_path.iterdir())
+
+
 async def test_unknown_length_oversize_fallback_counts_discarded_bytes(tmp_path):
     class Stream(httpx.AsyncByteStream):
         async def __aiter__(self):

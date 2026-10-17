@@ -36,8 +36,9 @@ _PHOTO_FALLBACK_CODES = {"http_400", "http_404", "http_410", "http_500", "http_5
 class TwitterMediaError(ValueError):
     """Safe error code without upstream bodies, account details, or credentials."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, details: dict | None = None):
         self.code = code
+        self.details = details or {}
         super().__init__(code)
 
 
@@ -425,9 +426,11 @@ class TwitterMediaDownloader:
                                 saved = await self._transfer(item.url, limit=min(remaining,self.transfer_budget.remaining), target=target, kind=item.kind)
                             else:
                                 from app.core.media_variants import native_variants
+                                diagnostics={'stage':'video_variant_selection'}
                                 choices=native_variants(list(item.variants) or [{'url':item.url}],
-                                    max_bytes=min(remaining,self.transfer_budget.remaining),original_only=self.original_only)
-                                if not choices:raise TwitterMediaError('no_mp4_stream_within_budget')
+                                    max_bytes=min(remaining,self.transfer_budget.remaining),original_only=self.original_only,
+                                    diagnostics=diagnostics)
+                                if not choices:raise TwitterMediaError('no_mp4_stream_within_budget',details=diagnostics)
                                 last=None
                                 for choice in choices:
                                     try:
@@ -462,10 +465,11 @@ class TwitterMediaDownloader:
                     self.check()  # Revocation never becomes an ordinary item failure.
                     item_failures.append({'index': index, 'kind': item.kind,
                         'error': exc.code if isinstance(exc, TwitterMediaError) else
-                            'download_timeout' if isinstance(exc, TimeoutError) else 'media_validation_or_storage_failed'})
+                            'download_timeout' if isinstance(exc, TimeoutError) else 'media_validation_or_storage_failed',
+                        **({'details':exc.details} if isinstance(exc,TwitterMediaError) and exc.details else {})})
                     target.unlink(missing_ok=True)
             if not files and item_failures:
-                raise TwitterMediaError(item_failures[0]['error'])
+                raise TwitterMediaError(item_failures[0]['error'],details=item_failures[0].get('details'))
             manifest = {"schema_version": 1, "post_id": post.post_id, "source_url": post.source_url,
                         "resolver": resolver, "resolver_failures": failures,
                         "created_at": datetime.now(UTC).isoformat(), "post": metadata, "total_bytes": total,

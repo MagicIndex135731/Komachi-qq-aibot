@@ -1,6 +1,7 @@
 """Durable deterministic media work. No child model or native chat session."""
 from __future__ import annotations
 
+from contextvars import ContextVar
 from hashlib import sha256
 import json
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from app.storage.models import Job
 from app.storage.models import Message
 
 MEDIA_OPERATIONS = frozenset({'generate_image', 'download_web_images', 'download_web_video', 'download_twitter_media'})
+local_fallback_plan = ContextVar('local_media_fallback_plan', default=None)
 
 
 def download_delivery_properties():
@@ -102,6 +104,44 @@ class MediaTaskQueue(ResearchDelegationQueue):
         # Do not spend the single execution attempt during process startup.
         return super().claim() if self.available() else None
 
+    def admit_claim(self, session, row, phase, now):
+        plan=row.payload_json.get('fallback_plan')
+        if not plan:return True
+        payload=row.payload_json
+        siblings=list(session.scalars(select(Job).where(Job.job_type==self.job_type,
+            Job.job_key.startswith(self.prefix(payload['scope_id'])),
+            Job.payload_json['fallback_plan']['key'].as_string()==plan['key'],
+            Job.payload_json['scope'].as_string()==payload['scope'],
+            Job.payload_json['actor_id'].as_integer()==payload['actor_id'],
+            Job.payload_json['source_id'].as_integer()==payload['source_id'])))
+        if any(j.status in {'uncertain','cancelled'} for j in siblings):
+            row.status='blocked';row.last_error_code='media_fallback_unknown_or_cancelled'
+            row.completed_at=now
+            return False
+        if phase!='running':return True
+        # Only confirmed deliveries count. Byte/logical identities prevent a
+        # repeated clip from satisfying the goal twice.
+        ready={};types=set()
+        for sibling in siblings:
+            if sibling.status!='completed':continue
+            result=sibling.payload_json.get('result',{})
+            if result.get('status')!='ok':continue
+            data=result.get('data',{})
+            for item in data.get('media',[]):
+                kind='image' if item.get('kind')=='photo' else 'video'
+                identity=item.get('sha256') or item.get('logical_media_id') or item.get('artifact_id')
+                if identity:ready[identity]=kind;types.add(kind)
+            if not data.get('media'):
+                for kind,ids in (('image',data.get('artifact_ids',[])),
+                        ('video',data.get('video_artifact_ids',[]) or ([data['video_artifact_id']] if data.get('video_artifact_id') else []))):
+                    for identifier in ids:ready[identifier]=kind;types.add(kind)
+        if len(ready)>=plan['minimum_count'] and set(plan['media_types'])<=types:
+            row.status='completed';row.last_error_code='media_fallback_goal_satisfied'
+            row.completed_at=now
+            return False
+        earlier=[j for j in siblings if j.payload_json['fallback_plan']['wave']<plan['wave']]
+        return not any(j.status in {'pending','queued','running','result_ready','delivering'} for j in earlier)
+
     def source_fingerprints(self, sources):
         with session_scope(self.engine) as session:
             result = {}
@@ -124,6 +164,11 @@ class MediaTaskQueue(ResearchDelegationQueue):
                     or payload['surface']=='group' and payload.get('request_addressed') is not True)):
             return ToolOutcome({'error':'invalid_media_delivery'},'blocked')
         payload = {**payload, 'arguments':arguments, 'delivery_mode':mode, 'delivery_text':caption}
+        plan=local_fallback_plan.get()
+        if plan is not None:
+            if mode!='auto' or any(plan.get(k)!=payload.get(k) for k in ('scope','actor_id','source_id')):
+                return ToolOutcome({'error':'media_fallback_out_of_scope'},'blocked')
+            payload={**payload,'fallback_plan':{k:plan[k] for k in ('key','wave','minimum_count','media_types')}}
         identity = sha256(json.dumps([payload['operation'], arguments],
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         result = self.enqueue({**payload, 'source_fingerprints': self.source_fingerprints(payload['sources']),
@@ -169,16 +214,20 @@ def media_result(outcome, payload):
         # Resource descriptions may be long; handles are never replaced by an error.
         keep = {'artifact_id','artifact_ids','media_artifact_ids','video_artifact_id',
             'video_artifact_ids','requested_count','downloaded_count','all_requested_downloaded',
-            'source_url','post_id','total_bytes','image_roles','quality_fallbacks'}
+            'source_url','post_id','total_bytes','image_roles','quality_fallbacks','video_quality_fallbacks','failure_detail','error'}
         compact = {key:value for key,value in data.items() if key in keep}
         compact['media'] = [{key:value for key,value in item.items() if key in {
-            'artifact_id','logical_media_id','source_ref','kind','index','status','bytes','image_size','sha256'}}
+            'artifact_id','logical_media_id','source_ref','kind','index','status','bytes','image_size','sha256','quality','fallback_reason'}}
             for item in data.get('media',[]) if isinstance(item,dict)]
         from app.core.media_source import media_source_key
         for item in compact['media']:
             if item.get('source_ref'):item['source_ref']=media_source_key(item['source_ref'])
         compact['failures'] = [{key:str(value)[:160] for key,value in item.items()
             if key in {'index','image_id','error'}} for item in data.get('failures',[]) if isinstance(item,dict)]
+        for original, failure in zip((item for item in data.get('failures',[]) if isinstance(item,dict)), compact['failures']):
+            if isinstance(original.get('details'),dict):
+                failure['details']={k:v for k,v in original['details'].items() if k in {
+                    'stage','variant_count','byte_limit','duration_limit_seconds','rejected_by_reason'}}
         compact.update(result_compacted=True, guidance='描述已压缩，保留真实成果句柄；失败和部分完成须如实说明。')
         data = compact
     # Downloads return handles; explicit read_artifact is the visual inspection
@@ -255,6 +304,20 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
     files = ()
     text = payload.get('delivery_text') or '下载完成，媒体在这里。'
     download_ok = result.get('status')=='ok' and bool(identifiers)
+    if not download_ok and payload.get('fallback_plan'):
+        # A failed candidate does not produce a warning between fallback
+        # waves. Only an exhausted request with no delivered media needs one.
+        with session_scope(engine) as session:
+            siblings=list(session.scalars(select(Job).where(Job.job_type=='agent_media_operation',
+                Job.job_key.startswith(guard.queue.prefix(payload['scope_id'])),
+                Job.payload_json['fallback_plan']['key'].as_string()==payload['fallback_plan']['key'],
+                Job.payload_json['scope'].as_string()==payload['scope'],
+                Job.payload_json['actor_id'].as_integer()==payload['actor_id'],
+                Job.payload_json['source_id'].as_integer()==payload['source_id'])))
+            if any(j.status in {'uncertain','cancelled'} for j in siblings):return 'blocked'
+            others=[j for j in siblings if j.id!=guard.job_id]
+            if any(j.status in {'pending','queued','running','result_ready','delivering','completed'} for j in others):
+                return 'failed'
     if download_ok:
         def before_read(identifier):
             guard.require_valid()
@@ -267,6 +330,8 @@ async def deliver_download(payload, guard, *, engine, settings, runner, send, cl
             text = f"成功下载{len(files)}项，另有{len(data.get('failures',[]))}项未完成；这里只发送已取得的媒体。"
         if data.get('quality_fallbacks'):
             text += f" 其中{len(data['quality_fallbacks'])}张图片原图不可用，已降为large尺寸（非原图）。"
+        if data.get('video_quality_fallbacks'):
+            text += f" 其中{len(data['video_quality_fallbacks'])}段视频采用较低清晰度的原生版本。"
     else:
         text = '这次媒体下载未完成，暂时无法发送。'
     boundary = ToolDispatchBoundary(engine=engine,account_id=payload['account_id'],scope=payload['scope'],

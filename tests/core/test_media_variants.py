@@ -30,3 +30,13 @@ def test_child_transfer_keeps_one_local_deadline_and_charges_shared_parent():
     assert child.deadline<parent.deadline
     with pytest.raises(ValueError):child.charge(51)
     assert parent.received==81
+
+
+def test_video_limits_accept_128_mib_and_twenty_minutes_but_keep_upper_bounds():
+    from app.core.video_file import MAX_VIDEO_BYTES,MAX_VIDEO_SECONDS
+    assert MAX_VIDEO_BYTES==128*1024*1024 and MAX_VIDEO_SECONDS==1200
+    variants=[{'url':'ordinary-long.mp4','codec':'h264','duration_seconds':1200,
+        'declared_bytes':128*1024*1024}]
+    assert len(native_variants(variants,max_bytes=MAX_VIDEO_BYTES))==1
+    assert not native_variants([{**variants[0],'duration_seconds':1200.1}],max_bytes=MAX_VIDEO_BYTES)
+    assert not native_variants([{**variants[0],'declared_bytes':MAX_VIDEO_BYTES+1}],max_bytes=MAX_VIDEO_BYTES)

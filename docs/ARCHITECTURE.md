@@ -223,7 +223,7 @@ SDK-minimal显式组合0.1.5rc1的token-meter、tool-result-pruner、compaction-
 
 小红书发现通过`search_xhs_posts`，由容器内固定只读CLI复用xiaohongshu-mcp站点动作；Chrome和CLI在同一小町镜像，登录态仅留专用Docker卷0700/0600目录，仅群私应用挂载。群私共用跨进程锁，采集无MCP监听端口，模型不接触登录参数或账号写操作。搜索卡片仅为候选，原帖ID/作者/UTC日期与附件须另验；核验后的图集/视频复用既有下载、队列、来源检查点与发送账本。内部JSON投影不冒充网页HTML，CDN客户端不携带会话；日期未知/过旧的近期目标不得排队。具体上限见[小红书合同](DEVELOPMENT.md#小红书容器采集合同)。
 
-小红书 `download_web_video` 仅取对应笔记公开H.264流，支持同笔记公开移动页回退，单视频64MiB/10分钟；以有界流写临时文件，ffprobe校验MP4/codec/时长/尺寸并由ffmpeg解码首帧。媒体由网页原像素工具相同的公网地址固定连接与逐跳校验下载，不让QQ网关自行访问外部URL。视频作为独立媒体由 `send_group/send_private(video_artifact_id=...)` 经base64传给OneBot，上传回执最多90秒且未知不重发；不与图集混发，不把已下载当观看内容。视频文件保存在独立下载目录，既有scoped artifact store只保存小型JSON指针及来源，保持原有8MiB图片/文本合同。
+小红书 `download_web_video` 仅取对应笔记公开H.264流，支持同笔记公开移动页回退，单视频128MiB/20分钟；以有界流写临时文件，ffprobe校验MP4/codec/时长/尺寸并由ffmpeg解码首帧。媒体由网页原像素工具相同的公网地址固定连接与逐跳校验下载，不让QQ网关自行访问外部URL。视频作为独立媒体由 `send_group/send_private(video_artifact_id=...)` 经base64传给OneBot，上传回执最多90秒且未知不重发；不与图集混发，不把已下载当观看内容。视频文件保存在独立下载目录，既有scoped artifact store只保存小型JSON指针及来源，保持原有8MiB图片/文本合同。
 
 网页媒体清理由 `DownloadedMediaCache/DownloadedMediaJanitor` 统一负责：只清理origin为web_page_image/web_reference_pixels/web_page_video的产物及专用目录内孤儿临时文件，默认24小时/512MiB；启动和每小时扫描，下载准入前也清理并预留空间。群私以文件锁共享预算，20分钟使用租约覆盖最长回合与发送时间；正在使用的媒体不足以腾出空间时拒绝新下载。视频指针与实际文件一并清理，过期ID安全失败。其他生成作品及用户文件保留。配置与范围见CONFIGURATION；原生会话、聊天/记忆和QQ桥接自有缓存不纳入此下载缓存额度。
 
@@ -264,4 +264,4 @@ systemd、watchdog和Windows计划任务保持进程与连接存活，QQ登录�
 
 持续群聊与工具/授权分工的设计参考了 [Tulpa](https://github.com/fumingyang2004/Tulpa)，感谢其作者和贡献者。
 
-跨站媒体共享逐项READY/语义选择/交付/完成状态，持久RequestBudget在原来源内贯穿后台与回传，已选定成果的收尾无需模型。逐逻辑资产及字节摘要认领复用现有效果表，无新表；来源令牌不作为媒体身份。稳定约束、计量边界和数值上限以[共享媒体合同](DEVELOPMENT.md#跨站媒体预算与尽力交付)为准。
+跨站媒体共享逐项READY/语义选择/交付/完成状态，持久RequestBudget在原来源内贯穿后台与回传，零选中兜底及收尾无需模型。逐逻辑资产及字节摘要认领复用现有效果表，无新表；来源令牌不作为媒体身份。稳定约束、计量边界和数值上限以[共享媒体合同](DEVELOPMENT.md#跨站媒体预算与尽力交付)为准。

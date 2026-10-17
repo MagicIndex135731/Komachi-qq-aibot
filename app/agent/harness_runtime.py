@@ -438,7 +438,8 @@ class _Bridge:
             self.pending_model_tokens+=estimated_tokens
 
     async def finalize_media(self):
-        """No model, new reads or downloads; a finite reserved send authority."""
+        """Recover excluded candidates, then send only existing approved files."""
+        await self.recover_excluded_media()
         if (self.finalizer_used or not self.control or not self.control.requires_media
                 or self.auto_handoff or self.cancelled.is_set() or self.control.unknown
                 or self.last_write and self.last_write.status=='uncertain'):
@@ -459,9 +460,10 @@ class _Bridge:
             props=tool.parameters.get('properties',{})
             selected=[];size=0
             if 'media_artifact_ids' in props:
+                from app.core.video_file import MAX_VIDEO_BYTES
                 for identifier in identifiers:
                     is_video=identifier in self.control.video_artifacts
-                    length=self.control.asset_details.get(identifier,{}).get('bytes') or (64*1024*1024 if is_video else 8*1024*1024)
+                    length=self.control.asset_details.get(identifier,{}).get('bytes') or (MAX_VIDEO_BYTES if is_video else 8*1024*1024)
                     if selected and (len(selected)>=20 or size+length>32*1024*1024):break
                     selected.append(identifier);size+=length
                     if length>32*1024*1024:break
@@ -497,6 +499,116 @@ class _Bridge:
             self.control.observe(name,args,result,'reserved-media-finalizer')
         except (ValueError,RuntimeError,OSError,TimeoutError) as exc:
             self.trace.append({'status':'media_finalizer_blocked','error':type(exc).__name__})
+
+    async def recover_excluded_media(self):
+        """Queue a bounded local download when model exclusions left no media."""
+        control=self.control
+        if (not control or not self.owner.require_reply or not self.delivery_tool()
+                or self.auto_handoff or self.cancelled.is_set() or self._tool_lock.locked()
+                or self.last_write and self.last_write.status=='uncertain'
+                or time.monotonic()>=self.finalization_deadline):return
+        sources=control.excluded_media_sources()
+        if not sources:return
+        caption='按网页候选直接取回这些媒体，内容尚未逐项核实；数量或类型可能仍有缺口。'
+        budget=self.request_budget()
+        sequence=0
+        downloads=0
+
+        async def invoke(name,args):
+            nonlocal sequence
+            tool=self.tools.get(name)
+            if not tool:return None
+            self.guard.require_valid()
+            if self.cancelled.is_set():raise RuntimeError('media_fallback_cancelled')
+            # Apply original-quality policy, then grant only this local call
+            # automatic delivery. Model calls still require topic review.
+            args=control.prepare_tool_arguments(name,args)
+            if name in {'download_twitter_media','download_web_images','download_web_video'}:
+                args={**args,'delivery_mode':'auto','delivery_text':caption}
+            if (tool.authorization is not None and tool.authorization() is not True
+                    or not validate_arguments(args,tool.parameters)):return None
+            if (name in {'download_twitter_media','download_web_images','download_web_video'}
+                    and control.publication_filter['provenance']=='explicit_user'):
+                refs=args.get('image_ids') or [args.get('ref_id')]
+                for ref in refs:
+                    key=control._resource_key(ref)
+                    post=next((pid for pid,row in control.post_metadata.items()
+                        if control._resource_key(row['url'])==key),None)
+                    if (failure:=control._check_publication(post)) is not None:return failure
+            rejected=control.preflight(name,args,local_fallback=True)
+            if rejected is not None:return rejected
+            if budget:budget.spend('tool_calls')
+            remaining=min(12.0,self.finalization_deadline-time.monotonic())
+            if remaining<=0:raise TimeoutError()
+            sequence+=1
+            call_id=f'local-media-fallback-{sequence}'
+            self.observer.event('tool.started',{'name':name,'call_id':call_id,'effect':tool.effect,
+                'arguments':args,'execution_kind':'local_media_fallback'})
+            from app.core.request_cost import request_cost_scope
+            from app.agent.media_tasks import local_fallback_plan
+            token=local_fallback_plan.set({
+                'key':control.workspace.task_id,'scope':control.workspace.scope,
+                'actor_id':control.workspace.actor_id,'source_id':control.workspace.source_id,
+                'wave':max(0,downloads-1)//3,'minimum_count':control.minimum_media_count,
+                'media_types':sorted(control.requested_media_types)})
+            try:
+                async with asyncio.timeout(remaining):
+                    with request_cost_scope(budget):
+                        result=await (self.invoke_tool(tool,args,call_id) if self.invoke_tool else tool.handler(args))
+            finally:local_fallback_plan.reset(token)
+            self.trace.append({'tool':name,'status':result.status,'execution_kind':'local_media_fallback'})
+            self.observer.event('tool.completed',{'name':name,'call_id':call_id,'status':result.status,
+                'data':result.data,'execution_kind':'local_media_fallback'})
+            control.workspace.observe_tool(name,args,result,call_id)
+            control.observe(name,args,result,call_id)
+            if result.status=='uncertain':raise RuntimeError('media_fallback_effect_unknown')
+            job=result.data.get('job_id')
+            if (result.status=='ok' and type(job) is int and job>0
+                    and result.data.get('delivery')=='automatic_delivery_to_original_request'):
+                self.pending_jobs[job]=result.data.get('execution_status',result.data.get('status','queued'))
+                self.auto_delivery_jobs.add(job)
+                self.auto_handoff=set(self.pending_jobs)<=self.auto_delivery_jobs
+            return result
+
+        try:
+            async with self._tool_lock:
+                self.guard.require_valid()
+                if budget:budget.check()
+                if not control.workspace.claim_media_fallback():return
+                for source in sources:
+                    if downloads>=12:break
+                    key=control._resource_key(source)
+                    row=next((r for r in control.post_metadata.values() if control._resource_key(r['url'])==key),{})
+                    images=[i for i,v in control.web_image_candidates.items() if v['page_url']==source
+                        and v['role'] not in {'avatar','icon','cover','thumbnail'}]
+                    if not row and not images:
+                        await invoke('inspect_web_resources',{'ref_ids':[source]})
+                        row=next((r for r in control.post_metadata.values() if control._resource_key(r['url'])==key),{})
+                    roles=set(row.get('media_roles',[]))
+                    kinds=({'image'} if 'post_image' in roles else set())|({'video'} if 'post_video' in roles else set())
+                    requested=control.requested_media_types
+                    if key.startswith('x:'):
+                        # X downloads the complete root post. A type-only
+                        # request must never receive mixed or unknown media.
+                        if requested and (not kinds or kinds-requested):continue
+                        downloads+=1
+                        await invoke('download_twitter_media',{'ref_id':source})
+                        continue
+                    if requested!={'image'} and ('video' in kinds or source.lower().endswith('.mp4')):
+                        downloads+=1
+                        await invoke('download_web_video',{'ref_id':source})
+                    if requested!={'video'} and downloads<12:
+                        if not images:
+                            await invoke('list_web_images',{'ref_id':source})
+                            images=[i for i,v in control.web_image_candidates.items() if v['page_url']==source
+                                and v['role'] not in {'avatar','icon','cover','thumbnail'}]
+                        if images:
+                            downloads+=1
+                            await invoke('download_web_images',{'image_ids':images[:min(6,control.minimum_media_count)]})
+                self.trace.append({'status':'local_media_fallback_finished','download_attempts':downloads,
+                    'queued_jobs':len(self.auto_delivery_jobs)})
+        except (ValueError,RuntimeError,OSError,TimeoutError) as exc:
+            self.trace.append({'status':'local_media_fallback_blocked','error':type(exc).__name__})
 
     def delivery_tool(self):
         candidates = [name for name in ("send_group", "send_private")
@@ -779,6 +891,12 @@ class _Bridge:
         info = {"name": name, "call_id": call_id, "effect": tool.effect if tool else "unknown"}
         self.observer.event("tool.started", {**info, "arguments": body.get("arguments")})
         was_seen = isinstance(call_id, str) and call_id in self._seen_calls
+        args=body.get('arguments')
+        if (not was_seen and name==self.delivery_tool() and tool is not None
+                and validate_arguments(args,tool.parameters)
+                and args.get('task_status','completed') in {'partial','blocked','completed'}
+                and not (args.get('artifact_ids') or args.get('media_artifact_ids') or args.get('video_artifact_id'))):
+            await self.recover_excluded_media()
         try:
             with observe_with(self.observer, call_id=call_id):
                 result = await self._call_tool(body)

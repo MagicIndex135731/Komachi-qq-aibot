@@ -216,6 +216,7 @@ class ResearchDelegationQueue:
 
     def claim(self):
         now = self.clock().astimezone(UTC).replace(tzinfo=None)
+        settled=[];claimed=None
         with self.transaction() as session:
             # Capacity limits execution, not the size of an authorized request.
             # Promotion is durable; tick revalidates source/permission/TTL before
@@ -249,6 +250,10 @@ class ResearchDelegationQueue:
                 if row.run_at > now:
                     continue
                 phase = 'running' if row.status == 'queued' else 'delivering'
+                if not self.admit_claim(session,row,phase,now):
+                    if row.status not in WAITING_STATES:
+                        settled.append((row.id,dict(row.payload_json),row.status))
+                    continue
                 if phase == 'running' and row.attempt_count >= row.max_attempts:
                     row.status, row.last_error_code = self.exhausted_execution_status, 'research_attempts_exhausted'
                     continue
@@ -256,7 +261,15 @@ class ResearchDelegationQueue:
                 row.lease_until = now + timedelta(seconds=900)
                 if phase == 'running':
                     row.attempt_count += 1
-                return row.id, dict(row.payload_json), phase
+                claimed=row.id, dict(row.payload_json), phase
+                break
+        for job_id,payload,status in settled:
+            self.record_job_completion(job_id,payload,status)
+        return claimed
+
+    def admit_claim(self, session, row, phase, now):
+        """Optional deterministic job admission inside the claim transaction."""
+        return True
 
     def finish(self, job_id, phase, *, status, payload=None, reason=''):
         completed_payload = None
@@ -268,22 +281,25 @@ class ResearchDelegationQueue:
                     row.payload_json = payload
                 row.completed_at = self.clock().astimezone(UTC).replace(tzinfo=None)
                 completed_payload = dict(row.payload_json)
-        if (completed_payload and self.task_workspace_root and completed_payload.get('parent_task_id')
-                and status not in WAITING_STATES):
+        if completed_payload:
+            self.record_job_completion(job_id,completed_payload,status)
+        return status if completed_payload is not None else None
+
+    def record_job_completion(self, job_id, payload, status):
+        if (self.task_workspace_root and payload.get('parent_task_id') and status not in WAITING_STATES):
             try:
                 from app.agent.research_tasks import ResearchTaskWorkspace
-                check = ResearchJobGuard(self, job_id, completed_payload, phase)
-                if not self.authorized(completed_payload):
-                    return status
-                task = ResearchTaskWorkspace(self.task_workspace_root, scope=completed_payload['scope'],
-                    actor_id=completed_payload['actor_id'], source_id=completed_payload['source_id'],
-                    request=completed_payload.get('goal', ''), valid_source=check.valid_source,
+                check = ResearchJobGuard(self, job_id, payload, 'running')
+                if not self.authorized(payload):
+                    return
+                task = ResearchTaskWorkspace(self.task_workspace_root, scope=payload['scope'],
+                    actor_id=payload['actor_id'], source_id=payload['source_id'],
+                    request=payload.get('goal', ''), valid_source=check.valid_source,
                     valid_dependencies=check.valid_dependencies, clock=lambda: self.clock().timestamp())
-                task.resume(completed_payload['parent_task_id'])
+                task.resume(payload['parent_task_id'])
                 task.record_job_result(job_id, status)
             except (ValueError, OSError, RuntimeError):
                 logger.warning('agent_task_checkpoint_unavailable job_id=%s', job_id)
-        return status if completed_payload is not None else None
 
     async def tick(self):
         claimed = self.claim()

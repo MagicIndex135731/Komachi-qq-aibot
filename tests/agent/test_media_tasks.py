@@ -196,3 +196,17 @@ def test_long_media_sources_compact_without_dropping_ready_handles():
         'media':media,'post':{'text':'x'*16000}}),{'operation':'download_web_images','task_id':'synthetic'})
     assert len(json.dumps(result))<12000
     assert len(result['data']['media_artifact_ids'])==20 and result['status']=='ok'
+
+
+def test_compacted_video_result_retains_quality_and_variant_rejection_details():
+    from app.agent.media_tasks import media_result
+    details={'stage':'video_variant_selection','variant_count':2,'byte_limit':128*1024*1024,
+        'duration_limit_seconds':1200,'rejected_by_reason':{'duration_limit':2}}
+    value=media_result(ToolOutcome({'post':{'text':'x'*20000},'media_artifact_ids':['art-video'],
+        'media':[{'artifact_id':'art-video','kind':'video','quality':'lower_native','fallback_reason':'higher_version_over_budget_or_failed'}],
+        'video_quality_fallbacks':[{'index':1,'quality':'lower_native','reason':'higher_version_over_budget_or_failed'}],
+        'failures':[{'index':2,'error':'no_mp4_stream_within_budget','details':details}]}),
+        {'operation':'download_twitter_media','task_id':'synthetic'})
+    assert value['data']['media'][0]['quality']=='lower_native'
+    assert value['data']['failures'][0]['details']==details
+    assert value['data']['video_quality_fallbacks'] and len(json.dumps(value))<12000

@@ -6,8 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
-MAX_VIDEO_BYTES = 64 * 1024 * 1024
-MAX_VIDEO_SECONDS = 600
+MAX_VIDEO_BYTES = 128 * 1024 * 1024
+MAX_VIDEO_SECONDS = 1200
 
 
 def validate_video(path: Path) -> dict:

@@ -191,7 +191,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
                 candidate = client.video(url, check=guard.require_valid)
                 from app.core.media_variants import TransferBudget,native_variants
                 from app.core.request_cost import current_request_budget
-                budget=TransferBudget(128*1024*1024,check=guard.require_valid,deadline=time.monotonic()+90,
+                budget=TransferBudget(256*1024*1024,check=guard.require_valid,deadline=time.monotonic()+90,
                     parent=transfer_budget or current_request_budget.get())
                 choices=native_variants(candidate.get('variants') or [candidate],max_bytes=MAX_VIDEO_BYTES,
                     original_only=args.get('quality')=='original_only')
@@ -228,7 +228,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
             guard.require_valid()
             code = str(exc) if isinstance(exc, ValueError) and str(exc).startswith(('web_', 'media_cache_')) else 'web_video_download_failed'
             logger.warning('web_video_failed code=%s error_type=%s', code, type(exc).__name__)
-            return ToolOutcome({'error': code, 'guidance': '视频未取到；登录/反爬、无兼容MP4、超64MiB/10分钟或缓存正在使用时说明原因。不能假装已发送，也不把封面当视频。'}, 'failed')
+            return ToolOutcome({'error': code, 'guidance': '视频未取到；登录/反爬、无兼容MP4、超128MiB/20分钟或缓存正在使用时说明原因。不能假装已发送，也不把封面当视频。'}, 'failed')
         guard.require_valid()
         video_results[url] = artifact_id, info
         return ToolOutcome({'video_artifact_id': artifact_id, **info, 'trust': 'untrusted_external_sources',
@@ -253,7 +253,7 @@ def build_web_image_tools(web_client, *, runner, guard, store, settings=None,
         AgentTool('download_web_images', '后台按序下载本轮image_ids，最多20张/32MiB/90秒；回传真实产物句柄，不默认输入像素。需看图时read_artifact；直接交付选auto，禁止重复排队/发送。',
             schema({'image_ids': {'type': 'array', 'items': text(64), 'minItems': 1, 'maxItems': 20, 'uniqueItems': True},
                 **download_delivery_properties()}, ['image_ids']), serial(batch)),
-        AgentTool('download_web_video', '后台下载公开网页或获准卡片的真实H.264 MP4，最大64MiB/10分钟；立即返回任务编号，完成后回传video_artifact_id再发送。不要重复排队；不观看/抽帧或执行网页脚本。',
+        AgentTool('download_web_video', '后台下载公开网页或获准卡片的真实H.264 MP4，最大128MiB/20分钟；立即返回任务编号，完成后回传video_artifact_id再发送。不要重复排队；不观看/抽帧或执行网页脚本。',
             schema({'ref_id': text(2000), **download_delivery_properties()}, ['ref_id']), serial(video)),
         build_twitter_media_tool(runner=runner, guard=guard, store=store, settings=settings, submit=submit,transfer_budget=transfer_budget),
     )

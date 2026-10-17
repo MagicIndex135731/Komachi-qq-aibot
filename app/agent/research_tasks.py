@@ -246,6 +246,19 @@ class ResearchTaskWorkspace:
             'coverage_verification': 'model_reported_not_independent_semantic_validation'}
 
     @serialized_checkpoint
+    def claim_media_fallback(self):
+        """One local recovery per source, shared across turns and workers."""
+        self._check()
+        path=self._file('media-fallback.json')
+        if self._load(path):return False
+        state={'scope':self.scope,'actor_id':self.actor_id,'source_id':self.source_id,
+            'task_id':self.task_id,'updated_at':self.clock()}
+        if self.dependency_snapshot:state['dependencies']=self.dependency_snapshot()
+        self._check(state)
+        self._write(path,state)
+        return True
+
+    @serialized_checkpoint
     def save_request_control(self, control):
         """Lightweight evidence/goal record; does not activate research budgets."""
         data={'scope':self.scope,'actor_id':self.actor_id,'source_id':self.source_id,

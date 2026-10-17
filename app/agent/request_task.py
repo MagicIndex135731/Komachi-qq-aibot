@@ -136,6 +136,7 @@ class RequestTaskControl:
         self.image_artifacts=set()
         self.reviewed_images=set()
         self.candidate_reviews={}
+        self.web_image_candidates={}
         self.resource_urls=set()
         self.post_metadata={}
         self.source_refs={}
@@ -388,15 +389,15 @@ class RequestTaskControl:
                 return 'user_publisher_unverified'
         return None
 
-    def preflight(self,name,args):
+    def preflight(self,name,args,*,local_fallback=False):
         downloads=(args.get('operations',[]) if name=='queue_media_batch' else
             [{'operation':name,'arguments':args}])
-        if self.topic_selection and any(e.get('operation') in _DOWNLOAD_TOOLS
+        if not local_fallback and self.topic_selection and any(e.get('operation') in _DOWNLOAD_TOOLS
                 and e.get('arguments',{}).get('delivery_mode')=='auto' for e in downloads):
             return ToolOutcome({'error':'media_topic_review_required',
                 'handler_executed':False,'suggested_delivery_mode':'review',
                 'guidance':'主题搜集用review下载，media_task_status取结果，按原帖正文/日期/类型筛选后交付；不要求视觉预览，不查看视频或动图。单帖不足继续其他来源，不重复下载同帖，不用auto提前交接。'},'blocked')
-        if (self.requires_media and self.minimum_media_count>1 and downloads
+        if (not local_fallback and self.requires_media and self.minimum_media_count>1 and downloads
                 and all(e.get('operation') in {'download_twitter_media','download_web_images','download_web_video'}
                     and e.get('arguments',{}).get('delivery_mode')=='auto' for e in downloads)):
             selected={}
@@ -606,6 +607,13 @@ class RequestTaskControl:
             for source in data.get('sources',[])[:20]:
                 if isinstance(source,dict) and isinstance(source.get('ref_id'),str) and isinstance(source.get('source'),str):
                     self.source_refs[source['ref_id']]=source['source']
+            if name=='list_web_images' and isinstance(data.get('page_url'),str):
+                page=data['page_url']
+                self.resource_urls.add(page)
+                for image in data.get('images',[])[:20]:
+                    if isinstance(image,dict) and isinstance(image.get('image_id'),str):
+                        self.source_refs[image['image_id']]=page
+                        self.web_image_candidates[image['image_id']]={'page_url':page,'role':image.get('role','page_image')}
             if name=='list_web_images' and data.get('identity_status')=='matched':
                 if isinstance(args.get('ref_id'),str):self.source_refs[args['ref_id']]=data.get('page_url','')
                 for image in data.get('images',[])[:20]:
@@ -752,6 +760,21 @@ class RequestTaskControl:
                     if self._check_publication(post) is not None:continue
                 approved.append(identifier)
         return approved
+
+    def excluded_media_sources(self):
+        """Current unattempted candidates when terminal model selection is zero."""
+        if (not self.requires_media or self.unknown or self.artifacts or self.delivered_artifacts
+                or any(v in {'queued','pending','running','result_ready','delivering','uncertain'} for v in self.jobs.values())):
+            return []
+        pages={v['page_url'] for v in self.web_image_candidates.values()}
+        pages.update(r['url'] for r in self.post_metadata.values()
+            if r.get('media_count',0) or set(r.get('media_roles',[]))&{'post_image','post_video'})
+        urls=sorted(url for url in self.resource_urls
+            if (resource_ready(url) or url in pages)
+            and self._resource_key(url) not in self.attempted_resources)
+        if not urls or any(self.candidate_reviews.get(self._resource_key(url),{}).get('decision')=='selected' for url in urls):
+            return []
+        return [url for url in urls if not self._source_constraints(url)][:12]
 
     def _persist(self):
         resources=list(self.post_metadata.values())[-32:]

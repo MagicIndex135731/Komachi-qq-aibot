@@ -87,6 +87,32 @@ async def test_large_photo_fallback_reaches_scoped_artifacts_and_quality_result(
     finally:http.close()
 
 
+@pytest.mark.parametrize('kind', ['video', 'animated_gif'])
+async def test_lower_native_video_never_reads_photo_image_size(sqlite_engine,tmp_path,monkeypatch,kind):
+    _,store,guard,http=tools_for(monkeypatch,sqlite_engine,tmp_path,lambda _:None)
+    calls=[]
+    def respond(request):
+        if request.url.host=='cdn.syndication.twimg.com':
+            return httpx.Response(200,json={'id_str':POST,'mediaDetails':[
+                {'type':kind,'video_info':{'duration_millis':20000,'variants':[
+                    {'content_type':'video/mp4','bitrate':80_000_000,'url':'https://video.twimg.com/high.mp4'},
+                    {'content_type':'video/mp4','bitrate':500_000,'url':'https://video.twimg.com/low.mp4'}]}}]})
+        calls.append(request.url.path)
+        return httpx.Response(200,content=VIDEO,headers={'content-type':'video/mp4'})
+    monkeypatch.setattr('app.agent.twitter_media.download_client',lambda _:httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    monkeypatch.setattr('app.agent.twitter_media.validate_video',lambda _:{'codec':'h264','duration_seconds':20})
+    try:
+        result=await build_twitter_media_tool(runner=Runner(),guard=guard,store=store).handler({'ref_id':URL})
+        assert result.status=='ok' and calls==['/low.mp4']
+        assert len(result.data['video_artifact_ids'])==1 and result.data['quality_fallbacks']==[]
+        assert result.data['video_quality_fallbacks']==[{'index':1,'quality':'lower_native',
+            'reason':'higher_version_over_budget_or_failed'}]
+        assert result.data['media'][0]['quality']=='lower_native'
+        assert 'image_size' not in result.data['media'][0]
+        assert '视频' in result.data['guidance'] and 'large尺寸' not in result.data['guidance']
+    finally:http.close()
+
+
 @pytest.mark.parametrize('failure', ['invalid_video', 'revoked', 'cancelled'])
 async def test_failed_mixed_download_removes_staging_and_registered_siblings(sqlite_engine, tmp_path, monkeypatch, failure):
     _, store, guard, http = tools_for(monkeypatch, sqlite_engine, tmp_path, lambda _: None)

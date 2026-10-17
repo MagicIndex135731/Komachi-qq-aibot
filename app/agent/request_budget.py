@@ -8,7 +8,7 @@ from app.agent.research_tasks import serialized_checkpoint
 
 class RequestBudget:
     LIMITS={'model_calls':24,'estimated_tokens':256000,'tool_calls':64,'discovery_calls':8,
-        'media_received':192*1024*1024,'network_reserved_bytes':512*1024*1024,'transfer_requests':96,'writes':8}
+        'media_received':384*1024*1024,'network_reserved_bytes':768*1024*1024,'transfer_requests':96,'writes':8}
 
     def __init__(self,workspace,*,create=True,limits=None):
         self.workspace=workspace

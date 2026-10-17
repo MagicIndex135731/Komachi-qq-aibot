@@ -47,6 +47,7 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
         if len(results) >= 2:
             return ToolOutcome({'error': 'twitter_media_turn_budget'}, 'blocked')
         created, images, videos, media, quality_fallbacks = [], [], [], [], []
+        video_quality_fallbacks = []
         try:
             # Include overhead and reserve before downloading a single byte.
             reservation_bytes = min(cache.max_bytes, MAX_TOTAL_BYTES + 2 * 1024 * 1024)
@@ -75,8 +76,11 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
                         media.append({'artifact_id': identifier, 'kind': item['kind'], 'index': item['index'], 'status': 'ready', 'bytes': item['bytes'], 'sha256':item['sha256'],
                             'logical_media_id': logical, 'source_ref': url, **{k:item[k] for k in ('quality','fallback_reason') if k in item},
                             **({'image_size':item.get('image_size','orig')} if item['kind']=='photo' else {})})
-                        if item.get('fallback_reason'):
+                        if item['kind']=='photo' and item.get('fallback_reason'):
                             quality_fallbacks.append({'index':item['index'],'image_size':item['image_size'],'reason':item['fallback_reason']})
+                        elif item.get('fallback_reason'):
+                            video_quality_fallbacks.append({'index':item['index'],'quality':item['quality'],
+                                'reason':item['fallback_reason']})
                     from app.providers.x_crawler_client import XCrawlerClient
                     async with download_client(settings) as client:
                         downloaded = await TwitterMediaDownloader(client, max_file_bytes=min(MAX_VIDEO_BYTES, transfer_bytes),
@@ -86,7 +90,7 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
                     result = {'source_url': url, 'post_id': downloaded.manifest['post_id'],
                         'post': downloaded.manifest.get('post', {}),
                         'media_artifact_ids': created[:], 'artifact_ids': images, 'video_artifact_ids': videos,
-                        'media': media, 'quality_fallbacks':quality_fallbacks,
+                        'media': media, 'quality_fallbacks':quality_fallbacks,'video_quality_fallbacks':video_quality_fallbacks,
                         'received_bytes':downloaded.manifest.get('received_bytes',downloaded.manifest['total_bytes']),
                         'downloaded_count': len(created), 'total_bytes': downloaded.manifest['total_bytes'],
                         'all_requested_downloaded': downloaded.manifest.get('all_requested_downloaded', True),
@@ -97,6 +101,8 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
                         result['guidance'] += '部分项目失败，只交付已成功项并说明缺口。'
                     if quality_fallbacks:
                         result['guidance']+='部分图片原图不可用，已降一档为large；须如实说明，不能声称全部原图。'
+                    if video_quality_fallbacks:
+                        result['guidance']+='部分视频采用较低清晰度的原生版本，未截短或转码。'
                     results[url] = result
                     return ToolOutcome(result)
         except BaseException as exc:
@@ -109,14 +115,17 @@ def build_twitter_media_tool(*, runner, guard, store, settings=None, submit=None
                 return ToolOutcome({'source_url':url, 'media_artifact_ids':created, 'artifact_ids':images,
                     'video_artifact_ids':videos, 'media':media, 'downloaded_count':len(created),
                     'all_requested_downloaded':False, 'failures':[{'error':'batch_interrupted'}],
+                    'quality_fallbacks':quality_fallbacks,'video_quality_fallbacks':video_quality_fallbacks,
                     'guidance':'批次未全部完成，已保留验证成功的媒体；发送子集并说明缺口。'})
             guard.require_valid()
             code = exc.code if isinstance(exc, TwitterMediaError) else str(exc) if isinstance(exc, ValueError) else 'twitter_media_download_failed'
-            return ToolOutcome({'error': code, 'guidance': '本次媒体未完成，不能声称已发送；可能是私密/删除/限制、接口验证、文件格式或容量上限。失败半成品已清理。'}, 'failed')
+            return ToolOutcome({'error': code,
+                **({'failure_detail':exc.details} if isinstance(exc,TwitterMediaError) and exc.details else {}),
+                'guidance': '本次媒体未完成，不能声称已发送；可能是私密/删除/限制、接口验证、文件格式或容量上限。失败半成品已清理。'}, 'failed')
 
     from app.agent.media_tasks import download_delivery_properties
     return AgentTool('download_twitter_media',
-        '后台下载当前获准任务中发现的X/Twitter公开原帖全部图片、视频和动图；图片优先原图，原图不可用时仅降一档large并在结果注明。已有原帖即可用，主题检索不限本人用search_x_posts，明确限定发布者才list_x_posts。配置X会话时自动使用爬虫读取元数据。最多16项/128MiB，单视频64MiB/10分钟；返回任务号，按原顺序交付，不展开引用帖。',
+        '后台下载当前获准任务中发现的X/Twitter公开原帖全部图片、视频和动图；图片优先原图，原图不可用时仅降一档large并在结果注明。已有原帖即可用，主题检索不限本人用search_x_posts，明确限定发布者才list_x_posts。配置X会话时自动使用爬虫读取元数据。最多16项/128MiB，单视频128MiB/20分钟；返回任务号，按原顺序交付，不展开引用帖。',
         {'type': 'object', 'properties': {'ref_id': {'type': 'string', 'minLength': 1, 'maxLength': 2000,
             'description':'本轮发现的原帖source_url、搜索ref_id或已观察到的post_id；优先完整原帖URL'},
             **download_delivery_properties()},
